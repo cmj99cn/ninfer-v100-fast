@@ -10,9 +10,11 @@
 #include "cutlass/gemm/device/gemm.h"
 #include "cutlass/half.h"
 
+#include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -104,13 +106,39 @@ template <class ElementOutput>
 using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
     ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value, ElementAccumulator,
     ElementComputeEpilogue>;
-template <class ElementOutput, int TileN = 128>
+template <class ElementOutput, int TileN = 128, class SwizzleTB = SwizzleThreadBlock,
+          int Stages = kNumStages>
 using GemmFor = cutlass::gemm::device::Gemm<ElementInputA, LayoutInputA, ElementInputB, LayoutInputB,
                                          ElementOutput, LayoutOutput, ElementAccumulator, MMAOp,
                                          SmArch, cutlass::gemm::GemmShape<128, TileN, 32>,
                                          ShapeMMAWarp, ShapeMMAOp,
-                                         EpilogueOp<ElementOutput>, SwizzleThreadBlock, kNumStages>;
+                                         EpilogueOp<ElementOutput>, SwizzleTB, Stages>;
 using Gemm = GemmFor<cutlass::bfloat16_t>;
+
+// NINFER_SM70_PREFILL_GEMM selects the prefill GEMM configuration:
+//   0 = CUTLASS identity swizzle, 2 pipeline stages (default)
+//   1 = cuBLAS fp16 GEMM over the same dequantized operands
+// Stages stays at 2 and swizzling stays identity: cutlass's SM70 device::Gemm hard-codes
+// 2 stages and its kernel calls get_tile_offset(int), which only the identity swizzle
+// satisfies, so neither axis is selectable through this API.
+int prefill_gemm_variant() {
+    static const int variant = [] {
+        const char* env = std::getenv("NINFER_SM70_PREFILL_GEMM");
+        return env ? std::atoi(env) : 0;
+    }();
+    return variant;
+}
+
+template <class ElementOutput>
+struct CublasOutType;
+template <>
+struct CublasOutType<cutlass::bfloat16_t> {
+    static constexpr cudaDataType_t value = CUDA_R_16BF;
+};
+template <>
+struct CublasOutType<float> {
+    static constexpr cudaDataType_t value = CUDA_R_32F;
+};
 
 template <class Allocator>
 struct CutlassWorkspace {
@@ -141,26 +169,13 @@ std::size_t workspace_bytes_impl(std::int32_t n, std::int32_t k, std::int32_t co
     return layout.peak_bytes(1);
 }
 
-template <class ElementOutput, int TileN>
-void launch_impl(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                 cudaStream_t stream) {
-    using Gemm = GemmFor<ElementOutput, TileN>;
+// Materializes the packed NVFP4 weight tile and the BF16 activation tile as FP16 so one
+// GEMM call can reuse them across every token tile of the chunk.
+void dequant_inputs(const Tensor& x, const Weight& w, cutlass::half_t* w_fp16,
+                    cutlass::half_t* x_fp16, cudaStream_t stream) {
     const std::int32_t k    = x.ne[0];
     const std::int32_t cols = x.ne[1];
     const std::int32_t n    = w.n;
-    cutlass::gemm::GemmCoord problem_size(cols, n, k);
-    typename Gemm::Arguments sizing_arguments{
-        problem_size, {nullptr, k}, {nullptr, k}, {nullptr, n}, {nullptr, n},
-        {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
-    const std::size_t gemm_workspace_bytes =
-        Gemm::get_workspace_size(sizing_arguments);
-
-    auto scratch_scope = ws.scope();
-    CutlassWorkspace<WorkspaceArena> scratch =
-        allocate_cutlass_workspace(ws, n, k, cols, gemm_workspace_bytes);
-    auto* w_fp16 = static_cast<cutlass::half_t*>(scratch.w_fp16.data);
-    auto* x_fp16 = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
-
     const dim3 block(256);
     if (w.layout == QuantLayout::VoltaQpnPrepacked) {
         const dim3 grid(static_cast<unsigned>((static_cast<std::int64_t>(n) * (k / 16) + 255) / 256));
@@ -182,6 +197,29 @@ void launch_impl(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& 
     bf16_to_fp16_kernel<<<x_blocks, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                                       x_fp16, x_count);
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <class ElementOutput, int TileN, class SwizzleTB, int Stages>
+void launch_impl(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                 cudaStream_t stream) {
+    using Gemm = GemmFor<ElementOutput, TileN, SwizzleTB, Stages>;
+    const std::int32_t k    = x.ne[0];
+    const std::int32_t cols = x.ne[1];
+    const std::int32_t n    = w.n;
+    cutlass::gemm::GemmCoord problem_size(cols, n, k);
+    typename Gemm::Arguments sizing_arguments{
+        problem_size, {nullptr, k}, {nullptr, k}, {nullptr, n}, {nullptr, n},
+        {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
+    const std::size_t gemm_workspace_bytes =
+        Gemm::get_workspace_size(sizing_arguments);
+
+    auto scratch_scope = ws.scope();
+    CutlassWorkspace<WorkspaceArena> scratch =
+        allocate_cutlass_workspace(ws, n, k, cols, gemm_workspace_bytes);
+    auto* w_fp16 = static_cast<cutlass::half_t*>(scratch.w_fp16.data);
+    auto* x_fp16 = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
+
+    dequant_inputs(x, w, w_fp16, x_fp16, stream);
 
     Gemm gemm_op;
     typename Gemm::Arguments arguments{
@@ -204,15 +242,58 @@ void launch_impl(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& 
 }
 
 template <class ElementOutput>
+void launch_cublas(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                   cudaStream_t stream) {
+    const std::int32_t k    = x.ne[0];
+    const std::int32_t cols = x.ne[1];
+    const std::int32_t n    = w.n;
+    auto scratch_scope = ws.scope();
+    CutlassWorkspace<WorkspaceArena> scratch = allocate_cutlass_workspace(ws, n, k, cols, 0);
+    auto* w_fp16 = static_cast<cutlass::half_t*>(scratch.w_fp16.data);
+    auto* x_fp16 = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
+    dequant_inputs(x, w, w_fp16, x_fp16, stream);
+
+    static thread_local cublasHandle_t handle = [] {
+        cublasHandle_t h{};
+        if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) {
+            throw std::runtime_error("nvfp4_cutlass_sm70: cublasCreate failed");
+        }
+        return h;
+    }();
+    if (cublasSetStream(handle, stream) != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error("nvfp4_cutlass_sm70: cublasSetStream failed");
+    }
+    // Row-major C[cols, n] = A[cols, k] x B[k, n] equals the column-major product
+    // (n x k) x (k x cols) over the same three buffers, so no transpose flags are needed.
+    const float alpha = 1.0F;
+    const float beta  = 0.0F;
+    cublasStatus_t status = cublasGemmEx(
+        handle, CUBLAS_OP_N, CUBLAS_OP_N, n, cols, k, &alpha,
+        w_fp16, CUDA_R_16F, k, x_fp16, CUDA_R_16F, k, &beta,
+        static_cast<ElementOutput*>(out.data), CublasOutType<ElementOutput>::value, n,
+        CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error("nvfp4_cutlass_sm70: cublasGemmEx failed");
+    }
+}
+
+template <class ElementOutput>
 void launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
             cudaStream_t stream) {
     // The same 64x64 warp contraction gains output-column reuse on the wide TP2 MLPs.
     // Narrow calls and other registered geometries retain their measured 128-column tile.
-    if (x.ne[1] >= 2048 && ((w.n == 17408 && w.k == 5120) ||
-                             (w.n == 5120 && w.k == 8704))) {
-        launch_impl<ElementOutput, 256>(x, w, out, ws, stream);
+    const int variant = prefill_gemm_variant();
+    if (variant == 1) {
+        launch_cublas<ElementOutput>(x, w, out, ws, stream);
+        return;
+    }
+    const bool wide = x.ne[1] >= 2048 && ((w.n == 17408 && w.k == 5120) ||
+                                          (w.n == 5120 && w.k == 8704));
+    const int tile_n = wide ? 256 : 128;
+    if (tile_n == 256) {
+        launch_impl<ElementOutput, 256, SwizzleThreadBlock, 2>(x, w, out, ws, stream);
     } else {
-        launch_impl<ElementOutput, 128>(x, w, out, ws, stream);
+        launch_impl<ElementOutput, 128, SwizzleThreadBlock, 2>(x, w, out, ws, stream);
     }
 }
 

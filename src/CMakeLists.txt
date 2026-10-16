@@ -278,12 +278,14 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear/ggml_k/ggml_k_cutlass_sm70.cu
     ops/linear/bf16/bf16_cutlass_sm70.cu
     ops/attn_input_proj/bf16/bf16_attn_input_cutlass_sm70.cu
+    ops/attn_input_proj/nvfp4/nvfp4_attn_input_cutlass_sm70.cu
     ops/linear_add/bf16/bf16_linear_add_volta.cu
     ops/attn_input_proj/fp8/fp8_attn_input_volta_qpn.cu
     ops/attn_input_proj/fp8/fp8_attn_input_cutlass_sm70.cu
     ops/attn_input_proj/q4_q5/q4_q5_attn_input_cutlass_sm70.cu
     ops/gdn_input_proj/fp8/fp8_gdn_input_volta_qpn.cu
     ops/gdn_input_proj/fp8/fp8_gdn_input_cutlass_sm70.cu
+    ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_cutlass_sm70.cu
     ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_cutlass_sm70.cu
     ops/gdn_input_proj/w8/w8_gdn_input_cutlass_sm70.cu
     ops/linear/fp8/fp8_volta_qpn_gemm.cu
@@ -346,6 +348,8 @@ endif()
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core)
+# NINFER_SM70_PREFILL_GEMM=4 routes the prefill GEMM through cuBLAS.
+target_link_libraries(ninfer_ops PRIVATE CUDA::cublas)
 if(TARGET ninfer_nvfp4_tma)
   target_link_libraries(ninfer_ops PRIVATE ninfer_nvfp4_tma)
 endif()

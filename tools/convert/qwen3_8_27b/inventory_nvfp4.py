@@ -44,8 +44,8 @@ FULL_ATTENTION_LAYERS = tuple(range(3, 64, 4))
 GDN_LAYERS = tuple(
     layer for layer in range(64) if layer not in FULL_ATTENTION_LAYERS
 )
-NVFP4_MLP_LAYERS = tuple(range(56))
-FP8_MLP_LAYERS = tuple(range(56, 64))
+NVFP4_MLP_LAYERS = tuple(range(64))
+FP8_MLP_LAYERS: tuple[int, ...] = ()
 
 
 def tensor_spec(
@@ -66,6 +66,10 @@ def tensor_spec(
     return TensorSpec(name, shape, numeric_format, layout)
 
 
+def _divisor_spec(site: str) -> TensorSpec:
+    return TensorSpec(site, (), FP32, CONTIGUOUS_LAYOUT)
+
+
 def _build_text_core_specs() -> tuple[TensorSpec, ...]:
     specs: list[TensorSpec] = [
         tensor_spec("text/token_embedding", (248320, 5120), FP8),
@@ -79,12 +83,18 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
                     tensor_spec(
                         prefix + "attention/query_key_gate_value",
                         (14336, 5120),
-                        FP8,
+                        NVFP4,
+                    ),
+                    _divisor_spec(
+                        prefix + "attention/input_projection/input_scale_divisor"
                     ),
                     tensor_spec(prefix + "attention/query_norm", (256,), BF16),
                     tensor_spec(prefix + "attention/key_norm", (256,), BF16),
                     tensor_spec(
-                        prefix + "attention/output", (5120, 6144), FP8
+                        prefix + "attention/output", (5120, 6144), NVFP4
+                    ),
+                    _divisor_spec(
+                        prefix + "attention/output_projection/input_scale_divisor"
                     ),
                 )
             )
@@ -102,45 +112,34 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
                     tensor_spec(
                         prefix + "gdn/query_key_value_z",
                         (16384, 5120),
-                        FP8,
+                        NVFP4,
+                    ),
+                    _divisor_spec(
+                        prefix + "gdn/input_projection/input_scale_divisor"
                     ),
                     tensor_spec(prefix + "gdn/norm", (128,), BF16),
-                    tensor_spec(prefix + "gdn/output", (5120, 6144), FP8),
+                    tensor_spec(prefix + "gdn/output", (5120, 6144), NVFP4),
+                    _divisor_spec(
+                        prefix + "gdn/output_projection/input_scale_divisor"
+                    ),
                 )
             )
 
         specs.append(
             tensor_spec(prefix + "post_attention_norm", (5120,), BF16)
         )
-        if layer in NVFP4_MLP_LAYERS:
-            specs.extend(
-                (
-                    tensor_spec(
-                        prefix + "mlp/gate_up", (34816, 5120), NVFP4
-                    ),
-                    tensor_spec(
-                        prefix
-                        + "mlp/gate_up_projection/input_scale_divisor",
-                        (),
-                        FP32,
-                    ),
-                    tensor_spec(
-                        prefix + "mlp/down", (5120, 17408), NVFP4
-                    ),
-                    tensor_spec(
-                        prefix + "mlp/down_projection/input_scale_divisor",
-                        (),
-                        FP32,
-                    ),
-                )
+        specs.extend(
+            (
+                tensor_spec(prefix + "mlp/gate_up", (34816, 5120), NVFP4),
+                _divisor_spec(
+                    prefix + "mlp/gate_up_projection/input_scale_divisor"
+                ),
+                tensor_spec(prefix + "mlp/down", (5120, 17408), NVFP4),
+                _divisor_spec(
+                    prefix + "mlp/down_projection/input_scale_divisor"
+                ),
             )
-        else:
-            specs.extend(
-                (
-                    tensor_spec(prefix + "mlp/gate_up", (34816, 5120), FP8),
-                    tensor_spec(prefix + "mlp/down", (5120, 17408), FP8),
-                )
-            )
+        )
 
     specs.extend(
         (
@@ -388,26 +387,26 @@ def validate_inventory() -> None:
         len(NVFP4_TENSOR_SPECS),
         len(FP8_TENSOR_SPECS),
         len(INPUT_SCALE_DIVISOR_SPECS),
-    ) != (771, 2, 12, 333, 1118, 1124, 112, 146, 112):
+    ) != (915, 2, 12, 333, 1262, 1268, 256, 2, 256):
         raise ValueError("registered Qwen3.8 NVFP4 inventory is incomplete")
     if FORMAT_COUNTS != {
         BF16: 534,
         FP16: 111,
-        FP32: 208,
+        FP32: 352,
         I32: 1,
         Q4: 1,
         Q5: 0,
         Q6: 0,
         W8: 5,
-        NVFP4: 112,
-        FP8: 146,
+        NVFP4: 256,
+        FP8: 2,
     }:
         raise ValueError(f"unexpected numeric allocation: {FORMAT_COUNTS}")
     if LAYOUT_COUNTS != {
-        CONTIGUOUS_LAYOUT: 854,
+        CONTIGUOUS_LAYOUT: 998,
         ROW_SPLIT_LAYOUT: 6,
-        BLOCK_SCALE_LAYOUT: 112,
-        ROW_SCALE_LAYOUT: 146,
+        BLOCK_SCALE_LAYOUT: 256,
+        ROW_SCALE_LAYOUT: 2,
     }:
         raise ValueError(f"unexpected layout allocation: {LAYOUT_COUNTS}")
 

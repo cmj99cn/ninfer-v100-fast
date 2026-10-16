@@ -1,6 +1,8 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_cutlass_sm70.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -14,6 +16,12 @@ enum class Nvfp4GdnInputRoute : std::uint8_t {
     W4A4,
 };
 
+#ifdef NINFER_VOLTA_BUILD
+// Same threshold the fp8 route measured on V100: at T>=33 the split-output cutlass projection
+// (one dequant + one GEMM over the whole call) beats repeated <=32-token QPN/small_t launches.
+constexpr std::int32_t kVoltaCutlassMinT = 33;
+#endif
+
 Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 gdn_input_proj: T must be positive"); }
     if (policy == LinearPolicy::A16Only) { return Nvfp4GdnInputRoute::A16; }
@@ -22,7 +30,13 @@ Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                cudaStream_t stream) {
+                WorkspaceArena* workspace, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    if (x.ne[1] >= kVoltaCutlassMinT && workspace != nullptr) {
+        nvfp4_gdn_input_cutlass_sm70_launch(x, weight, qkv, z, *workspace, stream);
+        return;
+    }
+#endif
     constexpr std::int32_t kChunk   = kNvfp4LastSmallT;
     constexpr std::int32_t kQkvRows = 10240;
     constexpr std::int32_t kZRows   = 6144;
@@ -38,6 +52,15 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor qkv_chunk(qkv_output, DType::BF16, {kQkvRows, active});
         Tensor z_chunk(z_output, DType::BF16, {kZRows, active});
+#ifdef NINFER_VOLTA_BUILD
+        // Prefill chunks up to kNvfp4LastSmallT=32 fit the QPN tensor-core schedule; the
+        // Nvfp4GdnInputOutput policy is token-indexed so active>1 chunks are valid. The SIMT
+        // small_t kernel measures ~3.6 TFLOP/s at T=32 on V100 -- keep it only as fallback.
+        if (nvfp4_volta_qpn_supported(weight.n, weight.k, active)) {
+            nvfp4_gdn_input_decode_launch(input_chunk, weight, qkv_chunk, z_chunk, stream);
+            continue;
+        }
+#endif
         if (active == 1) {
             nvfp4_gdn_input_decode_launch(input_chunk, weight, qkv_chunk, z_chunk, stream);
         } else {
@@ -49,7 +72,13 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
 // The tp2 column shard -- same chunking discipline, halved row counts
 // (Nvfp4GdnInputTp2ColumnGeometry's own qkv=5120=1024+1024+3072, z=3072).
 void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                      cudaStream_t stream) {
+                      WorkspaceArena* workspace, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    if (x.ne[1] >= kVoltaCutlassMinT && workspace != nullptr) {
+        nvfp4_gdn_input_cutlass_sm70_launch_shard(x, weight, qkv, z, *workspace, stream);
+        return;
+    }
+#endif
     constexpr std::int32_t kChunk   = kNvfp4LastSmallT;
     constexpr std::int32_t kQkvRows = 5120;
     constexpr std::int32_t kZRows   = 3072;
@@ -65,6 +94,12 @@ void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor qkv_chunk(qkv_output, DType::BF16, {kQkvRows, active});
         Tensor z_chunk(z_output, DType::BF16, {kZRows, active});
+#ifdef NINFER_VOLTA_BUILD
+        if (nvfp4_volta_qpn_supported(weight.n, weight.k, active)) {
+            nvfp4_gdn_input_decode_launch_shard(input_chunk, weight, qkv_chunk, z_chunk, stream);
+            continue;
+        }
+#endif
         if (active == 1) {
             nvfp4_gdn_input_decode_launch_shard(input_chunk, weight, qkv_chunk, z_chunk, stream);
         } else {
@@ -81,15 +116,21 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
         throw std::invalid_argument("nvfp4 gdn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
-    return resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::W4A4
-               ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4GdnInputGeometry::kInputRows)
-               : 0;
+    if (resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::W4A4) {
+        return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4GdnInputGeometry::kInputRows);
+    }
+#ifdef NINFER_VOLTA_BUILD
+    if (max_tokens >= kVoltaCutlassMinT) {
+        return nvfp4_gdn_input_cutlass_workspace_bytes(max_tokens);
+    }
+#endif
+    return 0;
 }
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
-        launch_a16(x, weight, qkv, z, stream);
+        launch_a16(x, weight, qkv, z, workspace, stream);
         return;
     }
     if (workspace == nullptr) {
@@ -108,7 +149,7 @@ void nvfp4_gdn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tenso
                                     LinearPolicy policy, WorkspaceArena* workspace,
                                     cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
-        launch_a16_shard(x, weight, qkv, z, stream);
+        launch_a16_shard(x, weight, qkv, z, workspace, stream);
         return;
     }
     if (workspace == nullptr) {

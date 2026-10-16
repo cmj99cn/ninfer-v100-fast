@@ -32,9 +32,12 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 
@@ -43,10 +46,13 @@ namespace ninfer::ops::detail {
 // unusable for this call, in which case the caller stays on the vendored llama.cpp kernel.
 bool volta_splitd_requested();
 
+bool splitd_positions_are_contiguous(const void* positions, std::int32_t base, std::int32_t width,
+                                     cudaStream_t stream);
+
 template <typename Geometry>
 bool volta_splitd_block(const void* q_bf16, const void* k_f16, const void* v_f16, int rows,
-                        int kv_len, int kv_offset, const void* positions, int position_begin,
-                        float scale, void* out_bf16, cudaStream_t stream);
+                        int kv_len, int kv_offset, bool positions_contiguous, float scale,
+                        void* out_bf16, cudaStream_t stream);
 
 namespace {
 
@@ -109,6 +115,33 @@ struct VoltaFlashParams {
 constexpr int kKeyPad = FATTN_KQ_STRIDE;
 
 constexpr int round_up_keys(int n) { return ((n + kKeyPad - 1) / kKeyPad) * kKeyPad; }
+
+// Report append/gather/attention CUDA-event deltas every 256 launches when
+// NINFER_FLASH_TIMING=1. persist=1/0 tags which gather path is active.
+inline void flash_timing_report(bool timing_on, cudaEvent_t t0, cudaEvent_t t1, cudaEvent_t t2,
+                                cudaEvent_t t3, int* timing_n, int width, int n_kv,
+                                bool persist_gather, cudaStream_t stream) {
+    if (!timing_on) { return; }
+    cudaEventRecord(t3, stream);
+    const cudaError_t sync_err = cudaEventSynchronize(t3);
+    // Timing is best-effort: never leave a sticky error for the next CUDA_CHECK.
+    (void)cudaGetLastError();
+    if (sync_err != cudaSuccess) { return; }
+    float append_ms = 0, gather_ms = 0, attn_ms = 0;
+    cudaEventElapsedTime(&append_ms, t0, t1);
+    cudaEventElapsedTime(&gather_ms, t1, t2);
+    cudaEventElapsedTime(&attn_ms, t2, t3);
+    (void)cudaGetLastError();
+    const int n = ++(*timing_n);
+    if ((n & 0xF) == 1) {
+        std::fprintf(stderr,
+                     "[flash-timing] n=%d persist=%d width=%d n_kv=%d append=%.3fms "
+                     "gather=%.3fms attn=%.3fms total=%.3fms\n",
+                     n, persist_gather ? 1 : 0, width, n_kv, append_ms, gather_ms, attn_ms,
+                     append_ms + gather_ms + attn_ms);
+    }
+    (void)n;
+}
 
 // ---------------------------------------------------------------------------
 // Staging kernels
@@ -281,14 +314,15 @@ __global__ void volta_flash_gather_kv_kernel(
         const __nv_bfloat16* __restrict__ k_pages, const __nv_bfloat16* __restrict__ v_pages,
         const std::int32_t* __restrict__ block_tables, const std::int32_t* __restrict__ table_rows,
         int logical_pages, half* __restrict__ k_out, half* __restrict__ v_out, int n_kv,
-        int n_kv_padded) {
-    const int key = blockIdx.x;
-    const int h   = blockIdx.y;
-    const int d   = threadIdx.x;
-    if (key >= n_kv_padded) { return; }
+        int n_kv_padded, int key_base = 0) {
+    const int local = static_cast<int>(blockIdx.x);
+    const int key   = local + key_base;
+    const int h     = blockIdx.y;
+    const int d     = threadIdx.x;
+    if (local >= n_kv_padded) { return; }
 
     const std::int64_t dst =
-        static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * key);
+        static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * local);
 
     // Padding rows are written as zero rather than left uninitialised: the mask
     // gives them weight zero, and 0 * NaN would still be NaN.
@@ -314,14 +348,15 @@ __global__ void volta_flash_gather_kv_i8_kernel(
         const half* __restrict__ k_scales, const half* __restrict__ v_scales,
         const std::int32_t* __restrict__ block_tables, const std::int32_t* __restrict__ table_rows,
         int logical_pages, half* __restrict__ k_out, half* __restrict__ v_out, int n_kv,
-        int n_kv_padded) {
-    const int key = blockIdx.x;
-    const int h   = blockIdx.y;
-    const int d   = threadIdx.x;
-    if (key >= n_kv_padded) { return; }
+        int n_kv_padded, int key_base = 0) {
+    const int local = static_cast<int>(blockIdx.x);
+    const int key   = local + key_base;
+    const int h     = blockIdx.y;
+    const int d     = threadIdx.x;
+    if (local >= n_kv_padded) { return; }
 
     const std::int64_t dst =
-        static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * key);
+        static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * local);
     if (key >= n_kv) {
         k_out[dst] = __float2half(0.0f);
         v_out[dst] = __float2half(0.0f);
@@ -348,19 +383,20 @@ __global__ void volta_flash_gather_kv_i4nl_kernel(
         const half* __restrict__ k_scales, const half* __restrict__ v_scales,
         const std::int32_t* __restrict__ block_tables, const std::int32_t* __restrict__ table_rows,
         int logical_pages, half* __restrict__ k_out, half* __restrict__ v_out, int n_kv,
-        int n_kv_padded) {
+        int n_kv_padded, int key_base = 0) {
     __shared__ std::int8_t lut_s[16];
     if (threadIdx.x < 16) { lut_s[threadIdx.x] = gqa_i4nl_value_at(static_cast<int>(threadIdx.x)); }
     __syncthreads();
 
-    const int key   = blockIdx.x;
+    const int local = static_cast<int>(blockIdx.x);
+    const int key   = local + key_base;
     const int h     = blockIdx.y;
     const int chunk = threadIdx.x;
-    if (key >= n_kv_padded) { return; }
+    if (local >= n_kv_padded) { return; }
 
     const int d0           = chunk * 8;
     const std::int64_t dst =
-        static_cast<std::int64_t>(d0) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * key);
+        static_cast<std::int64_t>(d0) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * local);
     if (key >= n_kv) {
         store_vec(k_out + dst, make_int4(0, 0, 0, 0));
         store_vec(v_out + dst, make_int4(0, 0, 0, 0));
@@ -589,7 +625,24 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     auto* rows         = static_cast<const std::int32_t*>(table_rows.data);
     auto* position_ptr = static_cast<const std::int32_t*>(positions.data);
 
+    // Phase timing (NINFER_FLASH_TIMING=1): CUDA-event deltas for append/gather/attention
+    // on the current stream, reported every 128 launches. Cost when off: two getenv once.
+    static const bool timing_on = std::getenv("NINFER_FLASH_TIMING") != nullptr;
+    static cudaEvent_t t0, t1, t2, t3;
+    static int timing_n = 0;
+    if (timing_on && t0 == nullptr) {
+        cudaEventCreate(&t0);
+        cudaEventCreate(&t1);
+        cudaEventCreate(&t2);
+        cudaEventCreate(&t3);
+        (void)cudaGetLastError();
+    }
+
     // 1. Append this call's K/V for the whole width.
+    if (timing_on) {
+        cudaEventRecord(t0, stream);
+        (void)cudaGetLastError(); // timing must not poison the append CUDA_CHECK below
+    }
     if (cache.dtype == DType::I8) {
         constexpr int kWarpsPerBlock = 8;
         const int units              = width * kKVHeads * kGqaKvQuantGroups;
@@ -617,41 +670,140 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
             static_cast<__nv_bfloat16*>(cache.v_pages.data), block_tables, logical_pages, width);
     }
     CUDA_CHECK(cudaGetLastError());
+    if (timing_on) {
+        cudaEventRecord(t1, stream);
+        (void)cudaGetLastError();
+    }
 
     // 2. Gather the visible key range paged -> contiguous FP16, once for every
     //    Q-block of this layer.
-    const std::int32_t n_kv_alloc = round_up_keys(n_kv_total);
-    if (cache.dtype == DType::I8) {
-        volta_flash_gather_kv_i8_kernel<kKVHeads>
-            <<<dim3(n_kv_alloc, kKVHeads), kHeadDim, 0, stream>>>(
-                static_cast<const std::int8_t*>(cache.k_pages.data),
-                static_cast<const std::int8_t*>(cache.v_pages.data),
-                static_cast<const half*>(cache.k_scale_pages.data),
-                static_cast<const half*>(cache.v_scale_pages.data), block_tables, rows,
-                logical_pages, static_cast<half*>(k_gathered.data),
-                static_cast<half*>(v_gathered.data), n_kv_total, n_kv_alloc);
-    } else if (cache.dtype == DType::I4NL) {
-        volta_flash_gather_kv_i4nl_kernel<kKVHeads>
-            <<<dim3(n_kv_alloc, kKVHeads), kHeadDim / 8, 0, stream>>>(
-                static_cast<const std::int8_t*>(cache.k_pages.data),
-                static_cast<const std::int8_t*>(cache.v_pages.data),
-                static_cast<const half*>(cache.k_scale_pages.data),
-                static_cast<const half*>(cache.v_scale_pages.data), block_tables, rows,
-                logical_pages, static_cast<half*>(k_gathered.data),
-                static_cast<half*>(v_gathered.data), n_kv_total, n_kv_alloc);
-    } else {
-        volta_flash_gather_kv_kernel<kKVHeads>
-            <<<dim3(n_kv_alloc, kKVHeads), kHeadDim, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(cache.k_pages.data),
-                static_cast<const __nv_bfloat16*>(cache.v_pages.data), block_tables, rows,
-                logical_pages, static_cast<half*>(k_gathered.data),
-                static_cast<half*>(v_gathered.data), n_kv_total, n_kv_alloc);
-    }
-    CUDA_CHECK(cudaGetLastError());
+    //    NINFER_FLASH_PERSIST_GATHER=1 uses a persistent 512 MiB buffer (key_base
+    //    incremental supported when base==flash_gathered); default uses per-call workspace.
+    static const bool persist_gather =
+        std::getenv("NINFER_FLASH_PERSIST_GATHER") != nullptr &&
+        std::string(std::getenv("NINFER_FLASH_PERSIST_GATHER")) != "0";
+    static half* flash_gather_k = nullptr;
+    static half* flash_gather_v = nullptr;
+    static int flash_gather_capacity = 0;
+    static int flash_gathered = 0;
+    static const void* flash_gather_layer = nullptr;
 
-    // 3. Q-blocks. Bounding the block bounds mask memory, and lets earlier blocks
-    //    attend over a shorter key range than later ones.
+    const std::int32_t n_kv_alloc = round_up_keys(n_kv_total);
+    half* gk = static_cast<half*>(k_gathered.data);
+    half* gv = static_cast<half*>(v_gathered.data);
+    int gather_begin = 0;
+    if (persist_gather) {
+        if (flash_gather_k == nullptr || flash_gather_capacity < n_kv_alloc) {
+            if (flash_gather_k != nullptr) {
+                cudaFree(flash_gather_k);
+                cudaFree(flash_gather_v);
+            }
+            const int cap = std::max(n_kv_alloc, 262144 + 1024);
+            const std::size_t elems =
+                static_cast<std::size_t>(cap) * static_cast<std::size_t>(kKVHeads) * kHeadDim;
+            CUDA_CHECK(cudaMalloc(&flash_gather_k, elems * sizeof(half)));
+            CUDA_CHECK(cudaMalloc(&flash_gather_v, elems * sizeof(half)));
+            // Eager-map every page: an untouched cudaMalloc buffer can fault on first
+            // touch inside the hot gather/attention path, which the phase timers then
+            // mis-attribute to surrounding work.
+            cudaMemset(flash_gather_k, 0, elems * sizeof(half));
+            cudaMemset(flash_gather_v, 0, elems * sizeof(half));
+            flash_gather_capacity = cap;
+            flash_gathered        = 0;
+            flash_gather_layer    = nullptr;
+        }
+        gk = flash_gather_k;
+        gv = flash_gather_v;
+        const void* layer_id = cache.k_pages.data;
+        const std::int32_t call_base = n_kv_total - width;
+        if (layer_id == flash_gather_layer && call_base == flash_gathered &&
+            n_kv_total > flash_gathered && n_kv_total <= flash_gather_capacity) {
+            gather_begin = flash_gathered;
+        }
+    }
+    {
+        const int gb = gather_begin;
+        const int gp = round_up_keys(n_kv_total - gb);
+        half* dk = gk + static_cast<std::int64_t>(gb) * kKVHeads * kHeadDim;
+        half* dv = gv + static_cast<std::int64_t>(gb) * kKVHeads * kHeadDim;
+        if (cache.dtype == DType::I8) {
+            volta_flash_gather_kv_i8_kernel<kKVHeads>
+                <<<dim3(gp, kKVHeads), kHeadDim, 0, stream>>>(
+                    static_cast<const std::int8_t*>(cache.k_pages.data),
+                    static_cast<const std::int8_t*>(cache.v_pages.data),
+                    static_cast<const half*>(cache.k_scale_pages.data),
+                    static_cast<const half*>(cache.v_scale_pages.data), block_tables, rows,
+                    logical_pages, dk, dv, n_kv_total, gp, gb);
+        } else if (cache.dtype == DType::I4NL) {
+            volta_flash_gather_kv_i4nl_kernel<kKVHeads>
+                <<<dim3(gp, kKVHeads), kHeadDim / 8, 0, stream>>>(
+                    static_cast<const std::int8_t*>(cache.k_pages.data),
+                    static_cast<const std::int8_t*>(cache.v_pages.data),
+                    static_cast<const half*>(cache.k_scale_pages.data),
+                    static_cast<const half*>(cache.v_scale_pages.data), block_tables, rows,
+                    logical_pages, dk, dv, n_kv_total, gp, gb);
+        } else {
+            volta_flash_gather_kv_kernel<kKVHeads>
+                <<<dim3(gp, kKVHeads), kHeadDim, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(cache.k_pages.data),
+                    static_cast<const __nv_bfloat16*>(cache.v_pages.data), block_tables, rows,
+                    logical_pages, dk, dv, n_kv_total, gp, gb);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        if (persist_gather && gb + (n_kv_total - gb) == n_kv_total) {
+            flash_gather_layer = cache.k_pages.data;
+            flash_gathered     = n_kv_total;
+        }
+    }
+    if (timing_on) {
+        cudaEventRecord(t2, stream);
+        (void)cudaGetLastError();
+    }
+    half* k_contig = gk;
+    half* v_contig = gv;
+
+    // 3. Attention. Prefer one Split-D launch over the whole Q chunk (up to kMaxRows=8192)
+    //    when the positions layout allows it — matches the upstream q8192 path. Otherwise
+    //    fall through to 1024-row blocks on the vendored llama.cpp kernel.
     const std::int32_t base = n_kv_total - width;
+    // Verify positions layout once for the whole launch (see splitd_positions_are_contiguous).
+    // Per-Q-block verification would sync the stream ~width/1024 times per layer.
+    const bool splitd_positions_ok =
+        volta_splitd_requested() && splitd_positions_are_contiguous(position_ptr, base, width, stream);
+    {
+        static int calls = 0, ok = 0;
+        ++calls;
+        if (splitd_positions_ok) ++ok;
+        if ((calls & 0xFF) == 1 && std::getenv("NINFER_SPLITD_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[splitd-flash] launches=%d pos_ok=%d width=%d n_kv=%d base=%d\n",
+                         calls, ok, width, n_kv_total, base);
+        }
+    }
+    if (splitd_positions_ok) {
+        const auto* q_ptr = static_cast<const __nv_bfloat16*>(q.data);
+        auto* out_ptr     = static_cast<__nv_bfloat16*>(out.data);
+        bool all_done     = true;
+        constexpr std::int32_t kMaxSplitdRows = 8192;
+        for (std::int32_t begin = 0; begin < width; begin += kMaxSplitdRows) {
+            const int rows = std::min<std::int32_t>(kMaxSplitdRows, width - begin);
+            const auto* q_row = q_ptr + static_cast<std::int64_t>(begin) * kQHeads * kHeadDim;
+            auto* out_row = out_ptr + static_cast<std::int64_t>(begin) * kQHeads * kHeadDim;
+            if (!volta_splitd_block<Geometry>(q_row, k_contig, v_contig, rows,
+                                              n_kv_total, base + begin,
+                                              /*positions_contiguous=*/true, scale, out_row,
+                                              stream)) {
+                all_done = false;
+                // Continue with the vendored path for the remaining rows via the loop below.
+                // (In practice splitd either accepts or rejects uniformly.)
+                break;
+            }
+        }
+        if (all_done) {
+            if (timing_on) flash_timing_report(timing_on, t0, t1, t2, t3, &timing_n, width,
+                                               n_kv_total, persist_gather, stream);
+            return;
+        }
+    }
     for (std::int32_t begin = 0; begin < width; begin += q_block_tokens) {
         const std::int32_t tokens = std::min(q_block_tokens, width - begin);
         const std::int32_t n_kv   = round_up_keys(base + begin + tokens);
@@ -662,14 +814,14 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
 
         // Split-D route: the 1CatAI kernel masks causally from (kv_len, kv_offset) itself,
         // so it needs neither this route's mask nor its Q/out f32 staging conversions.
-        if (volta_splitd_requested()) {
+        if (splitd_positions_ok) {
             const auto* q_row = static_cast<const __nv_bfloat16*>(q.data) +
                                 static_cast<std::int64_t>(begin) * kQHeads * kHeadDim;
             auto* out_row = static_cast<__nv_bfloat16*>(out.data) +
                             static_cast<std::int64_t>(begin) * kQHeads * kHeadDim;
             if (volta_splitd_block<Geometry>(
-                    q_row, k_gathered.data, v_gathered.data, tokens, n_kv, base + begin,
-                    position_ptr, begin, scale, out_row, stream)) {
+                    q_row, k_contig, v_contig, tokens, n_kv, base + begin,
+                    /*positions_contiguous=*/true, scale, out_row, stream)) {
                 continue;
             }
         }
@@ -692,8 +844,8 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
         cudaMemsetAsync(out_f32.data, 0, static_cast<std::size_t>(q_count) * sizeof(float), stream);
 
         launch_flash_block<Geometry>(static_cast<const float*>(q_f32.data),
-                           static_cast<const half*>(k_gathered.data),
-                           static_cast<const half*>(v_gathered.data),
+                           static_cast<const half*>(k_contig),
+                           static_cast<const half*>(v_contig),
                            static_cast<const half*>(mask.data),
                            static_cast<float*>(out_f32.data),
                            static_cast<float2*>(dst_meta.data), tokens, n_kv, n_kv, scale, stream);
@@ -704,6 +856,9 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                 static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
             q_count);
     }
+    if (timing_on)
+        flash_timing_report(timing_on, t0, t1, t2, t3, &timing_n, width, n_kv_total,
+                            persist_gather, stream);
 }
 
 } // namespace

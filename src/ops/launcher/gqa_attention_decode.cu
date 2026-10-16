@@ -40,14 +40,24 @@ std::int32_t gqa_small_t_split_upper_bound(std::int32_t window) {
 
     // Tuning hook: NINFER_SM70_LONG_SPLIT_KEYS overrides the long-window (>16K) keys per split.
     // tpx measured 1920 at 932 -> 662 us (T=4, 186K) on the 12/2 TP2 shard; plateaus from 1440 up.
-    // Default 480 matches upstream. Geometry-scaled so TP4 (6/1) gets proportionally fewer.
+    // Re-measured 59K-token T=1 decode on the TP2 NVFP4 shard: 30.33 -> 27.35 ms/step at 1920,
+    // flat across 960..7680, worse at 240 (28.84) and the upstream 480. Geometry-scaled so TP4
+    // (6/1) gets proportionally fewer.
     static const std::int32_t long_split_keys = [] {
         const char* v = std::getenv("NINFER_SM70_LONG_SPLIT_KEYS");
         if (v != nullptr && v[0] != '\0') {
             const long parsed = std::strtol(v, nullptr, 10);
             if (parsed > 0 && parsed < 65536) { return static_cast<std::int32_t>(parsed); }
         }
-        return 480;
+        return 1920;
+    }();
+
+    // Experiment hook: NINFER_SM70_LONG_SPLITS_ONLY skips the short-tier floors for windows
+    // above 16K so the long tier alone sets the split count. The tiers otherwise pin >=129
+    // splits at 59K, which is why LONG_SPLIT_KEYS >= 960 all measured identically.
+    static const bool long_splits_only = [] {
+        const char* v = std::getenv("NINFER_SM70_LONG_SPLITS_ONLY");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
 
     const auto include_tier = [&](std::int32_t window_limit, std::int32_t target_keys_per_split) {
@@ -58,10 +68,14 @@ std::int32_t gqa_small_t_split_upper_bound(std::int32_t window) {
         }
     };
 
-    include_tier(4096, 64 / Geometry::DecodeSplitScale);
-    if (window > 4096) { include_tier(8198, 128 / Geometry::DecodeSplitScale); }
-    if (window > 8198) { include_tier(16390, 256 / Geometry::DecodeSplitScale); }
-    if (window > 16390) { include_tier(window, long_split_keys / Geometry::DecodeSplitScale); }
+    if (long_splits_only && window > 16390) {
+        splits = div_up(window, long_split_keys / Geometry::DecodeSplitScale);
+    } else {
+        include_tier(4096, 64 / Geometry::DecodeSplitScale);
+        if (window > 4096) { include_tier(8198, 128 / Geometry::DecodeSplitScale); }
+        if (window > 8198) { include_tier(16390, 256 / Geometry::DecodeSplitScale); }
+        if (window > 16390) { include_tier(window, long_split_keys / Geometry::DecodeSplitScale); }
+    }
 
     return (splits < Geometry::DecodeSplits) ? splits : Geometry::DecodeSplits;
 }
@@ -365,8 +379,31 @@ ensure_func_attr_per_device(
         // Note the non-monotonicity in context is real and reproducible (p95 within 1%): the
         // wins land where the split policy is at a tier maximum and CTAs are plentiful. The
         // cliffs either side of those tiers are a separate and probably larger lever.
+        //
+        // NINFER_SM70_DECODE_MB overrides the register/occupancy point for the long-window
+        // route (2/4/5/6) so the trade can be re-measured whenever the split policy changes:
+        // the table above was taken under the old 480-key tier policy, and the policy now
+        // emits 129 splits at 59K instead of 222.
+        static const int decode_mb = [] {
+            const char* v = std::getenv("NINFER_SM70_DECODE_MB");
+            if (v != nullptr && v[0] != '\0') {
+                const long parsed = std::strtol(v, nullptr, 10);
+                if (parsed == 2 || parsed == 4 || parsed == 5 || parsed == 6) {
+                    return static_cast<int>(parsed);
+                }
+            }
+            return 5;
+        }();
         if (implementation_window > 6144) {
-            launch.template operator()<8, 5, 32, false>();
+            if (decode_mb == 2) {
+                launch.template operator()<8, 2, 32, false>();
+            } else if (decode_mb == 4) {
+                launch.template operator()<8, 4, 32, false>();
+            } else if (decode_mb == 6) {
+                launch.template operator()<8, 6, 32, false>();
+            } else {
+                launch.template operator()<8, 5, 32, false>();
+            }
         } else {
             launch.template operator()<8, 2, 32, false>();
         }

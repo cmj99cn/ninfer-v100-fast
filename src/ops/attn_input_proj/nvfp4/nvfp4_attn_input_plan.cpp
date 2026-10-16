@@ -1,6 +1,8 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 
+#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_cutlass_sm70.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 
 #include <algorithm>
@@ -15,6 +17,12 @@ enum class Nvfp4AttnInputRoute : std::uint8_t {
     W4A4,
 };
 
+#ifdef NINFER_VOLTA_BUILD
+// Same threshold the fp8 route measured on V100: at T>=33 the split-output cutlass projection
+// (one dequant + one GEMM over the whole call) beats repeated <=32-token QPN/small_t launches.
+constexpr std::int32_t kVoltaCutlassMinT = 33;
+#endif
+
 Nvfp4AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 attn_input_proj: T must be positive"); }
     if (policy == LinearPolicy::A16Only) { return Nvfp4AttnInputRoute::A16; }
@@ -25,7 +33,13 @@ Nvfp4AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
-                Tensor& v, cudaStream_t stream) {
+                Tensor& v, WorkspaceArena* workspace, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    if (x.ne[1] >= kVoltaCutlassMinT && workspace != nullptr) {
+        nvfp4_attn_input_cutlass_sm70_launch(x, weight, q, gate, k, v, *workspace, stream);
+        return;
+    }
+#endif
     constexpr std::int32_t kChunk  = kNvfp4LastSmallT;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
@@ -46,6 +60,16 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
         Tensor gate_chunk(output_gate, DType::BF16, {kQRows, active});
         Tensor key_chunk(key, DType::BF16, {kKvRows, active});
         Tensor value_chunk(value, DType::BF16, {kKvRows, active});
+#ifdef NINFER_VOLTA_BUILD
+        // Prefill chunks up to kNvfp4LastSmallT=32 fit the QPN tensor-core schedule; the
+        // token-indexed output store makes this route valid for active>1. The SIMT small_t
+        // kernel measures ~1.1 TFLOP/s at T=32 on V100 -- keep it only as fallback.
+        if (nvfp4_volta_qpn_supported(weight.n, weight.k, active)) {
+            nvfp4_attn_input_decode_launch(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
+                                           value_chunk, stream);
+            continue;
+        }
+#endif
         if (active == 1) {
             nvfp4_attn_input_decode_launch(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
                                            value_chunk, stream);
@@ -57,7 +81,13 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
 }
 
 void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
-                      Tensor& v, cudaStream_t stream) {
+                      Tensor& v, WorkspaceArena* workspace, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    if (x.ne[1] >= kVoltaCutlassMinT && workspace != nullptr) {
+        nvfp4_attn_input_cutlass_sm70_launch_shard(x, weight, q, gate, k, v, *workspace, stream);
+        return;
+    }
+#endif
     constexpr std::int32_t kChunk  = kNvfp4LastSmallT;
     constexpr std::int32_t kQRows  = Nvfp4AttnInputSections<Nvfp4AttnInputTp2ColumnGeometry>::kQueryRows;
     constexpr std::int32_t kKvRows = Nvfp4AttnInputSections<Nvfp4AttnInputTp2ColumnGeometry>::kKeyRows;
@@ -78,6 +108,13 @@ void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& 
         Tensor gate_chunk(output_gate, DType::BF16, {kQRows, active});
         Tensor key_chunk(key, DType::BF16, {kKvRows, active});
         Tensor value_chunk(value, DType::BF16, {kKvRows, active});
+#ifdef NINFER_VOLTA_BUILD
+        if (nvfp4_volta_qpn_supported(weight.n, weight.k, active)) {
+            nvfp4_attn_input_decode_launch_shard(input_chunk, weight, query_chunk, gate_chunk,
+                                                 key_chunk, value_chunk, stream);
+            continue;
+        }
+#endif
         if (active == 1) {
             nvfp4_attn_input_decode_launch_shard(input_chunk, weight, query_chunk, gate_chunk,
                                                  key_chunk, value_chunk, stream);
@@ -96,16 +133,22 @@ std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::
         throw std::invalid_argument("nvfp4 attn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
-    return resolve_route(policy, max_tokens) == Nvfp4AttnInputRoute::W4A4
-               ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4AttnInputGeometry::kInputRows)
-               : 0;
+    if (resolve_route(policy, max_tokens) == Nvfp4AttnInputRoute::W4A4) {
+        return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4AttnInputGeometry::kInputRows);
+    }
+#ifdef NINFER_VOLTA_BUILD
+    if (max_tokens >= kVoltaCutlassMinT) {
+        return nvfp4_attn_input_cutlass_workspace_bytes(max_tokens);
+    }
+#endif
+    return 0;
 }
 
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                                cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Nvfp4AttnInputRoute::A16) {
-        launch_a16(x, weight, q, gate, k, v, stream);
+        launch_a16(x, weight, q, gate, k, v, workspace, stream);
         return;
     }
     if (workspace == nullptr) {
@@ -126,7 +169,7 @@ void nvfp4_attn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tens
                                      Tensor& k, Tensor& v, LinearPolicy policy,
                                      WorkspaceArena* workspace, cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Nvfp4AttnInputRoute::A16) {
-        launch_a16_shard(x, weight, q, gate, k, v, stream);
+        launch_a16_shard(x, weight, q, gate, k, v, workspace, stream);
         return;
     }
     if (workspace == nullptr) {

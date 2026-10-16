@@ -103,6 +103,22 @@ def _build_quantized_matrix_recipes() -> tuple[
     input_divisors: list[InputDivisorRecipe] = []
     divisor_groups: list[tuple[MatrixSource, ...]] = []
 
+    def nvfp4_site(
+        object_name: str,
+        shape: tuple[int, int],
+        parts: tuple[MatrixPart, ...],
+        divisor_object: str,
+        sources: tuple[MatrixSource, ...],
+    ) -> None:
+        nvfp4_weights.append(
+            Nvfp4WeightRecipe(object_name, shape, parts, sources)
+        )
+        input_divisors.append(
+            InputDivisorRecipe(divisor_object, sources, (object_name,))
+        )
+        if len(sources) > 1:
+            divisor_groups.append(sources)
+
     for layer in range(64):
         source_prefix = f"model.language_model.layers.{layer}."
         object_prefix = f"text/layers/{layer}/"
@@ -111,24 +127,25 @@ def _build_quantized_matrix_recipes() -> tuple[
             key = _source(source_prefix + "self_attn.k_proj", 1024, 5120)
             value = _source(source_prefix + "self_attn.v_proj", 1024, 5120)
             output = _source(source_prefix + "self_attn.o_proj", 5120, 6144)
-            fp8_weights.extend(
+            nvfp4_site(
+                object_prefix + "attention/query_key_gate_value",
+                (14336, 5120),
                 (
-                    Fp8WeightRecipe(
-                        object_prefix + "attention/query_key_gate_value",
-                        (14336, 5120),
-                        (
-                            _q_part(query, False),
-                            _all(key),
-                            _q_part(query, True),
-                            _all(value),
-                        ),
-                    ),
-                    Fp8WeightRecipe(
-                        object_prefix + "attention/output",
-                        output.shape,
-                        (_all(output),),
-                    ),
-                )
+                    _q_part(query, False),
+                    _all(key),
+                    _q_part(query, True),
+                    _all(value),
+                ),
+                object_prefix + "attention/input_projection/input_scale_divisor",
+                (query, key, value),
+            )
+            nvfp4_site(
+                object_prefix + "attention/output",
+                output.shape,
+                (_all(output),),
+                object_prefix
+                + "attention/output_projection/input_scale_divisor",
+                (output,),
             )
         else:
             query_key_value = _source(
@@ -138,73 +155,39 @@ def _build_quantized_matrix_recipes() -> tuple[
             output = _source(
                 source_prefix + "linear_attn.out_proj", 5120, 6144
             )
-            fp8_weights.extend(
-                (
-                    Fp8WeightRecipe(
-                        object_prefix + "gdn/query_key_value_z",
-                        (16384, 5120),
-                        (_all(query_key_value), _all(z)),
-                    ),
-                    Fp8WeightRecipe(
-                        object_prefix + "gdn/output",
-                        output.shape,
-                        (_all(output),),
-                    ),
-                )
+            nvfp4_site(
+                object_prefix + "gdn/query_key_value_z",
+                (16384, 5120),
+                (_all(query_key_value), _all(z)),
+                object_prefix + "gdn/input_projection/input_scale_divisor",
+                (query_key_value, z),
+            )
+            nvfp4_site(
+                object_prefix + "gdn/output",
+                output.shape,
+                (_all(output),),
+                object_prefix + "gdn/output_projection/input_scale_divisor",
+                (output,),
             )
 
         gate = _source(source_prefix + "mlp.gate_proj", 17408, 5120)
         up = _source(source_prefix + "mlp.up_proj", 17408, 5120)
         down = _source(source_prefix + "mlp.down_proj", 5120, 17408)
-        if layer in inventory.NVFP4_MLP_LAYERS:
-            gate_up_sources = (gate, up)
-            divisor_groups.append(gate_up_sources)
-            nvfp4_weights.extend(
-                (
-                    Nvfp4WeightRecipe(
-                        object_prefix + "mlp/gate_up",
-                        (34816, 5120),
-                        (_all(gate), _all(up)),
-                        gate_up_sources,
-                    ),
-                    Nvfp4WeightRecipe(
-                        object_prefix + "mlp/down",
-                        down.shape,
-                        (_all(down),),
-                        (down,),
-                    ),
-                )
-            )
-            input_divisors.extend(
-                (
-                    InputDivisorRecipe(
-                        object_prefix
-                        + "mlp/gate_up_projection/input_scale_divisor",
-                        gate_up_sources,
-                        (object_prefix + "mlp/gate_up",),
-                    ),
-                    InputDivisorRecipe(
-                        object_prefix + "mlp/down_projection/input_scale_divisor",
-                        (down,),
-                        (object_prefix + "mlp/down",),
-                    ),
-                )
-            )
-        else:
-            fp8_weights.extend(
-                (
-                    Fp8WeightRecipe(
-                        object_prefix + "mlp/gate_up",
-                        (34816, 5120),
-                        (_all(gate), _all(up)),
-                    ),
-                    Fp8WeightRecipe(
-                        object_prefix + "mlp/down",
-                        down.shape,
-                        (_all(down),),
-                    ),
-                )
-            )
+        gate_up_sources = (gate, up)
+        nvfp4_site(
+            object_prefix + "mlp/gate_up",
+            (34816, 5120),
+            (_all(gate), _all(up)),
+            object_prefix + "mlp/gate_up_projection/input_scale_divisor",
+            gate_up_sources,
+        )
+        nvfp4_site(
+            object_prefix + "mlp/down",
+            down.shape,
+            (_all(down),),
+            object_prefix + "mlp/down_projection/input_scale_divisor",
+            (down,),
+        )
 
     output_head = _source("lm_head", 248320, 5120)
     fp8_weights.append(
@@ -285,24 +268,6 @@ def _build_quantized_direct_recipes() -> tuple[family_recipe.TensorRecipe, ...]:
                         ),
                     ),
                     family_recipe.TensorRecipe(
-                        object_prefix + "gdn/a_b_projection",
-                        family_recipe.Concat(
-                            (
-                                family_recipe.source(
-                                    source_prefix
-                                    + "linear_attn.in_proj_a.weight",
-                                    (48, 5120),
-                                ),
-                                family_recipe.source(
-                                    source_prefix
-                                    + "linear_attn.in_proj_b.weight",
-                                    (48, 5120),
-                                ),
-                            ),
-                            0,
-                        ),
-                    ),
-                    family_recipe.TensorRecipe(
                         object_prefix + "gdn/norm",
                         family_recipe.source(
                             source_prefix + "linear_attn.norm.weight", (128,)
@@ -358,6 +323,19 @@ QUANTIZED_DIRECT_RECIPES = _build_quantized_direct_recipes()
 QUANTIZED_DIRECT_BY_NAME = {
     item.object_name: item for item in QUANTIZED_DIRECT_RECIPES
 }
+
+# The selected QAT source stores the fused GDN A/B control projection as two
+# NVFP4 matrices (in_proj_a / in_proj_b); the artifact parent stays BF16, so
+# those two source matrices are dequantized at conversion time instead of
+# being preserved word-exactly.
+NVFP4_DEQUANT_SOURCES: dict[str, tuple[str, str]] = {}
+for _layer in inventory.GDN_LAYERS:
+    _src = f"model.language_model.layers.{_layer}.linear_attn."
+    NVFP4_DEQUANT_SOURCES[f"text/layers/{_layer}/gdn/a_b_projection"] = (
+        _src + "in_proj_a",
+        _src + "in_proj_b",
+    )
+NVFP4_DEQUANT_BY_NAME = NVFP4_DEQUANT_SOURCES
 QUANTIZED_DIRECT_SPECS = tuple(
     spec
     for spec in inventory.TEXT_CORE_TENSOR_SPECS
@@ -415,7 +393,7 @@ def validate_recipe() -> None:
         len(NVFP4_SOURCES),
         len(QUANTIZED_DIRECT_RECIPES),
         len(OFFICIAL_RECIPES),
-    ) != (145, 112, 112, 56, 233, 168, 401, 348):
+    ) != (1, 256, 256, 128, 1, 400, 353, 348):
         raise ValueError("Qwen3.8 NVFP4 source recipe is incomplete")
     ownership = (
         {"text/token_embedding"},
@@ -423,6 +401,7 @@ def validate_recipe() -> None:
         set(NVFP4_WEIGHTS_BY_NAME),
         set(INPUT_DIVISORS_BY_NAME),
         set(QUANTIZED_DIRECT_BY_NAME),
+        set(NVFP4_DEQUANT_BY_NAME),
         set(OFFICIAL_RECIPES_BY_NAME).difference({"text/token_embedding"}),
     )
     all_names: set[str] = set()
@@ -454,8 +433,8 @@ def validate_recipe() -> None:
         name for site in INPUT_DIVISOR_RECIPES for name in site.weight_names
     )
     if (
-        len(bound_weights) != 112
-        or len(set(bound_weights)) != 112
+        len(bound_weights) != 256
+        or len(set(bound_weights)) != 256
         or set(bound_weights) != set(NVFP4_WEIGHTS_BY_NAME)
     ):
         raise ValueError("input-divisor sites do not cover NVFP4 parents once")
@@ -504,6 +483,18 @@ def _source_requirements() -> dict[str, tuple[tuple[int, ...], str]]:
         QUANTIZED_DIRECT_RECIPES
     ).values():
         _merge_requirement(result, source.name, source.shape, source.dtype)
+    for a_prefix, b_prefix in NVFP4_DEQUANT_SOURCES.values():
+        for prefix in (a_prefix, b_prefix):
+            _merge_requirement(result, prefix + ".weight_packed", (48, 2560), "U8")
+            _merge_requirement(
+                result, prefix + ".weight_scale", (48, 320), "F8_E4M3"
+            )
+            _merge_requirement(
+                result, prefix + ".weight_global_scale", (1,), "F32"
+            )
+            _merge_requirement(
+                result, prefix + ".input_global_scale", (1,), "F32"
+            )
     return result
 
 

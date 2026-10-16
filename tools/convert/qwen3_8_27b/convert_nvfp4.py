@@ -43,13 +43,8 @@ from . import inventory_nvfp4 as inventory
 from . import recipe_nvfp4 as recipe
 
 
-RECIPE_ID = "qwen3_8_27b_nvfp4-v1"
+RECIPE_ID = "qwen3_8_27b_nvfp4-v1-qat"
 OUTPUT_BASENAME = "qwen3_8_27b_nvfp4.ninfer"
-
-_FP8_SOURCE_NAMES = frozenset(
-    source.name for source in recipe.FP8_SOURCES if source.name != "lm_head"
-)
-_NVFP4_SOURCE_NAMES = frozenset(source.name for source in recipe.NVFP4_SOURCES)
 
 
 def _check_target_coverage(
@@ -61,9 +56,13 @@ def _check_target_coverage(
 
     Accepts either explicit tensor names or ``re:`` patterns, so both the
     canonical (regex) and community (explicit-name) checkpoint layouts pass.
+    The compressed-tensors semantic target ``Linear`` covers every linear
+    weight in the model and therefore covers the full expected set.
     """
     if not isinstance(targets, list) or not targets:
         raise ValueError(f"{scope} must be a non-empty list")
+    if "Linear" in targets:
+        return
     patterns = [
         re.compile(target[3:])
         for target in targets
@@ -127,50 +126,16 @@ def _validate_index(model_dir: Path) -> None:
             raise ValueError(f"{path}: indexed shard is missing or empty")
 
 
-def _validate_float_group(group: Mapping[str, object]) -> None:
-    family_conversion.check_members(
-        "quantization_config.config_groups.group_0",
-        group,
-        {"format": "float-quantized"},
-    )
-    _check_target_coverage(
-        "quantization_config.config_groups.group_0.targets",
-        group.get("targets"),
-        _FP8_SOURCE_NAMES,
-    )
-    weights = group.get("weights")
-    activations = group.get("input_activations")
-    if not isinstance(weights, Mapping) or not isinstance(activations, Mapping):
-        raise ValueError("FP8 config is missing weight or activation settings")
-    common = {
-        "num_bits": 8,
-        "type": "float",
-        "group_size": None,
-        "symmetric": True,
-        "scale_dtype": None,
-    }
-    family_conversion.check_members(
-        "quantization_config.config_groups.group_0.weights",
-        weights,
-        {**common, "strategy": "channel", "dynamic": False},
-    )
-    family_conversion.check_members(
-        "quantization_config.config_groups.group_0.input_activations",
-        activations,
-        {**common, "strategy": "token", "dynamic": True},
-    )
-
-
 def _validate_nvfp4_group(group: Mapping[str, object]) -> None:
     family_conversion.check_members(
-        "quantization_config.config_groups.group_1",
+        "quantization_config.config_groups.group_0",
         group,
         {"format": "nvfp4-pack-quantized"},
     )
     _check_target_coverage(
-        "quantization_config.config_groups.group_1.targets",
+        "quantization_config.config_groups.group_0.targets",
         group.get("targets"),
-        _NVFP4_SOURCE_NAMES,
+        frozenset(source.name for source in recipe.NVFP4_SOURCES),
     )
     weights = group.get("weights")
     activations = group.get("input_activations")
@@ -185,12 +150,12 @@ def _validate_nvfp4_group(group: Mapping[str, object]) -> None:
         "scale_dtype": "torch.float8_e4m3fn",
     }
     family_conversion.check_members(
-        "quantization_config.config_groups.group_1.weights",
+        "quantization_config.config_groups.group_0.weights",
         weights,
         {**common, "dynamic": False},
     )
     family_conversion.check_members(
-        "quantization_config.config_groups.group_1.input_activations",
+        "quantization_config.config_groups.group_0.input_activations",
         activations,
         {**common, "dynamic": "local"},
     )
@@ -209,25 +174,21 @@ def _validate_quantized_config(
         {
             "quant_method": "compressed-tensors",
             "quantization_status": "compressed",
-            "format": "mixed-precision",
+            "format": "nvfp4-pack-quantized",
         },
     )
     groups = quantization.get("config_groups")
-    if not isinstance(groups, Mapping) or tuple(groups) != (
-        "group_0",
-        "group_1",
-    ):
+    if not isinstance(groups, Mapping) or tuple(groups) != ("group_0",):
         raise ValueError(
-            "quantized config must contain exactly group_0 then group_1"
+            "quantized config must contain exactly group_0 (all-NVFP4 source)"
         )
-    float_group = groups["group_0"]
-    nvfp4_group = groups["group_1"]
-    if not isinstance(float_group, Mapping) or not isinstance(
-        nvfp4_group, Mapping
-    ):
+    nvfp4_group = groups["group_0"]
+    if not isinstance(nvfp4_group, Mapping):
         raise ValueError("quantized config groups must be objects")
-    _validate_float_group(float_group)
     _validate_nvfp4_group(nvfp4_group)
+    ignore = quantization.get("ignore")
+    if not isinstance(ignore, list) or "lm_head" not in ignore:
+        raise ValueError("quantized config must ignore lm_head")
     return summary
 
 
@@ -326,6 +287,65 @@ def _materialize_official(
             f"{spec.name}: materialized shape {tuple(tensor.shape)} != {spec.shape}"
         )
     return tensor
+
+
+_E2M1_DECODE_LUT = None
+_E4M3FN_DECODE_LUT = None
+
+
+def _decode_luts() -> tuple[torch.Tensor, torch.Tensor]:
+    global _E2M1_DECODE_LUT, _E4M3FN_DECODE_LUT
+    if _E2M1_DECODE_LUT is None:
+        from tools.artifact.numeric import decode_e2m1_word, decode_e4m3fn_word
+
+        _E2M1_DECODE_LUT = torch.tensor(
+            [decode_e2m1_word(word) for word in range(16)], dtype=torch.float32
+        )
+        _E4M3FN_DECODE_LUT = torch.tensor(
+            [decode_e4m3fn_word(word) for word in range(256)],
+            dtype=torch.float32,
+        )
+    return _E2M1_DECODE_LUT, _E4M3FN_DECODE_LUT
+
+
+def _encode_nvfp4_dequant_ab(
+    spec: inventory.TensorSpec,
+    reader: ShardReader,
+) -> torch.Tensor:
+    """Dequantize the source's two NVFP4 GDN control matrices into one BF16 parent."""
+    e2m1_lut, e4m3_lut = _decode_luts()
+    a_prefix, b_prefix = recipe.NVFP4_DEQUANT_BY_NAME[spec.name]
+    halves: list[torch.Tensor] = []
+    for prefix in (a_prefix, b_prefix):
+        packed = reader.get(prefix + ".weight_packed")
+        scales = reader.get(prefix + ".weight_scale")
+        divisor = reader.get(prefix + ".weight_global_scale")
+        if (
+            packed.dtype != torch.uint8
+            or tuple(packed.shape) != (48, 2560)
+            or scales.dtype != torch.float8_e4m3fn
+            or tuple(scales.shape) != (48, 320)
+            or divisor.dtype != torch.float32
+            or divisor.numel() != 1
+        ):
+            raise ValueError(f"{prefix}: NVFP4 dequant source signature mismatch")
+        codes = packed.view(torch.uint8)
+        low = codes & 0x0F
+        high = codes >> 4
+        code_plane = torch.empty((48, 5120), dtype=torch.uint8)
+        code_plane[:, 0::2] = low
+        code_plane[:, 1::2] = high
+        weights = e2m1_lut[code_plane.long()]
+        scale_plane = e4m3_lut[scales.view(torch.uint8).long()]
+        weights = weights * scale_plane.repeat_interleave(16, dim=1)
+        weights = weights / float(divisor.item())
+        halves.append(weights)
+    fused = torch.cat(halves, dim=0)
+    if tuple(fused.shape) != spec.shape:
+        raise ValueError(
+            f"{spec.name}: dequant shape {tuple(fused.shape)} != {spec.shape}"
+        )
+    return fused.to(torch.bfloat16)
 
 
 def _build_report(
@@ -453,6 +473,12 @@ def convert(
                     payload = _encode_fp8_weight(spec, quantized_reader)
                 elif spec.name in recipe.NVFP4_WEIGHTS_BY_NAME:
                     payload = _encode_nvfp4_weight(spec, quantized_reader)
+                elif spec.name in recipe.NVFP4_DEQUANT_BY_NAME:
+                    tensor = _encode_nvfp4_dequant_ab(spec, quantized_reader)
+                    payload = family_conversion.encode_tensor_payload(
+                        tensor, spec, resolved_device
+                    )
+                    del tensor
                 elif spec.name in recipe.INPUT_DIVISORS_BY_NAME:
                     scalar = recipe.materialize_input_divisor(
                         recipe.INPUT_DIVISORS_BY_NAME[spec.name],

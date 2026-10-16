@@ -46,9 +46,10 @@ namespace {
 constexpr int kHeadDim     = 256;
 constexpr int kD256BlockM  = 64;   // FLASH_NAMESPACE::Sm70D256SplitDTraits::kBlockM
 constexpr int kD256Threads = 256;  // ...::kNThreads
-// The route's Q-block is at most kVoltaFlashQBlockTokens (1024) wide, so the padded row
-// count never exceeds this; staging is sized once for the maximum.
-constexpr int kMaxRows = 1024;
+// Cap matches the prefill chunk (8192). One splitd launch covers a whole Q chunk,
+// matching the upstream q8192 path: fewer stage/unstage roundtrips and better
+// latency hiding than many 1024-row launches.
+constexpr int kMaxRows = 8192;
 
 constexpr int round_up_rows(int rows) { return ((rows + kD256BlockM - 1) / kD256BlockM) * kD256BlockM; }
 
@@ -192,15 +193,75 @@ bool volta_splitd_requested() {
     return requested;
 }
 
+// Verify once per attention launch that positions[0..width) are contiguous
+// [base, base+width). The Split-D kernel derives its causal mask from
+// (kv_len, kv_offset) alone and assumes the query rows sit at the tail of the key
+// range at contiguous absolute positions. The public attention contract allows
+// arbitrary positions (the llama.cpp route builds its mask from the positions tensor),
+// so we verify the layout once and fall back for the whole call rather than
+// compute a different attention. Doing this per Q-block would sync the stream
+// hundreds of times per prefill layer and destroy throughput.
+// Inside a graph capture the check is illegal; the capture path keeps the llama.cpp kernel.
+bool splitd_positions_are_contiguous(const void* positions, std::int32_t base,
+                                     std::int32_t width, cudaStream_t stream) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    (void)cudaStreamIsCapturing(stream, &capture);
+    if (capture != cudaStreamCaptureStatusNone) { return false; }
+    if (positions == nullptr || width <= 0) { return false; }
+    // Prefill shares one positions tensor across every layer of a chunk: the D2H+sync
+    // verify costs a full stream drain per call, so cache the positive result keyed by
+    // (pointer, base, width). Decode rewrites a small positions buffer in place each
+    // step, so only the large-width prefill regime is eligible.
+    constexpr std::int32_t kCacheMinWidth = 256;
+    static const void* cached_positions   = nullptr;
+    static std::int32_t cached_base       = -1;
+    static std::int32_t cached_width      = -1;
+    if (width >= kCacheMinWidth && positions == cached_positions && base == cached_base &&
+        width == cached_width) {
+        return true;
+    }
+    static int* host_positions = nullptr;
+    static int host_rows      = 0;
+    if (host_rows < width) {
+        if (host_positions != nullptr) { cudaFreeHost(host_positions); }
+        host_positions = nullptr;
+        if (cudaMallocHost(&host_positions, static_cast<std::size_t>(width) * sizeof(int)) !=
+            cudaSuccess) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        host_rows = width;
+    }
+    if (cudaMemcpyAsync(host_positions, positions, static_cast<std::size_t>(width) * sizeof(int),
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    for (int i = 0; i < width; ++i) {
+        if (host_positions[i] != base + i) { return false; }
+    }
+    if (width >= kCacheMinWidth) {
+        cached_positions = positions;
+        cached_base      = base;
+        cached_width     = width;
+    }
+    return true;
+}
+
 // One Q-block: stage Q, run the Split-D kernel over the gathered K/V, unstage the result.
 // `q` is the block's bf16 row base in [D][heads][rows] layout, `out` the matching output
 // row base; `k_f16`/`v_f16` are the gathered contiguous FP16 caches [key][kv_heads][D].
 // `kv_len` is the padded visible key count and `kv_offset` the absolute key position of
-// row 0 (the kernel derives its causal mask from those two).
+// row 0 (the kernel derives its causal mask from those two). `positions_contiguous` must
+// already have been validated by splitd_positions_are_contiguous for the whole launch.
 template <typename Geometry>
 bool volta_splitd_block(const void* q_bf16, const void* k_f16, const void* v_f16, int rows,
-                        int kv_len, int kv_offset, const void* positions, int position_begin,
-                        float scale, void* out_bf16, cudaStream_t stream) {
+                        int kv_len, int kv_offset, bool positions_contiguous, float scale,
+                        void* out_bf16, cudaStream_t stream) {
     using Traits = FLASH_NAMESPACE::Sm70D256SplitDTraits;
     constexpr int kHeads = Geometry::QHeads;
     constexpr int kKvHeads = Geometry::KVHeads;
@@ -211,46 +272,18 @@ bool volta_splitd_block(const void* q_bf16, const void* k_f16, const void* v_f16
                   "unregistered geometry");
 
     if (rows <= 0 || rows > kMaxRows) { return false; }
+    if (!positions_contiguous) { return false; }
     if (!splitd_smem_ready(stream)) { return false; }
 
-    // The vendored kernel derives its causal mask from (kv_len, kv_offset) alone, i.e. it
-    // assumes the query rows sit at the tail of the key range at contiguous absolute
-    // positions. The public attention contract allows arbitrary positions (the llama.cpp
-    // route builds its mask from the positions tensor, so it is correct either way), so
-    // verify the layout here and fall back rather than compute a different attention.
-    // Cost: one 4 KB D2H copy plus a sync per call, against ~50 ms of attention per call
-    // at deep context -- under 0.2%. Inside a graph capture neither is legal, and the
-    // capture path keeps the llama.cpp kernel.
     {
-        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-        (void)cudaStreamIsCapturing(stream, &capture);
-        if (capture != cudaStreamCaptureStatusNone) { return false; }
-        static int* host_positions = nullptr;
-        static int host_rows = 0;
-        if (host_rows < rows) {
-            if (host_positions != nullptr) { cudaFreeHost(host_positions); }
-            host_positions = nullptr;
-            if (cudaMallocHost(&host_positions, static_cast<std::size_t>(rows) * sizeof(int)) !=
-                cudaSuccess) {
-                (void)cudaGetLastError();
-                return false;
-            }
-            host_rows = rows;
-        }
-        if (positions == nullptr) { return false; }
-        const auto* device_positions = static_cast<const std::int32_t*>(positions) + position_begin;
-        if (cudaMemcpyAsync(host_positions, device_positions,
-                            static_cast<std::size_t>(rows) * sizeof(int),
-                            cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
-            (void)cudaGetLastError();
-            return false;
-        }
-        if (cudaStreamSynchronize(stream) != cudaSuccess) {
-            (void)cudaGetLastError();
-            return false;
-        }
-        for (int i = 0; i < rows; ++i) {
-            if (host_positions[i] != kv_offset + i) { return false; }
+        static int hits = 0, split3_hits = 0, calls = 0;
+        ++calls;
+        const bool use3_dbg = split3_min_kv() > 0 && kv_len >= split3_min_kv() && kv_len > round_up_rows(rows);
+        if (use3_dbg) ++split3_hits;
+        ++hits;
+        if ((calls & 0xFF) == 1 && std::getenv("NINFER_SPLITD_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[splitd] calls=%d hit=%d split3=%d rows=%d kv_len=%d\n",
+                         calls, hits, split3_hits, rows, kv_len);
         }
     }
 
@@ -324,14 +357,12 @@ bool volta_splitd_block(const void* q_bf16, const void* k_f16, const void* v_f16
 }
 
 template bool volta_splitd_block<Gqa27Geometry>(const void*, const void*, const void*, int, int,
-                                                int, const void*, int, float, void*, cudaStream_t);
+                                                int, bool, float, void*, cudaStream_t);
 template bool volta_splitd_block<Gqa35Geometry>(const void*, const void*, const void*, int, int,
-                                                int, const void*, int, float, void*, cudaStream_t);
-template bool volta_splitd_block<Gqa27Tp2Geometry>(const void*, const void*, const void*, int, int,
-                                                   int, const void*, int, float, void*,
-                                                   cudaStream_t);
-template bool volta_splitd_block<Gqa27Tp4Geometry>(const void*, const void*, const void*, int, int,
-                                                   int, const void*, int, float, void*,
-                                                   cudaStream_t);
+                                                int, bool, float, void*, cudaStream_t);
+template bool volta_splitd_block<Gqa27Tp2Geometry>(const void*, const void*, const void*, int,
+                                                   int, int, bool, float, void*, cudaStream_t);
+template bool volta_splitd_block<Gqa27Tp4Geometry>(const void*, const void*, const void*, int,
+                                                   int, int, bool, float, void*, cudaStream_t);
 
 } // namespace ninfer::ops::detail
