@@ -1,5 +1,9 @@
 # HTTP serving
 
+> **本分支现状（2026-10，fork 维护者注）**：本仓库仅维护 `qwen3.8-27b`（NVFP4）在
+> 2×V100-SXM2-32GB / TP2 上的部署。下文中的 `qwen3.6-27b`/`qwen3.6-35b-a3b` 示例、上游路径
+> 及性能/兼容性结论**均未在本分支重新验证**，仅作引擎接口参考。
+
 `build/apps/ninfer-serve` loads one registered artifact and exposes OpenAI- and
 Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 

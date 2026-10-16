@@ -11,8 +11,8 @@ binder, and Qwen3.8 execution leaves. The generic artifact registry resolves its
 identity without a runtime profile flag. Common framing is defined in
 [`artifact-container.md`](artifact-container.md), numeric semantics in
 [`tensor-formats.md`](tensor-formats.md), byte packing in
-[`storage-layouts.md`](storage-layouts.md), and model mathematics and state behavior in
-[`qwen3.6-27b-model.md`](qwen3.6-27b-model.md).
+[`storage-layouts.md`](storage-layouts.md), and model mathematics and state behavior
+（Qwen3.6 model reference 已随上游文档移除）。
 
 ## 1. NVFP4 artifact identity and contents
 
@@ -33,6 +33,13 @@ The identity is read from the version-2 artifact directory. The filename, object
 representative tensor descriptor do not select the model or weights profile.
 
 ### 1.1 Upstream v3 container compatibility
+
+> **注（本项目实测，2026-10）**：该 v3 兼容读取路径**尚未通过实测**。直接加载官方
+> `neroued/Qwen3.8-27B-nvfp4-NInfer` 在当前构建下会以
+> `tensor descriptor does not match target contract: text/layers/0/gdn/query_key_value_z`
+> 失败。因此本分支改用自转换制品（见 `tools/convert/qwen3_8_27b/` 与
+> `models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer`）。下文 1.1/1.2 描述的
+> v3 兼容性为**设计意图，未验证**，引用时请以实测为准。
 
 The reader also accepts the official single-file `NINFER\x00\x03` container published as
 `neroued/Qwen3.8-27B-nvfp4-NInfer`. This is a narrow reader compatibility path for this registered
@@ -362,7 +369,7 @@ No Vision deep-stack object exists.
 ### 7.4 Vision tensor-parallel sharding
 
 At `tp > 1` the loader shards the Vision objects at bind time from the same full objects above; no
-separate sharded artifact exists. The per-device geometry (see `fp16-vision-plan.md` §5):
+separate sharded artifact exists. The per-device geometry（原文引用已移除的 `fp16-vision-plan.md` §5）:
 
 | Object family | Axis | Per-device extent |
 |---|---|---|

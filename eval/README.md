@@ -1,5 +1,10 @@
 # Capability Evaluation
 
+> **本分支现状（2026-10，fork 维护者注）**：本仓库仅维护 `qwen3.8-27b`（NVFP4）在
+> 2×V100-SXM2-32GB / TP2 上的部署。下文中 `qwen3_6_*` 配置、`qwen3.6-*` 型号、1M/YaRN
+> needle 与 400W/5090 相关结论**均未在本分支验证**（相关配置与结果目录已移除），仅作评测
+> 框架参考。
+
 `eval/` contains the repository-local capability evaluation coordinator. It can evaluate this
 project's server, another local OpenAI-compatible service, or a remote online model. The inference
 engine is only one possible target; its single-sequence limitation is represented by
@@ -29,7 +34,7 @@ See [`configs/capability-suite.yaml`](configs/capability-suite.yaml) for the ini
 AIME26, GPQA-Diamond, and BFCL-v4 suites, and [`configs/mock-suite.yaml`](configs/mock-suite.yaml)
 for a network-free example.
 
-[`configs/qwen3_6_35b_needle_haystack.yaml`](configs/qwen3_6_35b_needle_haystack.yaml)
+`configs/qwen3_6_35b_needle_haystack.yaml`（已从本分支移除，示例保留）
 defines the 35B-A3B Needle-in-a-Haystack profiles separately: `standard` preserves EvalScope's
 1K--32K, ten-length, ten-depth English/Chinese matrix (200 samples), while `native_long` evaluates
 the exact 64K, 128K, and safe 260K prompt profiles at eleven depths in both languages (66 samples).
@@ -292,8 +297,8 @@ python3 -c "import json,sys; [print(json.loads(l)['speculative']) for l in open(
 
 Recorded MTP3 results for `qwen3_8_27b_nvfp4.ninfer` (`--draft-tokens 3 --lm-head-draft`, INT8 KV,
 CUDA graphs on), TP2 at `--max-context 262144` against TP1 at `--max-context 252928`. **All rows in
-this subsection were taken at the 400 W per-GPU cap**; see `docs/performance.md` for the 575 W
-re-measurement and for why figures from the two conditions must not be compared:
+this subsection were taken at the 400 W per-GPU cap**（上游 5090 数据；`docs/performance.md` 已移除）;
+原 575 W 复测说明不再随仓库提供，相关结论未在本分支验证:
 
 | Prompt | Acceptance TP1 | Acceptance TP2 | Decode tok/s TP1 | Decode tok/s TP2 |
 |---|---:|---:|---:|---:|
@@ -344,7 +349,7 @@ an incomplete EvalScope job reuses its own prediction cache when available.
 
 ### Qwen3.8-27B NVFP4 needles at 655k and 1M (TP2 + YaRN x4), with a vLLM control
 
-[`configs/qwen3_8_27b_nvfp4_needle_1m.yaml`](configs/qwen3_8_27b_nvfp4_needle_1m.yaml) is the
+`configs/qwen3_8_27b_nvfp4_needle_1m.yaml`（已从本分支移除；1M/YaRN 未验证）is the
 extended-context suite. It differs from the 262k suite above in three ways that matter.
 
 **1. A distinct-text corpus.** EvalScope's needle adapter *tiles* a corpus shorter than the

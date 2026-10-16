@@ -28,7 +28,7 @@
 ## 开发思路
 
 1. **选基底**：对比多个 NInfer / vLLM / TRT fork 后，选择带**单进程 TP2/TP4** 的 `ninfer-v100`（jason-ni/ninfer-v100-tp4）作为基底——多进程双卡方案架构脆弱、无法扩展到 TP4，被直接放弃。
-2. **移植长上下文 prefill**：将 1catAI/ninfer-v100 的 **splitd prefill 内核**移植到本基底（geometry 映射、去掉 Hadamard 旋转、增加 `NINFER_VOLTA_SPLITD=0` 开关、`NINFER_SM70_SPLITKV3_MIN_KV` 阈值），实测 174K prefill +7.5%。
+2. **移植长上下文 prefill**：将 1CatAI/1Cat-vLLM 的 **splitd prefill 内核**（D256 Split-D）移植到本基底（geometry 映射、去掉 Hadamard 旋转、增加 `NINFER_VOLTA_SPLITD=0` 开关、`NINFER_SM70_SPLITKV3_MIN_KV` 阈值），实测 174K prefill +7.5%。
 3. **修复前缀缓存**：生产化验证时发现 prefix cache 在多轮场景触发引擎崩溃（见下文问题 2），修复后 `--prefix-cache` 可长期稳定运行。
 4. **速度验证与调参**：系统性分离 prefill / decode 测量，确认 MTP 是解码的主要杠杆；确认 `NINFER_SM70_LONG_SPLIT_KEYS` 类 attention 调参在本基底无效（瓶颈不在该处），避免无意义调优。
 5. **质量评测**：跑 BFCL-v3 多轮函数调用评测，得到当前基线分数（见测试结果），后续迭代以该基线对照。
@@ -249,7 +249,7 @@ TP4（四卡）把 `--tp 2 --devices 0,1` 换成 `--tp 4 --devices 0,1,2,3` 即�
 | `--max-context` | 最大上下文（本制品原生 262144） |
 | `--no-thinking` / `--greedy` | 关闭思考模式、贪婪采样（评测常用） |
 
-完整参数：`./build/apps/ninfer-serve --help`。也可参考仓库内 `run-tp2.sh` / `run-tp4.sh`。
+完整参数：`./build/apps/ninfer-serve --help`。参考启动脚本：`tools/v100/ninfer-aligned-tp2.sh`（对齐 A/B profile）、`tools/v100/ninfer-quality-matched.sh`（thinking/采样对齐）。
 
 ### 调用 API（OpenAI 兼容）
 
@@ -294,7 +294,8 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 - [Neroued/ninfer](https://github.com/Neroued/ninfer) — NInfer 原始项目，本仓库的引擎基座。
 - [wamansou/ninfer-tp2-1m](https://github.com/wamansou/ninfer-tp2-1m) — 双卡张量并行与 YaRN 扩展。
 - [jason-ni/ninfer-v100-tp4](https://github.com/jason-ni/ninfer-v100-tp4) — V100 TP4 单进程并行基底（本仓库代码直接来源）。
-- [1catAI/ninfer-v100](https://github.com/1catAI/ninfer-v100) — splitd 长上下文 prefill 内核的思路与参考实现。
+- [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) — splitd（D256 Split-D）长上下文 prefill 内核的来源，已 vendored 到 `third_party/llama_cpp_sm70_d256/`。
+- [dollarwong/ninfer-v100](https://github.com/dollarwong/ninfer-v100) — V100 上的 NInfer 单卡部署与跨引擎基准 fork（调研参考，未直接复用其代码）。
 - [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) — 默认模型的 NVFP4 量化权重源。
 - [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) — `.ninfer` 制品格式的参考（本 fork 契约不兼容，仅作格式参照）。
 - Qwen / NInfer 生态的所有贡献者。

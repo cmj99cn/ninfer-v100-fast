@@ -487,4 +487,4 @@ checkpoint) unchanged — unlike HPC §14.1, the legacy machinery is still const
 - **Contract.** The cache extended the published CLI/serve surface (`--prefix-cache`,
   `--host-cache-mib`), now documented in `docs/cli.md` and `docs/serving.md`. The
   `include/ninfer/types.h` `PrefixCacheOptions` comments carry the internal fields. If the supported
-  identities themselves ever change, update `docs/README.md` with them.
+  identities themselves ever change, update the documentation map with them.

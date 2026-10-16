@@ -1454,5 +1454,3 @@ admission。Later arrivals 从未成为 H 的 donor，也不能恢复已消费�
 - [Paged KV context storage](paged-kv-cache.md)
 - [ReplaySSM GDN technical reference](replayssm-gdn.md)
 - [Serving behavior](../serving.md)
-- [Qwen3.6-27B model semantics](qwen3.6-27b-model.md)
-- [Qwen3.6-35B-A3B model semantics](qwen3.6-35b-a3b-model.md)

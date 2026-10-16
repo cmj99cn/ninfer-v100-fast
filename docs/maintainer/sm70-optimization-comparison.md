@@ -14,8 +14,8 @@
 ## 移植进展（V100X2, 2026-10-10）
 
 已移植 **#1 decode attention v2、#5 split reduce、#6 的 mailbox allreduce + head row-gather**
-（N-rank，覆盖 tp2/tp4；不是 tpx 的 2-rank/两进程版）。工作记录与验证细节见
-`sm70-v2-mailbox-port-plan.md`。
+（N-rank，覆盖 tp2/tp4；不是 tpx 的 2-rank/两进程版）。工作记录详见上游（`sm70-v2-mailbox-port-plan.md`
+已从本分支移除）。
 
 V100X2 实测（NVFP4+FP16-vision 成品，TP2 devices 0,1，INT8-G64 KV，MTP3 + lm-head-draft，
 eager，180000 capacity，chunk 3072，512-token 窗口，65,536-token prompt，2 reps）：

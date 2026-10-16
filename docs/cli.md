@@ -1,5 +1,9 @@
 # NInfer CLI
 
+> **本分支现状（2026-10，fork 维护者注）**：本仓库仅维护 `qwen3.8-27b`（NVFP4）在
+> 2×V100-SXM2-32GB / TP2 上的部署。下文中的 `qwen3.6-27b`/`qwen3.6-35b-a3b` 示例、上游路径
+> 及性能/兼容性结论**均未在本分支重新验证**，仅作引擎接口参考。
+
 `build-v100/apps/ninfer` runs one request against one registered `.ninfer` artifact. Build NInfer and
 download an artifact using the [project README](../README.md) before following this guide.
 
@@ -140,7 +144,7 @@ MTP and DFlash cannot be enabled together, and DFlash cannot enable Vision. Qwen
 lattice selector always consumes the full target vocabulary; the optimized MTP shortlist is not
 its proposal path. The NVFP4 v3 drafter adds about 2.074 GiB of resident weights per TP rank.
 The demonstrated V100X2 configuration fits at 98304 capacity/chunk1024; 180000 capacity does not.
-See [performance results](performance.md) for measured workloads and limitations. Seven drafts
+See [`docs/vs-1cat-2026-10-16.md`](vs-1cat-2026-10-16.md) for measured workloads and limitations. Seven drafts
 are a measured choice, not the 35B-A3B semantic limit.
 
 ## Common options

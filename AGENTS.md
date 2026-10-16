@@ -178,20 +178,16 @@ Read only current authorities relevant to a live decision in the task. The follo
 routing map, not a mandatory reading list:
 
 - `README.md` and executable `--help`: delivered capabilities and exact commands;
-- `docs/README.md`: public documentation map;
 - `docs/cli.md`: CLI input, output, sampling, MTP, and runtime options;
 - `docs/serving.md`: OpenAI/Anthropic HTTP behavior;
-- `docs/performance.md`: published performance methodology and results;
 - `docs/maintainer/concurrent-inference-architecture.md`: bounded ingress, request/slot lifecycle,
   scheduling, batched execution, CUDA Graph, and speculative-concurrency semantics;
 - `docs/maintainer/paged-kv-cache.md`: shared KV capacity, page ownership, retention, physical
   layouts, and paged consumer contracts;
 - `docs/maintainer/artifact-container.md`, `storage-layouts.md`, and `tensor-formats.md`:
   generic `.ninfer` contracts;
-- `docs/maintainer/qwen3.6-27b-artifact.md`, `qwen3.8-27b-artifact.md`, and
-  `qwen3.6-35b-a3b-artifact.md`: exact target inventories, conversion, and binding;
-- `docs/maintainer/qwen3.6-27b-model.md` and `qwen3.6-35b-a3b-model.md`: exact model mathematics,
-  dimensions, and state semantics;
+- `docs/maintainer/qwen3.8-27b-artifact.md`: exact target inventory, conversion, and binding
+  （本仓库仅注册 qwen3.8-27b；Qwen3.6 相关文档已移除）;
 - `docs/maintainer/op-development.md`: Op admission, contracts, implementation ownership,
   qualification, and performance evidence rules;
 - `include/ninfer/engine.h` and `include/ninfer/types.h`: in-tree C++ product interface.

@@ -165,6 +165,40 @@ Paged KV trim extent would discard cache-owned pages
 
 ---
 
+## 10. 工具调用解析器严格性缺口（vs vLLM qwen3_coder）
+
+**文件**：`src/serve/tool_call_parser.cpp`（解析）+ `src/serve/generation_service.cpp:411-418`（调用点，对整段文本解析）
+
+**背景**：与 1cat-vLLM 的 `qwen3coder_tool_parser.py` 对比，两边对**标准 XML 输出**
+`<tool_call><function=NAME><parameter=P>value</parameter></function></tool_call>`
+解析结果一致（实测 BFCL 轨迹里 `ls {"a":true}` 两边都被正确解析成结构化 tool_calls）。
+但 ninfer 实现更严，存在以下缺口（当前 BFCL 口径下**不是**失败主因，非阻塞）：
+
+| 维度 | ninfer | 1cat |
+|---|---|---|
+| 外壳 | 必须 `<tool_call>…</tool_call>` | `<tool_call>` **或裸 `<function=…>`**（back-off） |
+| 体内格式 | 仅 XML | XML **+ `<tool_call>` 内 JSON body** `{"name","arguments"}` |
+| 参数类型 | `trim`+`JSON.parse`（不看 schema） | 按工具 schema `coerce_to_schema_type` 强制转换 |
+| 缺闭合标签 | 直接失败 | 可恢复缺失的 `</parameter>`/`</function>` |
+| 值内假标签 | 贪婪取首个 `</parameter>`（值内同串会误切） | 结构化边界判断，忽略值内 `<parameter=` |
+| 部分失败 | 任一 block 坏 → **整体回退成 content（丢弃全部 tool_calls）** | 过滤坏的、保留好的 |
+| 尾部杂文本 | `</function>` 后必须仅空白 | 更宽松 |
+| args 序列化 | nlohmann `dump()` → `{"a":true}` | `json.dumps` → `{"a": true}` |
+
+**影响**：在非标准/轻微畸形输出下，ninfer 会把本该是工具调用的响应退化成普通 content，
+导致 agent 循环/任务失败；1cat 能救回。当前模型+模板产出的都是标准 XML，故未暴露。
+
+**复核 TODO**：
+- [ ] 支持裸 `<function=…>`（无 `<tool_call>` 外壳）的 back-off
+- [ ] 支持 `<tool_call>` 内 JSON body `{"name","arguments"}`
+- [ ] 参数值按工具 schema 做类型转换（而非一律 JSON.parse）
+- [ ] 缺失 `</parameter>`/`</function>` 时尽量恢复，而非整体回退
+- [ ] 部分 block 解析失败时保留已成功的 tool_calls
+- [ ] 参数值内联 `<parameter=`/`</parameter>` 的结构化边界处理
+- [ ] 加单测覆盖上述畸形输入（当前无 tparser 单测）
+
+---
+
 ## 复核优先级建议
 
 | 优先级 | 项 | 阻塞什么 |
@@ -172,4 +206,5 @@ Paged KV trim extent would discard cache-owned pages
 | ~~P0~~ | ~~#2 paged KV trim bug~~ | ✅ 已修复 |
 | P1 | #1 vision 架构 | 多模态能力 |
 | P2 | #6 Hadamard 精度 | 长期质量风险 |
+| P2 | #10 工具调用解析器严格性（vs qwen3_coder） | agent 任务鲁棒性（非标准输出会丢工具调用） |
 | P3 | #3/#4/#5 构建规范化 | 可移植性 |
