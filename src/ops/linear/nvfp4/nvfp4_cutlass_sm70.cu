@@ -14,8 +14,11 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <stdexcept>
+#include <unistd.h>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -85,6 +88,12 @@ __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
                                     cutlass::half_t* __restrict__ out, std::int64_t count) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < count) { out[i] = cutlass::half_t(__bfloat162float(in[i])); }
+}
+
+__global__ void fp16_to_bf16_kernel(const cutlass::half_t* __restrict__ in,
+                                    __nv_bfloat16* __restrict__ out, std::int64_t count) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) { out[i] = __float2bfloat16(static_cast<float>(in[i])); }
 }
 
 int div_up_i(int a, int b) { return (a + b - 1) / b; }
@@ -253,27 +262,91 @@ void launch_cublas(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena
     auto* x_fp16 = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
     dequant_inputs(x, w, w_fp16, x_fp16, stream);
 
-    static thread_local cublasHandle_t handle = [] {
+    // One thread interleaves both TP ranks' calls, switching the current device per
+    // call, so the cuBLAS handle must be per-device (a handle created on another
+    // device fails some GEMMs with STATUS_EXECUTION_FAILED).
+    int dev_id = 0;
+    cudaGetDevice(&dev_id);
+    if (dev_id < 0 || dev_id >= 8) {
+        throw std::runtime_error("nvfp4_cutlass_sm70: unexpected device ordinal");
+    }
+    static thread_local cublasHandle_t tls_handles[8] = {};
+    if (tls_handles[dev_id] == nullptr) {
         cublasHandle_t h{};
         if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) {
             throw std::runtime_error("nvfp4_cutlass_sm70: cublasCreate failed");
         }
-        return h;
-    }();
+        tls_handles[dev_id] = h;
+    }
+    cublasHandle_t handle = tls_handles[dev_id];
     if (cublasSetStream(handle, stream) != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error("nvfp4_cutlass_sm70: cublasSetStream failed");
     }
-    // Row-major C[cols, n] = A[cols, k] x B[k, n] equals the column-major product
-    // (n x k) x (k x cols) over the same three buffers, so no transpose flags are needed.
+    // Buffers as dequant_inputs writes them: x is token-major [cols][k], w is
+    // out-major [n][k], out is row-major [cols][n]. The column-major product that
+    // reproduces Out[t, o] = sum_i W[o, i] * X[t, i] is:
+    //   C'(o, t) = sum_l Wmat(l, o) * Xmat(l, t), Wmat = w as col-major (k x n)
+    //   (transa=T, lda=k), Xmat = x as col-major (k x cols) (transb=N, ldb=k),
+    //   C' = out as col-major (n x cols), ldc = n.
     const float alpha = 1.0F;
     const float beta  = 0.0F;
-    cublasStatus_t status = cublasGemmEx(
-        handle, CUBLAS_OP_N, CUBLAS_OP_N, n, cols, k, &alpha,
-        w_fp16, CUDA_R_16F, k, x_fp16, CUDA_R_16F, k, &beta,
-        static_cast<ElementOutput*>(out.data), CublasOutType<ElementOutput>::value, n,
-        CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error("nvfp4_cutlass_sm70: cublasGemmEx failed");
+    const int peek_before = static_cast<int>(cudaPeekAtLastError());
+    static thread_local int trace_all = 0;
+    static thread_local int trace_small = 0;
+    const bool do_trace = std::getenv("NINFER_SM70_GEMM_TRACE") != nullptr;
+    trace_all++;
+    bool trace_this = do_trace && (trace_all <= 10 || (cols < 64 && trace_small < 8));
+    if (do_trace && cols < 64) { trace_small++; }
+    if (trace_this) {
+        fprintf(stderr, "[sm70-cublas] pid=%d tid=%zu dev=%d #%d m=%d n=%d k=%d peek_before=%d\n",
+            static_cast<int>(getpid()), static_cast<std::size_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 10000),
+            dev_id, trace_all, static_cast<int>(n), static_cast<int>(cols),
+            static_cast<int>(k), peek_before);
+    }
+    if constexpr (std::is_same_v<ElementOutput, cutlass::bfloat16_t>) {
+        // cuBLAS on SM70 rejects CUDA_R_16BF outputs (STATUS_NOT_SUPPORTED), so compute
+        // into FP16 scratch and convert; the storage round-trip is bit-exact for values
+        // that already came from an FP16 accumulator store.
+        Tensor out_fp16 = ws.alloc(DType::FP16, {cols, n});
+        cublasStatus_t status = cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N, n, cols, k, &alpha,
+            w_fp16, CUDA_R_16F, k, x_fp16, CUDA_R_16F, k, &beta,
+            out_fp16.data, CUDA_R_16F, n, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            cudaError_t sync_err = cudaStreamSynchronize(stream);
+            fprintf(stderr, "[sm70-cublas] FAILED status=%d sync_err=%d peek_after=%d\n",
+                    static_cast<int>(status), static_cast<int>(sync_err),
+                    static_cast<int>(cudaPeekAtLastError()));
+            status = cublasGemmEx(
+                handle, CUBLAS_OP_T, CUBLAS_OP_N, n, cols, k, &alpha,
+                w_fp16, CUDA_R_16F, k, x_fp16, CUDA_R_16F, k, &beta,
+                out_fp16.data, CUDA_R_16F, n, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            fprintf(stderr, "[sm70-cublas] retry status=%d\n", static_cast<int>(status));
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                throw std::runtime_error("nvfp4_cutlass_sm70: cublasGemmEx failed m=" + std::to_string(n) + " n=" + std::to_string(cols) + " k=" + std::to_string(k) + " ldc=n status=" + std::to_string(static_cast<int>(status)) + " peek_before=" + std::to_string(peek_before));
+            }
+        }
+        const std::int64_t count   = static_cast<std::int64_t>(cols) * n;
+        const int convert_blocks = static_cast<int>((count + 255) / 256);
+        fp16_to_bf16_kernel<<<convert_blocks, 256, 0, stream>>>(
+            static_cast<const cutlass::half_t*>(out_fp16.data),
+            static_cast<__nv_bfloat16*>(out.data), count);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        cublasStatus_t status = cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N, n, cols, k, &alpha,
+            w_fp16, CUDA_R_16F, k, x_fp16, CUDA_R_16F, k, &beta,
+            out.data, CublasOutType<ElementOutput>::value, n,
+            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            cudaStreamSynchronize(stream);
+            fprintf(stderr, "[sm70-cublas] FAILED status=%d post_sync_cuda_err=%d\n",
+                    static_cast<int>(status), static_cast<int>(cudaGetLastError()));
+            throw std::runtime_error("nvfp4_cutlass_sm70: cublasGemmEx failed m=" + std::to_string(n) + " n=" + std::to_string(cols) + " k=" + std::to_string(k) + " ldc=n status=" + std::to_string(static_cast<int>(status)) + " peek_before=" + std::to_string(peek_before));
+        }
+    }
+    if (trace_this) {
+        fprintf(stderr, "[sm70-cublas] #%d done\n", trace_all);
     }
 }
 
