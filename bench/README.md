@@ -1,5 +1,9 @@
 # Benchmarks
 
+> **本分支现状（2026-10，fork 维护者注）**：本仓库的部署目标是 2×V100-SXM2-32GB（SM70）。
+> 下文出现的 **RTX 5090** 带宽 / Tensor Core 参考值（如 `1792 GB/s`、`419 TFLOP/s`）为上游
+> 基准所用参考，**不代表本分支硬件**，引用时请以 V100 实测为准。
+
 `ninfer_bench` measures the complete public `ninfer::Engine` route against a `.ninfer` artifact.
 The `bench/ops/` `ninfer_<op>_bench` executables measure central public Op contracts while leaving
 implementation selection behind those contracts. Target benchmarks measure Program/model

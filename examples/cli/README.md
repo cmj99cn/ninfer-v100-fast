@@ -1,5 +1,10 @@
 # Stable CLI examples
 
+> **本分支现状（2026-10，fork 维护者注）**：本仓库仅维护 `qwen3.8-27b`（NVFP4，**text-only**）
+> 在 2×V100-SXM2-32GB / TP2 上的部署。下文的 `models/qwen3_6_27b.ninfer`、`Qwen3.6-27B/35B-A3B`
+> 型号与所有 `--vision`/多模态（图像、视频）示例均为上游内容，**本分支未验证**；本制品不支持
+> Vision，请勿使用 `--vision`。文本类示例的做法仍然适用，替换为你的 `qwen3.8-27b` 制品即可。
+
 This directory contains committed, offline `--messages` inputs for exercising the product CLI from
 the repository root. It covers short text, chat history, images, video, mixed multimodal history,
 hard thinking problems, long decode, and four long-context capacities. This is an operator-facing
