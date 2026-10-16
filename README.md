@@ -63,12 +63,18 @@
 | 冷 prefill @6683 tok | **3.076 s / 2172 tps** | 3.344 s / 1998 tps | **ninfer +8.7%** |
 | 冷 prefill @13344 tok | **6.299 s / 2118 tps** | 7.855 s / 1699 tps | **ninfer +24.7%** |
 | 冷 prefill @53142 tok | **29.867 s / 1779 tps** | 35.686 s / 1489 tps | **ninfer +19.5%** |
-| decode @502 / 3.7K | **50.9 / 50.0** | 49.6 / 49.0 | ninfer 赢 |
-| decode @15K / @59K | 46.2 / 35.9 | **46.7 / 39.1** | 平 / **−8%** |
+| decode @502 / 3.7K（无 MTP） | **50.9 / 50.0** | 49.6 / 49.0 | ninfer 赢 |
+| decode @15K / @59K（无 MTP） | 46.2 / 35.9 | **46.7 / 39.1** | 平 / −8% |
+| **decode @502 / 3.7K / 15K / 59K（MTP）** | **106.8 / 99.2 / 99.7 / 84.4** | 49.6 / 49.0 / 46.7 / 39.1 | **ninfer +80~116%** |
 | prefix warm（29.5K 命中后） | **0.34 s** | 1.08 s | ninfer 赢 |
-| conc2 decode 合计 | 65.2 | **83.6** | **−22%** |
+| conc2 总 wall（两流完成） | **9.96 / 10.00 s** | ~10.1 s | 持平 |
+| conc2 首流 TTFT | **3.6 s** | 6.7 s | ninfer 赢 |
+| conc2 共享前缀总 wall | **6.6 s**（借运行中 lane，`cache=7360`） | — | ninfer 赢 |
 
-冷 prefill 缺口（−23~−25%）已翻盘：GEMM 占 prefill 72%，cuBLAS 比 CUTLASS 快 18–27%；`NINFER_SM70_PREFILL_GEMM=1` 落地后三点全线反超（+8.7~+24.7%）。剩余缺口 = **conc2 混批 decode（−22%）** 与 **@59K decode（−8%）**。
+结论：
+- **冷 prefill 缺口（−23~−25%）已翻盘**：GEMM 占 prefill 72%，cuBLAS 比 CUTLASS 快 18–27%；`NINFER_SM70_PREFILL_GEMM=1` 落地后三点全线反超（+8.7~+24.7%）。
+- **@59K decode 的 −8% 由 MTP 反超**：84.4 vs 39.1（+116%）；MTP 各点 2.0–2.3×，接受率 47–58%（2.4–2.7 tok/round）。
+- **conc2 的旧 −22% 是指标假象**：原 bench 两流 seed 不同，prompt 在 token 3（块 0 内）即分叉，内容寻址前缀缓存对**两引擎都**不可复用；1cat 把两流 TTFT 都拖到 ~7s 后纯解码，使每流 decode 均值偏高，而 ninfer 首流 3.6s 即出首 token、其均值被“另一流 8192-token 预填块共享混批单元”稀释。**两边总 wall 均为 ~10s，ninfer 首流 TTFT 更好**。共享前缀场景下 ninfer 借运行中 lane 的 KV（`reuse=block_snapshot cache=7360`），第二路 prefill 3.5s→~0.2s，总 wall 6.6s。
 
 ### 与 1cat 的当前差距（历史，cuBLAS 路由之前的 2026-10-16 全套 A/B，保留作对照）
 
@@ -76,7 +82,7 @@
 |---|---|---|---|
 | 冷 prefill TTFT @14794 | 8.62 s | 6.68 s | −23%（已解决，见上表） |
 | 冷 prefill TTFT @59020 | 41.70 s | 31.34 s | −25%（已解决，见上表） |
-| conc2 合计 | 62.3 | 83.7 | −26%（部分缓解至 −22%） |
+| conc2 合计 | 62.3 | 83.7 | −26%（后确认该指标为假象，见上表说明） |
 
 ### 踩过的坑（已实测，避免重复）
 
@@ -90,6 +96,7 @@
 - **dequant 缓冲布局**：`w_fp16` 是 out-major `[n][k]`（不是 `[k][n]`），`x_fp16` 是 token-major `[cols][k]`；cuBLAS 映射需 `transa=CUBLAS_OP_T, lda=k, transb=OP_N, ldb=k, ldc=n`，映射错会静默出垃圾结果（服务不崩，输出乱码）。
 - **SM70 上 cuBLAS 不支持 bf16 输出**（`CUBLAS_STATUS_NOT_SUPPORTED`(15)）：bf16 输出走 fp16 GEMM + 转换 kernel。
 - **strata 会抢占 GPU**：杀掉 strata engine 后其 serve 层（pid 2555）会在 GPU 释放后自动重启 engine 抢占显存；必须连 serve 层一起杀。
+- **并发指标陷阱**：per-stream decode tok/s 的“合计”会惩罚早出首 token 的引擎（其解码期与另一流的 prefill 混批重叠）。并发对比应看**两流总 wall**，不能看每流 decode 均值之和。
 
 ---
 
@@ -121,12 +128,14 @@
 
 **Decode（生成 512–1024 tokens）**
 
-| 配置 | 用例 | 结果 |
-|---|---|---|
-| 无 MTP | server 自报（BFCL 评测期间，5K–12K 上下文） | **38–41 tok/s** |
-| MTP 开启（`--spec mtp --draft-tokens 3`） | 1.3K prompt，端到端 1024 tokens | **114.0 tok/s** |
-| MTP 开启 | 31K prompt，端到端 1024 tokens | **36.5 tok/s** |
-| MTP 开启 | 186K prompt，端到端 512 tokens | 2.7 tok/s（端到端被 ~180s prefill 主导；decode 段约 50 tok/s 量级） |
+对齐 profile，`long_gen_prompt` 四点（prompt 502 / 3.7K / 15K / 59K），`max_tokens=128`：
+
+| 配置 | @502 | @3.7K | @15K | @59K |
+|---|---|---|---|---|
+| 无 MTP | 50.9 | 50.0 | 46.2 | 35.9 |
+| **MTP（`--spec mtp --draft-tokens 3`）** | **106.8** | **99.2** | **99.7** | **84.4** |
+
+MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TTFT 增加约 0.15s（draft 初始化）。
 
 **多轮前缀缓存（`--prefix-cache`）**
 
