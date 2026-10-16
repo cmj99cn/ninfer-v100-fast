@@ -113,7 +113,7 @@ def request_payload(lane: dict[str, Any], messages: list[dict[str, str]]) -> dic
 
 
 # ---------------------------------------------------------------------------------------------
-# VRAM sampling (per-GPU, per-process), ported from eval/run_qwen3_8_27b_nvfp4_needle_tp2.sh
+# VRAM sampling (per-GPU, per-process), ported from the (now-removed) upstream TP2 needle script
 # ---------------------------------------------------------------------------------------------
 
 

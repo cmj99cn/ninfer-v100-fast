@@ -6,7 +6,7 @@ prompt, so the TP2 vs TP1 comparison is made on identical input.
 
 The prompt is built with EvalScope's own `needle_haystack` adapter (same corpus, same
 tokenizer, same insertion algorithm) and with the same system prompt and prompt template
-that `eval/configs/qwen3_8_27b_nvfp4_needle_haystack.yaml` sets, so the probe prompt is
+that the (now-removed) upstream needle suite used, so the probe prompt is
 token-for-token what the suite would send at that context length and depth.
 
 It streams the completion so time-to-first-token and the decode phase can be separated
