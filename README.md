@@ -80,13 +80,14 @@
 
 **Decode（生成 512–1024 tokens）**
 
-| 配置 | 用例 | 结果 |
-|---|---|---|
-| 无 MTP（cuBLAS prefill 路由，dev 分支） | @0.5K / 3.7K / 15K / 59K 上下文，流式 128–256 tokens | **50.9 / 50.0 / 46.2 / 35.9 tok/s** |
-| 无 MTP | server 自报（BFCL 评测期间，5K–12K 上下文） | 38–41 tok/s |
-| MTP 开启（`--spec mtp --draft-tokens 3`） | 1.3K prompt，端到端 1024 tokens | **114.0 tok/s** |
-| MTP 开启 | 31K prompt，端到端 1024 tokens | **36.5 tok/s** |
-| MTP 开启 | 186K prompt，端到端 512 tokens | 2.7 tok/s（端到端被 ~180s prefill 主导；decode 段约 50 tok/s 量级） |
+`long_gen_prompt` 四点（prompt 502 / 3.7K / 15K / 59K），`max_tokens=128`：
+
+| 配置 | @502 | @3.7K | @15K | @59K |
+|---|---|---|---|---|
+| 无 MTP（cuBLAS prefill 路由，dev 分支） | 50.9 | 50.0 | 46.2 | 35.9 |
+| **MTP（`--spec mtp --draft-tokens 3`）** | **106.8** | **99.2** | **99.7** | **84.4** |
+
+MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TTFT 增加约 0.15s（draft 初始化）。
 
 **多轮前缀缓存（`--prefix-cache`）**
 
