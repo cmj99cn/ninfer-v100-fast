@@ -102,7 +102,7 @@
 | 系统 | Linux x86_64，无 root 权限环境亦可构建（见安装） |
 | CUDA | 12.8 |
 | 编译器 | GCC 13.3，CMake ≥ 3.28，Ninja |
-| 模型 | `Qwen3.8-27B-nvfp4-NInfer`（neroued 官方 NVFP4 制品，约 22 GiB） |
+| 模型 | 自转换 `qwen3_8_27b_nvfp4.ninfer`（NVFP4，约 18 GiB；源 `unsloth/Qwen3.8-27B-NVFP4`） |
 | 服务参数 | `--tp 2 --devices 0,1 --kv-dtype int8 --max-context 262144` |
 
 ## 测试用例与结果
@@ -150,21 +150,22 @@
 
 ## 模型下载
 
-本项目以 NInfer 官方 `.ninfer` 容器格式的 NVFP4 制品为默认模型。
+本项目默认使用**自转换**的 NVFP4 `.ninfer` 制品（约 18 GiB）：以公开的 `unsloth/Qwen3.8-27B-NVFP4` 量化权重为源，套用官方 `Qwen/Qwen3.8-27B` 的结构与词表，经本仓库转换流水线 `tools/convert/qwen3_8_27b/convert_nvfp4.py` 生成。制品旁的 `qwen3_8_27b_nvfp4.ninfer.conversion.json` 记录了源仓库、revision 与转换参数，可作溯源与校验。
+
+量化权重源（公开可下载）：
 
 ```bash
 # 国内环境建议使用镜像，并禁用 Xet 传输（否则大文件下载会失败）
 export HF_ENDPOINT=https://hf-mirror.com
 export HF_HUB_DISABLE_XET=1
 
-huggingface-cli download neroued/Qwen3.8-27B-nvfp4-NInfer \
-  qwen3_8_27b_nvfp4.ninfer \
-  --local-dir ./models/ninfer-artifacts
+huggingface-cli download unsloth/Qwen3.8-27B-NVFP4 \
+  --local-dir ./models/unsloth-qwen3.8-27b-nvfp4
 ```
 
-下载完成后约 22 GiB，文件路径：`./models/ninfer-artifacts/qwen3_8_27b_nvfp4.ninfer`。仓库内 `SHA256SUMS` / `artifact-manifest.json` 可用于校验。
-
-> 注意：该制品为 **text-only** 路线。Vision tower 与本 fork 的加载契约不兼容（见问题 1），请不要使用 `--vision` 参数。
+> 注意：
+> - 官方 `neroued/Qwen3.8-27B-nvfp4-NInfer` 制品与本 fork 的 GDN `query_key_value_z` 加载契约不兼容（加载即报 tensor descriptor 契约错误），**请不要使用**。
+> - 该制品为 **text-only** 路线，Vision tower 契约不兼容（见问题 1），请不要使用 `--vision` 参数。
 
 ---
 
@@ -215,7 +216,7 @@ export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH   # 视你的 NCCL 位置
 
 ./build/apps/ninfer-serve \
-  ./models/ninfer-artifacts/qwen3_8_27b_nvfp4.ninfer \
+  ./models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
   --model-id qwen3.8-27b-nvfp4 \
   --host 0.0.0.0 --port 9010 \
   --api-key YOUR_API_KEY \
@@ -285,7 +286,8 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 - [wamansou/ninfer-tp2-1m](https://github.com/wamansou/ninfer-tp2-1m) — 双卡张量并行与 YaRN 扩展。
 - [jason-ni/ninfer-v100-tp4](https://github.com/jason-ni/ninfer-v100-tp4) — V100 TP4 单进程并行基底（本仓库代码直接来源）。
 - [1catAI/ninfer-v100](https://github.com/1catAI/ninfer-v100) — splitd 长上下文 prefill 内核的思路与参考实现。
-- [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) — 默认模型制品。
+- [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) — 默认模型的 NVFP4 量化权重源。
+- [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) — `.ninfer` 制品格式的参考（本 fork 契约不兼容，仅作格式参照）。
 - Qwen / NInfer 生态的所有贡献者。
 
 ## 许可协议
