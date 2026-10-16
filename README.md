@@ -47,6 +47,39 @@
 
 ---
 
+## 当前进度（开发分支，截至 2026-10-16）
+
+### 对齐测试参数（A/B 基准，两引擎同参）
+
+| 引擎 | 参数 |
+|---|---|
+| ninfer（本引擎） | `--tp 2 --devices 0,1 --max-context 262144 --max-concurrency 2 --prefill-chunk 8192 --prefix-cache --kv-dtype int8 --no-thinking --greedy`，`NINFER_VOLTA_SPLITD=1` |
+| 1cat-vLLM 1.5.1（对照） | `--max-num-seqs 2 --max-num-batched-tokens 8192 --kv-cache-dtype fp8_e5m2 --enable-prefix-caching`，model `qwen38-27b-nvfp4` |
+
+### 与 1cat 的当前差距（2026-10-16 全套 A/B，同参同模型）
+
+| 项 | ninfer | 1cat | 结论 |
+|---|---|---|---|
+| 冷 prefill TTFT @14794 | 8.62 s | 6.68 s | **−23%**（主攻） |
+| 冷 prefill TTFT @59020 | 41.70 s | 31.34 s | **−25%**（主攻） |
+| decode @500 / 3.7K | 50.8 / 49.8 | 49.5 / 48.9 | ninfer 赢 |
+| decode @15K / @59K | 46.2 / 35.9 | 46.6 / 39.4 | 平 / −9% |
+| prefix warm（命中后） | 0.38 | 1.10 | ninfer 赢 |
+| conc2 合计 | 62.3 | 83.7 | −26%（归因于冷 prefill） |
+
+最大缺口 = **冷 prefill 吞吐**。nvprof 剖析冷 7419 prefill：GPU 双卡 100% 饱和，GEMM 占 72%；其中 CUTLASS `device::Gemm` 比 cuBLAS 慢 18–27%（gate_up 62 TF vs 85 TF、down 69 vs 85）。已加 `NINFER_SM70_PREFILL_GEMM`（0=CUTLASS identity，1=cuBLAS）作为攻击点。
+
+### 踩过的坑（已实测，避免重复）
+
+- **stages=3 编译失败**：cutlass SM70 的 `DefaultGemm` 特化硬编码 2 stages，不可选。
+- **swizzle 不可选**：`device::Gemm` 内核调用 `get_tile_offset(int)`，只有 identity swizzle 满足，horizontal 无法通过该 API 使用。
+- **bench 方法论陷阱**：`speed_bench.py` 的 prefill 段各行共享前缀（部分缓存命中，非冷）；只有 ttft 段（独立 seed）才是干净的冷 prefill 对比。
+- **`#pragma unroll 4` 回退**：`__launch_bounds__(256,5)` 卡 ~51 regs/thread（实测 48）→ 溢出，27.27→29.86 回归，已回退。
+- **attention 两轴已挖尽**：`NINFER_SM70_LONG_SPLITS_ONLY`（tier3 地板 129 splits）与 `NINFER_SM70_DECODE_MB`（mb5 最优）均达局部最优，splits-only 绕过地板全面更差。
+- **`pkill -f` 自杀**：模式匹配到自身命令行会秒杀 shell，用 PID 或 bracket 技巧。
+
+---
+
 ## 测试环境
 
 | 项 | 配置 |
@@ -218,6 +251,9 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 | `NINFER_SM70_SPLITKV3_MIN_KV` | split-KV3 阈值（默认 2048） |
 | `NINFER_SM70_ATTN_V2=0` | 回退到 phase-1 decode 注意力内核（默认用 v2） |
 | `NINFER_SM70_LONG_SPLIT_KEYS` | 长窗口每 split key 数（本基底实测无效，保留作 A/B） |
+| `NINFER_SM70_LONG_SPLITS_ONLY` | 绕过 tier 地板强制 long-split 策略（A/B 实测全面更差，保留作对照） |
+| `NINFER_SM70_DECODE_MB` | T1-3 >6144 窗口 MinBlocks（默认 5；2/4/6 均更差） |
+| `NINFER_SM70_PREFILL_GEMM` | 冷 prefill GEMM 路由：0=CUTLASS identity（默认），1=cuBLAS（同形状实测 +18–27%） |
 
 ---
 
