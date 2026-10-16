@@ -95,17 +95,21 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 
 ### 质量
 
-**BFCL-v3 多轮函数调用**（evalscope，`multi_turn_base` / `multi_turn_miss_func` / `multi_turn_miss_param` / `multi_turn_long_context` 各 20 条，greedy，thinking 关闭，`--prefix-cache` 开启）：
+**BFCL-v3 多轮函数调用**（evalscope，`multi_turn_base` / `multi_turn_miss_func` / `multi_turn_miss_param` / `multi_turn_long_context` 各 20 条）。
+
+对齐口径（thinking 开启、`temperature=1.0`、`top_p=1.0`、`--prefix-cache` 开启）：
 
 | Subset | 分数 |
 |---|---|
-| multi_turn_base | 20% |
-| multi_turn_miss_func | 10% |
-| multi_turn_miss_param | 35% |
-| multi_turn_long_context | 15% |
-| **OVERALL（80 条）** | **20%** |
+| multi_turn_base | 6/20 |
+| multi_turn_long_context | 4/20 |
+| multi_turn_miss_func | 3/20 |
+| multi_turn_miss_param | 2/20 |
+| **OVERALL（80 条）** | **18.75%（15/80）** |
 
-该分数为当前基线，后续迭代在此基础上对照改进。函数调用质量与采样参数、工具模板、thinking 开关高度相关，迭代空间大。
+多轮工具调用质量仍是当前主要短板，集中于**多轮工具历史 / 模板渲染**（首步即与参考实现分叉）。后续迭代在此基础上对照改进。
+
+**历史基线（greedy，thinking 关闭，`--prefix-cache` 开启）**：OVERALL 20%（multi_turn_base 20% / miss_func 10% / miss_param 35% / long_context 15%）。
 
 ---
 
