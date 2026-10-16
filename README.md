@@ -159,17 +159,33 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 
 ## 模型下载
 
-本项目默认使用**自转换**的 NVFP4 `.ninfer` 制品（约 18 GiB）：以公开的 `unsloth/Qwen3.8-27B-NVFP4` 量化权重为源，套用官方 `Qwen/Qwen3.8-27B` 的结构与词表，经本仓库转换流水线 `tools/convert/qwen3_8_27b/convert_nvfp4.py` 生成。制品旁的 `qwen3_8_27b_nvfp4.ninfer.conversion.json` 记录了源仓库、revision 与转换参数，可作溯源与校验。
+本项目默认使用**自转换**的 NVFP4 `.ninfer` 制品（约 18 GiB）：以公开的 `unsloth/Qwen3.8-27B-NVFP4` 量化权重为源，套用官方 `Qwen/Qwen3.8-27B` 的结构与词表，经本仓库转换流水线 `tools/convert/qwen3_8_27b/convert_nvfp4.py` 生成。制品旁的 `qwen3_8_27b_nvfp4.ninfer.conversion.json` 记录了源仓库、revision 与转换参数（本制品固定：结构源 `1d4bf0f2…`、量化源 `60e813d4…`），可作溯源与校验。
 
-量化权重源（公开可下载）：
+两个来源均公开可下载，建议带 `--revision` 固定版本以复现：
 
 ```bash
 # 国内环境建议使用镜像，并禁用 Xet 传输（否则大文件下载会失败）
 export HF_ENDPOINT=https://hf-mirror.com
 export HF_HUB_DISABLE_XET=1
 
+# 官方结构 / 词表 / chat 模板
+huggingface-cli download Qwen/Qwen3.8-27B \
+  --revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 \
+  --local-dir ./models/Qwen3.8-27B
+
+# NVFP4 量化权重
 huggingface-cli download unsloth/Qwen3.8-27B-NVFP4 \
+  --revision 60e813d4dbbdc5d64cf3f5a8caf2897bedf03679 \
   --local-dir ./models/unsloth-qwen3.8-27b-nvfp4
+```
+
+转换（工具随 dev 分支维护，用法见 `tools/convert/qwen3_8_27b/convert_nvfp4.py` 顶部说明与 `--help`）：
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
+  --model ./models/Qwen3.8-27B \
+  --quantized-model ./models/unsloth-qwen3.8-27b-nvfp4 \
+  --out out/qwen3_8_27b_nvfp4.ninfer
 ```
 
 > 注意：
