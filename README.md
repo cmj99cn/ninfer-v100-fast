@@ -56,27 +56,40 @@
 | ninfer（本引擎） | `--tp 2 --devices 0,1 --max-context 262144 --max-concurrency 2 --prefill-chunk 8192 --prefix-cache --kv-dtype int8 --no-thinking --greedy`，`NINFER_VOLTA_SPLITD=1` |
 | 1cat-vLLM 1.5.1（对照） | `--max-num-seqs 2 --max-num-batched-tokens 8192 --kv-cache-dtype fp8_e5m2 --enable-prefix-caching`，model `qwen38-27b-nvfp4` |
 
-### 与 1cat 的当前差距（2026-10-16 全套 A/B，同参同模型）
+### 与 1cat 的当前差距（2026-10-16 全套 A/B，同参同模型；冷 prefill 为 cuBLAS 路由落地后）
 
 | 项 | ninfer | 1cat | 结论 |
 |---|---|---|---|
-| 冷 prefill TTFT @14794 | 8.62 s | 6.68 s | **−23%**（主攻） |
-| 冷 prefill TTFT @59020 | 41.70 s | 31.34 s | **−25%**（主攻） |
-| decode @500 / 3.7K | 50.8 / 49.8 | 49.5 / 48.9 | ninfer 赢 |
-| decode @15K / @59K | 46.2 / 35.9 | 46.6 / 39.4 | 平 / −9% |
-| prefix warm（命中后） | 0.38 | 1.10 | ninfer 赢 |
-| conc2 合计 | 62.3 | 83.7 | −26%（归因于冷 prefill） |
+| 冷 prefill @6683 tok | **3.076 s / 2172 tps** | 3.344 s / 1998 tps | **ninfer +8.7%** |
+| 冷 prefill @13344 tok | **6.299 s / 2118 tps** | 7.855 s / 1699 tps | **ninfer +24.7%** |
+| 冷 prefill @53142 tok | **29.867 s / 1779 tps** | 35.686 s / 1489 tps | **ninfer +19.5%** |
+| decode @502 / 3.7K | **50.9 / 50.0** | 49.6 / 49.0 | ninfer 赢 |
+| decode @15K / @59K | 46.2 / 35.9 | **46.7 / 39.1** | 平 / **−8%** |
+| prefix warm（29.5K 命中后） | **0.34 s** | 1.08 s | ninfer 赢 |
+| conc2 decode 合计 | 65.2 | **83.6** | **−22%** |
 
-最大缺口 = **冷 prefill 吞吐**。nvprof 剖析冷 7419 prefill：GPU 双卡 100% 饱和，GEMM 占 72%；其中 CUTLASS `device::Gemm` 比 cuBLAS 慢 18–27%（gate_up 62 TF vs 85 TF、down 69 vs 85）。已加 `NINFER_SM70_PREFILL_GEMM`（0=CUTLASS identity，1=cuBLAS）作为攻击点。
+冷 prefill 缺口（−23~−25%）已翻盘：GEMM 占 prefill 72%，cuBLAS 比 CUTLASS 快 18–27%；`NINFER_SM70_PREFILL_GEMM=1` 落地后三点全线反超（+8.7~+24.7%）。剩余缺口 = **conc2 混批 decode（−22%）** 与 **@59K decode（−8%）**。
+
+### 与 1cat 的当前差距（历史，cuBLAS 路由之前的 2026-10-16 全套 A/B，保留作对照）
+
+| 项 | ninfer | 1cat | 结论 |
+|---|---|---|---|
+| 冷 prefill TTFT @14794 | 8.62 s | 6.68 s | −23%（已解决，见上表） |
+| 冷 prefill TTFT @59020 | 41.70 s | 31.34 s | −25%（已解决，见上表） |
+| conc2 合计 | 62.3 | 83.7 | −26%（部分缓解至 −22%） |
 
 ### 踩过的坑（已实测，避免重复）
 
 - **stages=3 编译失败**：cutlass SM70 的 `DefaultGemm` 特化硬编码 2 stages，不可选。
 - **swizzle 不可选**：`device::Gemm` 内核调用 `get_tile_offset(int)`，只有 identity swizzle 满足，horizontal 无法通过该 API 使用。
-- **bench 方法论陷阱**：`speed_bench.py` 的 prefill 段各行共享前缀（部分缓存命中，非冷）；只有 ttft 段（独立 seed）才是干净的冷 prefill 对比。
+- **bench 方法论陷阱**：`speed_bench.py` 的 prefill 段各行共享前缀（部分缓存命中，非冷）；冷对比用 `tools/v100/bench_prefill_cold.py`（distinct seed）。
 - **`#pragma unroll 4` 回退**：`__launch_bounds__(256,5)` 卡 ~51 regs/thread（实测 48）→ 溢出，27.27→29.86 回归，已回退。
 - **attention 两轴已挖尽**：`NINFER_SM70_LONG_SPLITS_ONLY`（tier3 地板 129 splits）与 `NINFER_SM70_DECODE_MB`（mb5 最优）均达局部最优，splits-only 绕过地板全面更差。
 - **`pkill -f` 自杀**：模式匹配到自身命令行会秒杀 shell，用 PID 或 bracket 技巧。
+- **cuBLAS handle 必须按设备各持一个**：本引擎 TP2 单线程交替两卡调用（每次 `cudaSetDevice` 切换），单个 `thread_local` handle 会让部分 GEMM 报 `CUBLAS_STATUS_EXECUTION_FAILED`(13)。
+- **dequant 缓冲布局**：`w_fp16` 是 out-major `[n][k]`（不是 `[k][n]`），`x_fp16` 是 token-major `[cols][k]`；cuBLAS 映射需 `transa=CUBLAS_OP_T, lda=k, transb=OP_N, ldb=k, ldc=n`，映射错会静默出垃圾结果（服务不崩，输出乱码）。
+- **SM70 上 cuBLAS 不支持 bf16 输出**（`CUBLAS_STATUS_NOT_SUPPORTED`(15)）：bf16 输出走 fp16 GEMM + 转换 kernel。
+- **strata 会抢占 GPU**：杀掉 strata engine 后其 serve 层（pid 2555）会在 GPU 释放后自动重启 engine 抢占显存；必须连 serve 层一起杀。
 
 ---
 
@@ -253,7 +266,8 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 | `NINFER_SM70_LONG_SPLIT_KEYS` | 长窗口每 split key 数（本基底实测无效，保留作 A/B） |
 | `NINFER_SM70_LONG_SPLITS_ONLY` | 绕过 tier 地板强制 long-split 策略（A/B 实测全面更差，保留作对照） |
 | `NINFER_SM70_DECODE_MB` | T1-3 >6144 窗口 MinBlocks（默认 5；2/4/6 均更差） |
-| `NINFER_SM70_PREFILL_GEMM` | 冷 prefill GEMM 路由：0=CUTLASS identity（默认），1=cuBLAS（同形状实测 +18–27%） |
+| `NINFER_SM70_PREFILL_GEMM` | 冷 prefill GEMM 路由：0=CUTLASS identity，1=cuBLAS（+20~23% 冷 prefill tps；`tools/v100/ninfer-aligned-tp2.sh` 默认 1） |
+| `NINFER_SM70_GEMM_TRACE` | 设定后打印 prefill cuBLAS 调用维度/设备/线程诊断（排障用） |
 
 ---
 
