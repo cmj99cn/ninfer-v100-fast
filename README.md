@@ -143,7 +143,23 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 
 ### 质量
 
-**BFCL-v3 多轮函数调用**（evalscope，`multi_turn_base` / `multi_turn_miss_func` / `multi_turn_miss_param` / `multi_turn_long_context` 各 20 条，greedy，thinking 关闭，`--prefix-cache` 开启）：
+**BFCL-v3 多轮函数调用**（evalscope，`multi_turn_base` / `multi_turn_miss_func` / `multi_turn_miss_param` / `multi_turn_long_context` 各 20 条）。
+
+与 1cat 对齐口径（thinking 开启、`temperature=1.0`、`top_p=1.0`、`--prefix-cache` 开启；ninfer 侧见 `tools/v100/ninfer-quality-matched.sh`）：
+
+| Subset | ninfer | 1cat（qwen3_coder） |
+|---|---:|---:|
+| multi_turn_base | 6/20 | 9/20 |
+| multi_turn_long_context | 4/20 | 9/20 |
+| multi_turn_miss_func | 3/20 | 7/20 |
+| multi_turn_miss_param | 2/20 | 6/20 |
+| **OVERALL（80 条）** | **18.75%（15/80）** | **38.75%（31/80）** |
+
+配对对比（同 80 条样本）：`both_ok=11`、`both_bad=45`、`ninfer_only=4`、`1cat_only=20`（McNemar exact p=0.0015）。
+
+结论：**该差距不是采样参数造成的**——去掉 `--greedy`、开启 thinking、`temperature=1.0` 后 ninfer 仍为 18.75%（此前 greedy 口径 20%），1cat 同口径 38.75%。分叉出现在**首步**（1cat 先自然语言 + `pwd`，ninfer 直接空参 `ls` 并进入重复 `ls` 循环），指向**多轮工具历史 / 模板渲染**差异，已记入 `TEMP_WORKAROUNDS.md` §10 待修。
+
+**历史基线（greedy，thinking 关闭，`--prefix-cache` 开启）**：
 
 | Subset | 分数 |
 |---|---|
@@ -152,8 +168,6 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 | multi_turn_miss_param | 35% |
 | multi_turn_long_context | 15% |
 | **OVERALL（80 条）** | **20%** |
-
-该分数为当前基线，后续迭代在此基础上对照改进。函数调用质量与采样参数、工具模板、thinking 开关高度相关，迭代空间大。
 
 ---
 
