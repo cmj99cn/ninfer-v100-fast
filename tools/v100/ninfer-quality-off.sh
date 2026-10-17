@@ -18,7 +18,7 @@ exec "${repo_dir}/build/apps/ninfer-serve" \
   --kv-dtype "${KV_DTYPE:-int8}" \
   --max-context 262144 \
   --max-concurrency 2 \
-  --prefill-chunk 8192 \
+  --prefill-chunk "${PREFILL_CHUNK:-8192}" \
   ${PREFIX_FLAG:---prefix-cache} \
   --no-thinking \
   --presence-penalty 0.0 \
