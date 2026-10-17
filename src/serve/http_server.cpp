@@ -354,9 +354,9 @@ void HttpServer::handle_metrics(const httplib::Request& req, httplib::Response& 
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
-    nlohmann::json body;
+    nlohmann::ordered_json body;
     try {
-        body = nlohmann::json::parse(req.body);
+        body = nlohmann::ordered_json::parse(req.body);
     } catch (const std::exception&) {
         ApiError error;
         error.status  = 400;

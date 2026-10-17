@@ -12,7 +12,10 @@
 namespace ninfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+// Order-preserving JSON: request bodies are parsed into this type so that tool
+// schemas keep the client's key order in the rendered <tools> prompt block (a
+// sorted-key re-dump shifts the prompt and diverges from vLLM/HF).
+using Json = nlohmann::ordered_json;
 
 [[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {}) {
     ApiError error;
@@ -332,9 +335,10 @@ void parse_tools(const Json& body, GenerationRequest& out) {
                 bad_request("function strict must be a boolean", "tools");
             }
             tool.strict = fn.at("strict").get<bool>();
-        } else {
-            fn["strict"] = false;
         }
+        // Do not inject a default `strict` key into the prompt payload: it is not part
+        // of the client's tool schema and vLLM/HF render tools verbatim, so injecting it
+        // adds spurious tokens to the <tools> block.
         tool.definition_json = normalized.dump();
         out.tools.push_back(std::move(tool));
     }

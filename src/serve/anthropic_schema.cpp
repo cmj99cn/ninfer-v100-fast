@@ -166,7 +166,8 @@ void parse_tools(const Json& body, GenerationRequest& out) {
         const Json& parameters = item.at("input_schema");
         tool.parameters_json   = parameters.dump();
         function["parameters"] = parameters;
-        function["strict"]     = false;
+        // No default `strict` key: it is not part of the client's schema and would add
+        // spurious tokens to the rendered <tools> block (vLLM/HF render tools verbatim).
         // Normalized OpenAI-style function tool object consumed verbatim by the
         // Qwen chat template's <tools> block (render_tools_system_block).
         tool.definition_json = Json{{"type", "function"}, {"function", std::move(function)}}.dump();

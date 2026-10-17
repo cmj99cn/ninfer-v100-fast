@@ -20,7 +20,7 @@ namespace ninfer::serve {
 
 // Parse an already-decoded JSON body into a GenerationRequest. Throws ApiException
 // on malformed or unsupported requests (n>1, tools, non-text response_format, ...).
-GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
+GenerationRequest parse_chat_completion_request(const nlohmann::ordered_json& body,
                                                 const RequestLimits& limits);
 
 // Request-level chat-template options. A client may give each option at the top level of the body
@@ -34,7 +34,7 @@ struct RequestTemplateOptions {
     std::string reasoning_effort_param = "reasoning_effort";
 };
 
-RequestTemplateOptions parse_request_template_options(const nlohmann::json& body);
+RequestTemplateOptions parse_request_template_options(const nlohmann::ordered_json& body);
 
 // Non-streaming chat completion response body (JSON string). When `reasoning` is
 // non-empty it is attached as `message.reasoning_content` (the DeepSeek/vLLM-style
