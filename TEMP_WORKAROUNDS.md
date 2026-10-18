@@ -199,12 +199,35 @@ Paged KV trim extent would discard cache-owned pages
 
 ---
 
+## 11. NVFP4 预填充数值缺陷（`--prefill-chunk` ≥256 命中输入投影 CUTLASS 路径）
+
+**文件**：`src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp` + `.../nvfp4_attn_input_cutlass_sm70.cu`；`src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp` + `.../nvfp4_gdn_input_cutlass_sm70.cu`；共用 `src/ops/linear/nvfp4/nvfp4_cutlass_sm70.cu`。
+
+**现象**：BFCL 多轮默认配置分数 20–35% 且**每个新进程结果不同**（`<tool_call>` / 自然语言在首 token 处抖动）；对照 1cat 同口径 45%。
+
+**定位（2026-10-18）**：
+- 首 token 由**最后一个 prefill chunk 末位置**的 logits 决定，故 `--prefill-chunk` 的 128↔256 边界直接改变数值。
+- chunk=256 首 token 配置矩阵（每格 3 个全新进程）：**只有把输入投影（attn+gdn）从 CUTLASS 切到 QPN 才变稳**（`NINFER_VOLTA_CUTLASS_MIN_T=1000000` 单独即稳 3/3；`NINFER_NVFP4_FORCE_QPN`/`NINFER_SM70_PREFILL_GEMM=0` 仍抖）；MLP GEMM 与注意力内核（`NINFER_VOLTA_SPLITD`、`NINFER_SM70_ATTN_V2`）与抖动**无关**。
+- **时序敏感**（非单纯读未初始化内存）：开 `NINFER_DUMP_LAYERS`（每层 `cudaStreamSynchronize`+D2H）后 chunk=256 默认配置 5/5 `<tool_call>`；不开 dump 同 prompt 4 次里 1 次 `I`。两个同配置进程的 dump 前 4746 行一致、之后差 ~3e-3（top-1 未翻转）。
+- 静态复核未发现越界/别名：QPN dequant 恰好覆盖 `n*k`；各 shard `kOutputRows == w.n`（attn 7168 / gdn 8192）；arena 超额抛 `std::bad_alloc` 而非静默重叠。可疑点在 **`DeviceArena::Scope::~Scope` 在 host 侧立即回收 bump 指针且不同步流**（`src/core/arena.cu:125-127`），正确性完全依赖单流有序，而 runtime 使用**每 rank `cudaStreamNonBlocking` 流**（`stream_for(rank)`）并行执行两个 rank。
+
+**规避**：`--prefill-chunk 128`（结果确定，`multi_turn_base` 恢复到 50% = 1cat 水平）。代价：长提示冷预填充约 **3.3× 慢**（5060 tok TTFT 2.4s→8.0s；21620 tok 10.8s→34.6s），≤128 tok 无差异，BFCL 整轮因前缀缓存仅 +约 2min。
+
+**诊断开关**（dev 已提供）：`NINFER_VOLTA_CUTLASS_MIN_T`（输入投影 cutlass→QPN 阈值）、`NINFER_NVFP4_FORCE_QPN`、`NINFER_VOLTA_MMA_SPLITS`、`NINFER_SM70_PREFILL_GEMM`、`NINFER_DUMP_LAYERS`。
+
+**复核 TODO**：
+- [ ] 修 T≥256 的输入投影 CUTLASS 路径：候选（a）把 arena 作用域延长到覆盖异步内核、（b）该路径加一次流同步、（c）直接把该路径切到 QPN（已验证稳定但不恢复质量）。
+- [ ] 修好后以默认 chunk 复测，确认「稳且达 50%」后再决定是否保留 `--prefill-chunk 128`。
+
+---
+
 ## 复核优先级建议
 
 | 优先级 | 项 | 阻塞什么 |
 |---|---|---|
 | ~~P0~~ | ~~#2 paged KV trim bug~~ | ✅ 已修复 |
 | P1 | #1 vision 架构 | 多模态能力 |
+| P1 | #11 NVFP4 预填充数值缺陷（`--prefill-chunk` ≥256） | 默认配置的下游质量与可复现性 |
 | P2 | #6 Hadamard 精度 | 长期质量风险 |
 | P2 | #10 工具调用解析器严格性（vs qwen3_coder） | agent 任务鲁棒性（非标准输出会丢工具调用） |
 | P3 | #3/#4/#5 构建规范化 | 可移植性 |
