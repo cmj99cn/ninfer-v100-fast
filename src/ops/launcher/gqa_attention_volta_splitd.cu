@@ -32,7 +32,9 @@
 
 #include "core/device.h"
 #include "core/tensor.h"
+#include "ops/common/split_launch.h" // CurrentDeviceScope
 #include "ops/kernel/gqa_attention_geometry.cuh"
+#include "ops/launcher/kernel_attr_once.h" // ensure_func_attr_per_device
 
 #include <cstdio>
 #include <cstdlib>
@@ -40,7 +42,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#include <array>
+#include <map>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -55,56 +57,17 @@ constexpr int kMaxRows = 8192;
 
 constexpr int round_up_rows(int rows) { return ((rows + kD256BlockM - 1) / kD256BlockM) * kD256BlockM; }
 
-// Every piece of Split-D state below is per-CUDA-device. This engine drives all ranks from a
-// single host thread, so an unkeyed function-local static would have rank 1 reuse rank 0's
-// buffers -- a real cross-device race (rank 1's launches would read/write rank 0's memory).
-int clamp_device(int device) {
-    return (device >= 0 && device < static_cast<int>(kMaximumDevices)) ? device : 0;
-}
-
+// Every piece of Split-D state below (staging, smem opt-in, the pinned positions probe) is keyed
+// by CUDA device. This engine issues all ranks' work from a single host thread with that rank's
+// device made current (ops::detail::for_each_rank), so cudaGetDevice() IS the rank identity;
+// an unkeyed function-local static would have rank 1 bind to rank 0's buffers -- a real
+// cross-device race, since each launch then reads and writes the other rank's memory. Maps (not
+// a size-kMaximumDevices array) because device ids are physical and need not be < that count.
 int current_device() {
     int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess) {
-        (void)cudaGetLastError();
-        return 0;
-    }
-    return clamp_device(device);
+    CUDA_CHECK(cudaGetDevice(&device));
+    return device;
 }
-
-// Device that owns `pointer`; falls back to the caller's current device when the pointer is
-// unknown (e.g. null or host memory). Correct regardless of what the caller left the current
-// device set to, which matters because only the collectives here call cudaSetDevice.
-int device_of(const void* pointer) {
-    if (pointer == nullptr) { return current_device(); }
-    cudaPointerAttributes attributes{};
-    if (cudaPointerGetAttributes(&attributes, pointer) != cudaSuccess) {
-        (void)cudaGetLastError();
-        return current_device();
-    }
-    return attributes.device >= 0 ? clamp_device(attributes.device) : current_device();
-}
-
-// RAII current-device switch, for allocations/attributes that must land on a specific device.
-class ScopedDevice {
-public:
-    explicit ScopedDevice(int device) {
-        if (cudaGetDevice(&previous_) == cudaSuccess && device != previous_ &&
-            cudaSetDevice(device) == cudaSuccess) {
-            switching_ = true;
-        } else {
-            (void)cudaGetLastError();
-        }
-    }
-    ~ScopedDevice() {
-        if (switching_) { (void)cudaSetDevice(previous_); }
-    }
-    ScopedDevice(const ScopedDevice&)            = delete;
-    ScopedDevice& operator=(const ScopedDevice&) = delete;
-
-private:
-    int  previous_  = 0;
-    bool switching_ = false;
-};
 
 // Upstream's SplitKV3 activation threshold (LLAMA_SM70_SPLITKV3_MIN_KV default). Overridable
 // here so the attention contract tests can be pointed at the merge path: their cases are far
@@ -181,11 +144,11 @@ struct SplitDStaging {
     int              heads = 0;
 };
 
-SplitDStaging& splitd_staging(int heads, int device) {
-    static std::array<SplitDStaging, kMaximumDevices> stagings{};
-    SplitDStaging& staging = stagings[static_cast<std::size_t>(clamp_device(device))];
+SplitDStaging& splitd_staging(int heads) {
+    static std::map<int, SplitDStaging> stagings;
+    SplitDStaging& staging = stagings[current_device()];
     if (staging.q == nullptr || staging.heads != heads) {
-        ScopedDevice guard(clamp_device(device));
+        const CurrentDeviceScope scope;  // allocate on this rank's device, restore the caller's
         if (staging.q != nullptr) {
             cudaFree(staging.q);
             cudaFree(staging.o);
@@ -208,16 +171,14 @@ SplitDStaging& splitd_staging(int heads, int device) {
 
 // cudaFuncSetAttribute cannot run inside a CUDA graph capture (it would invalidate the
 // capture), and the engine captures during warmup. Raise it on the first call that is not
-// being captured; until then the caller keeps using the llama.cpp kernel.
-bool splitd_smem_ready(cudaStream_t stream, int device) {
+// being captured; until then the caller keeps using the llama.cpp kernel. The opt-in is a
+// per-device kernel property, so it goes through the shared per-device once-guard rather than a
+// bare static (which would configure only whichever device ran first).
+bool splitd_smem_ready(cudaStream_t stream) {
     using Traits = FLASH_NAMESPACE::Sm70D256SplitDTraits;
-    static std::array<bool, kMaximumDevices> raised{};
-    const std::size_t slot = static_cast<std::size_t>(clamp_device(device));
-    if (raised[slot]) { return true; }
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     (void)cudaStreamIsCapturing(stream, &capture);
     if (capture != cudaStreamCaptureStatusNone) { return false; }
-    ScopedDevice guard(clamp_device(device));
     const auto kernel =
         FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<cutlass::half_t, false, float, false,
                                                        false, false>;
@@ -226,14 +187,9 @@ bool splitd_smem_ready(cudaStream_t stream, int device) {
                                                        false, false>;
     for (const void* kfn : {reinterpret_cast<const void*>(kernel),
                             reinterpret_cast<const void*>(kernel_s3)}) {
-        if (cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 Traits::kSmemBytes) != cudaSuccess) {
-            (void)cudaGetLastError();
-            std::fprintf(stderr, "warning: sm70 split-D kernel smem attribute failed\n");
-            return false;
-        }
+        ensure_func_attr_per_device(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    Traits::kSmemBytes);
     }
-    raised[slot] = true;
     return true;
 }
 
@@ -279,8 +235,8 @@ bool splitd_positions_are_contiguous(const void* positions, std::int32_t base,
         std::int32_t host_rows = 0;
     };
     constexpr std::int32_t kCacheMinWidth = 256;
-    static std::array<ProbeCache, kMaximumDevices> probes{};
-    ProbeCache& probe = probes[static_cast<std::size_t>(device_of(positions))];
+    static std::map<int, ProbeCache> probes;
+    ProbeCache& probe = probes[current_device()];
     if (width >= kCacheMinWidth && positions == probe.positions && base == probe.base &&
         width == probe.width) {
         return true;
@@ -336,10 +292,8 @@ bool volta_splitd_block(const void* q_bf16, const void* k_f16, const void* v_f16
 
     if (rows <= 0 || rows > kMaxRows) { return false; }
     if (!positions_contiguous) { return false; }
-    // Bind the whole launch to Q's device. This is the only rank identity the Split-D route
-    // gets, and it is what keeps the per-device staging/smem state from crossing ranks.
-    const int device = device_of(q_bf16);
-    if (!splitd_smem_ready(stream, device)) { return false; }
+    // for_each_rank has rank's device current here; the helpers key their state on it.
+    if (!splitd_smem_ready(stream)) { return false; }
 
     {
         static int hits = 0, split3_hits = 0, calls = 0;
@@ -354,7 +308,7 @@ bool volta_splitd_block(const void* q_bf16, const void* k_f16, const void* v_f16
     }
 
     const int q_pad = round_up_rows(rows);
-    SplitDStaging& staging = splitd_staging(kHeads, device);
+    SplitDStaging& staging = splitd_staging(kHeads);
 
     constexpr int kStageWarps = 8;
     const int stage_blocks    = (rows * kHeads + kStageWarps - 1) / kStageWarps;
