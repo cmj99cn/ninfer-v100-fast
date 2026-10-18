@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -24,6 +25,17 @@ enum class Nvfp4GdnInputRoute : std::uint8_t {
 const std::int32_t kVoltaCutlassMinT = [] {
     const char* e = std::getenv("NINFER_VOLTA_CUTLASS_MIN_T");
     return e ? std::atoi(e) : 33;
+}();
+
+// Diagnosis only: NINFER_VOLTA_INPUT_CAP=cutlass|qpn overrides which capacity the planner
+// reserves, independently of kVoltaCutlassMinT (which drives the runtime route). Used to tell
+// "input-projection backend" apart from "arena size" when bisecting the T>=256 non-determinism.
+const int kVoltaInputCap = [] {
+    const char* e = std::getenv("NINFER_VOLTA_INPUT_CAP");
+    if (e == nullptr) { return 0; }
+    if (std::strcmp(e, "cutlass") == 0) { return 1; }
+    if (std::strcmp(e, "qpn") == 0) { return 2; }
+    return 0;
 }();
 #endif
 
@@ -125,7 +137,9 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
         return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4GdnInputGeometry::kInputRows);
     }
 #ifdef NINFER_VOLTA_BUILD
-    if (max_tokens >= kVoltaCutlassMinT) {
+    const bool cutlass_cap =
+        kVoltaInputCap == 1 || (kVoltaInputCap == 0 && max_tokens >= kVoltaCutlassMinT);
+    if (cutlass_cap) {
         return nvfp4_gdn_input_cutlass_workspace_bytes(max_tokens);
     }
 #endif
