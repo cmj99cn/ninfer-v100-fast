@@ -9,6 +9,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 
@@ -63,7 +64,11 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
 #ifdef NINFER_VOLTA_BUILD
     // Materialize each weight once for the whole prefill call, including QPN-prepacked TP2
     // shards. Repeated 32-token QPN launches reread the entire down projection per tile.
-    if (workspace != nullptr && total_t >= 128) {
+    static const bool kForceQpn = []() {
+        const char* env = std::getenv("NINFER_NVFP4_FORCE_QPN");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (!kForceQpn && workspace != nullptr && total_t >= 128) {
         nvfp4_cutlass_sm70_launch(x, weight, out, *workspace, stream);
         return;
     }

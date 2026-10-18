@@ -45,6 +45,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 
 namespace ninfer::ops::detail {
 
@@ -69,6 +70,11 @@ inline constexpr std::int32_t kVoltaMmaLongK = 12288;
 
 [[nodiscard]] inline int volta_mma_split_count(std::int32_t n, std::int32_t k,
                                                std::int32_t t) noexcept {
+    static const int kForced = []() {
+        const char* env = std::getenv("NINFER_VOLTA_MMA_SPLITS");
+        return env != nullptr ? std::atoi(env) : 0;
+    }();
+    if (kForced > 0) { return kForced; }
     const int row_ctas = (n + kVoltaMmaRowsPerCta - 1) / kVoltaMmaRowsPerCta;
     const int t_tiles  = (t + kVoltaMmaTTile - 1) / kVoltaMmaTTile;
     const int blocks   = row_ctas * t_tiles;

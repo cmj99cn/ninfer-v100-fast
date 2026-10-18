@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -19,7 +20,11 @@ enum class Nvfp4GdnInputRoute : std::uint8_t {
 #ifdef NINFER_VOLTA_BUILD
 // Same threshold the fp8 route measured on V100: at T>=33 the split-output cutlass projection
 // (one dequant + one GEMM over the whole call) beats repeated <=32-token QPN/small_t launches.
-constexpr std::int32_t kVoltaCutlassMinT = 33;
+// Overridable via NINFER_VOLTA_CUTLASS_MIN_T to force the QPN chunked path for diagnosis.
+const std::int32_t kVoltaCutlassMinT = [] {
+    const char* e = std::getenv("NINFER_VOLTA_CUTLASS_MIN_T");
+    return e ? std::atoi(e) : 33;
+}();
 #endif
 
 Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {

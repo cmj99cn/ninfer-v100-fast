@@ -32,9 +32,13 @@
 #include "ninfer/ops/silu_mul.h"
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -44,6 +48,61 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
+
+// Debug hook: when NINFER_DUMP_LAYERS=<path> is set, append the last-token residual
+// stream (BF16, K features) after every prefill layer. Used to bisect which layer first
+// diverges between two prefill-chunk configurations. Layout: x is [K, T] with tokens
+// contiguous (token t at offset t*K), so the last token is the final K elements.
+inline void dump_layer_last_token(int layer, const Tensor& x, cudaStream_t stream) {
+    const char* path = std::getenv("NINFER_DUMP_LAYERS");
+    if (path == nullptr) { return; }
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        std::fprintf(stderr, "[dump] first call pid=%d path=%s dtype=%d ne0=%lld ne1=%lld\n",
+                     static_cast<int>(getpid()), path, static_cast<int>(x.dtype),
+                     static_cast<long long>(x.ne[0]), static_cast<long long>(x.ne[1]));
+    }
+    if (x.data == nullptr || x.dtype != DType::BF16) { return; }
+    const int k = static_cast<int>(x.ne[0]);
+    const int t = static_cast<int>(x.ne[1]);
+    if (k <= 0 || t <= 0) { return; }
+    static FILE* file = std::fopen(path, "a");
+    if (file == nullptr) { return; }
+    int idxs[5];
+    int n_idx = 0;
+    const int probe[4] = {0, 63, 127, 255};
+    for (int p = 0; p < 4; ++p) {
+        if (probe[p] < t) { idxs[n_idx++] = probe[p]; }
+    }
+    if (idxs[n_idx - 1] != t - 1) { idxs[n_idx++] = t - 1; }
+    std::vector<__nv_bfloat16> host(static_cast<std::size_t>(k));
+    for (int ii = 0; ii < n_idx; ++ii) {
+        const int tok = idxs[ii];
+        const auto* base =
+            static_cast<const __nv_bfloat16*>(x.data) + static_cast<std::int64_t>(tok) * k;
+        if (cudaMemcpyAsync(host.data(), base, sizeof(__nv_bfloat16) * k,
+                            cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+            return;
+        }
+        if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+        std::string line;
+        line.reserve(static_cast<std::size_t>(k) * 10 + 48);
+        char head[80];
+        std::snprintf(head, sizeof(head), "pid=%d layer=%d T=%d tok=%d",
+                      static_cast<int>(getpid()), layer, t, tok);
+        line = head;
+        for (int i = 0; i < k; ++i) {
+            char num[20];
+            std::snprintf(num, sizeof(num), " %.6g",
+                          __bfloat162float(host[static_cast<std::size_t>(i)]));
+            line += num;
+        }
+        line += '\n';
+        std::fwrite(line.data(), 1, line.size(), file);
+    }
+    std::fflush(file);
+}
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
@@ -1628,6 +1687,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto mlp_scope = work_.scope();
                 mlp_tail(full.post_attn_norm, full.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
+                dump_layer_last_token(layer, x, ctx_.stream);
             }
         } else {
             const int gidx       = ModelConfig::gdn_idx(layer);
@@ -1653,6 +1713,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto mlp_scope = work_.scope();
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
+                dump_layer_last_token(layer, x, ctx_.stream);
             }
         }
     }
@@ -2307,6 +2368,7 @@ void TextContext::gdn_mix_parallel(const std::array<const GdnLayerW*, kMaximumDe
         ops::rmsnorm(x[r], *w[r]->input_norm, kCfg.rms_eps, true, h[r], stream_for(rank));
     });
     Variant::gdn_control_projection(h, projection, g, beta, ws, execution);
+    if (gidx == 0) { dump_layer_last_token(2003, g[0], stream_for(0)); dump_layer_last_token(2004, beta[0], stream_for(0)); }
 
     if (ph == Phase::Mixed) {
         const MixedOwnerState* mixed = active_mixed_;
@@ -2459,13 +2521,16 @@ void TextContext::gdn_mix_parallel(const std::array<const GdnLayerW*, kMaximumDe
             qkv[r]   = conv.projected;
             qkv_c[r] = conv.convolved;
         }
+        if (gidx == 0) { dump_layer_last_token(2000, h[0], stream_for(0)); }
         Variant::gdn_input_projection(h, projection, qkv, z, ph, ws, execution);
+        if (gidx == 0) { dump_layer_last_token(2001, qkv[0], stream_for(0)); }
         for_each_rank(execution, [&](int rank) {
             const auto r      = static_cast<std::size_t>(rank);
             cudaStream_t s    = stream_for(rank);
             Tensor conv_state = state_for(rank).conv_slot(static_cast<std::uint32_t>(gidx),
                                                           linear_state_current_slot_);
             ops::causal_conv1d_silu(qkv[r], *w[r]->conv1d, conv_state, conv_state, qkv_c[r], s);
+            if (gidx == 0 && rank == 0) { dump_layer_last_token(2002, qkv_c[r], s); }
             // Shard-local section offsets: this device's convolved block is its own
             // q(1024) | k(1024) | v(3072), not the model's 2048 | 2048 | 6144.
             ops::extract_bf16_columns(qkv_c[r], 0, qc[r], s);
@@ -2571,10 +2636,12 @@ void TextContext::gdn_mix_parallel(const std::array<const GdnLayerW*, kMaximumDe
                 static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
             ops::gated_delta_net(q_recurrent, k_recurrent, vv, g[r], beta[r], kGdnScale,
                                  /*normalize_qk=*/true, *ws[r], recurrent_state, o[r], s);
+            if (gidx == 0 && rank == 0) { dump_layer_last_token(2005, o[r], s); }
         }
         // `gdn_norm` is the per-head-DIMENSION gain {128}: replicated, so each rank applies the
         // whole weight over its own 24 value heads.
         ops::gated_rmsnorm(o[r], *w[r]->gdn_norm, z[r], kCfg.rms_eps, on[r], s);
+        if (gidx == 0 && rank == 0) { dump_layer_last_token(2006, on[r], s); }
     });
 
     std::array<Tensor, kMaximumDevices> on_flat;
@@ -2612,6 +2679,7 @@ void TextContext::run_layers_parallel(std::array<Tensor, kMaximumDevices>& x, Ph
                                  const std::array<Tensor, kMaximumDevices>& staging,
                                  DFlashFeatureSink* dflash_sink) {
     if (dflash_sink != nullptr) { dflash_sink->begin(x[0]); }
+    dump_layer_last_token(-1, x[0], stream_for(0));
     const bool prefill = ph == Phase::Prefill;
     const bool mixed   = ph == Phase::Mixed;
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
@@ -2644,6 +2712,7 @@ void TextContext::run_layers_parallel(std::array<Tensor, kMaximumDevices>& x, Ph
                         rank == 0 ? work_.scope() : tp_at(rank).work->scope());
                 }
                 attn_mix_parallel(w, x, static_cast<int>(fidx), ph, staging);
+                dump_layer_last_token(1000 + layer, x[0], stream_for(0));
             }
             {
                 nvtx::ScopedRange post_mixer_range(
@@ -2657,6 +2726,7 @@ void TextContext::run_layers_parallel(std::array<Tensor, kMaximumDevices>& x, Ph
                         rank == 0 ? work_.scope() : tp_at(rank).work->scope());
                 }
                 mlp_tail_parallel(post_norm, mlp, x, ph, staging);
+                dump_layer_last_token(layer, x[0], stream_for(0));
             }
         } else {
             const auto gidx = static_cast<std::size_t>(ModelConfig::gdn_idx(layer));
@@ -2687,6 +2757,7 @@ void TextContext::run_layers_parallel(std::array<Tensor, kMaximumDevices>& x, Ph
                         rank == 0 ? work_.scope() : tp_at(rank).work->scope());
                 }
                 gdn_mix_parallel(w, x, static_cast<int>(gidx), ph, staging);
+                dump_layer_last_token(1000 + layer, x[0], stream_for(0));
             }
             {
                 nvtx::ScopedRange post_mixer_range(
@@ -2700,6 +2771,7 @@ void TextContext::run_layers_parallel(std::array<Tensor, kMaximumDevices>& x, Ph
                         rank == 0 ? work_.scope() : tp_at(rank).work->scope());
                 }
                 mlp_tail_parallel(post_norm, mlp, x, ph, staging);
+                dump_layer_last_token(layer, x[0], stream_for(0));
             }
         }
         if (dflash_sink != nullptr) {
