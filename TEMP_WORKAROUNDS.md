@@ -220,13 +220,25 @@ chunk=8192（生产默认）→ `Let` 4/4 + 3/3。单独关掉该路线（`NINFE
 与修复后一致。**BFCL**（limit 20）默认 chunk=8192：修复后两次全新进程均为 **7/20 = 35%**，且
 **通过集合完全相同** `[2,4,6,12,13,14,20]` ⇒ 非确定已消除（这是本次修复的目标）。
 
-**遗留（真实且巨大，n=20 结论已证伪）**：改用**全量** BFCL `multi_turn_base`（200 条、逐样本配对、同一序）重测——
-修复后默认配置（chunk=8192）**41/200 = 20.5%**，1cat（APC 开、temp=1.0）**77/200 = 38.5%**，
-配对 exact McNemar **only-ninfer=4 / only-1cat=40，p < 0.0001**。⇒ **竞态修复并未关掉质量差距**。
+**遗留（真实且巨大；非 chunk 尺寸所致）**：改用**全量** BFCL `multi_turn_base`（200 条、逐样本配对、同一序）重测：
+
+| config（修复后，每格全新进程） | acc |
+|---|---|
+| ninfer 默认（chunk 8192） | 41/200 = 20.5% |
+| ninfer chunk 512 | 50/200 = 25.0% |
+| ninfer chunk 128 | 46/200 = 23.0% |
+| 1cat vLLM（APC 开、temp=1.0） | 77/200 = 38.5% |
+
+配对 exact McNemar：chunk 128 vs 8192 → only-128=13 / only-8192=8，**p=0.38**；chunk 512 vs 8192 → 18/9，**p=0.12**；
+chunk 128 或 8192 vs 1cat → **only-1cat=39/40，p<1e-5**。⇒ **竞态修复并未关掉质量差距，且 chunk 尺寸无显著效应**
+（limit-20 的"50% vs 35%"是噪声）。**残余主因不在预填充 chunk**；嫌疑转向：KV dtype（1cat `fp8_e5m2` vs 本引擎 int8/g64）、
+fork 自有的 Volta 路由选择（`NINFER_SM70_PREFILL_GEMM` cuBLAS 预填充 GEMM / Split-D / decode attn v2 / nvfp4 dispatch）、
+以及 fork 的 all-NVFP4 转换（`6f8f60fa`）。另：**最早一次匹配参数测试（2026-10-16，n=80，thinking 开）即为 18.75% vs 38.75%**，
+且两次 harness 都设了同一组快速路由 ⇒ 该差距**早于本文件所有修复，非本会话改动引入**。
+
 此前 §11 基于 limit-20 的"无可分辨差距 (p=0.69)"是子集假象（那 20 题偏易：35% vs 全量 20.5%），
-**limit-20 的 chunk 扫描结论全部作废**，需在全量上重做（进行中：chunk 128 → 512）。
-方法论教训：质量 A/B 必须用全量 200 条，`--limit 20` 既高估分数又看不出 18 点的差距。
-见调查记录 Session 4 后续(3)。
+**limit-20 的 chunk 扫描结论全部作废**（全量重做见上表）。方法论教训：质量 A/B 必须用全量 200 条，
+`--limit 20` 既高估分数又看不出 18 点的差距。见调查记录 Session 4 后续(3)(4)。
 
 **之前的两条错误结论（已作废）**：
 - ~~"注意力内核 splitd 与抖动无关"~~ —— 当时用 `env NINFER_VOLTA_SPLITD=0` 测试，但 harness 脚本**硬设**
@@ -235,7 +247,7 @@ chunk=8192（生产默认）→ `Let` 4/4 + 3/3。单独关掉该路线（`NINFE
   确实生效，但它们只是**改变了时序**，让这个时序相关的竞态不再触发；与 arena 容量/地址、GEMM 后端无关。
 
 **规避**：竞态本身不再需要规避（`--prefill-chunk 128` 的 3.3× 冷预填充代价仅在此前必要）。
-若后续确认默认 chunk=8192 的 35% 是真实的 chunk 尺寸效应，则 `--prefill-chunk 128` 仍是可用的质量优先选项。
+全量已验证 chunk 尺寸无显著效应，故 `--prefill-chunk 128` **不再**作为质量选项（只会徒增 3.3× 冷预填充开销）。
 
 **诊断开关**（dev 已有）：`NINFER_VOLTA_SPLITD`（0=关闭该路线）、`NINFER_ATTN_SYNC` / `NINFER_ATTN_SLEEP`
 （attention mixer 各阶段流同步/停顿）、`NINFER_STREAM_TRACE` / `NINFER_TENSOR_TRACE` / `NINFER_DUMP_ATTN`、
