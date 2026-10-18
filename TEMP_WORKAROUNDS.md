@@ -199,28 +199,50 @@ Paged KV trim extent would discard cache-owned pages
 
 ---
 
-## 11. NVFP4 预填充数值缺陷（`--prefill-chunk` ≥256 命中输入投影 CUTLASS 路径）
+## 11. ~~NVFP4 预填充数值缺陷~~ → 已定位并修复：Split-D staging 跨 rank 竞态
 
-**文件**：`src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp` + `.../nvfp4_attn_input_cutlass_sm70.cu`；`src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp` + `.../nvfp4_gdn_input_cutlass_sm70.cu`；共用 `src/ops/linear/nvfp4/nvfp4_cutlass_sm70.cu`。
+**真因（2026-10-18 复核后修正）**：`src/ops/launcher/gqa_attention_volta_splitd.cu` 的 Split-D 预填充路线把
+staging 缓冲、smem 属性开关、pinned positions 探针都放在**函数级 `static`** 里。本引擎由**单个主机线程**
+驱动两个 TP rank（`ops::detail::for_each_rank` 按 rank 设当前设备），于是 rank 1 复用 rank 0 的设备内存：
+两个 rank 的 splitd 启动并发读写**同一组** staging 缓冲；当 `kv_len` 越过 `kSplitKv3MinKv=2048` 后，
+split3 的 `partial_out/partial_max/partial_sum` 也落在同一组缓冲上。
 
-**现象**：BFCL 多轮默认配置分数 20–35% 且**每个新进程结果不同**（`<tool_call>` / 自然语言在首 token 处抖动）；对照 1cat 同口径 45%。
+**现象**（TP2）：prefill 从**第 8 个 chunk（KV=2048）**起 mixer 输出非确定；首 token argmax 在
+`<tool_call>` / `I` 间抖动；BFCL `multi_turn_base` 默认配置 20–35% 且每进程不同，chunk=128
+（split3 不触发）为 50% = 1cat 水平。
 
-**定位（2026-10-18）**：
-- 首 token 由**最后一个 prefill chunk 末位置**的 logits 决定，故 `--prefill-chunk` 的 128↔256 边界直接改变数值。
-- **解耦实验（已做：容量被排除）**：新增 `NINFER_VOLTA_INPUT_CAP=cutlass|qpn`，使**容量独立于路由**。chunk=256、各 3 个全新进程：`NINFER_VOLTA_CUTLASS_MIN_T=1000000`（路由→QPN）+ `NINFER_VOLTA_INPUT_CAP=cutlass`（容量=cutlass）→ **`<tool_call>` 3/3 稳定**；默认路由 + `NINFER_VOLTA_INPUT_CAP=qpn`（容量=qpn）→ **`<tool_call>`/`I`/`<tool_call>` 仍抖**。⇒ 决定因素是**输入投影的路由/后端**，与 arena 容量/地址**无关**（"容量混淆"已排除）。
-- 已通读输入投影 CUTLASS 全路径（`split_attn_output` 下标、几何 `kOutputRows == w.n`（7168/8192）、dequant 覆盖 `n*k`、每 rank 独立 arena + 独立流）**未发现结构缺陷**；且默认（cuBLAS）与 `NINFER_SM70_PREFILL_GEMM=0`（cutlass）两条 GEMM 后端**都抖** ⇒ 缺陷在这两条路径共享的数值行为（dequant / scratch 生命周期 / 分裂输出），非某个 GEMM 内核。
-- 注意：把输入投影强制切到 QPN 后 chunk=256 **变稳但仍 `<tool_call>`**，说明**与 1cat 的质量差**是另一回事（chunk 尺寸 / 数值敏感性），不等同于这个非确定缺陷。
-- chunk=256 首 token 配置矩阵（每格 3 个全新进程）：**只有把输入投影（attn+gdn）从 CUTLASS 切到 QPN 才变稳**（`NINFER_VOLTA_CUTLASS_MIN_T=1000000` 单独即稳 3/3；`NINFER_NVFP4_FORCE_QPN`/`NINFER_SM70_PREFILL_GEMM=0` 仍抖）；MLP GEMM 与注意力内核（`NINFER_VOLTA_SPLITD`、`NINFER_SM70_ATTN_V2`）与抖动**无关**。
-- **时序敏感**（非单纯读未初始化内存）：开 `NINFER_DUMP_LAYERS`（每层 `cudaStreamSynchronize`+D2H）后 chunk=256 默认配置 5/5 `<tool_call>`；不开 dump 同 prompt 4 次里 1 次 `I`。两个同配置进程的 dump 前 4746 行一致、之后差 ~3e-3（top-1 未翻转）。
-- 静态复核未发现越界/别名：QPN dequant 恰好覆盖 `n*k`；各 shard `kOutputRows == w.n`（attn 7168 / gdn 8192）；arena 超额抛 `std::bad_alloc` 而非静默重叠。可疑点在 **`DeviceArena::Scope::~Scope` 在 host 侧立即回收 bump 指针且不同步流**（`src/core/arena.cu:125-127`），正确性完全依赖单流有序，而 runtime 使用**每 rank `cudaStreamNonBlocking` 流**（`stream_for(rank)`）并行执行两个 rank。
+**修复**（commit `486ba771` 修复 + `f86b63ad` 改用既有约定）：Split-D 的启动期状态一律**按 CUDA 设备**键控
+—— staging 与 pinned 探针用 `std::map<int, …>`，smem 开关改用仓库既有的 `ensure_func_attr_per_device`
+（`kernel_attr_once.h`），设备切换用 `ops::detail::CurrentDeviceScope`。
 
-**规避**：`--prefill-chunk 128`（结果确定，`multi_turn_base` 恢复到 50% = 1cat 水平）。代价：长提示冷预填充约 **3.3× 慢**（5060 tok TTFT 2.4s→8.0s；21620 tok 10.8s→34.6s），≤128 tok 无差异，BFCL 整轮因前缀缓存仅 +约 2min。
+**验证**（修复后，TP2、int8 KV，每格全新进程）：chunk=256 → `Let` 8/8（首版）+ 4/4（重构版）；
+chunk=8192（生产默认）→ `Let` 4/4 + 3/3。单独关掉该路线（`NINFER_VOLTA_SPLITD=0`）同样 `Let` 4/4，
+与修复后一致。**BFCL**（limit 20）默认 chunk=8192：修复后两次全新进程均为 **7/20 = 35%**，且
+**通过集合完全相同** `[2,4,6,12,13,14,20]` ⇒ 非确定已消除（这是本次修复的目标）。
 
-**诊断开关**（dev 已提供）：`NINFER_VOLTA_CUTLASS_MIN_T`（输入投影 cutlass→QPN 阈值）、`NINFER_VOLTA_INPUT_CAP`（容量与路由解耦：`cutlass`/`qpn`）、`NINFER_NVFP4_FORCE_QPN`、`NINFER_VOLTA_MMA_SPLITS`、`NINFER_SM70_PREFILL_GEMM`、`NINFER_DUMP_LAYERS`。
+**遗留（待定位，确定性而非抖动）**：默认 chunk=8192 稳定 35%（7/20），低于 `--prefill-chunk 128` 的
+50%（10/20）与 1cat 45%。20 样本下 7 vs 10 的差异尚不显著，需（a）修复后重测 chunk=128、
+（b）在同一 chunk 下对照 `NINFER_VOLTA_SPLITD=0`（判断修复后的 splitd 路线数值是否仍劣于 vendored 路线）、
+（c）更多样本。见调查记录 Session 4 后续。
+
+**之前的两条错误结论（已作废）**：
+- ~~"注意力内核 splitd 与抖动无关"~~ —— 当时用 `env NINFER_VOLTA_SPLITD=0` 测试，但 harness 脚本**硬设**
+  `export NINFER_VOLTA_SPLITD=1` 把开关覆盖了，实验从未真正关闭该路线（脚本已改为 `${NINFER_VOLTA_SPLITD:-1}`）。
+- ~~"输入投影 CUTLASS 路由是决定因素"~~ —— 那些 env（`CUTLASS_MIN_T`/`INPUT_CAP`/`FORCE_QPN`/`SM70_PREFILL_GEMM`）
+  确实生效，但它们只是**改变了时序**，让这个时序相关的竞态不再触发；与 arena 容量/地址、GEMM 后端无关。
+
+**规避**：竞态本身不再需要规避（`--prefill-chunk 128` 的 3.3× 冷预填充代价仅在此前必要）。
+若后续确认默认 chunk=8192 的 35% 是真实的 chunk 尺寸效应，则 `--prefill-chunk 128` 仍是可用的质量优先选项。
+
+**诊断开关**（dev 已有）：`NINFER_VOLTA_SPLITD`（0=关闭该路线）、`NINFER_ATTN_SYNC` / `NINFER_ATTN_SLEEP`
+（attention mixer 各阶段流同步/停顿）、`NINFER_STREAM_TRACE` / `NINFER_TENSOR_TRACE` / `NINFER_DUMP_ATTN`、
+`NINFER_DUMP_LAYERS`、`NINFER_VOLTA_CUTLASS_MIN_T`、`NINFER_VOLTA_INPUT_CAP`、`NINFER_NVFP4_FORCE_QPN`、
+`NINFER_VOLTA_MMA_SPLITS`、`NINFER_SM70_PREFILL_GEMM`。
 
 **复核 TODO**：
-- [ ] 修 T≥256 的输入投影 CUTLASS 路径：候选（a）把 arena 作用域延长到覆盖异步内核、（b）该路径加一次流同步、（c）直接把该路径切到 QPN（已验证稳定但不恢复质量）。
-- [ ] 修好后以默认 chunk 复测，确认「稳且达 50%」后再决定是否保留 `--prefill-chunk 128`。
+- [x] 定位并修复竞态根因。
+- [ ] 同类审计：全仓 `static` 却持有按设备状态之处（单主机线程驱动多 rank 的约定）——首轮扫描已排除
+  `vision_attention_volta_flash.cu` / `gqa_attention_volta_flash.cu`（按设备 `std::map` 键控 ✓）。
 
 ---
 
@@ -230,7 +252,7 @@ Paged KV trim extent would discard cache-owned pages
 |---|---|---|
 | ~~P0~~ | ~~#2 paged KV trim bug~~ | ✅ 已修复 |
 | P1 | #1 vision 架构 | 多模态能力 |
-| P1 | #11 NVFP4 预填充数值缺陷（`--prefill-chunk` ≥256） | 默认配置的下游质量与可复现性 |
+| ~~P1~~ | ~~#11 NVFP4 预填充数值缺陷~~ | ✅ 已修复（Split-D staging 跨 rank 竞态，`486ba771`/`f86b63ad`） |
 | P2 | #6 Hadamard 精度 | 长期质量风险 |
 | P2 | #10 工具调用解析器严格性（vs qwen3_coder） | agent 任务鲁棒性（非标准输出会丢工具调用） |
 | P3 | #3/#4/#5 构建规范化 | 可移植性 |
