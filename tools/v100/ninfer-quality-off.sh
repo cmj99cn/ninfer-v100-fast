@@ -5,7 +5,7 @@
 # Everything else mirrors tools/v100/ninfer-quality-matched.sh.
 set -euo pipefail
 export LD_LIBRARY_PATH="/home/cmj/media-deps/root/usr/lib/x86_64-linux-gnu:/home/cmj/nccl-lib:${LD_LIBRARY_PATH:-}"
-export NINFER_VOLTA_SPLITD=1
+export NINFER_VOLTA_SPLITD="${NINFER_VOLTA_SPLITD:-1}"
 export NINFER_SM70_PREFILL_GEMM="${NINFER_SM70_PREFILL_GEMM:-1}"
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 PORT="${PORT:-9010}"
