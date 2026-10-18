@@ -145,6 +145,8 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 
 **BFCL-v3 多轮函数调用**（evalscope，`multi_turn_base` / `multi_turn_miss_func` / `multi_turn_miss_param` / `multi_turn_long_context` 各 20 条）。
 
+> 下表为 **prompt 修复（`ce64d89a`）之前**的记录，仅作历史对照；修复后的复测见本节末尾。
+
 与 1cat 对齐口径（thinking 开启、`temperature=1.0`、`top_p=1.0`、`--prefix-cache` 开启；ninfer 侧见 `tools/v100/ninfer-quality-matched.sh`）：
 
 | Subset | ninfer | 1cat（qwen3_coder） |

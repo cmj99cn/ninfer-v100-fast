@@ -207,6 +207,8 @@ Paged KV trim extent would discard cache-owned pages
 
 **定位（2026-10-18）**：
 - 首 token 由**最后一个 prefill chunk 末位置**的 logits 决定，故 `--prefill-chunk` 的 128↔256 边界直接改变数值。
+- **未排除的混淆因素（重要）**：`NINFER_VOLTA_CUTLASS_MIN_T` **同时改变了输入投影的 workspace 容量**（`nvfp4_{attn,gdn}_input_plan.cpp` 的容量函数按同一阈值分支），即"输入投影后端"与"arena 容量/地址"两个变量尚未解耦。其余配置（`NINFER_NVFP4_FORCE_QPN`、`NINFER_SM70_PREFILL_GEMM=0`）只改后端、不改容量且仍抖，故与两种解释都相容。
+- 已通读输入投影 CUTLASS 全路径（`split_attn_output` 下标、几何 `kOutputRows == w.n`（7168/8192）、dequant 覆盖 `n*k`、每 rank 独立 arena + 独立流）**未发现结构缺陷**，因此更倾向于**容量/地址相关**而非后端本身。
 - chunk=256 首 token 配置矩阵（每格 3 个全新进程）：**只有把输入投影（attn+gdn）从 CUTLASS 切到 QPN 才变稳**（`NINFER_VOLTA_CUTLASS_MIN_T=1000000` 单独即稳 3/3；`NINFER_NVFP4_FORCE_QPN`/`NINFER_SM70_PREFILL_GEMM=0` 仍抖）；MLP GEMM 与注意力内核（`NINFER_VOLTA_SPLITD`、`NINFER_SM70_ATTN_V2`）与抖动**无关**。
 - **时序敏感**（非单纯读未初始化内存）：开 `NINFER_DUMP_LAYERS`（每层 `cudaStreamSynchronize`+D2H）后 chunk=256 默认配置 5/5 `<tool_call>`；不开 dump 同 prompt 4 次里 1 次 `I`。两个同配置进程的 dump 前 4746 行一致、之后差 ~3e-3（top-1 未翻转）。
 - 静态复核未发现越界/别名：QPN dequant 恰好覆盖 `n*k`；各 shard `kOutputRows == w.n`（attn 7168 / gdn 8192）；arena 超额抛 `std::bad_alloc` 而非静默重叠。可疑点在 **`DeviceArena::Scope::~Scope` 在 host 侧立即回收 bump 指针且不同步流**（`src/core/arena.cu:125-127`），正确性完全依赖单流有序，而 runtime 使用**每 rank `cudaStreamNonBlocking` 流**（`stream_for(rank)`）并行执行两个 rank。
