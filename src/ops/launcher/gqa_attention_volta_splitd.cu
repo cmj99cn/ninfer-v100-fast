@@ -40,6 +40,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <array>
+
 namespace ninfer::ops::detail {
 namespace {
 
@@ -52,6 +54,57 @@ constexpr int kD256Threads = 256;  // ...::kNThreads
 constexpr int kMaxRows = 8192;
 
 constexpr int round_up_rows(int rows) { return ((rows + kD256BlockM - 1) / kD256BlockM) * kD256BlockM; }
+
+// Every piece of Split-D state below is per-CUDA-device. This engine drives all ranks from a
+// single host thread, so an unkeyed function-local static would have rank 1 reuse rank 0's
+// buffers -- a real cross-device race (rank 1's launches would read/write rank 0's memory).
+int clamp_device(int device) {
+    return (device >= 0 && device < static_cast<int>(kMaximumDevices)) ? device : 0;
+}
+
+int current_device() {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return clamp_device(device);
+}
+
+// Device that owns `pointer`; falls back to the caller's current device when the pointer is
+// unknown (e.g. null or host memory). Correct regardless of what the caller left the current
+// device set to, which matters because only the collectives here call cudaSetDevice.
+int device_of(const void* pointer) {
+    if (pointer == nullptr) { return current_device(); }
+    cudaPointerAttributes attributes{};
+    if (cudaPointerGetAttributes(&attributes, pointer) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return current_device();
+    }
+    return attributes.device >= 0 ? clamp_device(attributes.device) : current_device();
+}
+
+// RAII current-device switch, for allocations/attributes that must land on a specific device.
+class ScopedDevice {
+public:
+    explicit ScopedDevice(int device) {
+        if (cudaGetDevice(&previous_) == cudaSuccess && device != previous_ &&
+            cudaSetDevice(device) == cudaSuccess) {
+            switching_ = true;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    ~ScopedDevice() {
+        if (switching_) { (void)cudaSetDevice(previous_); }
+    }
+    ScopedDevice(const ScopedDevice&)            = delete;
+    ScopedDevice& operator=(const ScopedDevice&) = delete;
+
+private:
+    int  previous_  = 0;
+    bool switching_ = false;
+};
 
 // Upstream's SplitKV3 activation threshold (LLAMA_SM70_SPLITKV3_MIN_KV default). Overridable
 // here so the attention contract tests can be pointed at the merge path: their cases are far
@@ -128,9 +181,11 @@ struct SplitDStaging {
     int              heads = 0;
 };
 
-SplitDStaging& splitd_staging(int heads) {
-    static SplitDStaging staging;
+SplitDStaging& splitd_staging(int heads, int device) {
+    static std::array<SplitDStaging, kMaximumDevices> stagings{};
+    SplitDStaging& staging = stagings[static_cast<std::size_t>(clamp_device(device))];
     if (staging.q == nullptr || staging.heads != heads) {
+        ScopedDevice guard(clamp_device(device));
         if (staging.q != nullptr) {
             cudaFree(staging.q);
             cudaFree(staging.o);
@@ -154,13 +209,15 @@ SplitDStaging& splitd_staging(int heads) {
 // cudaFuncSetAttribute cannot run inside a CUDA graph capture (it would invalidate the
 // capture), and the engine captures during warmup. Raise it on the first call that is not
 // being captured; until then the caller keeps using the llama.cpp kernel.
-bool splitd_smem_ready(cudaStream_t stream) {
+bool splitd_smem_ready(cudaStream_t stream, int device) {
     using Traits = FLASH_NAMESPACE::Sm70D256SplitDTraits;
-    static bool raised = false;
-    if (raised) { return true; }
+    static std::array<bool, kMaximumDevices> raised{};
+    const std::size_t slot = static_cast<std::size_t>(clamp_device(device));
+    if (raised[slot]) { return true; }
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     (void)cudaStreamIsCapturing(stream, &capture);
     if (capture != cudaStreamCaptureStatusNone) { return false; }
+    ScopedDevice guard(clamp_device(device));
     const auto kernel =
         FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<cutlass::half_t, false, float, false,
                                                        false, false>;
@@ -176,7 +233,7 @@ bool splitd_smem_ready(cudaStream_t stream) {
             return false;
         }
     }
-    raised = true;
+    raised[slot] = true;
     return true;
 }
 
@@ -211,28 +268,34 @@ bool splitd_positions_are_contiguous(const void* positions, std::int32_t base,
     // Prefill shares one positions tensor across every layer of a chunk: the D2H+sync
     // verify costs a full stream drain per call, so cache the positive result keyed by
     // (pointer, base, width). Decode rewrites a small positions buffer in place each
-    // step, so only the large-width prefill regime is eligible.
+    // step, so only the large-width prefill regime is eligible. Cache and pinned staging
+    // are per device: with one host thread driving both ranks, a shared probe buffer would
+    // have one rank read positions another rank just overwrote.
+    struct ProbeCache {
+        const void*  positions = nullptr;
+        std::int32_t base      = -1;
+        std::int32_t width     = -1;
+        int*         host      = nullptr;
+        std::int32_t host_rows = 0;
+    };
     constexpr std::int32_t kCacheMinWidth = 256;
-    static const void* cached_positions   = nullptr;
-    static std::int32_t cached_base       = -1;
-    static std::int32_t cached_width      = -1;
-    if (width >= kCacheMinWidth && positions == cached_positions && base == cached_base &&
-        width == cached_width) {
+    static std::array<ProbeCache, kMaximumDevices> probes{};
+    ProbeCache& probe = probes[static_cast<std::size_t>(device_of(positions))];
+    if (width >= kCacheMinWidth && positions == probe.positions && base == probe.base &&
+        width == probe.width) {
         return true;
     }
-    static int* host_positions = nullptr;
-    static int host_rows      = 0;
-    if (host_rows < width) {
-        if (host_positions != nullptr) { cudaFreeHost(host_positions); }
-        host_positions = nullptr;
-        if (cudaMallocHost(&host_positions, static_cast<std::size_t>(width) * sizeof(int)) !=
+    if (probe.host_rows < width) {
+        if (probe.host != nullptr) { cudaFreeHost(probe.host); }
+        probe.host = nullptr;
+        if (cudaMallocHost(&probe.host, static_cast<std::size_t>(width) * sizeof(int)) !=
             cudaSuccess) {
             (void)cudaGetLastError();
             return false;
         }
-        host_rows = width;
+        probe.host_rows = width;
     }
-    if (cudaMemcpyAsync(host_positions, positions, static_cast<std::size_t>(width) * sizeof(int),
+    if (cudaMemcpyAsync(probe.host, positions, static_cast<std::size_t>(width) * sizeof(int),
                         cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
         (void)cudaGetLastError();
         return false;
@@ -242,12 +305,12 @@ bool splitd_positions_are_contiguous(const void* positions, std::int32_t base,
         return false;
     }
     for (int i = 0; i < width; ++i) {
-        if (host_positions[i] != base + i) { return false; }
+        if (probe.host[i] != base + i) { return false; }
     }
     if (width >= kCacheMinWidth) {
-        cached_positions = positions;
-        cached_base      = base;
-        cached_width     = width;
+        probe.positions = positions;
+        probe.base      = base;
+        probe.width     = width;
     }
     return true;
 }
@@ -273,7 +336,10 @@ bool volta_splitd_block(const void* q_bf16, const void* k_f16, const void* v_f16
 
     if (rows <= 0 || rows > kMaxRows) { return false; }
     if (!positions_contiguous) { return false; }
-    if (!splitd_smem_ready(stream)) { return false; }
+    // Bind the whole launch to Q's device. This is the only rank identity the Split-D route
+    // gets, and it is what keeps the per-device staging/smem state from crossing ranks.
+    const int device = device_of(q_bf16);
+    if (!splitd_smem_ready(stream, device)) { return false; }
 
     {
         static int hits = 0, split3_hits = 0, calls = 0;
@@ -288,7 +354,7 @@ bool volta_splitd_block(const void* q_bf16, const void* k_f16, const void* v_f16
     }
 
     const int q_pad = round_up_rows(rows);
-    SplitDStaging& staging = splitd_staging(kHeads);
+    SplitDStaging& staging = splitd_staging(kHeads, device);
 
     constexpr int kStageWarps = 8;
     const int stage_blocks    = (rows * kHeads + kStageWarps - 1) / kStageWarps;
