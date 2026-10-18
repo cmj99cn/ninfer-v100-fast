@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -102,6 +103,25 @@ inline void dump_layer_last_token(int layer, const Tensor& x, cudaStream_t strea
         std::fwrite(line.data(), 1, line.size(), file);
     }
     std::fflush(file);
+}
+
+// Diagnosis hook for the non-deterministic attention mixer: NINFER_ATTN_SYNC=<chars> drains
+// the stage stream at the matching sub-op boundary, where the chars select stages
+// (h=rmsnorm out, p=projection out, r=rope out, a=attention out, g=gate out, o=output out) and
+// "all" selects every stage. NINFER_DUMP_ATTN additionally dumps each hooked tensor.
+inline void attn_stage_hook(char stage, int tag, const Tensor& t, cudaStream_t s) {
+    const char* env = std::getenv("NINFER_ATTN_SYNC");
+    if (env != nullptr &&
+        (std::strstr(env, "all") != nullptr || std::strchr(env, stage) != nullptr)) {
+        cudaStreamSynchronize(s);
+    }
+    const char* sleep_env = std::getenv("NINFER_ATTN_SLEEP");
+    if (sleep_env != nullptr && std::strchr(sleep_env, stage) != nullptr) {
+        ::usleep(200000);
+    }
+    if (std::getenv("NINFER_DUMP_ATTN") != nullptr) {
+        dump_layer_last_token(tag, t, s);
+    }
 }
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
@@ -2193,6 +2213,21 @@ void TextContext::attn_mix_parallel(const std::array<const FullLayerW*, kMaximum
                                std::array<Tensor, kMaximumDevices>& x, int fidx, Phase ph,
                                const std::array<Tensor, kMaximumDevices>& staging) {
     const ExecutionContext& execution = ec();
+    {
+        static bool printed = false;
+        if (!printed && std::getenv("NINFER_STREAM_TRACE") != nullptr) {
+            printed = true;
+            std::fprintf(
+                stderr,
+                "[streams] pid=%d ctx0=%p ec_dev0=%p sfor0=%p | tpdev1=%p ec_dev1=%p sfor1=%p\n",
+                static_cast<int>(getpid()), static_cast<const void*>(ctx_.stream),
+                static_cast<const void*>(execution.dev[0]->stream),
+                static_cast<const void*>(stream_for(0)),
+                static_cast<const void*>(tp_at(1).device->stream),
+                static_cast<const void*>(execution.dev[1]->stream),
+                static_cast<const void*>(stream_for(1)));
+        }
+    }
     const int T                       = x[0].ne[1];
     if (active_gqa_envelope_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
@@ -2230,8 +2265,10 @@ void TextContext::attn_mix_parallel(const std::array<const FullLayerW*, kMaximum
         const auto r = static_cast<std::size_t>(rank);
         ops::rmsnorm(x[r], *w[r]->input_norm, kCfg.rms_eps, true, h[r], stream_for(rank));
     });
+    attn_stage_hook('h', 3000 + fidx, h[0], stream_for(0));
     Variant::attention_projection(h, projection, q_flat, gate_flat, k_flat, v_flat, ph, ws,
                                   execution);
+    attn_stage_hook('p', 3100 + fidx, q_flat[0], stream_for(0));
 
     std::array<Tensor, kMaximumDevices> qn;
     std::array<Tensor, kMaximumDevices> kn;
@@ -2253,8 +2290,34 @@ void TextContext::attn_mix_parallel(const std::array<const FullLayerW*, kMaximum
         Tensor rope_for_op = active_sequence_batch_ != 0 ? rope.view({T}) : rope;
         ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn[r], kn[r],
                   rope_frequency_[r], s);
+        if (rank == 0) {
+            attn_stage_hook('r', 3200 + fidx, qn[r], s);
+        }
 
         const qwen3_6::PagedKVCache& pages = rank == 0 ? *batch_text_kv_ : *tp_at(rank).batch_kv;
+        {
+            const char* te = std::getenv("NINFER_TENSOR_TRACE");
+            if (te != nullptr && fidx == 7 && rank == 1) {
+                auto dev_of = [](const void* p) -> int {
+                    cudaPointerAttributes a{};
+                    if (p == nullptr || cudaPointerGetAttributes(&a, p) != cudaSuccess) {
+                        (void)cudaGetLastError();
+                        return -2;
+                    }
+                    return a.device;
+                };
+                const auto lv = pages.batch_layer_view(fidx);
+                const Tensor& rows = rank_kv_table_rows(rank);
+                std::fprintf(stderr,
+                             "[tensor] rank=%d qn=%p(dev%d) a=%p(dev%d) kpages=%p(dev%d) "
+                             "vpages=%p(dev%d) kvrows=%p(dev%d)\n",
+                             rank, static_cast<const void*>(qn[r].data), dev_of(qn[r].data),
+                             static_cast<const void*>(a[r].data), dev_of(a[r].data),
+                             static_cast<const void*>(lv.k_pages.data), dev_of(lv.k_pages.data),
+                             static_cast<const void*>(lv.v_pages.data), dev_of(lv.v_pages.data),
+                             static_cast<const void*>(rows.data), dev_of(rows.data));
+            }
+        }
         if (ph == Phase::Mixed) {
             const MixedOwnerState* mixed = active_mixed_;
             if (mixed == nullptr) {
@@ -2317,7 +2380,13 @@ void TextContext::attn_mix_parallel(const std::array<const FullLayerW*, kMaximum
                                kAttnScale, pages.batch_layer_view(fidx), *active_gqa_envelope_,
                                *ws[r], a[r], s);
         }
+        if (rank == 0) {
+            attn_stage_hook('a', 3300 + fidx, a[r], s);
+        }
         ops::sigmoid_mul(gate[r], a[r], s);
+        if (rank == 0) {
+            attn_stage_hook('g', 3350 + fidx, a[r], s);
+        }
     });
 
     std::array<Tensor, kMaximumDevices> a_flat;
@@ -2326,7 +2395,10 @@ void TextContext::attn_mix_parallel(const std::array<const FullLayerW*, kMaximum
         a_flat[r] = a[r].view({shard_q_size(), T});
         o_proj[r] = *w[r]->o_proj;
     }
+    attn_stage_hook('b', 3450 + fidx, a[0], stream_for(0));
+    attn_stage_hook('n', 3460 + fidx, a[1], stream_for(1));
     Variant::attention_output_projection(a_flat, o_proj, x, staging, ph, ws, execution, *events_);
+    attn_stage_hook('o', 3400 + fidx, x[0], stream_for(0));
 }
 
 void TextContext::gdn_mix_parallel(const std::array<const GdnLayerW*, kMaximumDevices>& w,

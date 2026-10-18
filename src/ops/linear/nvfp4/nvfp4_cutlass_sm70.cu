@@ -16,7 +16,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <cmath>
 #include <thread>
+#include <vector>
 #include <stdexcept>
 #include <unistd.h>
 
@@ -138,6 +141,20 @@ int prefill_gemm_variant() {
     return variant;
 }
 
+// Diagnosis only: NINFER_VOLTA_DEQUANT=row|qpn forces which packed-weight dequant feeds the
+// fp16 GEMM operands, overriding the weight's declared layout. Used to tell a wrong/fast dequant
+// apart from a GEMM/split defect when bisecting the T>=256 non-determinism.
+int volta_dequant_override() {
+    static const int variant = [] {
+        const char* env = std::getenv("NINFER_VOLTA_DEQUANT");
+        if (env == nullptr) { return 0; }
+        if (std::strcmp(env, "row") == 0) { return 1; }
+        if (std::strcmp(env, "qpn") == 0) { return 2; }
+        return 0;
+    }();
+    return variant;
+}
+
 template <class ElementOutput>
 struct CublasOutType;
 template <>
@@ -178,6 +195,80 @@ std::size_t workspace_bytes_impl(std::int32_t n, std::int32_t k, std::int32_t co
     return layout.peak_bytes(1);
 }
 
+// Diagnosis only: NINFER_DUMP_INPUT=<path> appends one aggregate stat line for the first few
+// dequantized weight/activation tiles so two processes at the same config can be compared.
+void dump_fp16_stats(const char* tag, const cutlass::half_t* data, std::int64_t count,
+                     int n, int k, int layout, int use_qpn, cudaStream_t stream) {
+    const char* path = std::getenv("NINFER_DUMP_INPUT");
+    if (path == nullptr) { return; }
+    static int calls = 0;
+    if (calls >= 24) { return; }
+    ++calls;
+    std::vector<cutlass::half_t> host(static_cast<std::size_t>(count));
+    if (cudaMemcpyAsync(host.data(), data,
+                        static_cast<std::size_t>(count) * sizeof(cutlass::half_t),
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+    int device = -1;
+    cudaGetDevice(&device);
+    double sum = 0.0;
+    double sumsq = 0.0;
+    double maxabs = 0.0;
+    for (std::int64_t i = 0; i < count; ++i) {
+        const double v = static_cast<double>(static_cast<float>(host[static_cast<std::size_t>(i)]));
+        sum += v;
+        sumsq += v * v;
+        const double a = std::fabs(v);
+        if (a > maxabs) { maxabs = a; }
+    }
+    std::FILE* f = std::fopen(path, "a");
+    if (f == nullptr) { return; }
+    std::fprintf(f,
+                 "[%s] pid=%d dev=%d n=%d k=%d layout=%d use_qpn=%d count=%lld "
+                 "sum=%.9g sumsq=%.9g maxabs=%.9g\n",
+                 tag, static_cast<int>(getpid()), device, n, k, layout, use_qpn,
+                 static_cast<long long>(count), sum, sumsq, maxabs);
+    std::fclose(f);
+}
+
+// Diagnosis only: aggregate stats of a BF16 GEMM output tile for cross-process comparison.
+void dump_bf16_stats(const char* tag, const __nv_bfloat16* data, std::int64_t count, int n,
+                     int cols, cudaStream_t stream) {
+    const char* path = std::getenv("NINFER_DUMP_INPUT");
+    if (path == nullptr) { return; }
+    static int calls = 0;
+    if (calls >= 32) { return; }
+    ++calls;
+    std::vector<__nv_bfloat16> host(static_cast<std::size_t>(count));
+    if (cudaMemcpyAsync(host.data(), data,
+                        static_cast<std::size_t>(count) * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+    int device = -1;
+    cudaGetDevice(&device);
+    double sum = 0.0;
+    double sumsq = 0.0;
+    double maxabs = 0.0;
+    for (std::int64_t i = 0; i < count; ++i) {
+        const double v = static_cast<double>(__bfloat162float(host[static_cast<std::size_t>(i)]));
+        sum += v;
+        sumsq += v * v;
+        const double a = std::fabs(v);
+        if (a > maxabs) { maxabs = a; }
+    }
+    std::FILE* f = std::fopen(path, "a");
+    if (f == nullptr) { return; }
+    std::fprintf(f,
+                 "[%s] pid=%d dev=%d n=%d cols=%d count=%lld sum=%.9g sumsq=%.9g maxabs=%.9g\n",
+                 tag, static_cast<int>(getpid()), device, n, cols,
+                 static_cast<long long>(count), sum, sumsq, maxabs);
+    std::fclose(f);
+}
+
 // Materializes the packed NVFP4 weight tile and the BF16 activation tile as FP16 so one
 // GEMM call can reuse them across every token tile of the chunk.
 void dequant_inputs(const Tensor& x, const Weight& w, cutlass::half_t* w_fp16,
@@ -186,7 +277,10 @@ void dequant_inputs(const Tensor& x, const Weight& w, cutlass::half_t* w_fp16,
     const std::int32_t cols = x.ne[1];
     const std::int32_t n    = w.n;
     const dim3 block(256);
-    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+    const int dequant_variant = volta_dequant_override();
+    const bool use_qpn = dequant_variant == 2 ||
+                         (dequant_variant == 0 && w.layout == QuantLayout::VoltaQpnPrepacked);
+    if (use_qpn) {
         const dim3 grid(static_cast<unsigned>((static_cast<std::int64_t>(n) * (k / 16) + 255) / 256));
         dequant_nvfp4_qpn_to_fp16<<<grid, block, 0, stream>>>(
             static_cast<const std::uint8_t*>(w.qdata),
@@ -206,6 +300,15 @@ void dequant_inputs(const Tensor& x, const Weight& w, cutlass::half_t* w_fp16,
     bf16_to_fp16_kernel<<<x_blocks, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                                       x_fp16, x_count);
     CUDA_CHECK(cudaGetLastError());
+
+    if (std::getenv("NINFER_DUMP_INPUT") != nullptr) {
+        const int layout = static_cast<int>(w.layout);
+        const int qpn    = use_qpn ? 1 : 0;
+        dump_fp16_stats("w_fp16", w_fp16, static_cast<std::int64_t>(n) * k, n, k, layout, qpn,
+                        stream);
+        dump_fp16_stats("x_fp16", x_fp16, static_cast<std::int64_t>(cols) * k, k, cols, layout,
+                        qpn, stream);
+    }
 }
 
 template <class ElementOutput, int TileN, class SwizzleTB, int Stages>
@@ -248,6 +351,10 @@ void launch_impl(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& 
         throw std::runtime_error("nvfp4_cutlass_sm70: CUTLASS gemm() failed");
     }
     CUDA_CHECK(cudaGetLastError());
+    if constexpr (std::is_same_v<ElementOutput, cutlass::bfloat16_t>) {
+        dump_bf16_stats("out-cutlass", static_cast<const __nv_bfloat16*>(out.data),
+                        static_cast<std::int64_t>(cols) * n, n, cols, stream);
+    }
 }
 
 template <class ElementOutput>
@@ -347,6 +454,10 @@ void launch_cublas(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena
     }
     if (trace_this) {
         fprintf(stderr, "[sm70-cublas] #%d done\n", trace_all);
+    }
+    if constexpr (std::is_same_v<ElementOutput, cutlass::bfloat16_t>) {
+        dump_bf16_stats("out-cublas", static_cast<const __nv_bfloat16*>(out.data),
+                        static_cast<std::int64_t>(cols) * n, n, cols, stream);
     }
 }
 
