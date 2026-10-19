@@ -254,6 +254,15 @@ fork 自有的 Volta 路由选择（`NINFER_SM70_PREFILL_GEMM` cuBLAS 预填充 
 `NINFER_DUMP_LAYERS`、`NINFER_VOLTA_CUTLASS_MIN_T`、`NINFER_VOLTA_INPUT_CAP`、`NINFER_NVFP4_FORCE_QPN`、
 `NINFER_VOLTA_MMA_SPLITS`、`NINFER_SM70_PREFILL_GEMM`。
 
+**路由数值等价性（2026-10-19 验证）**：单请求逐层残差 dump（`NINFER_DUMP_LAYERS`，同一配置跑两次
+逐位相同，故差异是因果的）显示：每条 fork 自有路由的单算子差异仅 **1e-4~2e-3 relative L2**（≈1 个
+BF16 ULP），但到第 63 层被放大到 **0.15–0.50**；`NINFER_SM70_ATTN_V2` 对 prefill 完全无影响
+（decode-only）；Split-D 从 layer 3（第一个 full-attention 层，0-2 为 GDN）才开始有差异。
+⇒ 没有可“修正”的算术 bug，数值对齐只能靠选用与上游相同的路由（把亚 ULP 差异归零）。
+`NINFER_QUALITY_PARITY=1`（`tools/v100/ninfer-quality-off.sh`）一键切到上游 842078a1 的内核选择
+（Split-D / ATTENTION_V2 / cuBLAS 预填充 / cutlass 输入投影全关，QPN 默认）；细节见
+`bench-results/ninfer-quality-investigation.md`。
+
 **复核 TODO**：
 - [x] 定位并修复竞态根因。
 - [ ] 同类审计：全仓 `static` 却持有按设备状态之处（单主机线程驱动多 rank 的约定）——首轮扫描已排除
