@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <span>
@@ -386,6 +387,8 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
 }
 
 void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, bool ggml_k) {
+    const bool fp8_text = !ggml_k && std::getenv("NINFER_TEXT_RECIPE_FP8") != nullptr;
+    const NumericFormat fp8_format = NumericFormat::FP8_E4M3FN_ROW_BF16S;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
@@ -397,6 +400,9 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, b
             if (ggml_k) {
                 input = bind_weight(binder, prefix + "attention/query_key_gate_value",
                                     NumericFormat::GGML_K, {14336, 5120});
+            } else if (fp8_text) {
+                input = bind_weight(binder, prefix + "attention/query_key_gate_value",
+                                    fp8_format, {14336, 5120});
             } else {
                 input = bind_nvfp4_weight(
                     binder, prefix + "attention/query_key_gate_value", 14336, 5120,
@@ -412,6 +418,9 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, b
                 target.attention.output =
                     bind_weight(binder, prefix + "attention/output", NumericFormat::GGML_K,
                                 {5120, 6144});
+            } else if (fp8_text) {
+                target.attention.output =
+                    bind_weight(binder, prefix + "attention/output", fp8_format, {5120, 6144});
             } else {
                 target.attention.output =
                     bind_nvfp4_weight(binder, prefix + "attention/output", 5120, 6144,
@@ -433,6 +442,9 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, b
             if (ggml_k) {
                 gdn_input = bind_weight(binder, prefix + "gdn/query_key_value_z",
                                         NumericFormat::GGML_K, {16384, 5120});
+            } else if (fp8_text) {
+                gdn_input = bind_weight(binder, prefix + "gdn/query_key_value_z", fp8_format,
+                                        {16384, 5120});
             } else {
                 gdn_input = bind_nvfp4_weight(
                     binder, prefix + "gdn/query_key_value_z", 16384, 5120,
@@ -447,6 +459,8 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, b
             if (ggml_k) {
                 gdn_output =
                     bind_weight(binder, prefix + "gdn/output", NumericFormat::GGML_K, {5120, 6144});
+            } else if (fp8_text) {
+                gdn_output = bind_weight(binder, prefix + "gdn/output", fp8_format, {5120, 6144});
             } else {
                 gdn_output = bind_nvfp4_weight(binder, prefix + "gdn/output", 5120, 6144,
                                                prefix + "gdn/output_projection/input_scale_divisor");
@@ -460,6 +474,10 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, b
                 bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::GGML_K, {34816, 5120});
             target.mlp.down =
                 bind_weight(binder, prefix + "mlp/down", NumericFormat::GGML_K, {5120, 17408});
+        } else if (fp8_text && layer >= 56) {
+            target.mlp.gate_up =
+                bind_weight(binder, prefix + "mlp/gate_up", fp8_format, {34816, 5120});
+            target.mlp.down = bind_weight(binder, prefix + "mlp/down", fp8_format, {5120, 17408});
         } else {
             target.mlp.gate_up =
                 bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
