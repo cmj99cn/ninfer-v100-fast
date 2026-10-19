@@ -47,7 +47,7 @@
 
 ---
 
-## 当前进度（开发分支，截至 2026-10-16）
+## 当前进度（开发分支，截至 2026-10-19）
 
 ### 对齐测试参数（A/B 基准，两引擎同参）
 
@@ -143,11 +143,28 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 
 ### 质量
 
-**BFCL-v3 多轮函数调用**（evalscope，`multi_turn_base` / `multi_turn_miss_func` / `multi_turn_miss_param` / `multi_turn_long_context` 各 20 条）。
+**BFCL-v3 多轮函数调用**（evalscope，`multi_turn_base` / `multi_turn_miss_func` / `multi_turn_miss_param` / `multi_turn_long_context` 各 50 条，共 200 条全量；`--limit 20` 会系统性高估分数且掩盖差距，**不可用于结论**）。
 
-> 下表为 **prompt 修复（`ce64d89a`）之前**的记录，仅作历史对照；修复后的复测见本节末尾。
+**全量 200 条结果**（thinking OFF、`temperature=1.0`、`top_p=1.0`、`seed=42`、`--prefix-cache` 开启；四次 ninfer 运行均用同一 `ce64d89a` 之后构建的 server；server `tools/v100/ninfer-quality-off.sh`）：
 
-与 1cat 对齐口径（thinking 开启、`temperature=1.0`、`top_p=1.0`、`--prefix-cache` 开启；ninfer 侧见 `tools/v100/ninfer-quality-matched.sh`）：
+| 配置 | 分数 | 与默认（8192/int8）的配对 McNemar |
+|---|---:|---|
+| ninfer，默认（`--prefill-chunk 8192`，int8 KV） | **20.5%（41/200）** | — |
+| ninfer，`--prefill-chunk 512` | 25.0%（50/200） | p=0.12 |
+| ninfer，`--prefill-chunk 128` | 23.0%（46/200） | p=0.38 |
+| ninfer，bf16 KV | 23.0%（46/200） | p=0.40 |
+| 1cat（同口径） | **38.5%（77/200）** | only-1cat=40 / only-ninfer=4，p<1e-5 |
+
+结论：**差距不是采样参数、预填充 chunk 尺寸或 KV 量化（int8/bf16）造成的**——这些开关在全量下均无显著差异，而 ninfer 与 1cat 的差距高度显著。
+
+已排除的旧线索：
+
+1. **prompt 渲染 bug（已修，`ce64d89a`）**：ninfer 的 OpenAI/Anthropic schema 用 `nlohmann::json`（默认键按字母重排）并注入 `"strict": false`，使发给模型的多轮历史比 vLLM 多 **150 tokens**（5210 vs 5060）。修复后两侧 prompt **逐 token id 相同**（5060 tokens / 22746 B，尾部一致），故不是模板/工具历史差异；`TEMP_WORKAROUNDS.md` §10 的工具调用解析器严格性经复核**不是**本基准失败主因。
+2. ~~NVFP4 预填充 chunk≥256 数值缺陷~~：**全量复测未复现**——chunk 128 与默认无显著差异（p=0.38），512 亦无（p=0.12）。此前 limit-20 的"128=50% vs 默认 20–35%"是**小样本噪声**（limit-20 会高估分数且无法分辨真实差距），已废弃。
+
+**差距在 200 条全量下稳定存在**，根因仍在定位；候选方向：自转换的 all-NVFP4 工件、引擎路由/量化数值、上游代码基线。
+
+> 下表为 **prompt 修复（`ce64d89a`）之前**、80 条（4 类各 20）、thinking 开启的旧记录，仅作历史对照：
 
 | Subset | ninfer | 1cat（qwen3_coder） |
 |---|---:|---:|
@@ -159,23 +176,7 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 
 配对对比（同 80 条样本）：`both_ok=11`、`both_bad=45`、`ninfer_only=4`、`1cat_only=20`（McNemar exact p=0.0015）。
 
-结论：**该差距不是采样参数造成的**，而是两处实现缺陷（均已在 dev 定位）：
-
-1. **prompt 渲染 bug（已修）**：ninfer 的 OpenAI/Anthropic schema 用 `nlohmann::json`（默认键按字母重排）并注入 `"strict": false`，使发给模型的多轮历史比 vLLM 多 **150 tokens**（5210 vs 5060）。修于 `ce64d89a`（`src/serve/openai_schema.cpp` 改用 `ordered_json`、不再注入 `strict`，同步 `openai_schema.h`/`http_server.cpp`/`anthropic_schema.cpp`/`responses_schema.cpp`）。修复后两侧 prompt **逐 token id 相同**（5060 tokens / 22746 B，尾部一致），故**不是模板 / 工具历史差异**；`TEMP_WORKAROUNDS.md` §10 的工具调用解析器严格性经复核**不是**本基准失败主因。
-
-2. **NVFP4 预填充数值缺陷（未修，可用配置规避）**：当 `--prefill-chunk` ≥256 时，末 chunk 的 T≥256 命中**输入投影的 CUTLASS 路径**（`nvfp4_{attn,gdn}_input_cutlass_sm70`）；该路径的结果**随进程变化（非确定）且质量偏低**，`--prefill-chunk 128` 可完全绕开。根因定位见 `tools/v100/` 与下文复测。
-
-**复测**（thinking OFF、`temperature=1.0`、`top_p=1.0`、`seed=42`、`--prefix-cache`、`multi_turn_base` 20 条；server `tools/v100/ninfer-quality-off.sh`，评测 `tools/v100/run_bfcl_short.sh`）：
-
-| 配置 | 分数 |
-|---|---:|
-| ninfer，默认 `--prefill-chunk 8192` | 20–35%（4 个独立进程互不相同） |
-| ninfer，`--prefill-chunk 128` | **50%（10/20；4 个独立进程通过集完全一致）** |
-| 1cat（同口径） | 45%（9/20） |
-
 `--prefill-chunk 128` 的代价：长提示冷预填充约 **3.3× 慢**（5060 tok TTFT 2.4s→8.0s；21620 tok 10.8s→34.6s）；≤128 tok 无差异；BFCL 整轮因前缀缓存仅约 +2min。
-
-> 上表（80 条、thinking ON）为 **prompt 修复前**的旧数据，保留作历史对照；根因见上方两处缺陷。
 
 **历史基线（greedy，thinking 关闭，`--prefix-cache` 开启）**：
 
@@ -333,7 +334,7 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 
 - **多模态不可用**（问题 1）：当前制品 vision tower 不兼容，仅文本。
 - prefix cache 修复后未做长时间浸泡测试；超高压并发下的缓存行为仍在观察。
-- BFCL 基线 20%，质量迭代是下一步重点。
+- **BFCL 全量 200 条：ninfer 20.5% vs 1cat 38.5%**（同序配对 only-1cat=40 / only-ninfer=4，p<1e-5）；差距根因仍在定位（见"质量"节）。
 
 ---
 
