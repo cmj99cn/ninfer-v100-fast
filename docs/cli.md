@@ -152,7 +152,7 @@ are a measured choice, not the 35B-A3B semantic limit.
 | Option | Meaning | Default |
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
-| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
+| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` in the single-Engine path and `align64(max_concurrency * max_context)` per instance in the pool path | `2048` |
 | `--rope native\|yarn` | rotary regime; `yarn` applies YaRN frequency correction and raises the `--max-context` ceiling to `--yarn-origin` x `--yarn-factor` | `native` |
 | `--yarn-factor F` | YaRN scaling factor, in `[1.0, 64.0]`; only read under `--rope yarn`; `origin x factor` must be a whole token count not exceeding `1048576` | `4.0` |
 | `--yarn-origin O` | YaRN origin window; must equal the artifact's registered native context capacity (`262144`) | `262144` |
@@ -161,6 +161,13 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--device N` | CUDA device index | `0` |
 | `--tp 1\|2\|4` | tensor-parallel width; `2` or `4` splits the model across that many GPUs | `1` |
 | `--devices A,B[,...]` | one CUDA device index per `--tp` rank; required for `--tp 2` or `--tp 4` | `--device` |
+| `--groups N` | number of independent Engine instances in one process; `1` keeps the single-Engine path | `1` |
+| `--group-devices "0,1;2,3"` | explicit per-group device lists, semicolon-separated; `--tp` is inferred from the group width when omitted | unset |
+| `--max-concurrency N` | lanes per instance; defaults to `1` at TP1, `4` at TP2, `8` at TP4 when `--groups > 1` | `1` |
+| `--global-pending-requests N` | shared pool admission queue bound across all groups | `16` |
+| `--http-threads N` | HTTP worker count; `0` derives `groups * max_concurrency + global_pending_requests + 1` in the pool path | `0` |
+| `--affinity-slack-tokens N` | soft-affinity bonus for an idle home instance during pool routing | `2048` |
+| `--fairness-aging-ms N` | queue-head aging threshold before it bypasses deeper prefixes | `1000` |
 | `--kv-dtype bf16\|int8\|iq4nl` | KV-cache storage; `iq4nl` selects IQ4_NL group-32 and is accepted only by the Volta sm_70 build | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
@@ -245,6 +252,32 @@ bit-identical: a verify round evaluates the target model over `draft_tokens + 1`
 while an ordinary round evaluates one, which selects different GEMM shapes, so greedy streams can
 diverge on a near-tie token. Every committed token is still one the target model's own argmax
 selected.
+
+## Multi-instance serving
+
+`--groups N` starts N independent Engines in one process. Every group must use the same artifact
+and the same `--tp` width, and no device may appear in two groups. `--group-devices` assigns ranks
+explicitly and infers `--tp` from the group width when it is omitted:
+
+```bash
+build-v100/apps/ninfer-serve models/qwen3_8_27b.ninfer \
+  --groups 4 --group-devices "0,1;2,3;4,5;6,7" \
+  --max-context 262144 --kv-capacity 1048576 --kv-dtype int8 \
+  --max-concurrency 4 --spec mtp --draft-tokens 3 \
+  --prefix-cache --host-cache-mib 150000
+```
+
+Without `--group-devices`, `--devices` lists all `groups * tp` ranks in group order. `--tp`
+inference from `--group-devices` accepts only widths 1, 2, and 4. In the pool path
+`--max-concurrency` and `--kv-capacity` are per instance; omitting `--kv-capacity` derives
+`align64(max_concurrency * max_context)` for each instance so every lane can hold a full-context
+request. `--host-cache-mib` is the process-wide pinned host tier budget, not a per-instance
+allocation; it requires `--prefix-cache`. DFlash is rejected with `--groups > 1`.
+
+The CLI serves one request per process and keeps the single-Engine path; multi-instance routing,
+the shared host tier, and cross-instance manifests apply to `ninfer-serve`. See
+[`docs/maintainer/multi-instance.md`](maintainer/multi-instance.md) for routing, permit, and
+manifest semantics.
 
 ## Context and memory
 

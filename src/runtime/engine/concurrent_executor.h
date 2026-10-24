@@ -214,6 +214,28 @@ public:
         return out;
     }
 
+    // Content-addressed prefix probe through the Program. Takes the execution mutex so the probe
+    // reads a settled tree, never the middle of a unit's state transitions.
+    [[nodiscard]] PrefixProbe prefix_probe(std::span<const std::uint64_t> hashes) const {
+        std::scoped_lock lock(execution_mutex_);
+        return instance_.program->prefix_probe(hashes);
+    }
+
+    // Boundary-consistent capacity snapshot: the Program's pool counts, execution facts, and prefill
+    // sample under the execution lock, plus the scheduler's active/pending counters from the same
+    // boundary publication the /metrics path uses.
+    [[nodiscard]] CapacitySnapshot capacity_snapshot() const {
+        CapacitySnapshot out;
+        {
+            std::scoped_lock lock(execution_mutex_);
+            out = instance_.program->capacity_snapshot();
+        }
+        std::lock_guard lock(stats_mutex_);
+        out.active_requests  = published_stats_.running_requests;
+        out.pending_requests = published_stats_.waiting_requests;
+        return out;
+    }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);

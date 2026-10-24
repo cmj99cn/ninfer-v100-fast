@@ -3,15 +3,23 @@
 Scope: `src/core/paged_kv_cache.{h,cpp}`, `src/runtime/prefix_cache/{host_slab_pool,prefix_index}.{h,cpp}`,
 and the program-side callers in `src/targets/qwen3_6/impl/runtime/program_impl.h`.
 
-Status: one high-severity correctness bug (KV clobber on duplicate block commit), plus two
-medium-severity issues and three minor ones. The tree already carries an "M2 host-restore clobber
-investigation" (`paged_kv_cache.h:151`, `prefix_index.h:355`), and the primary finding below is a
-concrete mechanism for exactly that clobber that the current `debug_page_referenced` probe does not
-catch.
+Status: the HIGH finding is fixed at `8526dc2c`. The concurrent-prefix real-artifact regression
+(`ninfer_qwen3_8_27b_v100x2_concurrent_prefix_real_test`) exists, but this host-tier change did not
+rerun it; it is left for the GPU-idle window / acceptance run. Both MEDIUM findings are fixed
+in the host-tier paging change: `mapped_pages_` no longer counts cache-owned pages, and
+`evict_device_lru` reports only an eviction that `erase_subtree` actually performed. Two host unit
+tests cover them (`test_cache_page_accounting` and `test_evict_skips_pinned_subtree` in
+`tests/test_prefix_cache_host.cpp`). The three minor findings remain open notes. The original review
+text is retained below for history.
 
 ---
 
 ## 1. HIGH — duplicate block commit returns a live sequence page to the free pool (use-after-free)
+
+**Status:** Fixed at `8526dc2c` (commit-then-promote, promotion conditional on `adopted`).
+Regression coverage exists in
+`tests/targets/qwen3_6_27b/test_engine_v100x2_concurrent_prefix_real.cpp`, but was not rerun for
+this host-tier change; it remains pending a GPU-idle window / acceptance run.
 
 **Where:** `src/targets/qwen3_6/impl/runtime/program_impl.h:3479-3546`
 
@@ -83,6 +91,10 @@ Do not simply drop the `release_cached_pages` call without restoring ownership, 
 
 ## 2. MEDIUM — `mapped_pages_` accounting is asymmetric across cache acquire/release
 
+**Status:** Fixed. `acquire_cache_pages` removes the taken pages from `mapped_pages_` immediately,
+so `mapped_pages_` counts only pages owned by live allocations; `release_cache_pages` touches only
+`cached_pages_`. Covered by `test_cache_page_accounting` in `tests/test_prefix_cache_host.cpp`.
+
 **Where:** `paged_kv_cache.cpp:365`, `402-435`
 
 `acquire_cache_pages` goes through `take_pages`, which does `mapped_pages_ += count`
@@ -102,6 +114,11 @@ accessor. Still a latent accounting landmine; make acquire/release symmetric (e.
 ---
 
 ## 3. MEDIUM — `evict_device_lru` can report a phantom eviction and spin forever
+
+**Status:** Fixed. `erase_subtree` returns `bool` and performs no partial deletion when any node in
+the subtree is pinned; Pass 2 advances to the saved LRU successor on failure and returns
+`kInvalidNode` only when no candidate can make progress, so callers never retry a phantom eviction.
+Covered by `test_evict_skips_pinned_subtree` in `tests/test_prefix_cache_host.cpp`.
 
 **Where:** `prefix_index.cpp:644-679`, `711-756`
 

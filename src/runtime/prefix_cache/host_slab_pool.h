@@ -10,38 +10,17 @@
 // The pool is storage only: it carves a pinned allocation into slabs and tracks occupancy plus
 // GDSF eviction metadata. All policy decisions (which node/snapshot owns a slab, when a slab is
 // dead or superseded) live in PrefixIndex, which calls mark_dead/mark_alive/supersede/hit/pin.
-// Eviction order inside the pool: pinned slabs are never touched; among the rest, dead slabs
-// first (oldest), then superseded slabs (oldest), then by (frequency, recency) — GreedyDual-
-// Size-Frequency.
+// Eviction order inside the pool: slabs with a non-zero pin count are never touched; among the
+// rest, dead slabs first (oldest), then superseded slabs (oldest), then by (frequency, recency) —
+// GreedyDual-Size-Frequency.
+
+#include "runtime/prefix_cache/host_page_allocator.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
 namespace ninfer::prefix_cache {
-
-using HostPageId = std::int32_t;
-
-inline constexpr HostPageId kInvalidHostPage = -1;
-
-// One slab in the host pool. Each slab is a fixed-size pinned buffer.
-struct HostSlab {
-    void* data = nullptr;
-    std::size_t bytes = 0;
-    bool occupied = false;
-    // In-flight transfer destination/source; never evicted while pinned.
-    bool pinned = false;
-    // Dead-KV: unreachable from any live snapshot; evicted before live slabs.
-    bool dead = false;
-    std::uint64_t dead_at = 0;
-    // Superseded by a newer version of the same state; evicted before live slabs. Sticky until
-    // the slab is freed and re-allocated.
-    bool superseded = false;
-    std::uint64_t superseded_at = 0;
-    // GDSF recency/frequency metadata.
-    std::uint64_t freq = 0;
-    std::uint64_t last_hit_tick = 0;
-};
 
 struct HostSlabPoolOptions {
     // Total pinned memory in bytes. 0 = disabled (device-only mode).
@@ -54,68 +33,70 @@ struct HostSlabPoolOptions {
     std::size_t block_slab_count = 0;
     // Number of snapshot slabs to carve.
     std::size_t snapshot_slab_count = 0;
+    // When true, allocation evicts an unpinned slab if the pool is full.
+    // When false, allocation returns kInvalidHostPage on exhaustion instead of evicting.
+    // Shared tiers use false so that cross-owner local pages are never evicted.
+    bool evict_on_exhaustion = true;
 };
 
-// Result of a slab allocation: the page obtained, and the page that was evicted to make room
-// (kInvalidHostPage when none). The caller must reconcile the evicted page's owner before the
-// new slab's data is written.
-struct SlabAllocation {
-    HostPageId page = kInvalidHostPage;
-    HostPageId evicted = kInvalidHostPage;
-};
-
-class HostSlabPool {
+class HostSlabPool : public HostPageAllocator {
 public:
     explicit HostSlabPool(HostSlabPoolOptions options);
-    ~HostSlabPool();
+    ~HostSlabPool() override;
 
     HostSlabPool(const HostSlabPool&) = delete;
     HostSlabPool& operator=(const HostSlabPool&) = delete;
 
-    [[nodiscard]] bool enabled() const noexcept { return host_memory_ != nullptr; }
+    [[nodiscard]] bool enabled() const noexcept override { return host_memory_ != nullptr; }
     // Requested budget from the caller; may exceed the bytes actually pinned.
     [[nodiscard]] std::size_t total_bytes() const noexcept { return options_.total_bytes; }
     // Bytes actually pinned for slab data (excludes the heap-side HostSlab metadata).
-    [[nodiscard]] std::size_t pinned_bytes() const noexcept { return pinned_bytes_; }
-    [[nodiscard]] std::size_t used_bytes() const noexcept;
+    [[nodiscard]] std::size_t pinned_bytes() const noexcept override { return pinned_bytes_; }
+    [[nodiscard]] std::size_t used_bytes() const noexcept override;
     [[nodiscard]] std::size_t free_bytes() const noexcept;
-    [[nodiscard]] std::size_t block_slab_count() const noexcept { return block_slabs_.size(); }
-    [[nodiscard]] std::size_t snapshot_slab_count() const noexcept { return snapshot_slabs_.size(); }
+    [[nodiscard]] std::size_t block_slab_count() const noexcept override {
+        return block_slabs_.size();
+    }
+    [[nodiscard]] std::size_t snapshot_slab_count() const noexcept override {
+        return snapshot_slabs_.size();
+    }
 
     // Allocate a block slab, evicting another BLOCK slab if the pool is full. Returns
     // kInvalidHostPage when no block slab can be obtained (all pinned).
-    [[nodiscard]] SlabAllocation allocate_block();
+    [[nodiscard]] SlabAllocation allocate_block() override;
     // Allocate a snapshot slab, evicting another SNAPSHOT slab if the pool is full.
-    [[nodiscard]] SlabAllocation allocate_snapshot();
+    [[nodiscard]] SlabAllocation allocate_snapshot() override;
 
-    // Release a slab back to the free list. Resets all eviction metadata.
-    void release(HostPageId page) noexcept;
+    // Release a slab back to the free list. Resets all eviction metadata. When the slab is
+    // still pinned, the release is deferred until the last unpin.
+    void release(HostPageId page) noexcept override;
 
     // Raw pointer and size of a slab's data (for D2H/H2D transfers).
-    [[nodiscard]] void* data(HostPageId page) const noexcept;
-    [[nodiscard]] std::size_t bytes(HostPageId page) const noexcept;
+    [[nodiscard]] void* data(HostPageId page) const noexcept override;
+    [[nodiscard]] std::size_t bytes(HostPageId page) const noexcept override;
 
     // --- eviction metadata (driven by PrefixIndex policy) ---
 
-    // Protect a slab from eviction while a transfer is in flight.
-    void pin(HostPageId page) noexcept;
-    void unpin(HostPageId page) noexcept;
+    // Protect a slab from eviction while a transfer is in flight or a shared manifest owns it.
+    // Pins nest: each unpin releases one reference, and a deferred release completes on the last.
+    void pin(HostPageId page) noexcept override;
+    void unpin(HostPageId page) noexcept override;
 
     // Mark a slab dead (no live snapshot below its node) or alive again.
-    void mark_dead(HostPageId page) noexcept;
-    void mark_alive(HostPageId page) noexcept;
+    void mark_dead(HostPageId page) noexcept override;
+    void mark_alive(HostPageId page) noexcept override;
 
     // Mark a slab superseded by a newer version (sticky until re-allocated).
-    void supersede(HostPageId page) noexcept;
+    void supersede(HostPageId page) noexcept override;
 
     // Clear the superseded mark after the owner is hit again.
-    void clear_superseded(HostPageId page) noexcept;
+    void clear_superseded(HostPageId page) noexcept override;
 
     // Record a hit: bumps frequency and recency. Does not clear dead/superseded.
-    void hit(HostPageId page, std::uint64_t tick) noexcept;
+    void hit(HostPageId page, std::uint64_t tick) noexcept override;
 
     // Slab metadata access.
-    [[nodiscard]] const HostSlab* slab(HostPageId page) const noexcept;
+    [[nodiscard]] const HostSlab* slab(HostPageId page) const noexcept override;
     [[nodiscard]] HostSlab* slab_mut(HostPageId page) noexcept;
 
 private:

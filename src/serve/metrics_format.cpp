@@ -128,6 +128,35 @@ std::string metrics_to_prometheus(const ninfer::MetricsSnapshot& metrics) {
     sample(out, "ninfer_decode_rounds_total", "", metrics.scheduler.decode_rounds);
     header(out, "ninfer_decode_row_rounds_total", "Sum of decode batch sizes.", "counter");
     sample(out, "ninfer_decode_row_rounds_total", "", metrics.scheduler.decode_row_rounds);
+
+    if (!metrics.instances.empty()) {
+        header(out, "ninfer_instance_free_kv_pages",
+               "Free Main Text KV page groups per pool instance.", "gauge");
+        header(out, "ninfer_instance_active_requests",
+               "Active requests per pool instance.", "gauge");
+        header(out, "ninfer_instance_pending_requests",
+               "Requests waiting inside one pool instance.", "gauge");
+        header(out, "ninfer_instance_prefix_hit_tokens_total",
+               "Prompt tokens reused through any prefix path per pool instance.", "counter");
+        header(out, "ninfer_instance_manifest_restore_tokens_total",
+               "Prompt tokens attributed to a routed cross-instance manifest hint per pool instance.",
+               "counter");
+        header(out, "ninfer_instance_committed_tokens_total",
+               "Committed decode tokens per pool instance.", "counter");
+        for (std::size_t index = 0; index < metrics.instances.size(); ++index) {
+            const ninfer::InstanceMetrics& instance = metrics.instances[index];
+            const std::string label                 = labels({{"instance", std::to_string(index)}});
+            sample(out, "ninfer_instance_free_kv_pages", label, instance.free_kv_pages);
+            sample(out, "ninfer_instance_active_requests", label, instance.active_requests);
+            sample(out, "ninfer_instance_pending_requests", label, instance.pending_requests);
+            sample(out, "ninfer_instance_prefix_hit_tokens_total", label,
+                   instance.prefix_hit_tokens);
+            sample(out, "ninfer_instance_manifest_restore_tokens_total", label,
+                   instance.manifest_restore_tokens);
+            sample(out, "ninfer_instance_committed_tokens_total", label,
+                   instance.committed_tokens);
+        }
+    }
     return out;
 }
 
@@ -138,6 +167,17 @@ nlohmann::json metrics_to_json(const ninfer::MetricsSnapshot& metrics) {
                                          {"total_bytes", device.total_bytes},
                                          {"used_bytes", device.used_bytes},
                                          {"free_bytes", device.free_bytes}});
+    }
+
+    nlohmann::json instances = nlohmann::json::array();
+    for (const ninfer::InstanceMetrics& instance : metrics.instances) {
+        instances.push_back(nlohmann::json{{"free_kv_pages", instance.free_kv_pages},
+                                           {"active_requests", instance.active_requests},
+                                           {"pending_requests", instance.pending_requests},
+                                           {"prefix_hit_tokens", instance.prefix_hit_tokens},
+                                           {"manifest_restore_tokens",
+                                            instance.manifest_restore_tokens},
+                                           {"committed_tokens", instance.committed_tokens}});
     }
 
     const ninfer::HostCacheMetrics& host = metrics.prefix_cache.host;
@@ -163,7 +203,8 @@ nlohmann::json metrics_to_json(const ninfer::MetricsSnapshot& metrics) {
                                         {"pinned_bytes", host.pinned_bytes},
                                         {"used_bytes", host.used_bytes},
                                         {"block_slab_count", host.block_slab_count},
-                                        {"snapshot_slab_count", host.snapshot_slab_count}}}}}};
+                                        {"snapshot_slab_count", host.snapshot_slab_count}}}}},
+        {"instances", std::move(instances)}};
 }
 
 } // namespace ninfer::serve

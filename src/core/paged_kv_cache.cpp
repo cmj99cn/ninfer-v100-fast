@@ -365,15 +365,19 @@ std::vector<std::int32_t> PagedKVPool::acquire_cache_pages(std::uint32_t count) 
         throw std::bad_alloc();
     }
     std::vector<std::int32_t> pages = take_pages(count, -1);
+    // Cache-owned pages are not owned by any allocation, so they never count as allocation-mapped.
+    // take_pages() accounts every removal from the free list as mapped; undo that here so the
+    // acquire path is symmetric with promote_to_cache(), which also moves pages out of mapped_.
+    mapped_pages_ -= count;
     cached_pages_ += count;
     return pages;
 }
 
 void PagedKVPool::release_cache_pages(std::span<const std::int32_t> page_ids) noexcept {
     if (page_ids.empty()) { return; }
-    // A cache page was already removed from mapped_pages_ when it was promoted, so releasing it
-    // only moves it back to the free list and out of the cache. Decrementing mapped here (as
-    // return_pages does) would double-count and drive mapped_pages_ negative under eviction.
+    // Cache pages are never counted in mapped_pages_ (acquire_cache_pages removes them and
+    // promote_to_cache moves them out), so releasing one only moves it back to the free list and
+    // out of the cache-owned set. Decrementing mapped here would drive it negative.
     cached_pages_ -= static_cast<std::uint32_t>(page_ids.size());
     free_page_ids_.insert(free_page_ids_.end(), page_ids.begin(), page_ids.end());
     std::sort(free_page_ids_.begin(), free_page_ids_.end());

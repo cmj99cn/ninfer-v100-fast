@@ -47,8 +47,18 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     int tp                                 = 1;
-    // Resolved device ids, one per tp rank. Always populated by parse_serve_options() (from
-    // --devices, or synthesized as {device} when --devices is omitted).
+    // Multi-instance pooling. `groups == 1` keeps the single-Engine serving path. For `groups > 1`,
+    // `devices` and `group_devices` both name every rank of every group in group order; an empty
+    // `group_devices` means `devices` was split into equal per-group blocks.
+    std::uint32_t groups                   = 1;
+    std::vector<int> group_devices;
+    std::uint32_t global_pending_requests  = 16;
+    // 0 selects the existing default worker count. Positive values are an explicit worker count.
+    std::uint32_t http_threads             = 0;
+    std::uint32_t affinity_slack_tokens    = 2048;
+    std::uint32_t fairness_aging_ms        = 1000;
+    // Resolved device ids, one per tp rank (single group) or groups * tp entries (multi group).
+    // Always populated by parse_serve_options().
     std::vector<int> devices;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

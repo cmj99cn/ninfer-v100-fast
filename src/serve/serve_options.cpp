@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -97,10 +98,41 @@ std::vector<int> parse_devices(const char* text) {
         if (comma == std::string_view::npos) { break; }
         start = comma + 1;
     }
-    if (result.empty() || result.size() > 4) {
-        throw std::invalid_argument("--devices must list 1 to 4 device ids");
+    if (result.empty()) {
+        throw std::invalid_argument("--devices must list at least one device id");
     }
     return result;
+}
+
+// Semicolon-separated groups of comma-separated device ids, e.g. "0,1;2,3".
+std::vector<std::vector<int>> parse_group_devices(const char* text) {
+    std::vector<std::vector<int>> groups;
+    const std::string_view view(text);
+    std::size_t start = 0;
+    while (start <= view.size()) {
+        const std::size_t semicolon = view.find(';', start);
+        const std::string_view group_text =
+            semicolon == std::string_view::npos ? view.substr(start)
+                                                : view.substr(start, semicolon - start);
+        if (group_text.empty()) {
+            throw std::invalid_argument(std::string("invalid group-devices: ") + text);
+        }
+        groups.push_back(parse_devices(std::string(group_text).c_str()));
+        if (semicolon == std::string_view::npos) { break; }
+        start = semicolon + 1;
+    }
+    if (groups.empty()) {
+        throw std::invalid_argument("--group-devices must list at least one group");
+    }
+    return groups;
+}
+
+std::uint32_t align64(std::uint64_t value) {
+    const std::uint64_t aligned = (value + 63ULL) & ~63ULL;
+    if (aligned > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("multi-group --kv-capacity default is out of range");
+    }
+    return static_cast<std::uint32_t>(aligned);
 }
 
 KvCapacityPolicy parse_kv_capacity(const char* text) {
@@ -171,7 +203,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--rope native|yarn] [--yarn-factor F] [--yarn-origin O] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2|4] "
-           "[--devices N,N,...] "
+           "[--devices N,N,...] [--groups N] [--group-devices G0,G1;G2,G3] "
+           "[--global-pending-requests N] [--http-threads N] "
+           "[--affinity-slack-tokens N] [--fairness-aging-ms N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
@@ -221,9 +255,18 @@ std::string serve_usage_text(const char* argv0) {
             "       --tp selects the tensor-parallel degree (default 1); --tp 2 or --tp 4 splits "
             "the model across that many GPUs and requires --devices; it supports --spec mtp, "
             "--spec dflash at --tp 2, and --vision (the Vision tower runs sharded across the group).\n"
-           "       --devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
-           "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
-           "primary device.\n"
+            "       --devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
+            "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
+            "primary device. Omitting --devices synthesizes contiguous ids starting at --device; "
+            "in the multi-group path an explicit --device must equal the first resolved device.\n"
+            "       --groups N serves N independent Engine instances. --group-devices assigns "
+            "each group's ranks explicitly (e.g. '0,1;2,3') and infers --tp from the group "
+            "width; otherwise --devices lists groups*N ranks in group order. --max-concurrency "
+            "and --kv-capacity are per instance in the multi-group path. DFlash is single-group "
+            "only.\n"
+            "       --global-pending-requests bounds the shared admission queue across groups "
+            "(default 16); --http-threads overrides the HTTP worker count; "
+            "--affinity-slack-tokens and --fairness-aging-ms tune pool routing.\n"
            "       --rope selects the rotary regime (default native: the checkpoint\'s own RoPE and "
            "its registered 262144-position ceiling). --rope yarn applies YaRN frequency correction "
            "and raises the --max-context ceiling to --yarn-origin x --yarn-factor (at most "
@@ -254,6 +297,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool kv_capacity_explicit        = false;
     bool device_explicit             = false;
     bool devices_explicit            = false;
+    bool groups_explicit             = false;
+    bool group_devices_explicit      = false;
+    bool tp_explicit                 = false;
+    bool max_concurrency_explicit    = false;
+    std::vector<std::vector<int>> parsed_group_devices;
     bool preserve_thinking_explicit  = false;
     bool enable_thinking_explicit    = false;
     bool cuda_graph_explicit         = false;
@@ -297,6 +345,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
+            max_concurrency_explicit = true;
         } else if (arg == "--max-pending-requests") {
             options.max_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--max-pending-requests"), "max-pending-requests"));
@@ -361,9 +410,29 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             device_explicit = true;
         } else if (arg == "--tp") {
             options.tp = parse_tp(require_value("--tp"));
+            tp_explicit = true;
         } else if (arg == "--devices") {
             options.devices  = parse_devices(require_value("--devices"));
             devices_explicit = true;
+        } else if (arg == "--groups") {
+            options.groups = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--groups"), "groups"));
+            groups_explicit = true;
+        } else if (arg == "--group-devices") {
+            parsed_group_devices = parse_group_devices(require_value("--group-devices"));
+            group_devices_explicit = true;
+        } else if (arg == "--global-pending-requests") {
+            options.global_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--global-pending-requests"), "global-pending-requests"));
+        } else if (arg == "--http-threads") {
+            options.http_threads = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--http-threads"), "http-threads"));
+        } else if (arg == "--affinity-slack-tokens") {
+            options.affinity_slack_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--affinity-slack-tokens"), "affinity-slack-tokens"));
+        } else if (arg == "--fairness-aging-ms") {
+            options.fairness_aging_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--fairness-aging-ms"), "fairness-aging-ms"));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
@@ -441,10 +510,48 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             "--chat-template-kwargs reasoning_effort cannot be combined with disabled thinking "
             "(--no-thinking / enable_thinking=false)");
     }
-    if (!kv_capacity_explicit) {
-        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
-    }
-    if (devices_explicit) {
+    if (options.groups == 0) { throw std::invalid_argument("--groups must be positive"); }
+    if (group_devices_explicit) {
+        if (!groups_explicit) { options.groups = parsed_group_devices.size(); }
+        if (parsed_group_devices.size() != options.groups) {
+            throw std::invalid_argument("--group-devices must list exactly --groups groups");
+        }
+        const std::size_t width = parsed_group_devices.front().size();
+        if (!tp_explicit) {
+            if (width != 1 && width != 2 && width != 4) {
+                throw std::invalid_argument(
+                    "--group-devices group width must be 1, 2, or 4 when --tp is omitted");
+            }
+            options.tp = static_cast<int>(width);
+        }
+        std::vector<int> flattened;
+        for (const auto& group : parsed_group_devices) {
+            if (group.size() != static_cast<std::size_t>(options.tp)) {
+                throw std::invalid_argument(
+                    "--group-devices groups must all have exactly --tp devices");
+            }
+            flattened.insert(flattened.end(), group.begin(), group.end());
+        }
+        if (devices_explicit && options.devices != flattened) {
+            throw std::invalid_argument("--devices and --group-devices disagree");
+        }
+        options.devices       = std::move(flattened);
+        options.group_devices = options.devices;
+    } else if (options.groups > 1) {
+        const std::size_t total =
+            static_cast<std::size_t>(options.groups) * static_cast<std::size_t>(options.tp);
+        if (devices_explicit) {
+            if (options.devices.size() != total) {
+                throw std::invalid_argument(
+                    "--devices must list exactly --groups * --tp device ids");
+            }
+        } else {
+            options.devices.resize(total);
+            for (std::size_t index = 0; index < total; ++index) {
+                options.devices[index] = options.device + static_cast<int>(index);
+            }
+        }
+    } else if (devices_explicit) {
         if (options.devices.size() != static_cast<std::size_t>(options.tp)) {
             throw std::invalid_argument("--devices must list exactly --tp device ids");
         }
@@ -454,6 +561,30 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.device = options.devices.front();
     } else if (options.tp == 1) {
         options.devices = {options.device};
+    }
+    if (device_explicit && !options.devices.empty() &&
+        (options.groups > 1 || group_devices_explicit) &&
+        options.devices.front() != options.device) {
+        throw std::invalid_argument(
+            "--device and --devices/--group-devices disagree on the primary device");
+    }
+    {
+        std::set<int> unique_devices(options.devices.begin(), options.devices.end());
+        if (unique_devices.size() != options.devices.size()) {
+            throw std::invalid_argument("--devices must not repeat a device id");
+        }
+    }
+    if (!options.devices.empty()) { options.device = options.devices.front(); }
+    if (options.groups > 1 && !max_concurrency_explicit) {
+        options.max_concurrency = options.tp == 1 ? 1 : options.tp == 2 ? 4 : 8;
+    }
+    if (!kv_capacity_explicit) {
+        if (options.groups > 1) {
+            options.kv_capacity = KvCapacityPolicy::explicit_capacity(align64(
+                static_cast<std::uint64_t>(options.max_concurrency) * options.max_context));
+        } else {
+            options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+        }
     }
     if (!cuda_graph_explicit) { options.use_cuda_graph = options.tp <= 1; }
     if (options.port <= 0 || options.port > 65535) {
@@ -470,6 +601,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");
     }
+    if (options.global_pending_requests == 0) {
+        throw std::invalid_argument("--global-pending-requests must be positive");
+    }
+    if (!options.group_devices.empty() &&
+        options.group_devices.size() !=
+            static_cast<std::size_t>(options.groups) * static_cast<std::size_t>(options.tp)) {
+        throw std::invalid_argument("--group-devices must cover exactly --groups * --tp devices");
+    }
     if (options.pending_timeout_ms == 0) {
         throw std::invalid_argument("--pending-timeout-ms must be positive");
     }
@@ -482,6 +621,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");
+    }
+    if (options.groups > 1 && options.speculative.backend == SpeculativeBackend::DFlash) {
+        throw std::invalid_argument("DFlash 多组暂不支持");
     }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {

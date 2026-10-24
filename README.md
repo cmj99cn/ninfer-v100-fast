@@ -339,6 +339,36 @@ export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH   # 视你的 NCCL 位
 
 TP4（四卡）把 `--tp 2 --devices 0,1` 换成 `--tp 4 --devices 0,1,2,3` 即可，其余参数不变。
 
+#### 多实例分组（未验证）
+
+同一进程可以启动多个 Engine，各占一组互不重叠的卡，并共享一份只读 artifact 与 pinned host KV
+tier。`--group-devices` 用分号分组；省略 `--tp` 时由组宽推断。每实例的 `--max-concurrency` 与
+`--kv-capacity` 独立配置，`--global-pending-requests` 是共享等待队列上限（默认 16）。
+
+2 卡本机（2×TP1；真实集成测试已通过）：
+
+```bash
+./build/apps/ninfer-serve /home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
+  --groups 2 --group-devices "0;1" --tp 1 \
+  --max-context 262144 --kv-capacity 262144 --kv-dtype int8 \
+  --max-concurrency 1 --spec mtp --draft-tokens 3 \
+  --prefix-cache --host-cache-mib 1024
+```
+
+8 卡机（4×TP2；本窗口不可访问，未验证）：
+
+```bash
+./build/apps/ninfer-serve /home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
+  --groups 4 --group-devices "0,1;2,3;4,5;6,7" --tp 2 \
+  --max-context 262144 --kv-capacity 1048576 --kv-dtype int8 \
+  --max-concurrency 4 --spec mtp --draft-tokens 3 \
+  --prefix-cache --host-cache-mib 150000
+```
+
+多组模式不支持 `--spec dflash`。分组、路由、permit、manifest 生命周期与未验证清单见
+[`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md)。上述 profile 没有吞吐或
+显存实测数据，不得引用为验收结果。
+
 ### 关键参数
 
 | 参数 | 说明 |
@@ -776,6 +806,38 @@ export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH   # depends on your NC
 ```
 
 For TP4 (four GPUs), replace `--tp 2 --devices 0,1` with `--tp 4 --devices 0,1,2,3`; all other flags stay the same.
+
+#### Multi-instance groups (unverified)
+
+One process can serve several Engines, each on a disjoint device group, sharing one read-only
+artifact reader and one pinned host KV tier. `--group-devices` separates groups with semicolons and
+`--tp` is inferred from the group width when omitted. `--max-concurrency` and `--kv-capacity` are
+per instance; `--global-pending-requests` bounds the shared queue (default 16).
+
+Two-card host (2xTP1; the real integration test passed):
+
+```bash
+./build/apps/ninfer-serve /home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
+  --groups 2 --group-devices "0;1" --tp 1 \
+  --max-context 262144 --kv-capacity 262144 --kv-dtype int8 \
+  --max-concurrency 1 --spec mtp --draft-tokens 3 \
+  --prefix-cache --host-cache-mib 1024
+```
+
+Eight-card host (4xTP2; not accessible in this window, unverified):
+
+```bash
+./build/apps/ninfer-serve /home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
+  --groups 4 --group-devices "0,1;2,3;4,5;6,7" --tp 2 \
+  --max-context 262144 --kv-capacity 1048576 --kv-dtype int8 \
+  --max-concurrency 4 --spec mtp --draft-tokens 3 \
+  --prefix-cache --host-cache-mib 150000
+```
+
+`--spec dflash` is rejected with multiple groups. See
+[`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md) for grouping, routing,
+permits, manifest lifecycle, and the unverified list. These profiles have no measured throughput
+or memory result and are not acceptance evidence.
 
 ### Key Flags
 

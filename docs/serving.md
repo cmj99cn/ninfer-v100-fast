@@ -52,6 +52,34 @@ omitted at startup.
 `--lm-head-draft`: its selector uses the full vocabulary. It does not fit the 180000-capacity MTP
 profile. The 35B-A3B package has no tensor-parallel path.
 
+## Multi-instance pools
+
+`--groups N` serves N independent Engines from one process. All groups must use the same artifact
+and tensor-parallel width, their device sets must be disjoint, and `--group-devices "0,1;2,3"`
+assigns ranks explicitly (`--tp` is inferred from the group width when omitted). Without
+`--group-devices`, `--devices` lists all `groups * tp` ranks in group order. `--max-concurrency`
+and `--kv-capacity` are per instance in this path; omitting `--kv-capacity` derives
+`align64(max_concurrency * max_context)` for each instance.
+
+An `EnginePool` is the only admission queue: requests wait in one bounded FIFO until a pool permit
+reserves both a lane and the KV pages on one instance. Each Engine's own pending queue is fixed at
+one slot and only carries the request already routed to it. `--global-pending-requests` bounds the
+shared queue (default `16`); `--affinity-slack-tokens` and `--fairness-aging-ms` tune soft
+affinity and queue-head aging. The default HTTP worker count is
+`groups * max_concurrency + global_pending_requests + 1`; `--http-threads` overrides it.
+
+`--prefix-cache --host-cache-mib N` allocates one process-wide pinned host tier shared by every
+instance. A family with `--host-cache-mib 0` or without `--prefix-cache` keeps only the device
+tier, so cross-instance manifest restore is unavailable. Multi-instance serving supports MTP or no
+draft; `--groups > 1` with `--spec dflash` is rejected at startup. A full queue reports HTTP 429
+`server_overloaded`; an expired queue or preparation deadline reports HTTP 503
+`request_queue_timeout`. Capacity rejections from a routed Engine keep their existing error path
+after the permit is returned.
+
+See [`docs/maintainer/multi-instance.md`](maintainer/multi-instance.md) for grouping, routing,
+manifest lifecycle, and the current verification status. The 2-card and 8-card multi-instance
+profiles have not been validated on this checkout.
+
 Compatible-prefix reuse is enabled by default at every tensor-parallel width, including
 `--tp 2 --spec mtp` and `--tp 4 --spec mtp`.
 It applies transparently to the HTTP APIs: submit the normal conversation history. A matching
@@ -106,7 +134,7 @@ INT8 KV). `--kv-dtype int8` is mandatory at that window.
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | process health |
-| `GET /metrics` | live device, KV-tier, host-cache, and scheduler metrics |
+| `GET /metrics` | live device, KV-tier, host-cache, per-instance, and scheduler metrics |
 | `GET /v1/models` | configured OpenAI model alias |
 | `GET /v1/models/{id}` | lookup of the configured alias |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -136,9 +164,20 @@ Groups:
   and slab counts (`enabled` is 0 when the tier is off or its allocation failed).
 - `scheduler` — running/prefilling/decode-ready/waiting requests and the monotonic prefill/decode
   counters used to derive throughput.
+- `instances` — one row per pool Engine (JSON array; empty for a single Engine). Each row is
+  `free_kv_pages`, `active_requests`, `pending_requests` (only requests already routed to that
+  Engine), `prefix_hit_tokens`, `manifest_restore_tokens`, and `committed_tokens`. Prometheus
+  exposes the same figures as `ninfer_instance_*` samples with an `instance` label. The existing
+  aggregate groups remain pool-wide: device rows are concatenated, scheduler and KV figures are
+  summed, the shared host tier is reported once rather than per instance, and `committed_tokens`
+  per instance sums to `scheduler.committed_decode_tokens`.
+  `prefix_hit_tokens` and `manifest_restore_tokens` are instance-only counters with no aggregate
+  counterpart.
 
 Prometheus clients compute rates by differencing the `*_total` counters between scrapes; the
-gauge groups are point-in-time.
+gauge groups are point-in-time. In a pool, `ninfer_instance_committed_tokens_total` sums to
+`ninfer_committed_decode_tokens_total`; `prefix_hit_tokens` covers every reuse path and
+`manifest_restore_tokens` attributes a completion to the routed cross-instance manifest frontier.
 
 ```bash
 curl http://127.0.0.1:8080/metrics                  # Prometheus text

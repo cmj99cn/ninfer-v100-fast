@@ -2,13 +2,19 @@
 // host-residency state transitions. No GPU required. Checks are evaluated unconditionally
 // (no assert), so they hold in NDEBUG builds as well.
 
+#include "core/paged_kv_cache.h"
 #include "runtime/prefix_cache/host_slab_pool.h"
 #include "runtime/prefix_cache/prefix_index.h"
+#include "runtime/prefix_cache/shared_host_tier.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <iostream>
+#include <memory>
+#include <utility>
 #include <vector>
 
 namespace pc = ninfer::prefix_cache;
@@ -37,6 +43,45 @@ pc::HostSlabPool make_test_pool() {
                              .snapshot_slab_bytes = 128 * 1024,
                              .block_slab_count = 4,
                              .snapshot_slab_count = 2});
+}
+
+// PagedKVPool only performs pointer arithmetic in the paths under test, so a host buffer can back
+// it: the accounting and eviction tests never touch CUDA.
+struct TestPagedPool {
+    std::vector<unsigned char> backing;
+    ninfer::PagedKVPoolLayout layout;
+    std::unique_ptr<ninfer::PagedKVPool> pool;
+};
+
+TestPagedPool make_test_paged_pool(std::uint32_t pages) {
+    ninfer::LayoutBuilder builder;
+    auto layout = ninfer::plan_paged_kv_pool(
+        builder, {.page_group_count      = pages,
+                  .logical_page_capacity = pages,
+                  .table_rows            = 1,
+                  .plane_order           = ninfer::PagedKVPlaneOrder::PageMajor,
+                  .planes                = {{ninfer::DType::BF16, 16, 1}}});
+    const std::size_t bytes = builder.finish(256);
+
+    TestPagedPool fixture;
+    fixture.backing.assign(bytes + 256U, 0);
+    const auto address  = reinterpret_cast<std::uintptr_t>(fixture.backing.data());
+    const auto aligned  = (address + 255U) & ~static_cast<std::uintptr_t>(255U);
+    fixture.layout      = std::move(layout);
+    fixture.pool        = std::make_unique<ninfer::PagedKVPool>(
+        ninfer::DeviceSpan{reinterpret_cast<void*>(aligned), bytes}, fixture.layout);
+    return fixture;
+}
+
+template <typename Fn>
+int run_with_watchdog(Fn&& fn, const char* label) {
+    auto future = std::async(std::launch::async, std::forward<Fn>(fn));
+    if (future.wait_for(std::chrono::seconds(1)) != std::future_status::ready) {
+        std::cerr << label << " timed out (possible eviction spin)\n";
+        std::_Exit(1);
+    }
+    future.get();
+    return 0;
 }
 
 std::vector<std::int32_t> block_tokens(std::int32_t seed) {
@@ -88,6 +133,19 @@ void write_snapshot_to_host(pc::PrefixIndex& index, pc::SnapshotId id) {
 }
 
 // --- HostSlabPool tests ---
+
+int test_host_allocator_contract() {
+    int failures = 0;
+    auto pool = make_test_pool();
+    pc::HostPageAllocator& alloc = pool;
+    const auto before = alloc.used_bytes();
+    auto a = alloc.allocate_block();
+    failures += check(a.page >= 0, "block allocation");
+    failures += check(alloc.used_bytes() > before, "allocation must occupy a slab");
+    alloc.release(a.page);
+    failures += check(alloc.used_bytes() == before, "release must return the slab");
+    return failures;
+}
 
 int test_slab_pool_basic() {
     int failures = 0;
@@ -162,7 +220,7 @@ int test_prefix_index_host_residency() {
     TestSink sink;
     pc::PrefixIndex index(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
     pc::HostSlabPool pool = make_test_pool();
-    index.set_host_pool(&pool);
+    index.set_host_allocator(&pool);
 
     const pc::NodeId node = commit_block(index, index.root(), 42, 100);
     failures += check(node != pc::kInvalidNode, "block commit failed");
@@ -194,7 +252,7 @@ int test_device_fill_roundtrip() {
     TestSink sink;
     pc::PrefixIndex index(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
     pc::HostSlabPool pool = make_test_pool();
-    index.set_host_pool(&pool);
+    index.set_host_allocator(&pool);
 
     const pc::NodeId node = commit_block(index, index.root(), 7, 100);
     failures += check(node != pc::kInvalidNode, "block commit failed");
@@ -237,7 +295,7 @@ int test_evict_demote_vs_erase() {
     TestSink sink;
     pc::PrefixIndex index(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
     pc::HostSlabPool pool = make_test_pool();
-    index.set_host_pool(&pool);
+    index.set_host_allocator(&pool);
 
     const pc::NodeId a = commit_block(index, index.root(), 1, 100);
     const pc::NodeId b = commit_block(index, a, 2, 101);
@@ -261,6 +319,60 @@ int test_evict_demote_vs_erase() {
     return failures;
 }
 
+int test_cache_page_accounting() {
+    int failures = 0;
+    auto fixture = make_test_paged_pool(6);
+    ninfer::PagedKVPool& pool = *fixture.pool;
+
+    const std::uint32_t before = pool.mapped_pages();
+    const auto pages           = pool.acquire_cache_pages(2);
+    failures += check(pool.mapped_pages() == before,
+                      "cache pages must not count as allocation-mapped");
+    failures += check(pool.cached_pages() == 2, "acquired pages were not counted as cache-owned");
+
+    pool.release_cache_pages(pages);
+    failures += check(pool.mapped_pages() == before,
+                      "releasing cache pages must not change mapped count");
+    failures += check(pool.cached_pages() == 0, "released pages are still counted as cache-owned");
+    return failures;
+}
+
+int test_evict_skips_pinned_subtree() {
+    int failures = 0;
+    TestSink sink;
+    pc::PrefixIndex index(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
+    pc::HostSlabPool pool = make_test_pool();
+    index.set_host_allocator(&pool);
+
+    const pc::NodeId a = commit_block(index, index.root(), 1, 100);
+    const pc::NodeId b = commit_block(index, a, 2, 101);
+    failures += check(a != pc::kInvalidNode && b != pc::kInvalidNode, "block commits failed");
+
+    // b is deeper in the subtree than the LRU head a; its in-flight transfer pins the subtree.
+    index.pin_restore(b);
+
+    pc::NodeId first = pc::kInvalidNode;
+    failures += run_with_watchdog([&] { first = index.evict_device_lru(); },
+                                  "evict_device_lru with a pinned descendant");
+    failures += check(first == pc::kInvalidNode,
+                      "pinned subtree must yield no eviction, not a phantom victim");
+    failures += check(index.node(a) != nullptr && index.node(b) != nullptr,
+                      "partially erased a subtree containing a pinned descendant");
+    failures += check(sink.released_blocks == 0, "phantom eviction released block pages");
+
+    // Once the pin is gone the same node is a real victim and the whole subtree goes.
+    index.unpin_restore(b);
+    pc::NodeId second = pc::kInvalidNode;
+    failures += run_with_watchdog([&] { second = index.evict_device_lru(); },
+                                  "evict_device_lru after the pin was released");
+    failures += check(second == a, "unpinned LRU head was not evicted");
+    failures += check(index.node(a) == nullptr && index.node(b) == nullptr,
+                      "unpinned subtree was not erased");
+    failures += check(sink.released_blocks == 2,
+                      "erased subtree did not release every block page");
+    return failures;
+}
+
 int test_slab_eviction_reconciliation() {
     int failures = 0;
     TestSink sink;
@@ -271,7 +383,7 @@ int test_slab_eviction_reconciliation() {
                            .snapshot_slab_bytes = 64 * 1024,
                            .block_slab_count = 2,
                            .snapshot_slab_count = 1});
-    index.set_host_pool(&pool);
+    index.set_host_allocator(&pool);
 
     const pc::NodeId a = commit_block(index, index.root(), 1, 100);
     const pc::NodeId b = commit_block(index, index.root(), 2, 101);
@@ -323,7 +435,7 @@ int test_slot_demote_host_backed() {
     TestSink sink;
     pc::PrefixIndex index(pc::PrefixIndexOptions{.device_snapshot_slots = 1}, &sink);
     pc::HostSlabPool pool = make_test_pool();
-    index.set_host_pool(&pool);
+    index.set_host_allocator(&pool);
 
     const pc::NodeId a = commit_block(index, index.root(), 1, 100);
     const pc::NodeId b = commit_block(index, a, 2, 101);
@@ -358,7 +470,7 @@ int test_snapshot_restore_roundtrip() {
     TestSink sink;
     pc::PrefixIndex index(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
     pc::HostSlabPool pool = make_test_pool();
-    index.set_host_pool(&pool);
+    index.set_host_allocator(&pool);
 
     const pc::NodeId a = commit_block(index, index.root(), 1, 100);
     const pc::NodeId b = commit_block(index, a, 2, 101);
@@ -408,7 +520,7 @@ int test_best_host_admission() {
     TestSink sink;
     pc::PrefixIndex index(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
     pc::HostSlabPool pool = make_test_pool();
-    index.set_host_pool(&pool);
+    index.set_host_allocator(&pool);
 
     const auto block0 = block_tokens(1);
     const auto block1 = block_tokens(1000);
@@ -444,7 +556,7 @@ int test_dead_kv_and_supersede_marking() {
     TestSink sink;
     pc::PrefixIndex index(pc::PrefixIndexOptions{.device_snapshot_slots = 1}, &sink);
     pc::HostSlabPool pool = make_test_pool();
-    index.set_host_pool(&pool);
+    index.set_host_allocator(&pool);
 
     const pc::NodeId a = commit_block(index, index.root(), 1, 100);
     failures += check(a != pc::kInvalidNode, "block commit failed");
@@ -504,18 +616,326 @@ int test_dead_kv_and_supersede_marking() {
 
 } // namespace
 
+int test_overlapping_manifests_share_block_page() {
+    int failures = 0;
+    TestSink sink;
+    pc::PrefixIndex index(pc::PrefixIndexOptions{.device_snapshot_slots = 2}, &sink);
+
+    ninfer::SharedHostTier::Config cfg;
+    cfg.host_bytes          = 1 << 20;
+    cfg.block_slab_bytes    = 64 * 1024;
+    cfg.snapshot_slab_bytes = 16 * 1024;
+    cfg.block_slabs         = 4;
+    cfg.snapshot_slabs      = 4;
+    cfg.tp                  = 1;
+    cfg.manifest_ttl        = std::chrono::minutes(30);
+    auto tier = ninfer::SharedHostTier::create(cfg);
+    index.set_host_allocator(tier.get());
+    index.set_shared_host_tier(tier.get());
+
+    const pc::NodeId node_a = commit_block(index, index.root(), 1, 100);
+    const pc::NodeId node_b = commit_block(index, node_a, 2, 101);
+    failures += check(node_a != pc::kInvalidNode && node_b != pc::kInvalidNode,
+                      "block commit failed");
+
+    write_block_to_host(index, node_a);
+    write_block_to_host(index, node_b);
+
+    const pc::SnapshotId tap1 = add_tap(index, node_a, 64);
+    failures += check(tap1 != pc::kInvalidSnapshot, "tap1 failed");
+    write_snapshot_to_host(index, tap1);
+
+    const pc::SnapshotId tap2 = add_tap(index, node_b, 128);
+    failures += check(tap2 != pc::kInvalidSnapshot, "tap2 failed");
+    write_snapshot_to_host(index, tap2);
+
+    const std::uint64_t m1 = index.publish_snapshot_manifest(tap1, 1, 1, 1);
+    const std::uint64_t m2 = index.publish_snapshot_manifest(tap2, 1, 1, 1);
+    failures += check(m1 != 0 && m2 != 0, "manifest publish failed");
+
+    const pc::BlockNode* record_a = index.node(node_a);
+    failures += check(record_a != nullptr && record_a->host_shared &&
+                      record_a->shared_manifests.size() == 2,
+                      "node_a must hold both manifest ids");
+
+    index.remove_snapshot(tap1);
+    record_a = index.node(node_a);
+    failures += check(record_a != nullptr && record_a->host_shared &&
+                      record_a->shared_manifests.size() == 1 &&
+                      record_a->shared_manifests[0] == m2,
+                      "node_a must still be protected by manifest2 after manifest1 release");
+
+    index.remove_snapshot(tap2);
+    record_a = index.node(node_a);
+    failures += check(record_a != nullptr && !record_a->host_shared &&
+                      record_a->shared_manifests.empty(),
+                      "node_a must be cleared after both manifests released");
+    return failures;
+}
+
+int test_import_foreign() {
+    int failures = 0;
+    ninfer::SharedHostTier::Config tier_config;
+    tier_config.host_bytes          = 1 << 20;
+    tier_config.block_slab_bytes    = 64 * 1024;
+    tier_config.snapshot_slab_bytes = 16 * 1024;
+    tier_config.block_slabs         = 8;
+    tier_config.snapshot_slabs      = 8;
+    tier_config.tp                  = 1;
+    auto tier = ninfer::SharedHostTier::create(tier_config);
+    TestSink sink;
+    pc::PrefixIndex index({.device_snapshot_slots = 2}, &sink);
+    index.set_shared_host_tier(tier.get());
+    index.set_host_allocator(tier.get());
+
+    // The hashes must be the real chain hashes, otherwise `find_child` cannot locate the committed
+    // nodes. Block 0 has a local node (rule 6); block 1 only exists on the foreign chain.
+    const auto tokens0 = block_tokens(10);
+    const auto tokens1 = block_tokens(20);
+    std::vector<std::uint64_t> hashes(2);
+    hashes[0] = pc::block_hash(pc::kBlockHashSeed, tokens0, 0);
+    hashes[1] = pc::block_hash(hashes[0], tokens1, 0);
+    const pc::HostPageId page0 = tier->allocate_block().page;
+    const pc::HostPageId page1 = tier->allocate_block().page;
+    const pc::HostPageId state = tier->allocate_snapshot().page;
+
+    ninfer::SharedHostTier::PublishData data;
+    data.tp          = 1;
+    data.frontier    = 128;
+    data.hashes      = hashes;
+    data.block_pages = {page0, page1};
+    data.state_page  = state;
+    const std::uint64_t manifest = tier->publish(1, std::move(data));
+    failures += check(manifest != 0, "foreign test publish failed");
+
+    // A hint naming a manifest the tier does not hold cannot be imported.
+    pc::PrefixIndex::ForeignView bad;
+    bad.manifest_id  = manifest + 1000U;
+    bad.frontier     = 128;
+    bad.hashes       = hashes;
+    bad.block_pages  = {page0, page1};
+    bad.state_page   = state;
+    failures += check(!index.import_foreign(bad), "import must fail when retain fails");
+
+    pc::PrefixIndex::ForeignView view;
+    view.manifest_id  = manifest;
+    view.frontier     = 128;
+    view.hashes       = hashes;
+    view.block_pages  = {page0, page1};
+    view.state_page   = state;
+    failures += check(index.import_foreign(view), "import_foreign failed");
+    failures += check(index.live_snapshot_count() == 1,
+                      "import must count the foreign snapshot as live");
+
+    const pc::NodeId foreign0 = index.foreign_node(manifest, 0);
+    const pc::NodeId foreign1 = index.foreign_node(manifest, 1);
+    const pc::BlockNode* node0 = index.node(foreign0);
+    const pc::BlockNode* node1 = index.node(foreign1);
+    failures += check(node0 != nullptr && node1 != nullptr, "foreign nodes missing");
+    failures += check(node0 != nullptr && node0->foreign && node0->host_shared &&
+                          node0->host_state == pc::Residency::Host &&
+                          node0->device_state == pc::Residency::Absent &&
+                          node0->host_page == page0 && node0->depth == 0 &&
+                          node0->shared_manifests.size() == 1 &&
+                          node0->shared_manifests[0] == manifest,
+                      "foreign node 0 state is wrong");
+    failures += check(node1 != nullptr && node1->foreign && node1->depth == 1 &&
+                          node1->parent == foreign0,
+                      "foreign chain parent/depth is wrong");
+
+    // Foreign nodes are not in the local tree: the local match sees nothing, and the device LRU
+    // has nothing to evict.
+    const pc::PrefixMatch local = index.match({}, hashes, {});
+    failures += check(local.matched_blocks == 0, "foreign chain must not be locally matchable");
+    failures += check(index.evict_device_lru() == pc::kInvalidNode,
+                      "foreign node must not be in the local LRU");
+
+    // The manifest ref import_foreign took is still held: pages stay pinned and are not
+    // release-pending through the allocator.
+    failures += check(tier->slab(page1) != nullptr && tier->slab(page1)->pinned() &&
+                          !tier->slab(page1)->release_pending,
+                      "import must not release a manifest-owned page through the allocator");
+
+    // A device fill on a foreign node keeps the manifest reference.
+    index.begin_device_fill(foreign1, pc::PoolPages{{std::array<std::int32_t, pc::kMaxPools>{7, -1}}});
+    index.finish_device_fill(foreign1, true);
+    node1 = index.node(foreign1);
+    failures += check(node1 != nullptr && node1->foreign && node1->host_shared &&
+                          node1->host_page == page1 &&
+                          node1->device_state == pc::Residency::Resident,
+                      "foreign node must stay manifest-owned after a device fill");
+
+    // Rule 6: block 0 already has a local node, so the local node keeps its own storage; block 1
+    // has no local match, so the filled foreign node becomes the local node.
+    const pc::NodeId local0 = commit_block(index, index.root(), 10, 3);
+    failures += check(local0 != pc::kInvalidNode, "local block 0 commit failed");
+
+    std::vector<std::int32_t> all_tokens;
+    all_tokens.insert(all_tokens.end(), tokens0.begin(), tokens0.end());
+    all_tokens.insert(all_tokens.end(), tokens1.begin(), tokens1.end());
+    failures += check(index.commit_foreign(manifest, std::span<const std::int32_t>(all_tokens)),
+                      "commit_foreign failed");
+
+    const pc::ChildMatch replay0 = index.find_child(index.root(), hashes[0], tokens0, 0);
+    const pc::ChildMatch replay1 = index.find_child(local0, hashes[1], tokens1, 0);
+    const pc::NodeId local1 = replay1.node;
+    failures += check(replay0.node == local0 && local0 != foreign0,
+                      "rule 6 must keep the existing local node for block 0");
+    failures += check(replay1.node == local1 &&
+                          index.node(local1)->device_pages.page[0] == 7,
+                      "committed foreign block 1 must carry its device pages into the local tree");
+    const pc::BlockNode* committed = index.node(local1);
+    failures += check(committed != nullptr && !committed->foreign && !committed->host_shared &&
+                          committed->host_page == pc::kInvalidHostPage &&
+                          committed->host_state == pc::Residency::Absent &&
+                          committed->device_state == pc::Residency::Resident &&
+                          committed->live,
+                      "committed node must drop the manifest host reference");
+
+    // The foreign snapshot is now a local snapshot anchored at the deepest committed node, and the
+    // manifest ref import took is still held until release_foreign.
+    const pc::SnapshotId snap = index.foreign_snapshot(manifest);
+    const pc::Snapshot* record = index.snapshot(snap);
+    failures += check(record != nullptr && !record->foreign && !record->host_shared &&
+                          record->shared_manifest_id == 0 &&
+                          record->host_page == pc::kInvalidHostPage && record->live &&
+                          record->anchor == local1,
+                      "committed foreign snapshot must stop being manifest-owned");
+
+    // The retained ref is still held: pages stay pinned, the manifest is still recorded.
+    failures += check(tier->manifest_count() == 1, "manifest must survive until release_foreign");
+    failures += check(tier->slab(page1) != nullptr && tier->slab(page1)->pinned(),
+                      "manifest pages must stay pinned until release_foreign");
+
+    // `release_foreign` performs the single release for the ref `import_foreign` took, so the
+    // publisher ref is the last one and the manifest becomes evictable.
+    index.release_foreign(manifest);
+    failures += check(tier->manifest_count() == 1, "release_foreign must not erase the manifest");
+    failures += check(!tier->release_manifest(manifest), "the last ref must reach zero");
+    failures += check(tier->evict_one() == 1, "the released manifest must be evictable");
+    failures += check(tier->slab(page1) != nullptr && !tier->slab(page1)->occupied,
+                      "evicted manifest page must return to the pool");
+
+    // Bookkeeping: the committed snapshot is still live in the local table, so the count stays 1;
+    // detaching it returns to zero without wrapping.
+    failures += check(index.live_snapshot_count() == 1,
+                      "committed foreign snapshot must still be counted live");
+    index.remove_snapshot(snap);
+    failures += check(index.live_snapshot_count() == 0,
+                      "detaching the committed snapshot must return the count to zero");
+
+    // Cancel path: import then release without commit deletes the snapshot and the count returns
+    // to zero.
+    std::vector<std::uint64_t> cancel_hashes = {hashes[0]};
+    std::vector<pc::HostPageId> cancel_pages = {tier->allocate_block().page};
+    const pc::HostPageId cancel_state = tier->allocate_snapshot().page;
+    ninfer::SharedHostTier::PublishData cancel_data;
+    cancel_data.tp          = 1;
+    cancel_data.frontier    = 64;
+    cancel_data.hashes      = cancel_hashes;
+    cancel_data.block_pages = cancel_pages;
+    cancel_data.state_page  = cancel_state;
+    const std::uint64_t cancel_manifest = tier->publish(1, std::move(cancel_data));
+    pc::PrefixIndex::ForeignView cancel_view;
+    cancel_view.manifest_id  = cancel_manifest;
+    cancel_view.frontier     = 64;
+    cancel_view.hashes       = cancel_hashes;
+    cancel_view.block_pages  = cancel_pages;
+    cancel_view.state_page   = cancel_state;
+    failures += check(index.import_foreign(cancel_view), "cancel-path import failed");
+    failures += check(index.live_snapshot_count() == 1, "cancel-path import must count the snapshot");
+    index.release_foreign(cancel_manifest);
+    failures += check(index.live_snapshot_count() == 0,
+                      "cancel-path release must return the count to zero");
+    return failures;
+}
+
+// probe_device: longest local device-resident prefix along a hash chain, 64-aligned; stops at the
+// first missing or non-resident block. No GPU: the committed nodes carry raw page ids and the
+// residency transitions are pure bookkeeping.
+int test_probe_device() {
+    int failures = 0;
+    TestSink sink;
+    pc::PrefixIndex index({.device_snapshot_slots = 1}, &sink);
+
+    std::vector<std::int32_t> all;
+    for (std::int32_t seed = 10; seed <= 30; seed += 10) {
+        const auto tokens = block_tokens(seed);
+        all.insert(all.end(), tokens.begin(), tokens.end());
+    }
+    const std::vector<std::uint64_t> hashes = pc::chain_block_hashes(std::span<const std::int32_t>(all));
+    failures += check(hashes.size() == 3, "three full blocks must chain three hashes");
+    failures += check(index.probe_device(hashes) == 0, "cold index must probe an empty frontier");
+
+    auto fixture = make_test_paged_pool(4);
+    const std::vector<std::int32_t> pages = fixture.pool->acquire_cache_pages(3);
+    pc::NodeId parent = index.root();
+    for (std::size_t block = 0; block < hashes.size(); ++block) {
+        const std::span<const std::int32_t> tokens =
+            std::span<const std::int32_t>(all).subspan(block * pc::kBlockTokens, pc::kBlockTokens);
+        bool adopted = false;
+        const pc::NodeId node = index.commit_block(
+            pc::BlockCommit{.parent = parent,
+                            .lookup_hash = hashes[block],
+                            .extra = 0,
+                            .tokens = tokens,
+                            .pages = {std::array<std::int32_t, pc::kMaxPools>{pages[block], -1}}},
+            adopted);
+        failures += check(node != pc::kInvalidNode && adopted, "probe test commit failed");
+        parent = node;
+    }
+    failures += check(index.probe_device(hashes) == 3U * static_cast<std::uint32_t>(pc::kBlockTokens),
+                      "three committed resident blocks must probe the full frontier");
+    failures += check(index.probe_device(hashes) % static_cast<std::uint32_t>(pc::kBlockTokens) == 0,
+                      "probe frontier must be block aligned");
+
+    // Evicting the LRU head (block 0, unbacked, no host allocator) erases its subtree; the probe
+    // stops at the root even though blocks 1 and 2 were resident.
+    failures += check(index.evict_device_lru() != pc::kInvalidNode,
+                      "unbacked LRU head must be evictable");
+    failures += check(index.probe_device(hashes) == 0,
+                      "probe must stop at the first missing block after eviction");
+
+    // Re-committing only the head advances the frontier to exactly one block.
+    const std::span<const std::int32_t> head_tokens =
+        std::span<const std::int32_t>(all).subspan(0, pc::kBlockTokens);
+    bool adopted = false;
+    const pc::NodeId head = index.commit_block(
+        pc::BlockCommit{.parent = index.root(),
+                        .lookup_hash = hashes[0],
+                        .extra = 0,
+                        .tokens = head_tokens,
+                        .pages = {std::array<std::int32_t, pc::kMaxPools>{pages[0], -1}}},
+        adopted);
+    failures += check(head != pc::kInvalidNode && adopted, "head re-commit failed");
+    failures += check(index.probe_device(hashes) == static_cast<std::uint32_t>(pc::kBlockTokens),
+                      "probe must stop at the first missing block, not skip to a deeper one");
+
+    // A chain shorter than the committed path reports only its own blocks.
+    failures += check(index.probe_device(std::span<const std::uint64_t>(hashes).subspan(0, 1)) ==
+                          static_cast<std::uint32_t>(pc::kBlockTokens),
+                      "probe over a shorter chain must report only its own blocks");
+    return failures;
+}
+
 int main() {
     int failures = 0;
+    failures += test_probe_device();
+    failures += test_host_allocator_contract();
     failures += test_slab_pool_basic();
     failures += test_slab_pool_eviction();
     failures += test_slab_pool_gdsf();
     failures += test_prefix_index_host_residency();
     failures += test_device_fill_roundtrip();
     failures += test_evict_demote_vs_erase();
+    failures += test_cache_page_accounting();
+    failures += test_evict_skips_pinned_subtree();
     failures += test_slab_eviction_reconciliation();
     failures += test_slot_demote_host_backed();
     failures += test_snapshot_restore_roundtrip();
     failures += test_best_host_admission();
+    failures += test_overlapping_manifests_share_block_page();
+    failures += test_import_foreign();
     if (failures == 0) {
         std::printf("All host-tier unit tests passed.\n");
         return 0;

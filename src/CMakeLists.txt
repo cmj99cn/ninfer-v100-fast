@@ -27,12 +27,16 @@ add_library(ninfer_core STATIC
   core/tensor.cpp
   core/decode_graph.cpp
   runtime/engine/admission_policy.cpp
+  runtime/engine/engine_router.cpp
   runtime/engine/kv_capacity.cpp
   runtime/engine/public_types.cpp
   runtime/engine/request_memory.cpp
   runtime/prefix_cache/prefix_index.cpp
   runtime/prefix_cache/tap_planner.cpp
-  runtime/prefix_cache/host_slab_pool.cpp)
+  runtime/prefix_cache/host_page_allocator.h
+  runtime/prefix_cache/host_slab_pool.cpp
+  runtime/prefix_cache/shared_host_tier.cpp
+  runtime/prefix_cache/shared_host_tier.h)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads ninfer_nccl)
@@ -406,6 +410,8 @@ add_library(ninfer_engine STATIC
   targets/registry.cpp
   runtime/contract/sampling.cpp
   runtime/engine/engine.cpp
+  runtime/engine/engine_pool.cpp
+  runtime/engine/shared_model.cpp
   runtime/engine/raw_output_log.cpp)
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)

@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <memory>
+#include <span>
 #include <utility>
 
 namespace ninfer {
@@ -29,6 +30,15 @@ public:
     // prompt's ids to build extended "prompt + already-agreed continuation" probes via
     // Engine::prepare_tokens(). Not part of the wire-facing API.
     [[nodiscard]] std::vector<TokenId> debug_token_ids() const;
+
+    // The frontend-chained content-addressed key for every complete 64-token block of this
+    // prompt, in block order. Empty when the prompt has fewer than one full block. These are the
+    // keys a shared host-tier manifest is addressed by, so a caller can build a `PrefixReuseHint`
+    // from them without re-deriving anything. Not copied; the prompt owns the storage.
+    [[nodiscard]] std::span<const std::uint64_t> block_hashes() const;
+
+    // Exact token count of the prepared prompt.
+    [[nodiscard]] std::uint32_t token_count() const noexcept;
 
 private:
     class Impl;
@@ -96,10 +106,30 @@ public:
                               const CancellationView& cancellation = {});
 
     [[nodiscard]] const EngineOptions& options() const;
+    // Process-level handles owned or shared by this Engine. `shared_host_tier()` is null when the
+    // target uses a private host pool or the prefix cache has no host tier.
+    [[nodiscard]] std::shared_ptr<SharedModel> shared_model() const;
+    [[nodiscard]] std::shared_ptr<SharedHostTier> shared_host_tier() const;
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MetricsSnapshot metrics() const;
+
+    // Content-addressed prefix residency for a prepared prompt: the longest block-aligned prefix
+    // this Engine's local device tree holds resident, plus the longest prefix the shared host tier
+    // has a live manifest for. The returned probe is a copy of the frontier/id values; it holds no
+    // reference to the index or the tier. `block_tokens` is the probe granularity (64).
+    [[nodiscard]] PrefixProbe prefix_probe(const PreparedPrompt& prompt) const;
+
+    // The same probe read straight from a block-hash chain, for a caller that holds the chain but no
+    // PreparedPrompt: the EnginePool admission core scores one pending request against one instance
+    // through this path.
+    [[nodiscard]] PrefixProbe prefix_probe(std::span<const std::uint64_t> block_hashes) const;
+
+    // Boundary-consistent capacity snapshot of this Engine: text KV pool page counts, the
+    // scheduler's active/pending counts, and the startup-fixed execution facts. `recent_prefill_tps`
+    // is 0.0 until the first prefill completes.
+    [[nodiscard]] CapacitySnapshot capacity_snapshot() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     void reset_memory_peaks() noexcept;
 

@@ -2,10 +2,12 @@
 // both the Prometheus text exposition and the JSON object carry the device, KV, host, and
 // scheduler figures. No GPU or artifact required.
 
+#include "runtime/engine/engine_pool.h"
 #include "serve/metrics_format.h"
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -43,7 +45,36 @@ ninfer::MetricsSnapshot sample() {
     m.prefix_cache.host.used_bytes                     = 7ULL << 30;
     m.prefix_cache.host.block_slab_count               = 10291;
     m.prefix_cache.host.snapshot_slab_count            = 38;
+    m.instances.push_back(ninfer::InstanceMetrics{.free_kv_pages = 4096,
+                                                  .active_requests = 2,
+                                                  .pending_requests = 1,
+                                                  .prefix_hit_tokens = 8192,
+                                                  .manifest_restore_tokens = 4096,
+                                                  .committed_tokens = 200});
+    m.instances.push_back(ninfer::InstanceMetrics{.free_kv_pages = 2048,
+                                                  .active_requests = 1,
+                                                  .pending_requests = 0,
+                                                  .prefix_hit_tokens = 1024,
+                                                  .manifest_restore_tokens = 0,
+                                                  .committed_tokens = 150});
     return m;
+}
+
+ninfer::MetricsSnapshot instance_snapshot(std::uint64_t committed, std::uint32_t running,
+                                          std::uint32_t waiting, std::uint32_t free_pages) {
+    ninfer::MetricsSnapshot snapshot;
+    snapshot.scheduler.running_requests        = running;
+    snapshot.scheduler.waiting_requests        = waiting;
+    snapshot.scheduler.computed_prefill_tokens = committed * 2;
+    snapshot.scheduler.committed_decode_tokens = committed;
+    snapshot.main_kv.free_pages                = free_pages;
+    // Both instances share one host tier, so each reports the same process-wide figures.
+    snapshot.prefix_cache.host.enabled           = true;
+    snapshot.prefix_cache.host.pinned_bytes      = 8ULL << 30;
+    snapshot.prefix_cache.host.used_bytes        = 3ULL << 30;
+    snapshot.prefix_cache.host.block_slab_count  = 10291;
+    snapshot.prefix_cache.host.snapshot_slab_count = 38;
+    return snapshot;
 }
 
 int test_prometheus() {
@@ -71,6 +102,18 @@ int test_prometheus() {
     failures += check(has("ninfer_requests{state=\"waiting\"} 3"), "waiting requests missing");
     failures += check(has("# TYPE ninfer_decode_rounds_total counter"),
                       "decode rounds counter missing");
+    failures += check(has("ninfer_instance_free_kv_pages{instance=\"0\"} 4096"),
+                      "instance 0 free KV pages missing");
+    failures += check(has("ninfer_instance_active_requests{instance=\"0\"} 2"),
+                      "instance 0 active requests missing");
+    failures += check(has("ninfer_instance_pending_requests{instance=\"1\"} 0"),
+                      "instance 1 pending requests missing");
+    failures += check(has("ninfer_instance_prefix_hit_tokens_total{instance=\"0\"} 8192"),
+                      "instance 0 prefix hit tokens missing");
+    failures += check(has("ninfer_instance_manifest_restore_tokens_total{instance=\"0\"} 4096"),
+                      "instance 0 manifest restore tokens missing");
+    failures += check(has("ninfer_instance_committed_tokens_total{instance=\"1\"} 150"),
+                      "instance 1 committed tokens missing");
     return failures;
 }
 
@@ -94,6 +137,78 @@ int test_json() {
                       "json host slab count wrong");
     failures += check(parsed["scheduler"]["waiting_requests"] == 3,
                       "json scheduler waiting wrong");
+    failures += check(parsed["instances"].size() == 2, "json instance array size wrong");
+    failures += check(parsed["instances"][0]["active_requests"] == 2,
+                      "json instance active requests wrong");
+    failures += check(parsed["instances"][0]["pending_requests"] == 1,
+                      "json instance pending requests wrong");
+    failures += check(parsed["instances"][1]["prefix_hit_tokens"] == 1024,
+                      "json instance prefix hit tokens wrong");
+    failures += check(parsed["instances"][1]["manifest_restore_tokens"] == 0,
+                      "json instance manifest restore tokens wrong");
+    failures += check(parsed["instances"][0]["committed_tokens"] == 200,
+                      "json instance committed tokens wrong");
+    return failures;
+}
+
+// Pool aggregation is exercised with two fake per-instance snapshots: the aggregate committed
+// counter must equal the sum of the instance rows, and every row must carry the fields the
+// pool derives. This is aggregation, not rendering.
+int test_pool_metrics_aggregate() {
+    int failures = 0;
+    const std::array<ninfer::PoolInstanceMetrics, 2> rows{{
+        ninfer::PoolInstanceMetrics{
+            .metrics = instance_snapshot(100, 2, 1, 4096),
+            .prefix_hit_tokens = 7000,
+            .manifest_restore_tokens = 3000,
+        },
+        ninfer::PoolInstanceMetrics{
+            .metrics = instance_snapshot(250, 1, 3, 2048),
+            .prefix_hit_tokens = 1000,
+            .manifest_restore_tokens = 0,
+        },
+    }};
+
+    const ninfer::MetricsSnapshot pool = ninfer::aggregate_instance_metrics(rows);
+
+    failures += check(pool.instances.size() == 2,
+                      "the aggregate did not carry one row per instance");
+    failures += check(pool.scheduler.committed_decode_tokens == 350,
+                      "the aggregate committed decode counter is not the sum");
+    failures += check(pool.scheduler.computed_prefill_tokens == 700,
+                      "the aggregate prefill counter is not the sum");
+    if (pool.instances.size() == 2) {
+        failures += check(pool.instances[0].committed_tokens == 100 &&
+                              pool.instances[1].committed_tokens == 250,
+                          "an instance row carries the wrong committed token count");
+        failures += check(pool.instances[0].committed_tokens +
+                              pool.instances[1].committed_tokens ==
+                          pool.scheduler.committed_decode_tokens,
+                          "the instance committed rows do not sum to the aggregate");
+        failures += check(pool.instances[0].active_requests == 2 &&
+                              pool.instances[1].active_requests == 1,
+                          "an instance row carries the wrong active request count");
+        failures += check(pool.instances[0].pending_requests == 1 &&
+                              pool.instances[1].pending_requests == 3,
+                          "an instance row carries the wrong pending request count");
+        failures += check(pool.instances[0].free_kv_pages == 4096 &&
+                              pool.instances[1].free_kv_pages == 2048,
+                          "an instance row carries the wrong free KV page count");
+        failures += check(pool.instances[0].prefix_hit_tokens == 7000 &&
+                              pool.instances[1].prefix_hit_tokens == 1000,
+                          "an instance row carries the wrong prefix hit token count");
+        failures += check(pool.instances[0].manifest_restore_tokens == 3000 &&
+                              pool.instances[1].manifest_restore_tokens == 0,
+                          "an instance row carries the wrong manifest restore token count");
+    }
+    failures += check(pool.main_kv.free_pages == 6144,
+                      "the aggregate free KV pages are not the sum");
+    failures += check(pool.prefix_cache.host.pinned_bytes == (8ULL << 30) &&
+                          pool.prefix_cache.host.used_bytes == (3ULL << 30),
+                      "the aggregate multiplied the shared host tier");
+    failures += check(pool.prefix_cache.host.block_slab_count == 10291 &&
+                          pool.prefix_cache.host.snapshot_slab_count == 38,
+                      "the aggregate summed shared host slab counts");
     return failures;
 }
 
@@ -103,6 +218,7 @@ int main() {
     int failures = 0;
     failures += test_prometheus();
     failures += test_json();
+    failures += test_pool_metrics_aggregate();
     if (failures == 0) {
         std::printf("metrics format tests passed.\n");
         return 0;

@@ -13,6 +13,8 @@
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "runtime/prefix_cache/host_slab_pool.h"
+#include "runtime/prefix_cache/shared_host_tier.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -70,6 +72,9 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
+    // Cross-instance hint passed through the base plan; `plan_request_for_lane` validates it and
+    // either records it on the lane plan or clears it with `HintRejected`.
+    PrefixReuseHint prefix_hint;
 };
 
 template <>
@@ -97,6 +102,10 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::vector<ninfer::prefix_cache::NodeId> block_path;
     std::uint32_t block_path_blocks = 0;
     std::vector<std::uint32_t> prefix_taps;
+
+    // Validated cross-instance `PrefixReuseHint`. When set, `start_prefill_lane` re-verifies the
+    // manifest against the shared tier and restores through the foreign import path.
+    PrefixReuseHint prefix_hint;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -209,6 +218,21 @@ struct SequenceState {
     ninfer::prefix_cache::SnapshotId prefix_snapshot =
         ninfer::prefix_cache::kInvalidSnapshot;
     bool prefix_borrowed = false;
+    // Full (tail_len == 0) taps captured during this request. They are published only after the
+    // request completes successfully, never on failure/cancellation.
+    struct PendingSharedTap {
+        ninfer::prefix_cache::SnapshotId id;
+        std::uint32_t generation;
+    };
+    std::vector<PendingSharedTap> prefix_pending_shared_taps;
+    // Manifest id of the foreign import this request restored from, or 0. On completion the
+    // request commits its foreign device pages into local nodes before releasing the import; on
+    // cancel it releases the import without touching the manifest-owned host pages.
+    std::uint64_t prefix_foreign_manifest = 0;
+    // Prompt tokens of the request that performed the foreign import. Commit must not depend on the
+    // tap plan, which can be empty when the hint frontier leaves no block boundary before the
+    // prompt end; this copy is what `commit_foreign` compares against.
+    std::vector<TokenId> prefix_foreign_tokens;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -282,7 +306,8 @@ struct PeerRuntime {
 class ProgramImplCore {
 public:
     ProgramImplCore(const std::array<const LoadedModelData*, kMaximumDevices>& models,
-                    const SequencePlanImpl& plan, ExecutionContext& execution);
+                    const SequencePlanImpl& plan, ExecutionContext& execution,
+                    const EngineOptions& options);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan
@@ -331,7 +356,19 @@ public:
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    [[nodiscard]] std::shared_ptr<SharedHostTier> shared_host_tier() const noexcept {
+        return shared_tier;
+    }
+    void set_shared_tier_owner(std::uint64_t owner) noexcept { shared_tier_owner = owner; }
     [[nodiscard]] MetricsSnapshot metrics() const noexcept;
+
+    // Longest device-resident local prefix plus the longest shared-tier manifest prefix for the
+    // block-hash chain. The probe copies the frontier/id values and holds no reference to the
+    // index or the tier.
+    [[nodiscard]] PrefixProbe prefix_probe(std::span<const std::uint64_t> hashes) const;
+    // Text KV pool page counts, the startup-fixed execution facts, and the most recent prefill
+    // throughput sample. Scheduler counters are filled by the executor.
+    [[nodiscard]] CapacitySnapshot capacity_snapshot() const noexcept;
 
     void reset_memory_peaks() noexcept;
 
@@ -419,8 +456,13 @@ public:
     // null unless the cache is enabled, so the default path is byte-identical to the legacy one.
     struct PrefixCacheSink;
     std::unique_ptr<PrefixCacheSink> prefix_sink;
+    // Shared pinned-host tier, when one is configured. Declared before the index so the index
+    // destructor can release its manifests while the tier is still alive.
+    std::shared_ptr<SharedHostTier> shared_tier;
     std::unique_ptr<ninfer::prefix_cache::PrefixIndex> prefix_index;
-    std::unique_ptr<ninfer::prefix_cache::HostSlabPool> prefix_host_pool; // M2
+    std::uint64_t shared_tier_owner = 0;
+    std::unique_ptr<ninfer::prefix_cache::HostSlabPool> local_host_pool; // M2 private pool
+    ninfer::prefix_cache::HostPageAllocator* prefix_host_allocator = nullptr;
     std::uint32_t prefix_snapshot_slots = 0;
     std::uint32_t prefix_max_new_taps   = 0;
     std::uint32_t prefix_ladder_tokens  = 0;
@@ -514,6 +556,12 @@ public:
 
     std::size_t workspace_logical_peak_bytes = 0;
 
+    // Most recent completed prefill sample: prompt tokens evaluated (resident prefix hits
+    // excluded) over prefill seconds (vision excluded). Zero before the first prefill finalizes;
+    // `capacity_snapshot` reports it as `recent_prefill_tps`.
+    std::uint64_t last_prefill_tokens = 0;
+    double last_prefill_seconds = 0.0;
+
     // See logits_capture's comment. Read-only; the caller owns thread-safety (single-lane, read
     // after wait() returns). Empty while capture is disabled.
     [[nodiscard]] std::span<const std::uint16_t> last_round_logits_bf16() const noexcept {
@@ -546,7 +594,17 @@ private:
     // Release a request's prefix-cache state: persist blocks to the host tier (M2), return any
     // unconsumed tap-slot reservations, and drop the request's node/snapshot pins so its committed
     // blocks become evictable. Called when a request completes or its lane is cleared; idempotent.
-    void finalize_prefix_cache_state(SequenceState& sequence) noexcept;
+    void finalize_prefix_cache_state(SequenceState& sequence, bool request_completed) noexcept;
+    // Cross-instance hint execution: re-verify the hint against the shared tier, import the
+    // manifest's foreign chain, and complete the lane plan's block path/snapshot so the existing
+    // BlockSnapshot restore path runs over it. Returns false when the hint is rejected at
+    // execution time (manifest gone, identity mismatch, or a zero-token suffix), in which case the
+    // caller falls back to the cold path.
+    [[nodiscard]] bool restore_foreign_prefix_hint(SequenceState& sequence,
+                                                   RequestPlanImpl& plan,
+                                                   const PreparedPromptData& prompt);
+    void publish_shared_manifest(ninfer::prefix_cache::SnapshotId id,
+                                 std::uint32_t expected_generation) noexcept;
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();

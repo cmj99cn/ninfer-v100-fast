@@ -192,6 +192,15 @@ public:
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     [[nodiscard]] MetricsSnapshot metrics() const noexcept;
+
+    // Content-addressed prefix residency for a block-hash chain: the longest device-resident
+    // local prefix plus the longest shared-tier manifest prefix. The probe copies the frontier/id
+    // values and holds no reference to the index or the tier.
+    [[nodiscard]] PrefixProbe prefix_probe(std::span<const std::uint64_t> hashes) const;
+    // Text KV pool page counts, startup-fixed execution facts, and the most recent prefill
+    // throughput sample. Scheduler counters are filled by the executor.
+    [[nodiscard]] CapacitySnapshot capacity_snapshot() const noexcept;
+
     void reset_memory_peaks() noexcept;
 
     // Debug-only, OFF by default: capture of the full-vocabulary logits behind the most recently
@@ -213,6 +222,11 @@ public:
     [[nodiscard]] std::uint64_t peer_egress_check_rounds() const noexcept;
     [[nodiscard]] std::uint64_t peer_egress_check_mismatches() const noexcept;
 
+    // Shared pinned-host cache tier this Program publishes into, or null for a private pool or no
+    // host tier. Engine binds its owner id before executing requests.
+    [[nodiscard]] std::shared_ptr<SharedHostTier> shared_host_tier() const noexcept;
+    void set_shared_tier_owner(std::uint64_t owner) noexcept;
+
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;
     std::unique_ptr<detail::ProgramImpl<Variant>> impl_;
@@ -220,7 +234,8 @@ private:
     template <class V>
     friend std::unique_ptr<Program<V>>
     create_program(const std::array<const typename V::ModelView*, kMaximumDevices>&,
-                   typename V::WeightsProfile, SequencePlan<V>&&, ExecutionContext&);
+                   typename V::WeightsProfile, SequencePlan<V>&&, ExecutionContext&,
+                   const EngineOptions&);
 };
 
 template <class Variant>
@@ -236,6 +251,6 @@ template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
 create_program(const std::array<const typename Variant::ModelView*, kMaximumDevices>& models,
                typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
-               ExecutionContext& execution);
+               ExecutionContext& execution, const EngineOptions& options);
 
 } // namespace ninfer::targets::qwen3_6

@@ -107,7 +107,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
 
 std::unique_ptr<Package::Program>
 Package::create_program(const LoadedModel& model, SequencePlan&& plan,
-                        ExecutionContext& execution) {
+                        ExecutionContext& execution, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     if (execution.tp != 1) {
         throw std::invalid_argument("qwen3_6_35b_a3b has no tensor-parallel execution path");
@@ -115,7 +115,7 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan,
     std::array<const detail::RuntimeModelView*, artifact::kMaximumDevices> models{};
     models[0] = &model.impl_->data.runtime;
     return qwen3_6::create_program<detail::Variant>(models, model.impl_->weights_profile,
-                                                   std::move(plan), execution);
+                                                   std::move(plan), execution, options);
 }
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b

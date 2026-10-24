@@ -169,7 +169,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
 
 std::unique_ptr<Package::Program>
 Package::create_program(const LoadedModel& model, SequencePlan&& plan,
-                        ExecutionContext& execution) {
+                        ExecutionContext& execution, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     const detail::LoadedModelData& data = model.impl_->data;
     if (data.tp != execution.tp) {
@@ -181,7 +181,7 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan,
         models[static_cast<std::size_t>(rank)] = &data.view(rank);
     }
     return qwen3_6::create_program<detail::Variant>(models, model.impl_->weights_profile,
-                                                   std::move(plan), execution);
+                                                   std::move(plan), execution, options);
 }
 
 } // namespace ninfer::targets::qwen3_6_27b

@@ -4,6 +4,8 @@
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/concurrent_executor.h"
+#include "runtime/engine/shared_model.h"
+#include "runtime/prefix_cache/shared_host_tier.h"
 #include "targets/registry.h"
 
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -24,6 +26,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
+    resolved.execution.prefix_reuse_hint       = options.execution.prefix_reuse_hint;
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     return resolved;
@@ -73,6 +76,17 @@ std::vector<int> resolve_execution_device_ids(const EngineOptions& options) {
     return options.devices;
 }
 
+std::shared_ptr<SharedModel> resolve_shared_model(const EngineOptions& options) {
+    if (options.shared_model != nullptr) {
+        if (options.shared_model->path() != options.artifact_path) {
+            throw std::invalid_argument(
+                "EngineOptions.shared_model path does not match EngineOptions.artifact_path");
+        }
+        return options.shared_model;
+    }
+    return std::make_shared<SharedModel>(options.artifact_path);
+}
+
 std::string context_capacity_error(std::uint32_t prompt_tokens, std::uint32_t max_context) {
     return "prepared prompt has " + std::to_string(prompt_tokens) +
            " tokens, exceeding Engine max_context " + std::to_string(max_context);
@@ -115,6 +129,18 @@ PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
 std::vector<TokenId> PreparedPrompt::debug_token_ids() const {
     if (impl_ == nullptr) { throw std::logic_error("PreparedPrompt is empty"); }
     return targets::qwen3_6::PreparedPromptAccess::view(impl_->value).token_ids;
+}
+
+std::span<const std::uint64_t> PreparedPrompt::block_hashes() const {
+    if (impl_ == nullptr) { throw std::logic_error("PreparedPrompt is empty"); }
+    return std::span<const std::uint64_t>(
+        targets::qwen3_6::PreparedPromptAccess::view(impl_->value).block_hashes);
+}
+
+std::uint32_t PreparedPrompt::token_count() const noexcept {
+    if (impl_ == nullptr) { return 0; }
+    return static_cast<std::uint32_t>(
+        targets::qwen3_6::PreparedPromptAccess::view(impl_->value).token_ids.size());
 }
 
 class GenerationHandle::Impl {
@@ -188,12 +214,23 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)),
+          shared_model(resolve_shared_model(options)),
           execution(resolve_execution_device_ids(options)) {
         DeviceContext& device = execution.primary();
-        auto constructed      = targets::construct_target(options, execution);
+        auto constructed      = targets::construct_target(options, execution, *shared_model);
         active                = std::move(constructed.active);
         load                  = std::move(constructed.load);
         sampling_defaults     = constructed.sampling_defaults;
+        std::visit(
+            [&](auto& target_ptr) {
+                if (target_ptr == nullptr) { return; }
+                shared_host_tier = target_ptr->program->shared_host_tier();
+                if (shared_host_tier != nullptr) {
+                    owner_id = shared_host_tier->allocate_owner();
+                    target_ptr->program->set_shared_tier_owner(owner_id);
+                }
+            },
+            active);
         executor              = std::visit(
             [&](auto& target_ptr) -> Executor {
                 using Instance =
@@ -209,6 +246,13 @@ public:
 
     ~Impl() noexcept {
         executor.emplace<std::monostate>();
+        // Destroy the Program (which drops its cache pins and releases its tap manifests) before
+        // retiring the owner and dropping the shared tier.
+        active = targets::ActiveTarget{};
+        if (shared_host_tier != nullptr) {
+            if (owner_id != 0) { shared_host_tier->retire_owner(owner_id); }
+            shared_host_tier.reset();
+        }
         for (int rank = execution.tp - 1; rank >= 0; --rank) {
             try {
                 execution.dev[static_cast<std::size_t>(rank)]->synchronize();
@@ -217,6 +261,9 @@ public:
     }
 
     EngineOptions options;
+    std::shared_ptr<SharedModel> shared_model;
+    std::shared_ptr<SharedHostTier> shared_host_tier;
+    std::uint64_t owner_id = 0;
     // One or two devices. `execution.primary()` is rank 0 -- the device the executor thread binds
     // to, the one that owns request bookkeeping, sampling and the emitted tokens.
     ExecutionContext execution;
@@ -360,6 +407,16 @@ const EngineOptions& Engine::options() const {
     return impl_->options;
 }
 
+std::shared_ptr<SharedModel> Engine::shared_model() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->shared_model;
+}
+
+std::shared_ptr<SharedHostTier> Engine::shared_host_tier() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->shared_host_tier;
+}
+
 LoadSummary Engine::load_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->load;
@@ -412,6 +469,50 @@ MetricsSnapshot Engine::metrics() const {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
                 return executor->metrics();
+            }
+        },
+        impl_->executor);
+}
+
+PrefixProbe Engine::prefix_probe(const PreparedPrompt& prompt) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
+    const std::span<const std::uint64_t> hashes = prompt.block_hashes();
+    return std::visit(
+        [&](const auto& executor) -> PrefixProbe {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->prefix_probe(hashes);
+            }
+        },
+        impl_->executor);
+}
+
+PrefixProbe Engine::prefix_probe(std::span<const std::uint64_t> block_hashes) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& executor) -> PrefixProbe {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->prefix_probe(block_hashes);
+            }
+        },
+        impl_->executor);
+}
+
+CapacitySnapshot Engine::capacity_snapshot() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& executor) -> CapacitySnapshot {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->capacity_snapshot();
             }
         },
         impl_->executor);

@@ -107,6 +107,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    base->prefix_hint                    = options.prefix_reuse_hint;
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
@@ -229,48 +230,86 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         return true;
     };
 
+    // Cross-instance `PrefixReuseHint` validation. A hint that names no manifest is not a hint at
+    // all; a present hint must match this Engine's tp, the index's block size, and a block-aligned
+    // frontier inside the prompt, and the Program must own a live shared tier to act on it. A hint
+    // that fails any of these is cleared and recorded as `HintRejected`; the request then falls
+    // through to the ordinary local-match path.
+    const bool hint_present = base.prefix_hint.manifest_id != 0;
+    const bool hint_usable =
+        base.prefix_hint.valid() &&
+        base.prefix_hint.tp == static_cast<std::uint32_t>(tp) &&
+        base.prefix_hint.block_tokens ==
+            static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens) &&
+        base.prefix_hint.frontier < plan->summary.prompt_tokens &&
+        base.prefix_hint.frontier %
+            static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens) == 0U &&
+        prefix_index != nullptr && shared_tier != nullptr && shared_tier->enabled();
+
     if (!base.allow_prefix_reuse) {
         plan->reuse_reason = PrefixReuseReason::ReuseDisabled;
     } else if (!prompt.identity.reusable) {
         plan->reuse_reason = PrefixReuseReason::PromptNotReusable;
-    } else if (admit_block_snapshot()) {
-        // Hybrid block-snapshot reuse selected by the helper; plan fields are already populated.
-        // Content-addressed reuse does not depend on a retained owner sequence, so it is tried
-        // before the legacy owner checks.
-    } else if (!sequence.retained) {
-        plan->reuse_reason = PrefixReuseReason::NoRetainedSequence;
     } else {
-        const bool dflash_append_ready =
-            speculative_backend != SpeculativeBackend::DFlash ||
-            sequence.dflash_context_frontier == sequence.execution_frontier;
-        if (sequence.execution_frontier != 0 && dflash_append_ready &&
-            qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                            sequence.execution_frontier)) {
-            plan->reuse        = ReusePath::AppendAtFrontier;
-            plan->reuse_base   = sequence.execution_frontier;
-            plan->reuse_reason = PrefixReuseReason::ReusedFrontier;
-        } else if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
-                   sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
-                   qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
-                                                   sequence.prefix_identity,
-                                                   sequence.rewrite_checkpoint.frontier)) {
-            plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
-            plan->reuse_base = sequence.rewrite_checkpoint.frontier;
-            plan->reuse_reason =
-                sequence.rewrite_checkpoint.kind == RewriteCheckpointKind::TurnClosure
-                    ? PrefixReuseReason::ReusedTurnCheckpoint
-                    : PrefixReuseReason::ReusedResponseCheckpoint;
-        } else if (sequence.execution_frontier == 0) {
-            plan->reuse_reason = PrefixReuseReason::FrontierEmpty;
-        } else if (!dflash_append_ready) {
-            plan->reuse_reason = PrefixReuseReason::DflashFrontierMismatch;
+        if (hint_present) {
+            if (hint_usable) {
+                plan->prefix_hint = base.prefix_hint;
+            } else {
+                plan->reuse_reason = PrefixReuseReason::HintRejected;
+            }
+        }
+
+        if (plan->prefix_hint.valid()) {
+            plan->reuse      = ReusePath::BlockSnapshot;
+            plan->reuse_base = plan->prefix_hint.frontier;
+            plan->block_path_blocks = static_cast<std::uint32_t>(
+                plan->prefix_hint.frontier /
+                static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens));
+            plan->reuse_reason = PrefixReuseReason::ReusedBlockSnapshot;
+            // `block_path` and `block_snapshot` are completed at execution time by the foreign
+            // import, which prefers an existing local node for every hash the local tree knows.
+        } else if (admit_block_snapshot()) {
+            // Hybrid block-snapshot reuse selected by the helper; plan fields are already populated.
+            // Content-addressed reuse does not depend on a retained owner sequence, so it is tried
+            // before the legacy owner checks.
+        } else if (!sequence.retained) {
+            if (plan->reuse_reason == PrefixReuseReason::None) {
+                plan->reuse_reason = PrefixReuseReason::NoRetainedSequence;
+            }
         } else {
-            plan->reuse_divergence = qwen3_6::detail::prefix_divergence(
-                prompt, sequence.ledger, sequence.execution_frontier);
-            plan->reuse_reason =
-                (!sequence.rewrite_checkpoint.valid || sequence.rewrite_checkpoint.frontier == 0)
-                    ? PrefixReuseReason::CheckpointUnavailable
-                    : PrefixReuseReason::FrontierPrefixMismatch;
+            const bool dflash_append_ready =
+                speculative_backend != SpeculativeBackend::DFlash ||
+                sequence.dflash_context_frontier == sequence.execution_frontier;
+            if (sequence.execution_frontier != 0 && dflash_append_ready &&
+                qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                                sequence.execution_frontier)) {
+                plan->reuse        = ReusePath::AppendAtFrontier;
+                plan->reuse_base   = sequence.execution_frontier;
+                plan->reuse_reason = PrefixReuseReason::ReusedFrontier;
+            } else if (sequence.rewrite_checkpoint.valid &&
+                       sequence.rewrite_checkpoint.frontier != 0 &&
+                       sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
+                       qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
+                                                       sequence.prefix_identity,
+                                                       sequence.rewrite_checkpoint.frontier)) {
+                plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
+                plan->reuse_base = sequence.rewrite_checkpoint.frontier;
+                plan->reuse_reason =
+                    sequence.rewrite_checkpoint.kind == RewriteCheckpointKind::TurnClosure
+                        ? PrefixReuseReason::ReusedTurnCheckpoint
+                        : PrefixReuseReason::ReusedResponseCheckpoint;
+            } else if (sequence.execution_frontier == 0) {
+                plan->reuse_reason = PrefixReuseReason::FrontierEmpty;
+            } else if (!dflash_append_ready) {
+                plan->reuse_reason = PrefixReuseReason::DflashFrontierMismatch;
+            } else {
+                plan->reuse_divergence = qwen3_6::detail::prefix_divergence(
+                    prompt, sequence.ledger, sequence.execution_frontier);
+                plan->reuse_reason =
+                    (!sequence.rewrite_checkpoint.valid || sequence.rewrite_checkpoint.frontier == 0)
+                        ? PrefixReuseReason::CheckpointUnavailable
+                        : PrefixReuseReason::FrontierPrefixMismatch;
+            }
         }
     }
 
@@ -350,7 +389,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     // The planner produces the prompt tail + geometric ladder, which is sufficient for the
     // OpenCode repro (the geometric ladder covers edits at various depths, and the prompt tail
     // covers the full-length case).
-    if (prefix_index != nullptr && !prompt.block_hashes.empty()) {
+    if (prefix_index != nullptr && !prompt.block_hashes.empty() && prompt.identity.reusable) {
         ninfer::prefix_cache::TapHint hints;
         ninfer::prefix_cache::TapPlanOptions options;
         options.prompt_tokens  = plan->summary.prompt_tokens;
@@ -387,17 +426,14 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
-    // A prompt that does not end on a kBlockTokens boundary prefills one extra short tail chunk so
-    // the hybrid cache can capture its deepest tap at a block-aligned frontier (advance_prefill caps
-    // the final chunk at floor(n/kBlockTokens)*kBlockTokens). Charge one prefill quantum for it so
-    // the executor's service projection is never exceeded; it is an upper bound (the extra chunk is
-    // skipped when no tap survives to the prompt tail).
+    // A planned tap below the prompt tail splits the final prefill chunk at that tap's frontier so
+    // the captured state image matches the published manifest. Charge one prefill quantum for the
+    // extra short chunk so the executor's service projection is never exceeded; it is an upper
+    // bound (the split is skipped when no tap survives to the prompt tail).
     const std::size_t tap_tail_split =
         prefix_index != nullptr && !plan->prefix_taps.empty() &&
                 plan->reuse_base < plan->summary.prompt_tokens &&
-                plan->summary.prompt_tokens %
-                        static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens) !=
-                    0
+                plan->prefix_taps.back() < plan->summary.prompt_tokens
             ? 1ULL
             : 0ULL;
     const std::size_t prefill_splits =

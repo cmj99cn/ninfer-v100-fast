@@ -166,7 +166,14 @@ std::array<Tokens, kLanes> reference(ninfer::Engine& engine, const Tokens& prefi
         require(depth[lane] > 0 && depth[lane] == depth[0],
                 "reference lanes resumed from different prefix depths");
     }
-    std::cout << "reference: shared depth=" << depth[0] << " lanes distinct" << std::endl;
+    bool distinct = true;
+    for (std::uint32_t i = 0; i < kLanes; ++i) {
+        for (std::uint32_t j = i + 1; j < kLanes; ++j) {
+            if (ref[i] == ref[j]) { distinct = false; }
+        }
+    }
+    std::cout << "reference: shared depth=" << depth[0] << " lanes "
+              << (distinct ? "distinct" : "collapsed") << std::endl;
     return ref;
 }
 
@@ -230,7 +237,17 @@ void require_consistent(const std::array<Tokens, kLanes>& ref, const ConcurrentR
             if (round.lanes[i].tokens == round.lanes[j].tokens) { distinct = false; }
         }
     }
-    require(distinct, "two concurrent lanes produced the same answer -- state is being shared");
+    bool reference_distinct = true;
+    for (std::uint32_t i = 0; i < kLanes; ++i) {
+        for (std::uint32_t j = i + 1; j < kLanes; ++j) {
+            if (ref[i] == ref[j]) { reference_distinct = false; }
+        }
+    }
+    // Greedy collapse is a model property, not a sharing defect: only demand distinct batched
+    // lanes when the single-lane reference answers are themselves distinct.
+    if (reference_distinct) {
+        require(distinct, "two concurrent lanes produced the same answer -- state is being shared");
+    }
 
     std::size_t exact = 0;
     for (std::uint32_t lane = 0; lane < kLanes; ++lane) {

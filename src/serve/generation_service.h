@@ -5,6 +5,7 @@
 // streaming callbacks, and tool-call parsing) outside the target package.
 
 #include "ninfer/engine.h"
+#include "runtime/engine/engine_pool.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
@@ -67,7 +68,14 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception);
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().
 struct PreparedRequest {
+    // Declared first so it is destroyed last. `GenerationService` waits for the request lifetime
+    // count to reach zero before destroying a multi-group `EnginePool`; that wait is only safe when
+    // every `PoolHandle` below has already run its destructor and released its permit.
+    std::shared_ptr<RequestLifetime> lifetime;
+    // Exactly one of these carries the submitted request: `generation` on the single-Engine path,
+    // `pooled_generation` on the multi-group path.
     ninfer::GenerationHandle generation;
+    ninfer::PoolHandle pooled_generation;
     ninfer::ResolvedSamplingParameters sampling;
     double prepare_seconds     = 0.0;
     double acquisition_seconds = 0.0;
@@ -79,30 +87,25 @@ struct PreparedRequest {
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
-    std::shared_ptr<RequestLifetime> lifetime;
 };
 
 class GenerationService {
 public:
     explicit GenerationService(ServeOptions options, LoadProgress load_progress = {});
+    ~GenerationService();
+
+    GenerationService(const GenerationService&)            = delete;
+    GenerationService& operator=(const GenerationService&) = delete;
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
+    [[nodiscard]] bool multi_group() const noexcept { return pool_ != nullptr; }
 
-    [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
-
-    [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
-
-    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
-
-    [[nodiscard]] ninfer::MetricsSnapshot metrics() const { return engine_->metrics(); }
-
-    [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
-        return engine_->media_cache_summary();
-    }
-
-    [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
-        return engine_->sampling_defaults();
-    }
+    [[nodiscard]] ninfer::LoadSummary load_summary() const;
+    [[nodiscard]] ninfer::MemorySummary memory_summary() const;
+    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const;
+    [[nodiscard]] ninfer::MetricsSnapshot metrics() const;
+    [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const;
+    [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const;
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
@@ -117,9 +120,13 @@ public:
 
 private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
+    [[nodiscard]] const ninfer::Engine& primary_engine() const;
+    [[nodiscard]] ninfer::EngineOptions make_engine_options(const std::vector<int>& devices,
+                                                            int device) const;
 
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
+    std::unique_ptr<ninfer::EnginePool> pool_;
     ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
 };

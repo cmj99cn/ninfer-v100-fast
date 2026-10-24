@@ -245,6 +245,16 @@ MetricsSnapshot Program<Variant>::metrics() const noexcept {
 }
 
 template <>
+PrefixProbe Program<Variant>::prefix_probe(std::span<const std::uint64_t> hashes) const {
+    return impl_->prefix_probe(hashes);
+}
+
+template <>
+CapacitySnapshot Program<Variant>::capacity_snapshot() const noexcept {
+    return impl_->capacity_snapshot();
+}
+
+template <>
 void Program<Variant>::reset_memory_peaks() noexcept {
     impl_->reset_memory_peaks();
 }
@@ -275,6 +285,16 @@ std::uint64_t Program<Variant>::peer_egress_check_mismatches() const noexcept {
 }
 
 template <>
+std::shared_ptr<SharedHostTier> Program<Variant>::shared_host_tier() const noexcept {
+    return impl_->shared_host_tier();
+}
+
+template <>
+void Program<Variant>::set_shared_tier_owner(std::uint64_t owner) noexcept {
+    impl_->set_shared_tier_owner(owner);
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {
@@ -286,7 +306,7 @@ template <>
 std::unique_ptr<Program<Variant>>
 create_program<Variant>(const std::array<const Variant::ModelView*, kMaximumDevices>& models,
                         Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
-                        ExecutionContext& execution) {
+                        ExecutionContext& execution, const EngineOptions& options) {
     if (models[0] == nullptr) { throw std::invalid_argument("rank 0 model view is null"); }
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->weights_profile != weights_profile) {
@@ -294,7 +314,7 @@ create_program<Variant>(const std::array<const Variant::ModelView*, kMaximumDevi
             "loaded model weights profile does not match the sequence plan");
     }
     auto impl =
-        std::make_unique<detail::ProgramImpl<Variant>>(models, *plan.impl_, execution);
+        std::make_unique<detail::ProgramImpl<Variant>>(models, *plan.impl_, execution, options);
     plan.impl_.reset();
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }

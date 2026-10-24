@@ -135,7 +135,8 @@ public:
 
     // Cache-owned physical pages. They are removed from the free list and counted against pool
     // capacity but are not owned by any sequence allocation; callers hand the raw page ids to the
-    // prefix cache and return them here when the cache releases the block.
+    // prefix cache and return them here when the cache releases the block. Cache pages never count
+    // toward mapped_pages(): that counter tracks only the pages owned by live allocations.
     [[nodiscard]] std::vector<std::int32_t> acquire_cache_pages(std::uint32_t count);
     void release_cache_pages(std::span<const std::int32_t> page_ids) noexcept;
 

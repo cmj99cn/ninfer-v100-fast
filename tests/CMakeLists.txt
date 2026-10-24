@@ -76,9 +76,16 @@ ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_request_memory_test SOURCES test_request_memory.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
+ninfer_add_test(ninfer_engine_router_test SOURCES test_engine_router.cpp)
+# Host-only: no artifact, no device, no Engine construction. The global admission queue, the
+# lane+KV permit, the queue-full path and the permit timeout, driven through scripted instance views.
+ninfer_add_test(ninfer_engine_pool_test
+  SOURCES test_engine_pool.cpp
+  LIBRARIES ninfer_engine)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
 ninfer_add_test(ninfer_prefix_cache_index_test SOURCES test_prefix_cache_index.cpp)
 ninfer_add_test(ninfer_prefix_cache_host_test SOURCES test_prefix_cache_host.cpp)
+ninfer_add_test(ninfer_shared_host_tier_test SOURCES test_shared_host_tier.cpp)
 # Host-only: no artifact, no device, no Engine construction. tp2 per-device KV pool sizing (4.1).
 ninfer_add_test(ninfer_kv_capacity_tp2_test SOURCES test_kv_capacity_tp2.cpp)
 ninfer_add_test(ninfer_sampling_defaults_test
@@ -184,6 +191,13 @@ ninfer_add_test(ninfer_qwen3_8_27b_v100x2_hybrid_real_test
 target_link_libraries(ninfer_qwen3_8_27b_v100x2_hybrid_real_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_8_27b_v100x2_hybrid_real_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# M4: two tp1 Engines share one artifact reader and one pinned-host cache tier; a full tap
+# publishes a manifest and local reuse survives manifest ownership.
+ninfer_add_test(ninfer_qwen3_8_27b_multi_instance_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_multi_instance_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_multi_instance_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 # Concurrent shared-prefix reuse: several lanes borrow the same retained prefix in one batched round,
 # the shape that turned a served request into malformed tail output.
 ninfer_add_test(ninfer_qwen3_8_27b_v100x2_concurrent_prefix_real_test
@@ -241,7 +255,7 @@ set_tests_properties(ninfer_qwen3_8_27b_tp2_parity_test PROPERTIES SKIP_RETURN_C
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
-  LIBRARIES ninfer_engine)
+  LIBRARIES ninfer_engine ninfer_nccl)
 target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)

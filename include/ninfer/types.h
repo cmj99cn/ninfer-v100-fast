@@ -109,6 +109,9 @@ struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
 
+class SharedModel;
+class SharedHostTier;
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device = 0;
@@ -150,6 +153,15 @@ struct EngineOptions {
     // override either default.
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;
+    // Process-level artifact reader shared by Engines loading the same path. Null creates one for
+    // this Engine. The reader is not safe for concurrent materialization.
+    std::shared_ptr<SharedModel> shared_model;
+    // Process-level pinned-host cache tier. When set, the target Program uses it instead of
+    // creating a private HostSlabPool; its geometry must match this artifact and tp.
+    std::shared_ptr<SharedHostTier> shared_host_tier;
+    // Create and publish a tier for this Engine when `shared_host_tier` is null. Requires
+    // `prefix_cache.host_cache_mib > 0`, which supplies the tier's host budget.
+    bool create_shared_host_tier = false;
 };
 
 enum class SamplingMode : std::uint8_t {
@@ -218,10 +230,24 @@ struct StopPolicy {
     bool publish_stop_token     = false;
 };
 
+// Cross-instance prefix reuse hint. A caller that observed a shared host-tier manifest for a
+// prompt passes the manifest identity to another Engine owning the same tier. The hint is advisory:
+// the target re-verifies it against the tier at execution and falls back to the cold path when the
+// manifest is gone, the identity does not match, or the geometry does not fit this Engine.
+struct PrefixReuseHint {
+    std::uint64_t manifest_id  = 0;
+    std::uint32_t frontier     = 0;
+    std::uint32_t tp           = 0;
+    std::uint32_t block_tokens = 64;
+
+    [[nodiscard]] bool valid() const noexcept { return manifest_id != 0 && frontier > 0; }
+};
+
 struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    PrefixReuseHint prefix_reuse_hint;
 };
 
 struct OutputOptions {
@@ -471,6 +497,7 @@ enum class PrefixReuseReason : std::uint8_t {
     MtpCacheMissing,
     MtpKvTooShort,
     DflashCheckpointInvalid,
+    HintRejected,
 };
 
 // First point where an incoming prompt stops matching a retained prefix. Captured only when a
@@ -622,6 +649,32 @@ struct HostCacheMetrics {
     std::uint32_t snapshot_slab_count = 0;
 };
 
+// Content-addressed prefix residency for a prompt's block-hash chain, read at a settled boundary.
+// `device_frontier` is the longest prefix this Engine's local block tree holds device-resident;
+// `manifest_frontier` is the longest prefix the shared host tier has a live manifest for, with the
+// manifest id. Both are 64-token aligned; a probe copies these values and holds no reference to
+// the index or the tier.
+struct PrefixProbe {
+    std::uint32_t device_frontier = 0;   // longest local resident prefix, 64-token aligned
+    std::uint32_t manifest_frontier = 0; // longest shared manifest prefix
+    std::uint64_t manifest_id = 0;
+    std::uint32_t block_tokens = 64;
+};
+
+// Boundary-consistent capacity view of one Engine: the text KV pool's physical page counts, the
+// scheduler's active/pending counts, and the startup-fixed execution facts. `recent_prefill_tps`
+// is tokens evaluated over seconds for the most recent completed prefill, 0.0 with no sample.
+struct CapacitySnapshot {
+    std::uint32_t free_pages = 0;
+    std::uint32_t total_pages = 0;
+    std::uint32_t active_requests = 0;
+    std::uint32_t pending_requests = 0;
+    std::uint32_t max_concurrency = 1;
+    std::uint32_t max_context = 0;
+    std::uint32_t prefill_chunk = 0;
+    double recent_prefill_tps = 0.0;
+};
+
 // Hybrid prefix cache residency. Device snapshot slots are the on-device state images; the host
 // tier carries demoted blocks and state images.
 struct PrefixCacheMetrics {
@@ -631,14 +684,31 @@ struct PrefixCacheMetrics {
     HostCacheMetrics host;
 };
 
+// Per-Engine row inside a multi-instance pool. Counters are cumulative for the process lifetime;
+// `committed_tokens` is committed decode tokens (the same counter as
+// `RuntimeStats::committed_decode_tokens`), `prefix_hit_tokens` counts prompt tokens reused through
+// any prefix path, and `manifest_restore_tokens` counts prompt tokens restored through a routed
+// cross-instance manifest hint. Gauges are the instance's latest boundary reading.
+struct InstanceMetrics {
+    std::uint32_t free_kv_pages = 0;
+    std::uint32_t active_requests = 0;
+    std::uint32_t pending_requests = 0;
+    std::uint64_t prefix_hit_tokens = 0;
+    std::uint64_t manifest_restore_tokens = 0;
+    std::uint64_t committed_tokens = 0;
+};
+
 // Live resource metrics for the serving /metrics endpoint: a boundary-consistent snapshot. This is
 // not a performance ledger; throughput is derived by consumers from RuntimeStats as usual.
+// `instances` carries one row per Engine in a multi-instance pool, in instance order; a single
+// Engine reports it empty. The aggregate fields above are the pool-wide reading.
 struct MetricsSnapshot {
     RuntimeStats scheduler;
     std::vector<DeviceMemoryMetrics> devices;
     KvPoolMetrics main_kv;    // text KV pool (always present)
     KvPoolMetrics backend_kv; // MTP/DFlash KV pool; zero when the backend has none
     PrefixCacheMetrics prefix_cache;
+    std::vector<InstanceMetrics> instances;
 };
 
 struct LoadSummary {

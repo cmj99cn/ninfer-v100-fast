@@ -819,6 +819,27 @@ pages 返回各自 pool；随后各 pool 的 exact frontier 和 fixed continuati
 连同 Linear Attention/backend state branching 一起重新设计；仅共享 Main Text pages 不能形成完整
 可继续的 sequence state。
 
+### 10.4 Shared host tier across instances
+
+多实例 pool 可以共享一个 pinned host tier（`SharedHostTier`）。tier 只拥有 host slab pool 和
+manifest 目录；device page、device snapshot slot、device LRU 和 `PrefixIndex` 仍属于各自 Engine。
+
+- manifest 描述一个完整 64-token 边界前缀：`tp`、frontier、block hash 链、每个 block 的 host page
+  id 和 state page id。manifest 不复制 KV payload。
+- manifest 发布时对每个被引用的 host 页 pin 一次；manifest 有独立引用计数和 TTL。引用归零后
+  manifest 可被淘汰；淘汰释放页引用，页在 slab 引用归零后回到 pool。manifest 不会永久占用 pool。
+- `SharedHostTier::match()` 只返回 id/frontier/hashes/page id 的值副本，不 retain、不延长页生命周期。
+  消费方必须在 `import_foreign` 时 retain；release 必须恰好一次。
+- 导入的 foreign 节点是目标 `PrefixIndex` 中的本地节点：它们引用 tier 的 host 页，`foreign=true`，
+  不进入本地 device LRU，也不通过本地 allocator 释放这些页。block 页和状态镜像恢复为请求私有的
+  device page 后，正常完成的请求把 foreign 链提交为本地 device-resident 节点；取消/错误路径释放
+  device page 和 manifest 引用，不提交。
+- 本地节点优先：恢复路径上若本地树已有相同 hash/token 的节点，则复用本地节点，foreign 页只作为
+  该次请求的 backup；提交不会覆盖本地所有权。
+- host tier 的 manifest 目录、引用计数和 slab 元数据由 tier mutex 串行化，D2H/H2D 传输在锁外执行。
+  manifest 只描述 host 页，不包含 MTP/DFlash provisional backend KV，因此跨实例恢复后 backend
+  state 按普通冷启动路径建立。
+
 ---
 
 ## 11. Speculative decoding

@@ -5,6 +5,7 @@
 #include "artifact/reader.h"
 #include "core/device.h"
 #include "runtime/engine/kv_capacity.h"
+#include "runtime/engine/shared_model.h"
 
 #include <chrono>
 #include <cstdint>
@@ -166,7 +167,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
     }
     auto loaded   = std::make_unique<Loaded>(std::move(model), options);
     auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
-                                               std::move(sequence_plan), execution);
+                                               std::move(sequence_plan), execution, options);
     for (int rank = 0; rank < tp; ++rank) {
         execution.dev[static_cast<std::size_t>(rank)]->synchronize();
     }
@@ -229,11 +230,13 @@ LoadedQwen3_6_27B::~LoadedQwen3_6_27B() = default;
 Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
                                          runtime::KvCapacityResolution resolution,
                                          Qwen3_6_27B::SequencePlan sequence_plan,
-                                         ExecutionContext& execution)
+                                         ExecutionContext& execution,
+                                         const EngineOptions& options)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       request_memory(execution.primary(), sequence_plan.request_transient_capacity_bytes()),
       capacity(sequence_plan.capacity()),
-      program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), execution)) {}
+      program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), execution,
+                                          options)) {}
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 
@@ -246,23 +249,25 @@ LoadedQwen3_6_35BA3B::~LoadedQwen3_6_35BA3B() = default;
 Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
                                                runtime::KvCapacityResolution resolution,
                                                Qwen3_6_35BA3B::SequencePlan sequence_plan,
-                                               ExecutionContext& execution)
+                                               ExecutionContext& execution,
+                                               const EngineOptions& options)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       request_memory(execution.primary(), sequence_plan.request_transient_capacity_bytes()),
       capacity(sequence_plan.capacity()),
       program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan),
-                                             execution)) {}
+                                             execution, options)) {}
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 
-ConstructedTarget construct_target(const EngineOptions& options, ExecutionContext& execution) {
+ConstructedTarget construct_target(const EngineOptions& options, ExecutionContext& execution,
+                                   SharedModel& shared) {
     validate_options(options);
     if (execution.tp != options.tp) {
         throw std::invalid_argument("execution context width does not match EngineOptions.tp");
     }
     const auto load_start = Clock::now();
 
-    artifact::Reader reader(options.artifact_path);
+    artifact::Reader& reader = shared.reader();
     const auto& identity = reader.identity();
     if (identity.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(

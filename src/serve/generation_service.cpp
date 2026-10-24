@@ -6,7 +6,9 @@
 #include "serve/translate.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <mutex>
 #include <stdexcept>
@@ -19,6 +21,7 @@ struct RequestCapacity {
     explicit RequestCapacity(std::size_t limit) : maximum(limit) {}
 
     std::mutex mutex;
+    std::condition_variable idle;
     std::size_t active = 0;
     const std::size_t maximum;
 };
@@ -30,8 +33,11 @@ struct RequestLifetime {
         : capacity(std::move(owner)), started(begin), deadline(limit) {}
 
     ~RequestLifetime() {
-        std::lock_guard lock(capacity->mutex);
-        --capacity->active;
+        {
+            std::lock_guard lock(capacity->mutex);
+            --capacity->active;
+        }
+        capacity->idle.notify_all();
     }
 
     std::shared_ptr<RequestCapacity> capacity;
@@ -223,13 +229,13 @@ private:
 
 } // namespace
 
-GenerationService::GenerationService(ServeOptions options, LoadProgress load_progress)
-    : options_(std::move(options)) {
+ninfer::EngineOptions GenerationService::make_engine_options(const std::vector<int>& devices,
+                                                              int device) const {
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
-    engine_options.device                   = options_.device;
+    engine_options.device                   = devices.empty() ? device : devices.front();
     engine_options.tp                       = options_.tp;
-    engine_options.devices                  = options_.devices;
+    engine_options.devices                  = devices;
     engine_options.max_context              = options_.max_context;
     engine_options.rope_mode                = options_.rope_mode;
     engine_options.yarn_factor              = options_.yarn_factor;
@@ -248,11 +254,90 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.prefix_cache.enabled     = options_.prefix_cache_enabled;
     engine_options.prefix_cache.host_cache_mib = options_.host_cache_mib;
-    engine_options.load_progress            = std::move(load_progress);
+    return engine_options;
+}
+
+GenerationService::GenerationService(ServeOptions options, LoadProgress load_progress)
+    : options_(std::move(options)) {
+    if (options_.groups > 1) {
+        const std::size_t tp = static_cast<std::size_t>(options_.tp);
+        if (options_.devices.size() != static_cast<std::size_t>(options_.groups) * tp) {
+            throw std::invalid_argument(
+                "multi-group serving requires groups * tp resolved device ids");
+        }
+        ninfer::EnginePool::Options pool_options;
+        pool_options.global_pending_requests = options_.global_pending_requests;
+        pool_options.affinity_slack_tokens   = options_.affinity_slack_tokens;
+        pool_options.fairness_aging = std::chrono::milliseconds(options_.fairness_aging_ms);
+        for (std::uint32_t group = 0; group < options_.groups; ++group) {
+            ninfer::EnginePool::GroupOptions group_options;
+            const auto begin = options_.devices.begin() +
+                               static_cast<std::ptrdiff_t>(group) *
+                                   static_cast<std::ptrdiff_t>(tp);
+            group_options.devices.assign(begin, begin + static_cast<std::ptrdiff_t>(tp));
+            group_options.tp      = options_.tp;
+            group_options.engine  = make_engine_options(group_options.devices, options_.device);
+            group_options.engine.load_progress = load_progress;
+            pool_options.groups.push_back(std::move(group_options));
+        }
+        pool_ = std::make_unique<ninfer::EnginePool>(std::move(pool_options));
+        prompt_capabilities_ = pool_->engines().front()->prompt_capabilities();
+        request_capacity_    = std::make_shared<RequestCapacity>(
+            static_cast<std::size_t>(options_.groups) * options_.max_concurrency +
+            options_.global_pending_requests);
+        return;
+    }
+    ninfer::EngineOptions engine_options =
+        make_engine_options(options_.devices, options_.device);
+    engine_options.load_progress = std::move(load_progress);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
     request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+}
+
+GenerationService::~GenerationService() {
+    if (pool_ == nullptr) { return; }
+    // HTTP ingress is stopped before this destructor runs. Wait for every PreparedRequest to finish
+    // destruction; `PreparedRequest::lifetime` is declared first so it is destroyed last, which
+    // means each PoolHandle has already released its permit. Only then may the pool (and its
+    // Engines) be destroyed.
+    {
+        std::unique_lock lock(request_capacity_->mutex);
+        request_capacity_->idle.wait(lock,
+                                     [this] { return request_capacity_->active == 0; });
+    }
+    assert(pool_->permits_held() == 0);
+    assert(pool_->pending_count() == 0);
+    pool_.reset();
+}
+
+const ninfer::Engine& GenerationService::primary_engine() const {
+    return pool_ != nullptr ? *pool_->engines().front() : *engine_;
+}
+
+ninfer::LoadSummary GenerationService::load_summary() const {
+    return primary_engine().load_summary();
+}
+
+ninfer::MemorySummary GenerationService::memory_summary() const {
+    return primary_engine().memory_summary();
+}
+
+ninfer::RuntimeStats GenerationService::runtime_stats() const {
+    return pool_ != nullptr ? pool_->metrics().scheduler : engine_->runtime_stats();
+}
+
+ninfer::MetricsSnapshot GenerationService::metrics() const {
+    return pool_ != nullptr ? pool_->metrics() : engine_->metrics();
+}
+
+ninfer::MediaCacheSummary GenerationService::media_cache_summary() const {
+    return primary_engine().media_cache_summary();
+}
+
+ninfer::ModelSamplingDefaults GenerationService::sampling_defaults() const {
+    return primary_engine().sampling_defaults();
 }
 
 std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() const {
@@ -311,15 +396,25 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
             .deadline     = prepared.lifetime->deadline,
             .cancellation = CancellationView(is_cancelled),
         };
-        ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
+        ninfer::PreparedPrompt prompt =
+            pool_ != nullptr ? pool_->prepare(std::move(input), control)
+                             : engine_->prepare(std::move(input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
-        prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
-                                              prepared.lifetime->deadline);
-        prepared.sampling   = prepared.generation.resolved_sampling();
+        if (pool_ != nullptr) {
+            // The pool owns prefix placement and injects the reuse hint when it routes the request.
+            request_options.execution.prefix_reuse_hint = {};
+            prepared.pooled_generation = pool_->submit(
+                std::move(prompt), std::move(request_options), prepared.lifetime->deadline);
+            prepared.sampling = prepared.pooled_generation.resolved_sampling();
+        } else {
+            prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
+                                                  prepared.lifetime->deadline);
+            prepared.sampling   = prepared.generation.resolved_sampling();
+        }
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
@@ -350,7 +445,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
             .cancellation = CancellationView(is_cancelled),
         };
         const int prompt_tokens =
-            static_cast<int>(engine_->count_tokens(std::move(input), control));
+            static_cast<int>(primary_engine().count_tokens(std::move(input), control));
         check_preparation_control(deadline, is_cancelled);
         return prompt_tokens;
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
@@ -375,7 +470,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 
     ninfer::GenerationResult result;
     try {
-        result = prepared.generation.wait(public_sink, cancellation);
+        result = pool_ != nullptr ? prepared.pooled_generation.wait(public_sink, cancellation)
+                                  : prepared.generation.wait(public_sink, cancellation);
     } catch (const ninfer::RequestError& exception) { throw_request_error(exception); }
     GenerationOutcome outcome;
     outcome.text              = std::move(result.content);

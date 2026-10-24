@@ -17,7 +17,8 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 
 ### 1.1 Supported workload
 
-- 单 GPU、单 resident model instance；
+- 单 GPU、单 resident model instance；多实例 pool 由 N 个这样的 Engine 组成，另见
+  [多实例共享缓存](multi-instance.md)；
 - 启动时固定 `max_concurrency=C`，典型 `C=2..8`；
 - 运行时 `0..C` 个 admitted requests；
 - Text 与 image/video prompt；
@@ -119,6 +120,18 @@ blocked head 建立唯一 protection epoch；later admission 不能破坏该 hea
 Backfill 只改变 waiting request 的 admission order。它不取得 active request 已承诺但尚未 materialize 的
 资源，不产生 partial admission，不抢占已经 admitted 的 request，也不建立第二套 decode priority。所有
 backfilled decode-ready requests 仍进入同一个 maximal compact batch。
+
+### 2.10 Multi-instance pools
+
+多实例 serving 在多个 Engine 之上放一个 `EnginePool`。pool 是唯一的 admission 队列：请求先在
+有界全局 FIFO 中等待，`EnginePool` 的路由器选择一个实例并用 permit 同时预留 lane 和 KV 页，
+然后才调用该实例的 Engine。每实例 `max_pending_requests` 固定为 1，Engine 内队列只承载已经路由给
+它的那一个请求，不承担第二层公平性；route 决策、queue-full 和 deadline 语义见
+[多实例共享缓存](multi-instance.md)。
+
+pool 仍按本文的 boundary 模型消费每个 Engine：permit 只保证该 Engine 的 lane/KV entitlement，
+prefill ownership、maximal batched decode、slot 和 sequence-state 语义没有改变。实例之间不共享
+device 权重或可写 KV；跨实例只共享只读 artifact reader 和 pinned host tier 中的缓存页。
 
 ---
 

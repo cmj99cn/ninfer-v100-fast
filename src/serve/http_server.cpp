@@ -129,9 +129,22 @@ HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
       response_store_(options_.response_store_max_records, options_.response_store_max_bytes),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
+    const bool multi_group = options_.groups > 1;
+    // In the pool path max_concurrency is one instance's lane count; the global lane count is
+    // groups * that. The pool's own pending queue (not each Engine's) bounds queued requests.
+    const std::size_t global_lanes =
+        multi_group
+            ? static_cast<std::size_t>(options_.groups) * options_.max_concurrency
+            : static_cast<std::size_t>(options_.max_concurrency);
     const std::size_t queued_requests =
-        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
-    const std::size_t worker_count = queued_requests + 1;
+        multi_group
+            ? global_lanes + options_.global_pending_requests
+            : static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
+    const std::size_t worker_count =
+        options_.http_threads > 0
+            ? options_.http_threads
+            : (multi_group ? global_lanes + options_.global_pending_requests + 1
+                           : queued_requests + 1);
     server_.new_task_queue         = [queued_requests, worker_count] {
         return new httplib::ThreadPool(worker_count, queued_requests);
     };

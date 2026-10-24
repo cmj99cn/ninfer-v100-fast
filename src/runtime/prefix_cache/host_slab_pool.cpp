@@ -77,7 +77,8 @@ std::size_t HostSlabPool::free_bytes() const noexcept {
 
 void HostSlabPool::reset_slab(HostSlab& slab) noexcept {
     slab.occupied = false;
-    slab.pinned = false;
+    slab.pin_count = 0;
+    slab.release_pending = false;
     slab.dead = false;
     slab.dead_at = 0;
     slab.superseded = false;
@@ -92,7 +93,8 @@ void HostSlabPool::occupy(HostPageId page) noexcept {
         return;
     }
     slab->occupied = true;
-    slab->pinned = false;
+    slab->pin_count = 0;
+    slab->release_pending = false;
     slab->dead = false;
     slab->dead_at = 0;
     slab->superseded = false;
@@ -119,7 +121,7 @@ HostPageId HostSlabPool::pick_victim(std::size_t offset, std::size_t count) noex
     for (std::size_t i = 0; i < count; ++i) {
         const std::size_t idx = offset + i;
         const HostSlab* s = slab(static_cast<HostPageId>(idx));
-        if (s == nullptr || !s->occupied || s->pinned || !s->dead) {
+        if (s == nullptr || !s->occupied || s->pinned() || !s->dead) {
             continue;
         }
         if (s->dead_at < oldest) {
@@ -137,7 +139,7 @@ HostPageId HostSlabPool::pick_victim(std::size_t offset, std::size_t count) noex
     for (std::size_t i = 0; i < count; ++i) {
         const std::size_t idx = offset + i;
         const HostSlab* s = slab(static_cast<HostPageId>(idx));
-        if (s == nullptr || !s->occupied || s->pinned || !s->superseded) {
+        if (s == nullptr || !s->occupied || s->pinned() || !s->superseded) {
             continue;
         }
         if (s->superseded_at < oldest) {
@@ -156,7 +158,7 @@ HostPageId HostSlabPool::pick_victim(std::size_t offset, std::size_t count) noex
     for (std::size_t i = 0; i < count; ++i) {
         const std::size_t idx = offset + i;
         const HostSlab* s = slab(static_cast<HostPageId>(idx));
-        if (s == nullptr || !s->occupied || s->pinned) {
+        if (s == nullptr || !s->occupied || s->pinned()) {
             continue;
         }
         if (s->freq < min_freq ||
@@ -177,8 +179,9 @@ SlabAllocation HostSlabPool::allocate_block() {
 
     HostPageId page = find_free(0, block_slabs_.size());
     if (page == kInvalidHostPage) {
-        // No free slab: evict one. The victim's previous owner must be reconciled by the caller
-        // before the new data is written.
+        if (!options_.evict_on_exhaustion) {
+            return result; // shared tier: never evict another owner's local page
+        }
         page = pick_victim(0, block_slabs_.size());
         if (page == kInvalidHostPage) {
             return result; // all block slabs pinned
@@ -199,8 +202,9 @@ SlabAllocation HostSlabPool::allocate_snapshot() {
     const std::size_t offset = slab_offset(block_slabs_.size());
     HostPageId page = find_free(offset, snapshot_slabs_.size());
     if (page == kInvalidHostPage) {
-        // No free slab: evict one. The victim's previous owner must be reconciled by the caller
-        // before the new data is written.
+        if (!options_.evict_on_exhaustion) {
+            return result; // shared tier: never evict another owner's local page
+        }
         page = pick_victim(offset, snapshot_slabs_.size());
         if (page == kInvalidHostPage) {
             return result; // all snapshot slabs pinned
@@ -215,6 +219,11 @@ SlabAllocation HostSlabPool::allocate_snapshot() {
 void HostSlabPool::release(HostPageId page) noexcept {
     HostSlab* slab = slab_mut(page);
     if (slab == nullptr) {
+        return;
+    }
+    if (slab->pin_count > 0) {
+        // A transfer or shared manifest still holds the slab: free it on the last unpin.
+        slab->release_pending = true;
         return;
     }
     reset_slab(*slab);
@@ -239,14 +248,18 @@ std::size_t HostSlabPool::bytes(HostPageId page) const noexcept {
 void HostSlabPool::pin(HostPageId page) noexcept {
     HostSlab* slab = slab_mut(page);
     if (slab != nullptr && slab->occupied) {
-        slab->pinned = true;
+        ++slab->pin_count;
     }
 }
 
 void HostSlabPool::unpin(HostPageId page) noexcept {
     HostSlab* slab = slab_mut(page);
-    if (slab != nullptr && slab->occupied) {
-        slab->pinned = false;
+    if (slab == nullptr || !slab->occupied || slab->pin_count == 0) {
+        return;
+    }
+    --slab->pin_count;
+    if (slab->pin_count == 0 && slab->release_pending) {
+        reset_slab(*slab);
     }
 }
 

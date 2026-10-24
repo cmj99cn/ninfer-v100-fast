@@ -29,6 +29,12 @@ int main() {
     int failures = 0;
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(defaults.groups == 1 && defaults.group_devices.empty() &&
+                          defaults.max_concurrency == 1 && defaults.http_threads == 0 &&
+                          defaults.global_pending_requests == 16 &&
+                          defaults.affinity_slack_tokens == 2048 &&
+                          defaults.fairness_aging_ms == 1000,
+                      "single-group pooling/HTTP defaults changed");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
@@ -326,6 +332,132 @@ int main() {
     }
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
+
+    // --groups / --group-devices: multi-instance pooling surface. --devices names every rank of
+    // every group in group order when --group-devices is omitted.
+    const ServeOptions four_groups = parse({"ninfer-serve", "model.ninfer", "--groups", "4",
+                                            "--tp", "2", "--devices",
+                                            "0,1,2,3,4,5,6,7"});
+    failures += check(four_groups.groups == 4 && four_groups.tp == 2 &&
+                          four_groups.devices == std::vector<int>({0, 1, 2, 3, 4, 5, 6, 7}) &&
+                          four_groups.group_devices.empty(),
+                      "explicit --groups/--tp/--devices did not form four groups");
+
+    const ServeOptions two_groups = parse(
+        {"ninfer-serve", "model.ninfer", "--groups", "2", "--tp", "2", "--devices", "0,1,2,3"});
+    failures += check(two_groups.groups == 2 && two_groups.tp == 2 &&
+                          two_groups.devices == std::vector<int>({0, 1, 2, 3}),
+                      "two explicit groups did not accept one rank per device");
+
+    const ServeOptions inferred = parse(
+        {"ninfer-serve", "model.ninfer", "--group-devices", "0,1;2,3"});
+    failures += check(inferred.groups == 2 && inferred.tp == 2 &&
+                          inferred.devices == std::vector<int>({0, 1, 2, 3}) &&
+                          inferred.group_devices == std::vector<int>({0, 1, 2, 3}),
+                      "--group-devices did not infer groups/tp from its group lengths");
+
+    bool wrong_device_count_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--groups", "2", "--tp", "2", "--devices",
+                     "0,1,2"});
+    } catch (const std::invalid_argument&) { wrong_device_count_rejected = true; }
+    failures += check(wrong_device_count_rejected,
+                      "multi-group device count that does not match groups * tp was accepted");
+
+    bool overlapping_devices_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--groups", "2", "--tp", "2", "--devices",
+                     "0,1,1,2"});
+    } catch (const std::invalid_argument&) { overlapping_devices_rejected = true; }
+    failures += check(overlapping_devices_rejected, "overlapping multi-group devices were accepted");
+
+    bool zero_groups_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--groups", "0"});
+    } catch (const std::invalid_argument&) { zero_groups_rejected = true; }
+    failures += check(zero_groups_rejected, "--groups 0 was accepted");
+
+    bool uneven_groups_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--group-devices", "0,1;2"});
+    } catch (const std::invalid_argument&) { uneven_groups_rejected = true; }
+    failures += check(uneven_groups_rejected, "uneven --group-devices group lengths were accepted");
+
+    bool dflash_groups_rejected = false;
+    bool dflash_groups_message  = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--groups", "2", "--tp", "1", "--devices",
+                     "0,1", "--spec", "dflash", "--draft-tokens", "15"});
+    } catch (const std::invalid_argument& error) {
+        dflash_groups_rejected = true;
+        dflash_groups_message =
+            std::string(error.what()).find("DFlash 多组暂不支持") != std::string::npos;
+    }
+    failures += check(dflash_groups_rejected, "DFlash was accepted with multiple groups");
+    failures += check(dflash_groups_message, "multi-group DFlash rejection lacks its contract text");
+
+    bool device_conflict_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--device", "5", "--groups", "2", "--tp",
+                     "2", "--devices", "0,1,2,3"});
+    } catch (const std::invalid_argument&) { device_conflict_rejected = true; }
+    failures += check(device_conflict_rejected,
+                      "multi-group --device silently disagreed with --devices");
+
+    const ServeOptions dflash_single =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15"});
+    failures += check(dflash_single.groups == 1 &&
+                          dflash_single.speculative.backend == ninfer::SpeculativeBackend::DFlash,
+                      "single-group DFlash was rejected");
+
+    // Multi-group lane and KV defaults are per instance, not process totals.
+    const ServeOptions tp2_defaults =
+        parse({"ninfer-serve", "model.ninfer", "--groups", "4", "--tp", "2", "--max-context",
+               "262144"});
+    failures += check(tp2_defaults.max_concurrency == 4 &&
+                          tp2_defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          tp2_defaults.kv_capacity.explicit_tokens == 1048576,
+                      "tp2 multi-group defaults are not per-instance lanes/KV capacity");
+
+    const ServeOptions tp4_defaults =
+        parse({"ninfer-serve", "model.ninfer", "--groups", "2", "--tp", "4", "--max-context",
+               "262144"});
+    failures += check(tp4_defaults.max_concurrency == 8 &&
+                          tp4_defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          tp4_defaults.kv_capacity.explicit_tokens == 2097152,
+                      "tp4 multi-group defaults are not per-instance lanes/KV capacity");
+
+    const ServeOptions tp1_defaults =
+        parse({"ninfer-serve", "model.ninfer", "--groups", "2", "--tp", "1", "--max-context",
+               "262144"});
+    failures += check(tp1_defaults.max_concurrency == 1 &&
+                          tp1_defaults.kv_capacity.explicit_tokens == 262144,
+                      "tp1 multi-group defaults are not per-instance lanes/KV capacity");
+
+    const ServeOptions explicit_concurrency =
+        parse({"ninfer-serve", "model.ninfer", "--groups", "4", "--tp", "2",
+               "--max-concurrency", "4", "--max-context", "262144"});
+    failures += check(explicit_concurrency.max_concurrency == 4 &&
+                          explicit_concurrency.kv_capacity.explicit_tokens == 1048576,
+                      "--max-concurrency did not stay a per-instance lane count");
+
+    const ServeOptions explicit_kv =
+        parse({"ninfer-serve", "model.ninfer", "--groups", "2", "--tp", "2",
+               "--max-concurrency", "4", "--kv-capacity", "4096", "--max-context", "2048"});
+    failures += check(explicit_kv.max_concurrency == 4 &&
+                          explicit_kv.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          explicit_kv.kv_capacity.explicit_tokens == 4096,
+                      "explicit --kv-capacity was not kept as one per-instance budget");
+
+    const ServeOptions pool_controls =
+        parse({"ninfer-serve", "model.ninfer", "--groups", "2", "--tp", "2", "--devices",
+               "0,1,2,3", "--global-pending-requests", "7", "--http-threads", "5",
+               "--affinity-slack-tokens", "512", "--fairness-aging-ms", "250"});
+    failures += check(pool_controls.global_pending_requests == 7 &&
+                          pool_controls.http_threads == 5 &&
+                          pool_controls.affinity_slack_tokens == 512 &&
+                          pool_controls.fairness_aging_ms == 250,
+                      "pool/HTTP scheduling options did not reach serving options");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

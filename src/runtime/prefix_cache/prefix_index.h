@@ -9,13 +9,18 @@
 // PrefixPageSink when the index drops its last copy.
 
 #include <ninfer/types.h>
-#include "runtime/prefix_cache/host_slab_pool.h"
+#include "runtime/prefix_cache/host_page_allocator.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <unordered_map>
 #include <vector>
+
+namespace ninfer {
+class SharedHostTier;
+}
 
 namespace ninfer::prefix_cache {
 
@@ -81,6 +86,13 @@ struct BlockNode {
     // Host tier (M2): pinned host slab holding this block's KV data.
     HostPageId host_page = kInvalidHostPage;
     Residency host_state = Residency::Absent;
+    // Set when this node's page is owned by a shared-tier manifest. Releasing the manifest clears
+    // the local reference without returning the page through the allocator.
+    bool host_shared = false;
+    // Manifest ids that reference this node's host page. A node may be covered by multiple
+    // overlapping manifests; the local reference is cleared only when all of them are released
+    // and no restore pin is in flight.
+    std::vector<std::uint64_t> shared_manifests;
 
     std::uint32_t active_refs          = 0; // active sequences whose table maps this node
     std::uint32_t restore_pins         = 0; // in-flight transfers reading/writing this node
@@ -96,6 +108,10 @@ struct BlockNode {
 
     std::uint32_t generation = 1;
     bool live                = true;
+    // True when this node belongs to a foreign import (`foreign_roots_`), not to the local tree.
+    // A foreign node is never in the local LRU, and its manifest-owned host page is released only
+    // by `release_foreign`.
+    bool foreign = false;
 
     // True when a host copy exists and can back the device copy (safe to demote on eviction).
     [[nodiscard]] bool is_backed() const noexcept { return host_state == Residency::Host; }
@@ -116,6 +132,8 @@ struct Snapshot {
     // Host tier (M2): pinned host slab holding this snapshot's state image.
     HostPageId host_page = kInvalidHostPage;
     Residency host_state = Residency::Absent;
+    bool host_shared = false; // this state image is pinned by the shared-tier manifest below
+    std::uint64_t shared_manifest_id = 0;
 
     SnapshotKind kind = SnapshotKind::Tap;
     bool superseded   = false;
@@ -129,6 +147,10 @@ struct Snapshot {
 
     std::uint32_t generation = 1;
     bool live                = true;
+    // True when this snapshot record was created by a foreign import. Its manifest ref is owned by
+    // `release_foreign`, so `detach_snapshot` must not release it, and its manifest-owned host image
+    // is never returned through the allocator.
+    bool foreign = false;
 
     [[nodiscard]] bool device_resident() const noexcept {
         return device_state == Residency::Resident;
@@ -231,6 +253,41 @@ public:
     PrefixIndex(const PrefixIndex&)            = delete;
     PrefixIndex& operator=(const PrefixIndex&) = delete;
 
+    // --- foreign import (cross-instance restore) ---
+
+    // One shared-tier manifest projected into this index. `import_foreign` retains the manifest and
+    // builds a chain of foreign block nodes (one per `(hash, page)`) plus one foreign snapshot
+    // record for the state image. Foreign nodes are not part of the local tree or the local LRU,
+    // and their manifest-owned host pages are never released through the allocator. The manifest
+    // ref taken here is released exactly once by `release_foreign`.
+    struct ForeignView {
+        std::uint64_t manifest_id = 0;
+        std::uint32_t frontier    = 0;
+        std::vector<std::uint64_t> hashes;
+        std::vector<HostPageId> block_pages;
+        HostPageId state_page = kInvalidHostPage;
+    };
+
+    // Retains `view.manifest_id` and builds the foreign chain; returns false when the tier is
+    // absent, the manifest is not live, or the view is malformed (the retain is rolled back on a
+    // malformed view).
+    bool import_foreign(const ForeignView& view);
+
+    // Adopts the foreign chain's device pages into the local tree: for each block, an existing
+    // local node with the same exact tokens keeps its own storage and the foreign node is dropped;
+    // otherwise the foreign node becomes a local node with its host reference cleared (the host
+    // page stays owned by the manifest). The foreign snapshot is re-anchored at the deepest local
+    // node and stops being manifest-owned on the index side. Only the successful completion path
+    // commits; the cancel path releases without committing.
+    bool commit_foreign(std::uint64_t manifest_id, std::span<const TokenId> tokens) noexcept;
+
+    // Releases the foreign nodes/snapshot for `manifest_id` (device pages through the sink, host
+    // pages untouched) and releases the manifest ref exactly once. Idempotent for an unknown id.
+    void release_foreign(std::uint64_t manifest_id) noexcept;
+
+    [[nodiscard]] NodeId foreign_node(std::uint64_t manifest_id, std::size_t block) const noexcept;
+    [[nodiscard]] SnapshotId foreign_snapshot(std::uint64_t manifest_id) const noexcept;
+
     [[nodiscard]] NodeId root() const noexcept { return root_; }
     [[nodiscard]] const BlockNode* node(NodeId id) const noexcept;
     [[nodiscard]] SnapshotId snapshot_id_at(std::size_t index) const noexcept;
@@ -259,6 +316,11 @@ public:
     [[nodiscard]] ChildMatch find_child(NodeId parent, std::uint64_t lookup_hash,
                                         std::span<const TokenId> tokens,
                                         std::uint64_t extra) const;
+
+    // Longest local device-resident prefix along `block_hashes`, in tokens (64-aligned). Walks the
+    // local tree from the root following the hash chain and stops at the first missing or
+    // non-resident block; foreign nodes are not part of the local tree.
+    [[nodiscard]] std::uint32_t probe_device(std::span<const std::uint64_t> hashes) const;
 
     // --- mutation ---
 
@@ -299,13 +361,29 @@ public:
     // evicted node, or kInvalidNode when nothing is evictable.
     NodeId evict_device_lru();
 
-    // Delete `node` and its subtree, releasing pages and deleting anchored snapshots. Pinned nodes
-    // are left untouched.
-    void erase_subtree(NodeId node);
+    // Delete `node` and its subtree, releasing pages and deleting anchored snapshots. When any node
+    // in the subtree is pinned the operation makes no change and returns false; otherwise it erases
+    // the whole subtree and returns true.
+    bool erase_subtree(NodeId node);
 
-    // Set the host slab pool for M2 write-through/restore. Must be called before any
+    // Set the host page allocator for M2 write-through/restore. Must be called before any
     // commit_block or match that involves host residency.
-    void set_host_pool(HostSlabPool* pool) noexcept { host_pool_ = pool; }
+    void set_host_allocator(HostPageAllocator* allocator) noexcept {
+        host_allocator_ = allocator;
+    }
+
+    // Shared-tier publication. The tier must outlive this index; the index releases every manifest
+    // it still owns in its destructor. `publish_snapshot_manifest` requires a full host copy of the
+    // entire anchor path plus the snapshot state image and returns the manifest id (0 on failure).
+    void set_shared_host_tier(ninfer::SharedHostTier* tier) noexcept { shared_tier_ = tier; }
+    [[nodiscard]] std::uint32_t snapshot_generation(SnapshotId id) const noexcept {
+        if (id == kInvalidSnapshot || id > snapshots_.size()) { return 0; }
+        const Snapshot& record = snapshots_[id - 1U];
+        return record.live ? record.generation : 0;
+    }
+    [[nodiscard]] std::uint64_t publish_snapshot_manifest(SnapshotId id, std::uint64_t owner,
+                                                          std::uint32_t tp,
+                                                          std::uint32_t expected_generation) noexcept;
 
     // --- M2 async fill APIs ---
     //
@@ -393,7 +471,9 @@ private:
 
     PrefixIndexOptions options_;
     PrefixPageSink* sink_ = nullptr;
-    HostSlabPool* host_pool_ = nullptr; // M2: pinned host memory for write-through/restore
+    HostPageAllocator* host_allocator_ = nullptr; // M2: pinned host memory for
+                                                  // write-through/restore
+    ninfer::SharedHostTier* shared_tier_ = nullptr;
 
     std::vector<BlockNode> nodes_;
     std::vector<Snapshot> snapshots_; // index + 1 == SnapshotId
@@ -413,6 +493,14 @@ private:
 
     std::uint64_t tick_            = 0;
     std::uint32_t evictable_pages_ = 0;
+
+    struct ForeignRecord {
+        std::uint64_t manifest_id = 0;
+        std::vector<NodeId> nodes;      // foreign block nodes in block order
+        SnapshotId snapshot             = kInvalidSnapshot;
+        bool committed                  = false;
+    };
+    std::unordered_map<std::uint64_t, ForeignRecord> foreign_records_;
 };
 
 } // namespace ninfer::prefix_cache

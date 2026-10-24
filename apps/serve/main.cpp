@@ -70,6 +70,14 @@ int main(int argc, char** argv) {
                << std::chrono::duration<double>(Clock::now() - load_start).count() << " s";
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, loaded.str());
 
+        if (options.groups > 1) {
+            std::ostringstream pooling;
+            pooling << "engine pool groups=" << options.groups << " tp=" << options.tp
+                    << " lanes/instance=" << options.max_concurrency
+                    << " global-pending=" << options.global_pending_requests;
+            ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, pooling.str());
+        }
+
         const ninfer::MemorySummary memory = service.memory_summary();
         std::ostringstream capacity;
         capacity << "KV capacity "

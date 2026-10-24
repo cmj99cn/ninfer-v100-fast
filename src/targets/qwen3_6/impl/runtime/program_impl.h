@@ -265,7 +265,8 @@ PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer
 }
 
 ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaximumDevices>& models,
-                                 const SequencePlanImpl& plan, ExecutionContext& execution_in)
+                                 const SequencePlanImpl& plan, ExecutionContext& execution_in,
+                                 const EngineOptions& options)
     : model(*models[0]), execution(execution_in), device(execution_in.primary()), tp(execution_in.tp),
       capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
@@ -564,12 +565,14 @@ ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaxim
         prefix_index = std::make_unique<ninfer::prefix_cache::PrefixIndex>(
             ninfer::prefix_cache::PrefixIndexOptions{.device_snapshot_slots = prefix_snapshot_slots},
             prefix_sink.get());
-        // M2: create host slab pool if requested. Slabs are rank-sliced: a block slab holds
-        // tp x per-rank block bytes (rank r at offset r * per_rank_block_bytes), a snapshot slab
-        // holds tp x per-rank snapshot image bytes. Each rank transfers only its own slice.
-        if (plan.prefix_cache.host_cache_mib > 0) {
-            const std::size_t total_bytes =
-                static_cast<std::size_t>(plan.prefix_cache.host_cache_mib) * 1024U * 1024U;
+        // M2: host tier setup. Slabs are rank-sliced: a block slab holds tp x per-rank block
+        // bytes (rank r at offset r * per_rank_block_bytes), a snapshot slab holds tp x per-rank
+        // snapshot image bytes. Each rank transfers only its own slice. A caller-supplied
+        // process-level tier must describe exactly this artifact and execution width.
+        const bool wants_host_tier = plan.prefix_cache.host_cache_mib > 0 ||
+                                     options.shared_host_tier != nullptr ||
+                                     options.create_shared_host_tier;
+        if (wants_host_tier) {
             // Per-rank block bytes: this rank's text-pool page plus its backend-pool page (all
             // planes of both pools), exactly what one cache node stores per rank.
             const std::size_t per_rank_block_bytes =
@@ -590,42 +593,104 @@ ProgramImplCore::ProgramImplCore(const std::array<const LoadedModelData*, kMaxim
                 (per_layer_conv_bytes + per_layer_recurrent_bytes);
             prefix_block_rank_bytes    = per_rank_block_bytes;
             prefix_snapshot_rank_bytes = per_rank_snapshot_bytes;
-            const std::size_t block_slab_bytes    = static_cast<std::size_t>(tp) * per_rank_block_bytes;
+            const std::size_t block_slab_bytes =
+                static_cast<std::size_t>(tp) * per_rank_block_bytes;
             const std::size_t snapshot_slab_bytes =
                 static_cast<std::size_t>(tp) * per_rank_snapshot_bytes;
-            // Split budget: 80% for KV blocks, 20% for snapshot images.
-            const std::size_t block_budget = (total_bytes * 8) / 10;
-            const std::size_t snap_budget  = total_bytes - block_budget;
-            const std::size_t block_count = block_slab_bytes > 0 ? (block_budget / block_slab_bytes) : 0;
-            const std::size_t snap_count  = snapshot_slab_bytes > 0 ? (snap_budget / snapshot_slab_bytes) : 0;
-            if (block_count == 0 || snap_count == 0) {
-                // Budget too small for at least one slab of each kind; skip host tier.
+            if (block_slab_bytes == 0 || snapshot_slab_bytes == 0) {
+                throw std::invalid_argument(
+                    "prefix cache host slabs have zero size for this target geometry");
+            }
+
+            if (options.shared_host_tier != nullptr) {
+                if (options.shared_host_tier->tp() != static_cast<std::uint32_t>(tp) ||
+                    options.shared_host_tier->block_slab_bytes() != block_slab_bytes ||
+                    options.shared_host_tier->snapshot_slab_bytes() != snapshot_slab_bytes) {
+                    throw std::invalid_argument(
+                        "EngineOptions.shared_host_tier geometry does not match this target");
+                }
+                shared_tier          = options.shared_host_tier;
+                prefix_host_allocator = shared_tier.get();
+                prefix_index->set_shared_host_tier(shared_tier.get());
                 std::fprintf(stderr,
-                             "[host-cache] requested %u MiB is too small for one block slab "
-                             "(%zu MiB) plus one snapshot slab (%zu MiB); host tier disabled\n",
-                             plan.prefix_cache.host_cache_mib, block_slab_bytes >> 20U,
-                             snapshot_slab_bytes >> 20U);
-            } else {
-                prefix_host_pool = std::make_unique<ninfer::prefix_cache::HostSlabPool>(
-                    ninfer::prefix_cache::HostSlabPoolOptions{
-                        .total_bytes         = total_bytes,
-                        .block_slab_bytes    = block_slab_bytes,
-                        .snapshot_slab_bytes = snapshot_slab_bytes,
-                        .block_slab_count    = block_count,
-                        .snapshot_slab_count = snap_count,
-                    });
+                             "[host-cache] reusing shared tier: %zu block + %zu snapshot slabs\n",
+                             shared_tier->block_slab_count(),
+                             shared_tier->snapshot_slab_count());
+            } else if (options.create_shared_host_tier) {
+                if (plan.prefix_cache.host_cache_mib == 0) {
+                    throw std::invalid_argument(
+                        "EngineOptions.create_shared_host_tier requires "
+                        "prefix_cache.host_cache_mib > 0");
+                }
+                const std::size_t total_bytes =
+                    static_cast<std::size_t>(plan.prefix_cache.host_cache_mib) * 1024U * 1024U;
+                // Split budget: 80% for KV blocks, 20% for snapshot images.
+                const std::size_t block_budget = (total_bytes * 8) / 10;
+                const std::size_t snap_budget  = total_bytes - block_budget;
+                const std::size_t block_count  = block_budget / block_slab_bytes;
+                const std::size_t snap_count   = snap_budget / snapshot_slab_bytes;
+                if (block_count == 0 || snap_count == 0) {
+                    throw std::invalid_argument(
+                        "prefix cache host budget is too small for one block and one snapshot "
+                        "slab");
+                }
+                shared_tier = SharedHostTier::create(SharedHostTier::Config{
+                    .host_bytes          = total_bytes,
+                    .block_slab_bytes    = block_slab_bytes,
+                    .snapshot_slab_bytes = snapshot_slab_bytes,
+                    .block_slabs         = block_count,
+                    .snapshot_slabs      = snap_count,
+                    .block_tokens        = static_cast<std::uint32_t>(
+                        ninfer::prefix_cache::kBlockTokens),
+                    .tp = static_cast<std::uint32_t>(tp),
+                });
+                prefix_host_allocator = shared_tier.get();
+                prefix_index->set_shared_host_tier(shared_tier.get());
                 std::fprintf(stderr,
-                             "[host-cache] pinned %zu MiB (requested %u MiB): %zu block + %zu "
+                             "[host-cache] created shared tier pinned %zu MiB: %zu block + %zu "
                              "snapshot slabs\n",
-                             prefix_host_pool->pinned_bytes() >> 20U,
-                             plan.prefix_cache.host_cache_mib,
-                             prefix_host_pool->block_slab_count(),
-                             prefix_host_pool->snapshot_slab_count());
-                prefix_index->set_host_pool(prefix_host_pool.get());
-                // M2: dedicated cache transfer stream per rank for D2H/H2D copies. Each rank's
-                // stream and events must be created with THAT rank's device current, because they
-                // operate on that rank's KV/GDN memory under ScopedDevice(rank_device.device); a
-                // stream or event bound to the wrong device is an invalid resource handle.
+                             shared_tier->pinned_bytes() >> 20U,
+                             shared_tier->block_slab_count(),
+                             shared_tier->snapshot_slab_count());
+            } else {
+                const std::size_t total_bytes =
+                    static_cast<std::size_t>(plan.prefix_cache.host_cache_mib) * 1024U * 1024U;
+                const std::size_t block_budget = (total_bytes * 8) / 10;
+                const std::size_t snap_budget  = total_bytes - block_budget;
+                const std::size_t block_count  = block_budget / block_slab_bytes;
+                const std::size_t snap_count   = snap_budget / snapshot_slab_bytes;
+                if (block_count == 0 || snap_count == 0) {
+                    // Budget too small for at least one slab of each kind; skip host tier.
+                    std::fprintf(stderr,
+                                 "[host-cache] requested %u MiB is too small for one block slab "
+                                 "(%zu MiB) plus one snapshot slab (%zu MiB); host tier disabled\n",
+                                 plan.prefix_cache.host_cache_mib, block_slab_bytes >> 20U,
+                                 snapshot_slab_bytes >> 20U);
+                } else {
+                    local_host_pool = std::make_unique<ninfer::prefix_cache::HostSlabPool>(
+                        ninfer::prefix_cache::HostSlabPoolOptions{
+                            .total_bytes         = total_bytes,
+                            .block_slab_bytes    = block_slab_bytes,
+                            .snapshot_slab_bytes = snapshot_slab_bytes,
+                            .block_slab_count    = block_count,
+                            .snapshot_slab_count = snap_count,
+                        });
+                    prefix_host_allocator = local_host_pool.get();
+                    std::fprintf(stderr,
+                                 "[host-cache] pinned %zu MiB (requested %u MiB): %zu block + %zu "
+                                 "snapshot slabs\n",
+                                 local_host_pool->pinned_bytes() >> 20U,
+                                 plan.prefix_cache.host_cache_mib,
+                                 local_host_pool->block_slab_count(),
+                                 local_host_pool->snapshot_slab_count());
+                }
+            }
+            if (prefix_host_allocator != nullptr) {
+                prefix_index->set_host_allocator(prefix_host_allocator);
+                // Dedicated cache transfer stream per rank for D2H/H2D copies. Each rank's stream
+                // and events must be created with THAT rank's device current, because they operate
+                // on that rank's KV/GDN memory under ScopedDevice(rank_device.device); a stream or
+                // event bound to the wrong device is an invalid resource handle.
                 for (int rank = 0; rank < tp; ++rank) {
                     const auto slot = static_cast<std::size_t>(rank);
                     DeviceContext& rank_device = rank == 0 ? device : peer[slot]->device;
@@ -923,6 +988,15 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     }
 
     const auto started       = Clock::now();
+    // Cross-instance hint: the plan validated it, but the live manifest is re-verified here. A
+    // rejected hint clears the plan's reuse decision and the request runs cold.
+    if (request_plan.prefix_hint.valid() && prefix_index != nullptr && shared_tier != nullptr) {
+        if (!restore_foreign_prefix_hint(sequence, request_plan, prompt)) {
+            request_plan.reuse        = ReusePath::FullReset;
+            request_plan.reuse_base   = 0;
+            request_plan.reuse_reason = PrefixReuseReason::HintRejected;
+        }
+    }
     const std::uint32_t base = request_plan.reuse_base;
     const std::uint32_t initial_mtp_extent =
         speculative_backend == SpeculativeBackend::Mtp
@@ -1045,10 +1119,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                         backend_pages.push_back(node->device_pages.page[1]);
                     }
                 } else if (node->host_state == ninfer::prefix_cache::Residency::Host &&
-                           prefix_host_pool != nullptr) {
+                           prefix_host_allocator != nullptr) {
                     const ninfer::prefix_cache::PoolPages pages = acquire_cache_bundle();
                     prefix_index->begin_device_fill(node_id, pages);
-                    char* slab = static_cast<char*>(prefix_host_pool->data(node->host_page));
+                    char* slab = static_cast<char*>(prefix_host_allocator->data(node->host_page));
                     bool ok = true;
                     for (int rank = 0; ok && rank < tp; ++rank) {
                         ok = copy_cache_block(rank, pages.page[0], pages.page[1],
@@ -1073,7 +1147,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             const ninfer::prefix_cache::Snapshot* after = prefix_index->snapshot(snap_id);
             if (after != nullptr && !after->device_resident() &&
                 after->host_state == ninfer::prefix_cache::Residency::Host &&
-                prefix_host_pool != nullptr) {
+                prefix_host_allocator != nullptr) {
                 const auto target = prefix_index->begin_snapshot_restore(snap_id);
                 if (target.slot == ninfer::prefix_cache::kInvalidSlot) {
                     throw std::logic_error("snapshot restore has no device slot");
@@ -1081,7 +1155,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 const std::int32_t restore_state_slot = LinearStateSlots::snapshot_state_slot(
                     static_cast<std::uint32_t>(target.slot), max_concurrency,
                     prefix_snapshot_slots);
-                char* slab = static_cast<char*>(prefix_host_pool->data(target.page));
+                char* slab = static_cast<char*>(prefix_host_allocator->data(target.page));
                 bool ok = true;
                 for (int rank = 0; ok && rank < tp; ++rank) {
                     ok = copy_snapshot_slot(rank, restore_state_slot,
@@ -1534,7 +1608,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 // Release this request's cache pins now that it is done: its committed blocks stay
                 // in the cache but must become evictable, otherwise the next request's admission
                 // sees them as permanently unavailable and the tap-slot array accumulates.
-                finalize_prefix_cache_state(sequence);
+                finalize_prefix_cache_state(sequence, /*request_completed=*/true);
                 sequence.retained = true;
                 request.lifecycle = Lifecycle::Complete;
             } else {
@@ -1573,12 +1647,13 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
     return lane < max_concurrency ? requests[lane].speculative_stats : SpeculativeStats{};
 }
 
-void ProgramImplCore::finalize_prefix_cache_state(SequenceState& sequence) noexcept {
+void ProgramImplCore::finalize_prefix_cache_state(SequenceState& sequence,
+                                                  bool request_completed) noexcept {
     if (prefix_index == nullptr) { return; }
     // M2: persist device-resident blocks that gained no host copy yet. This runs BEFORE the
     // lane's pins drop, and each issue pins its node against eviction for the transfer's
     // duration, so the D2H can never race a page release. Best-effort; never throws.
-    if (prefix_host_pool != nullptr) {
+    if (prefix_host_allocator != nullptr) {
         for (ninfer::prefix_cache::NodeId id : sequence.prefix_pinned_nodes) {
             issue_block_write_through(id);
         }
@@ -1599,6 +1674,18 @@ void ProgramImplCore::finalize_prefix_cache_state(SequenceState& sequence) noexc
     for (ninfer::prefix_cache::NodeId id : sequence.prefix_pinned_nodes) {
         prefix_index->unpin_node(id);
     }
+    // A foreign import commits its device pages to the local tree only on a successful completion;
+    // the manifest's host pages are never released by this Engine. The single manifest ref taken by
+    // `import_foreign` is released exactly once here.
+    if (sequence.prefix_foreign_manifest != 0) {
+        if (request_completed) {
+            (void)prefix_index->commit_foreign(
+                sequence.prefix_foreign_manifest,
+                std::span<const TokenId>(sequence.prefix_foreign_tokens));
+        }
+        prefix_index->release_foreign(sequence.prefix_foreign_manifest);
+        sequence.prefix_foreign_manifest = 0;
+    }
     // Reset the per-request capture state so the next request starts clean.
     sequence.prefix_pinned_nodes.clear();
     sequence.prefix_tap_positions.clear();
@@ -1609,6 +1696,7 @@ void ProgramImplCore::finalize_prefix_cache_state(SequenceState& sequence) noexc
     sequence.prefix_matched_blocks = 0;
     sequence.prefix_parent         = ninfer::prefix_cache::kInvalidNode;
     sequence.prefix_prompt_tokens.clear();
+    sequence.prefix_foreign_tokens.clear();
     sequence.prefix_block_hashes.clear();
     sequence.prefix_block_extras.clear();
     sequence.prefix_snapshot = ninfer::prefix_cache::kInvalidSnapshot;
@@ -1619,11 +1707,99 @@ void ProgramImplCore::finalize_prefix_cache_state(SequenceState& sequence) noexc
     // blocks as still in-flight (restore_pins != 0), counts them as non-evictable, and rejects a
     // request that would otherwise fit once the prior blocks can be demoted to host.
     settle_prefix_writes();
+    // Publish only successful full taps, now that every D2H copy has landed. A failed or cancelled
+    // request drops its pending list without leaving a manifest or pin behind.
+    if (request_completed && shared_tier != nullptr) {
+        for (const auto& tap : sequence.prefix_pending_shared_taps) {
+            publish_shared_manifest(tap.id, tap.generation);
+        }
+    }
+    sequence.prefix_pending_shared_taps.clear();
+}
+
+void ProgramImplCore::publish_shared_manifest(
+    ninfer::prefix_cache::SnapshotId id, std::uint32_t expected_generation) noexcept {
+    if (shared_tier == nullptr || prefix_index == nullptr || shared_tier_owner == 0) { return; }
+    (void)prefix_index->publish_snapshot_manifest(
+        id, shared_tier_owner, static_cast<std::uint32_t>(tp), expected_generation);
+}
+
+bool ProgramImplCore::restore_foreign_prefix_hint(SequenceState& sequence,
+                                                  RequestPlanImpl& plan,
+                                                  const PreparedPromptData& prompt) {
+    if (prefix_index == nullptr || shared_tier == nullptr || !plan.prefix_hint.valid()) {
+        return false;
+    }
+    const auto view = shared_tier->match(static_cast<std::uint32_t>(tp),
+                                         std::span<const std::uint64_t>(prompt.block_hashes),
+                                         plan.prefix_hint.frontier);
+    // The hint is advisory: the live manifest must still be the one the hint names, and its
+    // frontier must reach the hinted frontier. A stale or different manifest falls to the cold path.
+    if (!view.has_value() || view->id != plan.prefix_hint.manifest_id ||
+        view->frontier < plan.prefix_hint.frontier) {
+        return false;
+    }
+    const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
+    // A tap state image carries only the GDN state, so a zero-token suffix cannot sample the first
+    // token; a hint that covers the whole prompt is not usable for restore.
+    if (view->frontier >= prompt_tokens || view->frontier % ninfer::prefix_cache::kBlockTokens != 0) {
+        return false;
+    }
+
+    ninfer::prefix_cache::PrefixIndex::ForeignView foreign;
+    foreign.manifest_id  = view->id;
+    foreign.frontier     = view->frontier;
+    foreign.hashes       = view->hashes;
+    foreign.block_pages  = view->block_pages;
+    foreign.state_page   = view->state_page;
+    if (!prefix_index->import_foreign(foreign)) { return false; }
+
+    // Build the effective path. A local node with the exact same tokens wins (rule 6): the foreign
+    // pages then only back this request's restore. A foreign node is used only where the local tree
+    // has no match.
+    const std::uint32_t blocks = view->frontier / ninfer::prefix_cache::kBlockTokens;
+    std::vector<ninfer::prefix_cache::NodeId> path{prefix_index->root()};
+    ninfer::prefix_cache::NodeId parent = prefix_index->root();
+    for (std::uint32_t block = 0; block < blocks; ++block) {
+        const std::span<const TokenId> block_tokens =
+            std::span<const TokenId>(prompt.token_ids)
+                .subspan(static_cast<std::size_t>(block) *
+                             static_cast<std::size_t>(ninfer::prefix_cache::kBlockTokens),
+                         static_cast<std::size_t>(ninfer::prefix_cache::kBlockTokens));
+        const auto local = prefix_index->find_child(parent, view->hashes[block], block_tokens, 0);
+        ninfer::prefix_cache::NodeId node = local.node;
+        if (node == ninfer::prefix_cache::kInvalidNode) {
+            node = prefix_index->foreign_node(view->id, block);
+        }
+        if (node == ninfer::prefix_cache::kInvalidNode) {
+            prefix_index->release_foreign(view->id);
+            return false;
+        }
+        path.push_back(node);
+        parent = node;
+    }
+
+    plan.block_path         = std::move(path);
+    plan.block_path_blocks  = blocks;
+    plan.block_snapshot     = prefix_index->foreign_snapshot(view->id);
+    if (plan.block_snapshot == ninfer::prefix_cache::kInvalidSnapshot) {
+        prefix_index->release_foreign(view->id);
+        return false;
+    }
+    plan.reuse      = ReusePath::BlockSnapshot;
+    plan.reuse_base = view->frontier;
+    plan.reuse_reason = PrefixReuseReason::ReusedBlockSnapshot;
+    sequence.prefix_foreign_manifest = view->id;
+    // Commit at finalize compares the foreign chain against these exact tokens. Saving them here
+    // keeps the commit path alive even when this request plans no tap (frontier one block from the
+    // prompt end), where `prefix_prompt_tokens` would otherwise stay empty.
+    sequence.prefix_foreign_tokens = prompt.token_ids;
+    return true;
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
-    finalize_prefix_cache_state(sequence);
+    finalize_prefix_cache_state(sequence, /*request_completed=*/false);
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
     sequence.execution_frontier = 0;
@@ -2773,9 +2949,11 @@ std::uint32_t ProgramImplCore::cap_final_chunk_for_taps(const SequenceState& seq
         cursor + nominal != prompt_tokens) {
         return nominal;
     }
-    const std::uint32_t kBlock = static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens);
-    const std::uint32_t boundary = (prompt_tokens / kBlock) * kBlock;
-    if (boundary > cursor) { nominal = boundary - cursor; }
+    // End the chunk at the next planned tap so the captured state image belongs to the tap's
+    // frontier. Capping only at the prompt's block boundary would capture a block-aligned prompt
+    // at its full length, publishing a manifest that can never restore a shorter prefix.
+    const std::uint32_t next_tap = sequence.prefix_tap_positions[sequence.prefix_tap_next];
+    if (next_tap > cursor && next_tap < cursor + nominal) { nominal = next_tap - cursor; }
     return nominal;
 }
 
@@ -2870,6 +3048,12 @@ void ProgramImplCore::capture_prefix_after_chunk(SequenceState& sequence) {
                 prefix_index->release_reserved_slot(slot);
             }
             issue_snapshot_write_through(snap_id);
+            // A full tap can be published as a shared manifest, but only after the request
+            // completes successfully. Record it now; the D2H copy is still in flight.
+            if (published != nullptr && published->tail_len == 0 && shared_tier != nullptr &&
+                shared_tier->enabled()) {
+                sequence.prefix_pending_shared_taps.push_back({snap_id, published->generation});
+            }
         } else {
             prefix_index->release_reserved_slot(slot);
         }
@@ -3053,7 +3237,7 @@ void ProgramImplCore::order_prefix_cache_after_compute(int rank) noexcept {
 }
 
 void ProgramImplCore::issue_block_write_through(ninfer::prefix_cache::NodeId node) noexcept {
-    if (prefix_index == nullptr || prefix_host_pool == nullptr) { return; }
+    if (prefix_index == nullptr || prefix_host_allocator == nullptr) { return; }
     const ninfer::prefix_cache::BlockNode* n = prefix_index->node(node);
     if (n == nullptr || n->device_state != ninfer::prefix_cache::Residency::Resident ||
         n->host_state != ninfer::prefix_cache::Residency::Absent) {
@@ -3061,7 +3245,7 @@ void ProgramImplCore::issue_block_write_through(ninfer::prefix_cache::NodeId nod
     }
     const auto target = prefix_index->begin_host_write(node);
     if (target.page == ninfer::prefix_cache::kInvalidHostPage) { return; }
-    char* slab = static_cast<char*>(prefix_host_pool->data(target.page));
+    char* slab = static_cast<char*>(prefix_host_allocator->data(target.page));
     bool ok = true;
     for (int rank = 0; ok && rank < tp; ++rank) {
         order_prefix_cache_after_compute(rank);
@@ -3081,12 +3265,12 @@ void ProgramImplCore::issue_block_write_through(ninfer::prefix_cache::NodeId nod
 }
 
 void ProgramImplCore::issue_snapshot_write_through(ninfer::prefix_cache::SnapshotId id) noexcept {
-    if (prefix_index == nullptr || prefix_host_pool == nullptr) { return; }
+    if (prefix_index == nullptr || prefix_host_allocator == nullptr) { return; }
     const ninfer::prefix_cache::Snapshot* s = prefix_index->snapshot(id);
     if (s == nullptr) { return; }
     const auto target = prefix_index->begin_snapshot_write(id);
     if (target.page == ninfer::prefix_cache::kInvalidHostPage) { return; }
-    char* slab = static_cast<char*>(prefix_host_pool->data(target.page));
+    char* slab = static_cast<char*>(prefix_host_allocator->data(target.page));
     const std::int32_t state_slot = LinearStateSlots::snapshot_state_slot(
         static_cast<std::uint32_t>(s->device_slot), max_concurrency, prefix_snapshot_slots);
     bool ok = true;
@@ -3413,6 +3597,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         sequence.tail_hidden_valid      = true;
         request.timings.vision_seconds  = vision_seconds;
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
+        last_prefill_tokens             = prompt_tokens - staged.base;
+        last_prefill_seconds            = request.timings.prefill_seconds;
         if (rewrite_checkpoint_capture) {
             const std::uint32_t frontier = rewrite_checkpoint_capture->frontier;
             if (frontier == 0 || frontier > prompt_tokens || sequence.text_kv_valid < frontier) {
@@ -4513,7 +4699,7 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         // Release this request's cache pins now that it is done: its committed blocks stay in the
         // cache but must become evictable, otherwise the next request's admission sees them as
         // permanently unavailable and the tap-slot array accumulates.
-        finalize_prefix_cache_state(sequence);
+        finalize_prefix_cache_state(sequence, /*request_completed=*/true);
         sequence.retained = true;
     }
     request.lifecycle = terminal ? Lifecycle::Complete : Lifecycle::Active;
@@ -4597,16 +4783,48 @@ MetricsSnapshot ProgramImplCore::metrics() const noexcept {
         out.prefix_cache.device_snapshot_slots_used =
             prefix_index->device_snapshot_slots() - prefix_index->device_snapshot_slots_free();
     }
-    if (prefix_host_pool != nullptr) {
+    if (prefix_host_allocator != nullptr) {
         HostCacheMetrics& host = out.prefix_cache.host;
-        host.enabled           = prefix_host_pool->enabled();
-        host.pinned_bytes      = prefix_host_pool->pinned_bytes();
-        host.used_bytes        = prefix_host_pool->used_bytes();
+        host.enabled           = prefix_host_allocator->enabled();
+        host.pinned_bytes      = prefix_host_allocator->pinned_bytes();
+        host.used_bytes        = prefix_host_allocator->used_bytes();
         host.block_slab_count =
-            static_cast<std::uint32_t>(prefix_host_pool->block_slab_count());
+            static_cast<std::uint32_t>(prefix_host_allocator->block_slab_count());
         host.snapshot_slab_count =
-            static_cast<std::uint32_t>(prefix_host_pool->snapshot_slab_count());
+            static_cast<std::uint32_t>(prefix_host_allocator->snapshot_slab_count());
     }
+    return out;
+}
+
+PrefixProbe ProgramImplCore::prefix_probe(std::span<const std::uint64_t> hashes) const {
+    PrefixProbe probe;
+    probe.block_tokens = static_cast<std::uint32_t>(ninfer::prefix_cache::kBlockTokens);
+    if (prefix_index != nullptr) {
+        probe.device_frontier = prefix_index->probe_device(hashes);
+    }
+    if (shared_tier != nullptr) {
+        const auto manifest = shared_tier->match(
+            static_cast<std::uint32_t>(tp), hashes,
+            static_cast<std::uint32_t>(hashes.size()) * probe.block_tokens);
+        if (manifest.has_value()) {
+            probe.manifest_frontier = manifest->frontier;
+            probe.manifest_id       = manifest->id;
+        }
+    }
+    return probe;
+}
+
+CapacitySnapshot ProgramImplCore::capacity_snapshot() const noexcept {
+    CapacitySnapshot out;
+    const PagedKVPool& pool = decoder->text_kv.pool();
+    out.total_pages     = pool.page_group_count();
+    out.free_pages      = pool.free_pages();
+    out.max_concurrency = max_concurrency;
+    out.max_context     = capacity;
+    out.prefill_chunk   = prefill_chunk;
+    out.recent_prefill_tps = last_prefill_seconds > 0.0
+                                 ? static_cast<double>(last_prefill_tokens) / last_prefill_seconds
+                                 : 0.0;
     return out;
 }
 

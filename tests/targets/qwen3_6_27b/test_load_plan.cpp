@@ -189,7 +189,7 @@ int verify_profile_mismatch_rejection() {
     try {
         const std::array<const RuntimeModelView*, ninfer::kMaximumDevices> models{&empty_model};
         (void)ninfer::targets::qwen3_6::create_program<Variant>(
-            models, WeightsProfile::Qwen36Nvfp4, std::move(sequence), execution);
+            models, WeightsProfile::Qwen36Nvfp4, std::move(sequence), execution, options);
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }
     }
