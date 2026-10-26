@@ -115,7 +115,12 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     const Weight weight = host_weight.device_weight(device_weight.data());
 
     int failures = 0;
+    const bool a8_supported = cuda_supports_fp8_a8();
     for (const Invocation invocation : invocations) {
+        if (!a8_supported && invocation.policy == ops::LinearPolicy::AllowA8 &&
+            invocation.tokens >= first_a8) {
+            continue;
+        }
         const std::size_t output_words = static_cast<std::size_t>(n) * invocation.tokens;
         GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
         output.copy_from_host(initial_residual.data(), output.bytes());
@@ -187,8 +192,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1, 1024);
     const std::size_t exact_1024 = ops::linear_add_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1024, 1024);
-    if (a16_interval != 0 || pre_boundary != 0 || hot_interval != exact_48 ||
-        through_1024 != exact_1024 || exact_1024 <= exact_48) {
+    if (a8_supported && (a16_interval != 0 || pre_boundary != 0 ||
+                         hot_interval != exact_48 || through_1024 != exact_1024 ||
+                         exact_1024 <= exact_48)) {
         std::cerr << "FP8 linear_add [" << n << ',' << k
                   << "]: workspace interval contract mismatch\n";
         ++failures;

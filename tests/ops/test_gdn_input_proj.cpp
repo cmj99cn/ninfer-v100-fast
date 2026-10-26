@@ -218,10 +218,12 @@ int run_nvfp4() {
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::A16Only);
-    failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    if (cuda_supports_nvfp4_a4()) {
+        failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
+        failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
+        failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
+        failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    }
     return failures;
 }
 
@@ -302,8 +304,10 @@ int run_fp8() {
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 1024, 1024);
     const std::size_t a16 = ops::gdn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::A16Only, 1, 2048);
-    if (one != 0 || seven != 0 || eight == 0 || forty_eight <= eight ||
-        hot_interval != forty_eight || exact_1024 <= forty_eight || a16 != 0) {
+    const bool a8_supported = cuda_supports_fp8_a8();
+    if (a8_supported && (one != 0 || seven != 0 || a16 != 0 || eight == 0 ||
+                         forty_eight <= eight || hot_interval != forty_eight ||
+                         exact_1024 <= forty_eight)) {
         std::cerr << "FP8 gdn input workspace interval contract mismatch\n";
         ++failures;
     }
@@ -311,6 +315,7 @@ int run_fp8() {
     failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, true);
     failures += run_fp8_case(parent, 2, ops::LinearPolicy::A16Only);
     for (const std::int32_t tokens : {1, 2, 7, 8, 48, 65, 1024}) {
+        if (!a8_supported && tokens >= 8) { continue; }
         failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
     return failures;

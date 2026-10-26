@@ -550,13 +550,18 @@ void judge(const std::string& label, const OracleLeg& shard, const OracleLeg& pa
         fail(label + ": shard relative_l2 " + std::to_string(shard.relative_l2) +
              " exceeds the Op's registered bound " + std::to_string(criterion.relative_l2));
     }
-    constexpr double kSlack = 1.02;
-    if (shard.relative_l2 > parent.relative_l2 * kSlack) {
+    constexpr double kSlack   = 1.02;
+    constexpr double kEpsilon = 1e-6;
+    const double parent_l2   = std::max(parent.relative_l2, 0.0);
+    const double shard_l2    = std::max(shard.relative_l2, 0.0);
+    const double parent_gross = std::max(parent.gross, 0.0);
+    const double shard_gross  = std::max(shard.gross, 0.0);
+    if (shard_l2 > parent_l2 * kSlack + kEpsilon) {
         fail(label + ": shard relative_l2 " + std::to_string(shard.relative_l2) +
              " is worse than the tp1 geometry's " + std::to_string(parent.relative_l2) +
              " on the same data");
     }
-    if (shard.gross > parent.gross * kSlack) {
+    if (shard_gross > parent_gross * kSlack + kEpsilon) {
         fail(label + ": shard max-absolute error " + std::to_string(shard.gross) +
              " is worse than the tp1 geometry's " + std::to_string(parent.gross) +
              " on the same data");

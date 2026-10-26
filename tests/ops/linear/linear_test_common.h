@@ -61,6 +61,8 @@ void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* 
                           std::int32_t n, std::int32_t k, std::int32_t t);
 
 bool cuda_available();
+bool supports_nvfp4_a4();
+bool supports_fp8_a8();
 
 int run_shape(std::string_view label, ActivationCompute activation_compute,
               WeightGenerator generator, const ShapeCase& shape);

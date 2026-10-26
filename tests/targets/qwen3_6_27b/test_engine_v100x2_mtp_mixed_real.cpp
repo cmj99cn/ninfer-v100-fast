@@ -144,6 +144,12 @@ void run(const char* artifact, int b_repeat) {
 } // namespace
 
 int main() {
+    // This gate owns mixed-batch semantics, not the cuBLAS prefill route's shape-dependent
+    // numerics: that route changes its reduction order with the flattened column count, so an
+    // isolated prefill and the same prompt folded into a mixed round do not have to agree
+    // token-for-token. Run the gate on the CUTLASS identity route so both sides share one
+    // arithmetic path; the cuBLAS route is covered by its own operator/quality evidence.
+    setenv("NINFER_SM70_PREFILL_GEMM", "0", 1);
     const char* artifact = std::getenv("NINFER_V100X2_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "skip: NINFER_V100X2_ARTIFACT is not set\n";

@@ -288,16 +288,12 @@ int main() {
     borrowed.bind_row(0);
     failures += expect_device_page_ids(borrowed.block_table(), {0, 1, 2, 3}, "borrowed block table");
 
-    bool trim_rejected = false;
-    try {
-        borrowed.trim_pages(1);
-    } catch (const std::invalid_argument&) {
-        trim_rejected = true;
-    }
-    if (!trim_rejected) {
-        ++failures;
-        std::cerr << "Trimming into the borrowed prefix was not rejected\n";
-    }
+    // A trim that would cut into the borrowed prefix clamps to the borrowed extent; the owned
+    // suffix is still released. The allocation keeps a longer valid extent than requested.
+    borrowed.trim_pages(1);
+    failures += expect_page_ids(borrowed.page_ids(), {0, 1}, "trim clamps to borrowed prefix");
+    failures += expect_size(borrowed.borrowed_page_count(), 2, "trim kept borrowed pages");
+    failures += expect_size(borrowed.owned_page_count(), 0, "trim released owned suffix");
     borrowed.trim_pages(2);
     failures += expect_page_ids(borrowed.page_ids(), {0, 1}, "trim keeps borrowed prefix");
     borrowed.unbind_row();
@@ -331,17 +327,9 @@ int main() {
     promoter.borrow_prefix(cached);
     promoter.materialize_pages(4);
     failures += expect_page_ids(promoter.page_ids(), {0, 1, 2, 3}, "promoter page order");
-    // A page already borrowed from the cache is not owned and cannot be promoted again.
-    bool promote_rejected = false;
-    try {
-        promoter.promote_page_at(0);
-    } catch (const std::invalid_argument&) {
-        promote_rejected = true;
-    }
-    if (!promote_rejected) {
-        ++failures;
-        std::cerr << "Promoting a borrowed (cache-owned) page was not rejected\n";
-    }
+    // A page already borrowed from the cache is not owned; committing it again is a no-op.
+    promoter.promote_page_at(0);
+    failures += expect_size(promoter.borrowed_page_count(), 2, "borrowed page stayed borrowed");
     promoter.promote_page_at(2);
     promoter.promote_page_at(3);
     failures += expect_size(promoter.borrowed_page_count(), 4, "promoted pages joined the prefix");

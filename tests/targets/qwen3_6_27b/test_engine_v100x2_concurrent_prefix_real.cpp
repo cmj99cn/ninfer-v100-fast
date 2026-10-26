@@ -190,17 +190,17 @@ struct ConcurrentRound {
 
 // Submit all lanes up front so the scheduler places them in one batched round; every lane reuses
 // the shared prefix while it decodes alongside the others.
-ConcurrentRound run_concurrent(ninfer::Engine& engine, const Tokens& prefix) {
+ConcurrentRound run_concurrent(ninfer::Engine& engine, const Tokens& prefix, bool reuse) {
     const ninfer::RuntimeStats before = engine.runtime_stats();
     std::vector<ninfer::PreparedPrompt> prompts;
     prompts.reserve(kLanes);
     for (std::uint32_t lane = 0; lane < kLanes; ++lane) {
-        prompts.push_back(engine.prepare_tokens(lane_tokens(prefix, lane), true));
+        prompts.push_back(engine.prepare_tokens(lane_tokens(prefix, lane), reuse));
     }
     std::vector<ninfer::GenerationHandle> handles;
     handles.reserve(kLanes);
     for (auto& prompt : prompts) {
-        handles.push_back(engine.submit(std::move(prompt), request_options(true)));
+        handles.push_back(engine.submit(std::move(prompt), request_options(reuse)));
     }
     ConcurrentRound out;
     for (std::uint32_t lane = 0; lane < kLanes; ++lane) {
@@ -220,44 +220,24 @@ std::size_t prefix_agreement(const Tokens& a, const Tokens& b) {
     return agreed;
 }
 
-// The reference lane answer must be reproduced exactly, or the batched-reuse path changed the
-// context. `test_engine_tp2_real.cpp` documents that one prompt can sit on a greedy knife edge
-// where any last-bit perturbation flips the continuation, so the leg only has full strength on a
-// lane that IS batch-invariant; it still requires every lane to be at least as faithful as the
-// single-lane answer (agreement is measured against that answer, so a corrupted lane collapses to
-// a short prefix and fails).
-void require_consistent(const std::array<Tokens, kLanes>& ref, const ConcurrentRound& round) {
-    require(round.rows > round.rounds, "the concurrent round did not batch multiple lanes");
-    bool distinct = true;
-    for (std::uint32_t i = 0; i < kLanes; ++i) {
-        require(round.lanes[i].tokens.size() == kOutput,
-                "a concurrent lane did not generate its tokens");
-        require(round.lanes[i].reused > 0, "a concurrent lane did not reuse the shared prefix");
-        for (std::uint32_t j = i + 1; j < kLanes; ++j) {
-            if (round.lanes[i].tokens == round.lanes[j].tokens) { distinct = false; }
-        }
-    }
-    bool reference_distinct = true;
-    for (std::uint32_t i = 0; i < kLanes; ++i) {
-        for (std::uint32_t j = i + 1; j < kLanes; ++j) {
-            if (ref[i] == ref[j]) { reference_distinct = false; }
-        }
-    }
-    // Greedy collapse is a model property, not a sharing defect: only demand distinct batched
-    // lanes when the single-lane reference answers are themselves distinct.
-    if (reference_distinct) {
-        require(distinct, "two concurrent lanes produced the same answer -- state is being shared");
-    }
-
-    std::size_t exact = 0;
+// The correct control is a cold batch with the same four lanes: it has the same batch shape and
+// arithmetic as the reuse batch but never reads the shared prefix. If prefix reuse is correct, the
+// two batches produce identical per-lane tokens; a corrupted borrowed page or a wrong lane mapping
+// changes the reuse batch and fails here. Comparing against a sequential single-lane reference
+// would also fold in batch-composition numerics, which is not what this gate owns.
+void require_batch_control(const ConcurrentRound& cold, const ConcurrentRound& reuse) {
+    require(reuse.rows > reuse.rounds, "the concurrent round did not batch multiple lanes");
     for (std::uint32_t lane = 0; lane < kLanes; ++lane) {
-        const std::size_t agreed = prefix_agreement(ref[lane], round.lanes[lane].tokens);
-        std::cout << "lane " << lane << ": reused=" << round.lanes[lane].reused
-                  << " agreement=" << agreed << "/" << kOutput << std::endl;
-        if (agreed == kOutput) { ++exact; }
+        require(reuse.lanes[lane].tokens.size() == kOutput,
+                "a concurrent lane did not generate its tokens");
+        require(reuse.lanes[lane].reused > 0, "a concurrent lane did not reuse the shared prefix");
+        const std::size_t agreed =
+            prefix_agreement(cold.lanes[lane].tokens, reuse.lanes[lane].tokens);
+        std::cout << "lane " << lane << ": reused=" << reuse.lanes[lane].reused
+                  << " cold_agreement=" << agreed << "/" << kOutput << std::endl;
+        require(agreed == kOutput,
+                "batched shared-prefix reuse changed a lane's greedy continuation");
     }
-    require(exact == kLanes,
-            "batched shared-prefix reuse changed a lane's greedy continuation");
 }
 
 struct Reference {
@@ -293,10 +273,11 @@ void exercise_device(const char* artifact, const ninfer::PromptInput& input, con
     ninfer::Engine engine(engine_options(artifact));
     v100x2_test::check_identity(engine);
     seed(engine, input);
-    const auto first  = run_concurrent(engine, ref.prefix);
-    const auto second = run_concurrent(engine, ref.prefix);
+    const auto first  = run_concurrent(engine, ref.prefix, true);
+    const auto second = run_concurrent(engine, ref.prefix, true);
     require_reproducible(first, second);
-    require_consistent(ref.answers, first);
+    const auto cold = run_concurrent(engine, ref.prefix, false);
+    require_batch_control(cold, first);
     std::cout << "V100X2 concurrent shared-prefix reuse (device): PASS" << std::endl;
 }
 
@@ -338,10 +319,11 @@ void exercise_host(const char* artifact, const ninfer::PromptInput& input, const
         if (host_single[lane] != ref.answers[lane]) { host_single_ok = false; }
     }
     require(host_single_ok, "single-lane host restore did not reproduce the device answer");
-    const auto first  = run_concurrent(engine, ref.prefix);
-    const auto second = run_concurrent(engine, ref.prefix);
+    const auto first  = run_concurrent(engine, ref.prefix, true);
+    const auto second = run_concurrent(engine, ref.prefix, true);
     require_reproducible(first, second);
-    require_consistent(ref.answers, first);
+    const auto cold = run_concurrent(engine, ref.prefix, false);
+    require_batch_control(cold, first);
     std::cout << "V100X2 concurrent shared-prefix reuse (host tier): PASS" << std::endl;
 }
 

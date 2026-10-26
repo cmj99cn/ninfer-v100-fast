@@ -308,9 +308,11 @@ int run_nvfp4_target() {
     for (const std::int32_t tokens : {1, 2, 4, 8, 16, 20, 32, 33}) {
         failures += run_nvfp4_target_case(parent, tokens);
     }
-    failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    if (cuda_supports_nvfp4_a4()) {
+        failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
+        failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
+        failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    }
     return failures;
 }
 
@@ -387,14 +389,17 @@ int run_fp8_target() {
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 1024, 1024);
     const std::size_t a16 = ops::attn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::A16Only, 1, 2048);
-    if (one != 0 || ten != 0 || eleven == 0 || forty_eight <= eleven ||
-        hot_interval != forty_eight || exact_1024 <= forty_eight || a16 != 0) {
+    const bool a8_supported = cuda_supports_fp8_a8();
+    if (a8_supported && (one != 0 || ten != 0 || a16 != 0 || eleven == 0 ||
+                         forty_eight <= eleven || hot_interval != forty_eight ||
+                         exact_1024 <= forty_eight)) {
         std::cerr << "FP8 attention input workspace interval contract mismatch\n";
         ++failures;
     }
     failures += run_fp8_target_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_fp8_target_case(parent, 2, ops::LinearPolicy::A16Only);
     for (const std::int32_t tokens : {1, 2, 10, 11, 48, 65, 1024}) {
+        if (!a8_supported && tokens >= 11) { continue; }
         failures += run_fp8_target_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
     return failures;

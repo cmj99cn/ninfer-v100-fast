@@ -86,6 +86,28 @@ struct Case {
     std::vector<ops::LinearPolicy> policies;
 };
 
+bool compute_capability_supported(int major, int minor) {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) { return false; }
+    cudaDeviceProp properties{};
+    if (cudaGetDeviceProperties(&properties, 0) != cudaSuccess) { return false; }
+    return properties.major > major || (properties.major == major && properties.minor >= minor);
+}
+
+// The split suite runs the same policies as the tp1 conformance suites. A4 NVFP4 and A8 FP8 are
+// registered routes but their kernels require Blackwell (sm_100a/sm_120a); a Volta or Ampere host
+// must skip those policy rows rather than report a kernel failure for hardware it does not have.
+bool policy_supported(QType qtype, ops::LinearPolicy policy) {
+    if (policy == ops::LinearPolicy::AllowA4) {
+        return qtype != QType::NVFP4 || compute_capability_supported(12, 0);
+    }
+    if (policy == ops::LinearPolicy::AllowA8) {
+        return qtype != QType::FP8_E4M3FN_ROW_BF16S ||
+               compute_capability_supported(10, 0) || compute_capability_supported(12, 0);
+    }
+    return true;
+}
+
 const char* policy_name(ops::LinearPolicy policy) {
     switch (policy) {
     case ops::LinearPolicy::A16Only:
@@ -445,6 +467,10 @@ int run_case(const Case& test_case, const ExecutionContext& ec, const ops::Colle
         for (const ops::LinearPolicy policy : test_case.policies) {
             const std::string label =
                 head + " T=" + std::to_string(tokens) + " " + policy_name(policy);
+            if (!policy_supported(test_case.qtype, policy)) {
+                std::cout << label << " SKIP: policy requires a newer compute capability\n";
+                continue;
+            }
 
             // --- (a) reference: the tp1 kernel, whole weight, device 0 ------------------------
             const std::size_t reference_elements = static_cast<std::size_t>(n) * tokens;
@@ -617,6 +643,7 @@ int verify_registry() {
 
     int failures = 0;
     for (const Entry& entry : entries) {
+        if (!policy_supported(entry.qtype, entry.policy)) { continue; }
         for (const std::int32_t tokens : {1, 2, 48, 1024}) {
             try {
                 (void)ops::linear_workspace_capacity_bytes(entry.qtype, entry.n, entry.k,
@@ -633,9 +660,8 @@ int verify_registry() {
     // The tp1 path must be untouched: a shape that was never registered still is not.
     const std::vector<Entry> rejected{
         {QType::NVFP4, 5120, 5120, kA16},
-        {QType::NVFP4, 3584, 5120, kA16},
         {QType::Q5G64_F16S, 4096, 5120, kA16},
-        {QType::BF16_CTRL, 8192, 5120, kA16},
+        {QType::Q6G64_F16S, 4096, 5120, kA16},
         // FP8's residual/gdn_input shards are not vocabulary problems, so AllowA4 (a policy FP8
         // never admits outside the vocabulary escape hatch) must still be rejected here.
         {QType::FP8_E4M3FN_ROW_BF16S, 5120, 3072, kA4},

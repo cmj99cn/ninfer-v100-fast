@@ -299,11 +299,14 @@ void gdn_input_proj_column_parallel(const std::array<Tensor, kMaximumDevices>& x
                                     const std::array<Tensor, kMaximumDevices>& qkv, const std::array<Tensor, kMaximumDevices>& z,
                                     const ExecutionContext& ec);
 
-/** Q4G64_F16S/Q5G64_F16S split-storage two-weight form. */
+/** Q4G64_F16S/Q5G64_F16S split-storage two-weight form. The Volta CUTLASS route stages
+ *  dequantized operands, so every rank supplies a workspace sized by
+ *  q4_q5_gdn_input_proj_workspace_capacity_bytes. */
 void gdn_input_proj_column_parallel(const std::array<Tensor, kMaximumDevices>& x,
                                     const std::array<Weight, kMaximumDevices>& query_key_weight,
                                     const std::array<Weight, kMaximumDevices>& value_z_weight,
                                     const std::array<Tensor, kMaximumDevices>& qkv, const std::array<Tensor, kMaximumDevices>& z,
+                                    const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
                                     const ExecutionContext& ec);
 
 // --- Tensor-parallel split forms of the fused projection+conv1d+SiLU pair (tp == 2) -------------

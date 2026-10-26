@@ -143,6 +143,10 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+    if (!ninfer::test::linear::supports_fp8_a8()) {
+        std::cout << "SKIP: FP8 A8 requires sm_100a or sm_120a\n";
+        return 77;
+    }
     try {
         const int failures = run_fp8_a8();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A8 Linear\n";

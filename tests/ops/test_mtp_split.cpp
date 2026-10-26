@@ -2107,17 +2107,25 @@ int run_leg_c(const ExecutionContext& ec) {
     std::cout << "\n--- Leg C: gdn_input_proj_conv_snapshot / conv_record channel split "
                  "(contract 2) ---\n";
     int failures = 0;
-    const std::vector<ConvCase> cases{
+    std::vector<ConvCase> cases{
         {"fp8 gdn conv", QType::FP8_E4M3FN_ROW_BF16S, ops::LinearPolicy::A16Only, 1, 4, false},
-        {"fp8 gdn conv", QType::FP8_E4M3FN_ROW_BF16S, ops::LinearPolicy::AllowA8, 2, 3, true},
         {"nvfp4 gdn conv", QType::NVFP4, ops::LinearPolicy::A16Only, 1, 4, false},
-        {"nvfp4 gdn conv", QType::NVFP4, ops::LinearPolicy::AllowA4, 2, 3, true},
+    };
+    if (cuda_compute_major() >= 8) {
         // Split-storage two-weight form (Q4 query_key + Q5 value_z), the groupwise profile's
         // binding for this object -- a real tp2 + groupwise + MTP route, so it gets the same GPU
         // parity treatment as the fused forms rather than registry coverage alone. A16 only.
-        {"q4/q5 gdn conv", QType::Q4G64_F16S, ops::LinearPolicy::A16Only, 1, 4, false},
-        {"q4/q5 gdn conv", QType::Q4G64_F16S, ops::LinearPolicy::A16Only, 2, 3, true},
-    };
+        cases.push_back({"q4/q5 gdn conv", QType::Q4G64_F16S, ops::LinearPolicy::A16Only, 1, 4, false});
+        cases.push_back({"q4/q5 gdn conv", QType::Q4G64_F16S, ops::LinearPolicy::A16Only, 2, 3, true});
+    }
+    if (cuda_supports_fp8_a8()) {
+        cases.push_back(
+            {"fp8 gdn conv", QType::FP8_E4M3FN_ROW_BF16S, ops::LinearPolicy::AllowA8, 2, 3, true});
+    }
+    if (cuda_supports_nvfp4_a4()) {
+        cases.push_back(
+            {"nvfp4 gdn conv", QType::NVFP4, ops::LinearPolicy::AllowA4, 2, 3, true});
+    }
     for (const ConvCase& test_case : cases) { failures += run_conv_case(ec, test_case); }
     return failures;
 }

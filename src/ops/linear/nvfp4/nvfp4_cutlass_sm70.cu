@@ -93,10 +93,10 @@ __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
     if (i < count) { out[i] = cutlass::half_t(__bfloat162float(in[i])); }
 }
 
-__global__ void fp16_to_bf16_kernel(const cutlass::half_t* __restrict__ in,
+__global__ void fp32_to_bf16_kernel(const float* __restrict__ in,
                                     __nv_bfloat16* __restrict__ out, std::int64_t count) {
-    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < count) { out[i] = __float2bfloat16(static_cast<float>(in[i])); }
+    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) { out[index] = __float2bfloat16(in[index]); }
 }
 
 int div_up_i(int a, int b) { return (a + b - 1) / b; }
@@ -184,7 +184,8 @@ CutlassWorkspace<Allocator> allocate_cutlass_workspace(Allocator& allocator, std
     return out;
 }
 
-std::size_t workspace_bytes_impl(std::int32_t n, std::int32_t k, std::int32_t cols) {
+std::size_t workspace_bytes_impl(std::int32_t n, std::int32_t k, std::int32_t cols,
+                                 bool bf16_output) {
     WorkspaceLayoutBuilder layout;
     cutlass::gemm::GemmCoord problem_size(cols, n, k);
     typename Gemm::Arguments arguments{
@@ -192,6 +193,14 @@ std::size_t workspace_bytes_impl(std::int32_t n, std::int32_t k, std::int32_t co
         {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
     const std::size_t gemm_workspace_bytes = Gemm::get_workspace_size(arguments);
     (void)allocate_cutlass_workspace(layout, n, k, cols, gemm_workspace_bytes);
+    if (bf16_output && prefill_gemm_variant() == 1) {
+        // cuBLAS on SM70 cannot write BF16 directly; launch_cublas stages [cols,n] FP32 output
+        // before converting it to the BF16 destination. An FP16 staging buffer would overflow
+        // for projections whose true BF16 result is outside FP16's range (real activations can
+        // exceed it), so the staging precision must cover BF16's exponent. The FP32 fused-SwiGLU
+        // form writes its FP32 projection directly and must not reserve this buffer.
+        (void)layout.alloc(DType::FP32, {cols, n});
+    }
     return layout.peak_bytes(1);
 }
 
@@ -412,13 +421,13 @@ void launch_cublas(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena
     }
     if constexpr (std::is_same_v<ElementOutput, cutlass::bfloat16_t>) {
         // cuBLAS on SM70 rejects CUDA_R_16BF outputs (STATUS_NOT_SUPPORTED), so compute
-        // into FP16 scratch and convert; the storage round-trip is bit-exact for values
-        // that already came from an FP16 accumulator store.
-        Tensor out_fp16 = ws.alloc(DType::FP16, {cols, n});
+        // into FP32 scratch and convert. FP16 scratch is not wide enough: it overflows for
+        // projections whose BF16 result exceeds FP16's range, which real activations can reach.
+        Tensor out_fp32 = ws.alloc(DType::FP32, {cols, n});
         cublasStatus_t status = cublasGemmEx(
             handle, CUBLAS_OP_T, CUBLAS_OP_N, n, cols, k, &alpha,
             w_fp16, CUDA_R_16F, k, x_fp16, CUDA_R_16F, k, &beta,
-            out_fp16.data, CUDA_R_16F, n, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            out_fp32.data, CUDA_R_32F, n, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
         if (status != CUBLAS_STATUS_SUCCESS) {
             cudaError_t sync_err = cudaStreamSynchronize(stream);
             fprintf(stderr, "[sm70-cublas] FAILED status=%d sync_err=%d peek_after=%d\n",
@@ -427,7 +436,7 @@ void launch_cublas(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena
             status = cublasGemmEx(
                 handle, CUBLAS_OP_T, CUBLAS_OP_N, n, cols, k, &alpha,
                 w_fp16, CUDA_R_16F, k, x_fp16, CUDA_R_16F, k, &beta,
-                out_fp16.data, CUDA_R_16F, n, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+                out_fp32.data, CUDA_R_32F, n, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
             fprintf(stderr, "[sm70-cublas] retry status=%d\n", static_cast<int>(status));
             if (status != CUBLAS_STATUS_SUCCESS) {
                 throw std::runtime_error("nvfp4_cutlass_sm70: cublasGemmEx failed m=" + std::to_string(n) + " n=" + std::to_string(cols) + " k=" + std::to_string(k) + " ldc=n status=" + std::to_string(static_cast<int>(status)) + " peek_before=" + std::to_string(peek_before));
@@ -435,8 +444,8 @@ void launch_cublas(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena
         }
         const std::int64_t count   = static_cast<std::int64_t>(cols) * n;
         const int convert_blocks = static_cast<int>((count + 255) / 256);
-        fp16_to_bf16_kernel<<<convert_blocks, 256, 0, stream>>>(
-            static_cast<const cutlass::half_t*>(out_fp16.data),
+        fp32_to_bf16_kernel<<<convert_blocks, 256, 0, stream>>>(
+            static_cast<const float*>(out_fp32.data),
             static_cast<__nv_bfloat16*>(out.data), count);
         CUDA_CHECK(cudaGetLastError());
     } else {
@@ -485,7 +494,12 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
 
 std::size_t nvfp4_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k,
                                                std::int32_t cols) {
-    return workspace_bytes_impl(n, k, cols);
+    return workspace_bytes_impl(n, k, cols, true);
+}
+
+std::size_t nvfp4_cutlass_sm70_fp32_workspace_bytes(std::int32_t n, std::int32_t k,
+                                                    std::int32_t cols) {
+    return workspace_bytes_impl(n, k, cols, false);
 }
 
 void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,

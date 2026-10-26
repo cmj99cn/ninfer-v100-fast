@@ -51,6 +51,10 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+    if (!ninfer::test::linear::supports_nvfp4_a4()) {
+        std::cout << "SKIP: NVFP4 A4 requires sm_120a\n";
+        return 77;
+    }
     try {
         const int failures = run_nvfp4_a4();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4_A4 Linear\n";

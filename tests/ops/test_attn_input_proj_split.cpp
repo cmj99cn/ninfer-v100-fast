@@ -623,8 +623,8 @@ int run_split_storage_case(const ExecutionContext& ec, std::uint32_t seed) {
         Tensor reference_k(ref_k.data(), DType::BF16, {kKvRows, tokens});
         Tensor reference_v(ref_v.data(), DType::BF16, {kKvRows, tokens});
 
-        DeviceArena reference_workspace(
-            ops::q4_q5_attn_input_proj_workspace_capacity_bytes(tokens, tokens));
+        DeviceArena reference_workspace(std::max<std::size_t>(
+            ops::q4_q5_attn_input_proj_workspace_capacity_bytes(tokens, tokens), 1));
 
         cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
         ops::attn_input_proj(reference_x, full_qk_device.weight, full_gv_device.weight, reference_q,
@@ -913,16 +913,18 @@ int main() {
     // T sweep: T=1 (decode edge), small-T/MMA frontiers, T=128 (W4A4 MMA under AllowA4), T=1024 (a
     // multiple of 256 -- the sole route into the NVFP4 W4A4 TMA kernel, exercised on the shard
     // TMA descriptor as well as the tp1 one).
+    std::vector<ops::LinearPolicy> nvfp4_policies{ops::LinearPolicy::A16Only};
+    if (cuda_supports_nvfp4_a4()) { nvfp4_policies.push_back(ops::LinearPolicy::AllowA4); }
     failures += run_fused_case(ec, QType::NVFP4, 41u, "nvfp4 attn_input fused",
-                               {1, 2, 5, 8, 17, 32, 48, 128, 1024},
-                               {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4});
+                               {1, 2, 5, 8, 17, 32, 48, 128, 1024}, nvfp4_policies);
     // FP8's own tp2 column shard, wired as a TRUE split (the fused kernel family is
     // Geometry-templated, same as NVFP4 -- see attn_input_proj.h's design note). T sweep: 1 the
     // decode edge; 2/8/10 small-T (kFp8LinearSmallTMax<AttnInput>=11); 11 the AllowA8 route's own
     // A8 crossover; 32/48/128/1024 beyond it.
+    std::vector<ops::LinearPolicy> fp8_policies{ops::LinearPolicy::A16Only};
+    if (cuda_supports_fp8_a8()) { fp8_policies.push_back(ops::LinearPolicy::AllowA8); }
     failures += run_fused_case(ec, QType::FP8_E4M3FN_ROW_BF16S, 46u, "fp8 attn_input fused",
-                               {1, 2, 8, 10, 11, 32, 48, 128, 1024},
-                               {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8});
+                               {1, 2, 8, 10, 11, 32, 48, 128, 1024}, fp8_policies);
     failures += run_split_storage_case(ec, 43u);
 
     std::cout << (failures ? "FAIL" : "OK") << " attn_input_proj split\n";

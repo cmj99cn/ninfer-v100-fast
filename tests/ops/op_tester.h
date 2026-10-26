@@ -63,6 +63,17 @@ inline bool cuda_unavailable() {
     throw std::runtime_error(std::string("cudaGetDeviceCount: ") + cudaGetErrorString(e));
 }
 
+inline int cuda_compute_major() {
+    int device = 0;
+    cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+    cudaDeviceProp properties{};
+    cuda_check(cudaGetDeviceProperties(&properties, device), "cudaGetDeviceProperties");
+    return properties.major;
+}
+
+inline bool cuda_supports_nvfp4_a4() { return cuda_compute_major() >= 12; }
+inline bool cuda_supports_fp8_a8() { return cuda_compute_major() >= 10; }
+
 // --- bf16 <-> f32 (round-to-nearest-even) -----------------------------------
 inline float bf16_to_f32(std::uint16_t h) {
     std::uint32_t u = std::uint32_t(h) << 16;

@@ -1365,6 +1365,7 @@ void gdn_input_proj_column_parallel(const std::array<Tensor, kMaximumDevices>& x
                                     const std::array<Weight, kMaximumDevices>& query_key_weight,
                                     const std::array<Weight, kMaximumDevices>& value_z_weight,
                                     const std::array<Tensor, kMaximumDevices>& qkv, const std::array<Tensor, kMaximumDevices>& z,
+                                    const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
                                     const ExecutionContext& ec) {
     validate_split_storage_split_pair(x, query_key_weight, value_z_weight, ec);
     for (std::size_t slot = 0; slot < static_cast<std::size_t>(ec.tp); ++slot) {
@@ -1387,9 +1388,8 @@ void gdn_input_proj_column_parallel(const std::array<Tensor, kMaximumDevices>& x
     std::array<Tensor, kMaximumDevices> z_dst = z;
     detail::for_each_rank(ec, [&](int rank) {
         const auto slot = static_cast<std::size_t>(rank);
-        WorkspaceArena no_workspace(DeviceSpan{});
         detail::q4_q5_gdn_input_dispatch(x[slot], query_key_weight[slot], value_z_weight[slot],
-                                         qkv_dst[slot], z_dst[slot], no_workspace,
+                                         qkv_dst[slot], z_dst[slot], *workspace[slot],
                                          ec.dev[slot]->stream);
     });
 }

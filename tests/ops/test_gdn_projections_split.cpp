@@ -546,6 +546,10 @@ SplitStorageShard make_split_storage_shard(QType qtype, std::int32_t half_rows, 
 }
 
 int run_split_storage_case(const ExecutionContext& ec, std::uint32_t seed) {
+    if (cuda_compute_major() < 8) {
+        std::cout << "SKIP: Q4/Q5 split-storage shard routes through the sm_80+ grouped-MMA kernel\n";
+        return 0;
+    }
     const std::string head = "q4/q5 gdn_input split-storage";
     std::cout << head << " query_key [" << kQkRows << ',' << kInputRows << "] -> [" << kShardQkRows
               << ',' << kInputRows << "], value_z [" << kValueZRows << ',' << kInputRows << "] -> ["
@@ -668,8 +672,19 @@ int run_split_storage_case(const ExecutionContext& ec, std::uint32_t seed) {
         const std::array<Tensor, ninfer::kMaximumDevices> z_out{Tensor(split_z[0]->data(), DType::BF16, {kShardValueRows, tokens}),
                                           Tensor(split_z[1]->data(), DType::BF16, {kShardValueRows, tokens})};
 
+        const std::size_t split_workspace_bytes =
+            ops::q4_q5_gdn_input_proj_workspace_capacity_bytes(tokens, tokens);
+        std::array<std::optional<DeviceArena>, 2> split_arena;
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto slot = static_cast<std::size_t>(rank);
+            set_device(ec, rank);
+            split_arena[slot].emplace(std::max<std::size_t>(split_workspace_bytes, 1));
+        }
+        const std::array<WorkspaceArena*, ninfer::kMaximumDevices> split_workspace{
+            &*split_arena[0], &*split_arena[1]};
         retire_staging(ec);
-        ops::gdn_input_proj_column_parallel(x, qk_weight, vz_weight, qkv_out, z_out, ec);
+        ops::gdn_input_proj_column_parallel(x, qk_weight, vz_weight, qkv_out, z_out,
+                                            split_workspace, ec);
         synchronize_both(ec);
 
         std::array<std::vector<double>, 2> observed_qkv;
@@ -1244,11 +1259,12 @@ int main() {
     std::cout << "collective transport: NCCL over NVLink P2P\n";
 
     failures += verify_split_rejections(ec);
-    failures += run_fused_case(
-        ec, QType::NVFP4, {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4}, 41u);
-    failures += run_fused_case(
-        ec, QType::FP8_E4M3FN_ROW_BF16S, {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8},
-        45u);
+    std::vector<ops::LinearPolicy> nvfp4_policies{ops::LinearPolicy::A16Only};
+    if (cuda_supports_nvfp4_a4()) { nvfp4_policies.push_back(ops::LinearPolicy::AllowA4); }
+    failures += run_fused_case(ec, QType::NVFP4, nvfp4_policies, 41u);
+    std::vector<ops::LinearPolicy> fp8_policies{ops::LinearPolicy::A16Only};
+    if (cuda_supports_fp8_a8()) { fp8_policies.push_back(ops::LinearPolicy::AllowA8); }
+    failures += run_fused_case(ec, QType::FP8_E4M3FN_ROW_BF16S, fp8_policies, 45u);
     failures += run_split_storage_case(ec, 43u);
     failures += run_gating_case(ec, 51u);
     failures += run_gating_fused_case(ec, 53u, 48);

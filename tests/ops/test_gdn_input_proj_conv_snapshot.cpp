@@ -775,7 +775,7 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     return failures;
 }
 
-int run_nvfp4() {
+int run_nvfp4(bool a4_supported) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
     quantized_weight::PatternedWeightOptions options;
@@ -786,39 +786,43 @@ int run_nvfp4() {
 
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
-    failures += run_nvfp4_case(parent, 3, ops::LinearPolicy::AllowA4, 4);
-    failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
-    failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
-    failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4, 1025);
-    constexpr std::int32_t kValueRows = 6144;
-    constexpr std::int32_t kZRows     = 6144;
-    constexpr std::int32_t kChannels  = 10240;
-    constexpr std::int32_t kWidth     = 6;
-    constexpr std::int32_t kBatch     = 3;
-    const std::vector<std::int32_t> valid_columns{6, 3, 1};
-    const std::vector<float> conv_weight = make_conv_weight(kChannels, 829U);
-    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, kBatch, kWidth, kWidth);
-    failures += run_batched_case(
-        "NVFP4 A4 B=3 W=6 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
-        conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA4Tolerance,
-        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
-            return quantized_weight::dot_fp64(
-                parent.host, row,
-                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
-        },
-        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
-            return quantized_weight::dot_fp64(
-                parent.host, kChannels + row,
-                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
-        },
-        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
-            const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-            Tensor& z, WorkspaceArena& workspace) {
-            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
-                                              snapshot_base, q, k, v, z, ops::LinearPolicy::AllowA4,
-                                              workspace, nullptr);
-        });
+    if (a4_supported) {
+        failures += run_nvfp4_case(parent, 3, ops::LinearPolicy::AllowA4, 4);
+        failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
+        failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
+        failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4, 1025);
+    }
+    if (a4_supported) {
+        constexpr std::int32_t kValueRows = 6144;
+        constexpr std::int32_t kZRows     = 6144;
+        constexpr std::int32_t kChannels  = 10240;
+        constexpr std::int32_t kWidth     = 6;
+        constexpr std::int32_t kBatch     = 3;
+        const std::vector<std::int32_t> valid_columns{6, 3, 1};
+        const std::vector<float> conv_weight = make_conv_weight(kChannels, 829U);
+        const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, kBatch, kWidth, kWidth);
+        failures += run_batched_case(
+            "NVFP4 A4 B=3 W=6 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
+            conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA4Tolerance,
+            [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+                return quantized_weight::dot_fp64(
+                    parent.host, row,
+                    activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+            },
+            [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+                return quantized_weight::dot_fp64(
+                    parent.host, kChannels + row,
+                    activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+            },
+            [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+                const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+                Tensor& z, WorkspaceArena& workspace) {
+                ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
+                                                  snapshot_base, q, k, v, z,
+                                                  ops::LinearPolicy::AllowA4, workspace, nullptr);
+            });
+    }
     failures += parent.verify_preserved("batched NVFP4 parent weight");
     return failures;
 }
@@ -926,7 +930,7 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     return failures;
 }
 
-int run_fp8() {
+int run_fp8(bool a8_supported) {
     constexpr std::int32_t kHidden    = 5120;
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
@@ -941,11 +945,13 @@ int run_fp8() {
     failures += run_fp8_case(parent, 4, ops::LinearPolicy::A16Only, 5);
     failures += run_fp8_case(parent, 6, ops::LinearPolicy::A16Only, 7);
     failures += run_fp8_case(parent, 7, ops::LinearPolicy::A16Only, 8);
-    failures += run_fp8_case(parent, 9, ops::LinearPolicy::AllowA8, 10);
-    failures += run_fp8_case(parent, 10, ops::LinearPolicy::AllowA8, 11);
+    if (a8_supported) {
+        failures += run_fp8_case(parent, 9, ops::LinearPolicy::AllowA8, 10);
+        failures += run_fp8_case(parent, 10, ops::LinearPolicy::AllowA8, 11);
+    }
     failures += run_fp8_case(parent, 10, ops::LinearPolicy::A16Only, 11);
     failures += run_fp8_case(parent, 11, ops::LinearPolicy::A16Only, 12);
-    failures += run_fp8_case(parent, 17, ops::LinearPolicy::AllowA8, 1);
+    if (a8_supported) { failures += run_fp8_case(parent, 17, ops::LinearPolicy::AllowA8, 1); }
 
     const auto run_batched = [&](std::int32_t width, std::int32_t batch,
                                  std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
@@ -980,7 +986,7 @@ int run_fp8() {
             });
     };
     failures += run_batched(4, 2, {4, 2}, 937U);
-    failures += run_batched(16, 8, {16, 13, 11, 7, 5, 3, 2, 1}, 941U);
+    if (a8_supported) { failures += run_batched(16, 8, {16, 13, 11, 7, 5, 3, 2, 1}, 941U); }
     failures += parent.verify_preserved("batched FP8 parent weight");
     return failures;
 }
@@ -994,6 +1000,10 @@ int main() {
     }
 
     int failures = 0;
+    cudaDeviceProp properties{};
+    cudaGetDeviceProperties(&properties, 0);
+    const bool a4_supported = properties.major >= 12;
+    const bool a8_supported = properties.major >= 10;
     const std::size_t q4_interval =
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 1, 6);
     const std::size_t q4_witness =
@@ -1004,14 +1014,31 @@ int main() {
         std::cerr << "Q4/Q5 snapshot interval did not retain its non-monotonic T=4 route\n";
         ++failures;
     }
-    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 16) !=
-            0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 17) !=
-            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 17,
-                                                                       17)) {
-        std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
+    const std::size_t w8_1_16 =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 16);
+    const std::size_t w8_1_17 =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 17);
+    const std::size_t w8_17_17 =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 17, 17);
+#ifdef NINFER_VOLTA_BUILD
+    const std::size_t w8_1_1 =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 1);
+    const std::size_t w8_1_2 =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 2);
+    const std::size_t w8_2_2 =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 2, 2);
+    if (w8_1_1 != 0 || w8_1_2 != w8_2_2 || w8_1_2 == 0) {
+        std::cerr << "W8 snapshot interval did not preserve its Volta zero/nonzero route boundary: "
+                  << w8_1_1 << ' ' << w8_1_2 << ' ' << w8_2_2 << '\n';
         ++failures;
     }
+#else
+    if (w8_1_16 != 0 || w8_1_17 != w8_17_17) {
+        std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary: "
+                  << w8_1_16 << ' ' << w8_1_17 << ' ' << w8_17_17 << '\n';
+        ++failures;
+    }
+#endif
     const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4, 4);
     if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -1046,8 +1073,8 @@ int main() {
     }
     failures += run_q4_q5();
     failures += run_w8();
-    failures += run_nvfp4();
-    failures += run_fp8();
+    failures += run_nvfp4(a4_supported);
+    failures += run_fp8(a8_supported);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;
 }

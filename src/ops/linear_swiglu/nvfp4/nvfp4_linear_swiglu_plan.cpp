@@ -131,7 +131,7 @@ template <class Geometry>
 std::size_t cutlass_route_workspace_bytes(std::int32_t tokens) {
     const std::size_t projected = static_cast<std::size_t>(
         Geometry::kOutputRows) * tokens * sizeof(float);
-    return projected + nvfp4_cutlass_sm70_workspace_bytes(
+    return projected + nvfp4_cutlass_sm70_fp32_workspace_bytes(
                            Geometry::kOutputRows, Geometry::kInputRows, tokens);
 }
 #endif // NINFER_VOLTA_BUILD

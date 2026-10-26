@@ -607,7 +607,8 @@ int run_pipeline_case(const PipelineCase& test_case, const ExecutionContext& ec,
     failures += reference_residual.verify_guards(head + " reference residual");
     const std::vector<double> expected =
         from_device_bf16(reference_residual.data(), residual_elements);
-
+    const std::vector<double> expected_activation =
+        from_device_bf16(reference_activation.data(), activation_elements);
     // --- (b) the split pipeline -------------------------------------------------------------------
     std::array<std::optional<DeviceBuffer>, 2> split_activation;
     std::array<std::optional<DeviceArena>, 2> swiglu_arena;
@@ -632,6 +633,25 @@ int run_pipeline_case(const PipelineCase& test_case, const ExecutionContext& ec,
         retire_staging(ec);
         ops::linear_swiglu_column_parallel(x, w, out, test_case.policy, workspace, ec);
         synchronize_both(ec);
+    }
+
+    // The pipeline's down projection consumes this intermediate directly. Validate it against
+    // the tp1 swiglu output before it can be blamed on the row-parallel add.
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        set_device(ec, rank);
+        const std::vector<double> actual = from_device_bf16(
+            split_activation[slot]->p, static_cast<std::size_t>(kShardHalf) * tokens);
+        std::vector<double> shard_expected(actual.size());
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            const std::size_t source = static_cast<std::size_t>(token) * kParentHalf +
+                                       static_cast<std::size_t>(rank) * kShardHalf;
+            std::copy(expected_activation.begin() + static_cast<std::ptrdiff_t>(source),
+                      expected_activation.begin() + static_cast<std::ptrdiff_t>(source + kShardHalf),
+                      shard_expected.begin() + static_cast<std::ptrdiff_t>(token) * kShardHalf);
+        }
+        failures += compare(head + " pipeline rank " + std::to_string(rank) + " gate_up", actual,
+                            shard_expected);
     }
 
     std::array<std::optional<GuardedDeviceBuffer>, 2> split_residual;

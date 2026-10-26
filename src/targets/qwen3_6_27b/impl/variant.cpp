@@ -701,7 +701,7 @@ void Variant::gdn_input_projection(const std::array<Tensor, kMaximumDevices>& hi
         ops::gdn_input_proj_column_parallel(
             hidden, weights_from(split, ec.tp, &SplitGdnInputProjectionPayload::query_key),
             weights_from(split, ec.tp, &SplitGdnInputProjectionPayload::value_z), qkv,
-            output_gate_flat, ec);
+            output_gate_flat, workspace, ec);
         return;
     }
     const auto fused = require_same_alternative<FusedGdnInputProjectionPayload>(
