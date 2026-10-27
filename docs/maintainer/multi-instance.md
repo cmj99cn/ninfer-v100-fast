@@ -13,6 +13,9 @@
   pinned host KV tier（`SharedHostTier`）。
 - 每个 Engine 保留自己的 device 权重、device KV、GDN/backend 状态、snapshot slots、CUDA 流和
   executor。
+- KV 只有两级：每 Engine 私有的 device KV，以及启用 host tier 时进程共享的 pinned host
+  prefix-KV。host tier 只保存完整 64-token prefix block 和 snapshot，不是所有活跃请求的 KV；
+  没有磁盘 KV tier、KV offload 或全局活跃 KV 池。artifact mmap 是权重，不属于 KV 缓存。
 - 前端只有一个 OpenAI/Anthropic 入口；`EnginePool` 是所有请求唯一的 admission 队列。
 
 非目标：多进程/多机、运行中抢占或迁移、运行期改变组数或卡数、同进程混合 TP 宽度、TP8。
@@ -51,29 +54,59 @@ tier。未启用 prefix cache 或预算为 0 时不分配 host tier，跨实例 
   --prefix-cache --host-cache-mib 1024
 ```
 
-8 卡机（本任务窗口不可访问；未验证）。profile 由脚本统一展开，避免文档与命令漂移：
+4 卡与 8 卡机在本任务窗口不可访问。下表给出完整 profile；除 `2xTP1` 外全部未验证。
+
+| profile | 卡数 | `--groups` | `--group-devices` | `--tp` | `--max-concurrency`（每实例） | `--kv-capacity`（每实例） | 状态 |
+|---|---:|---:|---|---:|---:|---:|---|
+| `2xTP1` | 2 | 2 | `0;1` | 1 | 1 | 262144 | **真实集成通过** |
+| `4xTP1` | 4 | 4 | `0;1;2;3` | 1 | 1 | 262144 | 未验证 |
+| `2xTP2` | 4 | 2 | `0,1;2,3` | 2 | 4 | 1048576 | 未验证 |
+| `8xTP1` | 8 | 8 | `0;1;2;3;4;5;6;7` | 1 | 1 | 262144 | 未验证 |
+| `4xTP2` | 8 | 4 | `0,1;2,3;4,5;6,7` | 2 | 4 | 1048576 | 未验证 |
+| `2xTP4` | 8 | 2 | `0,1,2,3;4,5,6,7` | 4 | 8 | 2097152 | 未验证 |
+
+4/8 卡 profile 可按表设置变量后启动：
 
 ```bash
+ARTIFACT=/home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer
+GROUPS=4
+GROUP_DEVICES="0;1;2;3"
+TP=1
+KV=262144
+CONCURRENCY=1
+./build/apps/ninfer-serve "$ARTIFACT" \
+  --groups "$GROUPS" --group-devices "$GROUP_DEVICES" --tp "$TP" \
+  --max-context 262144 --kv-capacity "$KV" --kv-dtype int8 \
+  --max-concurrency "$CONCURRENCY" --spec mtp --draft-tokens 3 \
+  --global-pending-requests 16 --prefix-cache --host-cache-mib 153600 \
+  --no-thinking --greedy \
+  --request-log-jsonl "profiles/bench/multi_instance_${GROUPS}xTP${TP}.requests.jsonl"
+```
+
+`2xTP1` 使用上面的 `--host-cache-mib 1024`。4/8 卡 profile 共用 `--max-context 262144`、
+`--global-pending-requests 16`、`--kv-dtype int8`、`--spec mtp --draft-tokens 3`、
+`--prefix-cache --host-cache-mib 153600`（150 GiB）、`--no-thinking --greedy`，并把
+`--request-log-jsonl` 写到 `profiles/bench/multi_instance_<mode>.requests.jsonl`。默认可执行文件
+是 `build/apps/ninfer-serve`（可用 `NINFER` 覆盖），默认 artifact 是
+`/home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer`（可用
+`NINFER_V100X2_ARTIFACT` 覆盖）。`8xTP1` 需要 32GB 卡；16GB V100 放不下一份完整的 27B 权重。
+
+8 卡 profile 由脚本统一展开，避免文档与命令漂移：
+
+```bash
+bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1
 bash tools/v100/bench_multi_instance_8gpu.sh 4xTP2
 bash tools/v100/bench_multi_instance_8gpu.sh 2xTP4
 ```
 
-| profile | `--groups` | `--group-devices` | `--tp` | `--max-concurrency`（每实例） | `--kv-capacity`（每实例） |
-|---|---:|---|---:|---:|---:|
-| `4xTP2` | 4 | `0,1;2,3;4,5;6,7` | 2 | 4 | 1048576 |
-| `2xTP4` | 2 | `0,1,2,3;4,5,6,7` | 4 | 8 | 2097152 |
-
-两份 profile 共用 `--max-context 262144`、`--global-pending-requests 16`、`--kv-dtype int8`、
-`--spec mtp --draft-tokens 3`、`--prefix-cache --host-cache-mib 153600`（150 GiB）、
-`--no-thinking --greedy`，并把 `--request-log-jsonl` 写到
-`profiles/bench/multi_instance_<mode>.requests.jsonl`。默认可执行文件是
-`build/apps/ninfer-serve`（可用 `NINFER` 覆盖），默认 artifact 是
-`/home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer`（可用 `NINFER_V100X2_ARTIFACT` 覆盖）。
+4 卡 profile 没有专用脚本；用上面的变量模板并按表设置 `GROUPS`、`GROUP_DEVICES`、`TP`、
+`KV`、`CONCURRENCY`。
 
 `--dry-run` 只打印完整命令，不创建目录、不读取 artifact、不分配 GPU，因此可在 2 卡机上安全
 执行：
 
 ```bash
+bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1 --dry-run
 bash tools/v100/bench_multi_instance_8gpu.sh 4xTP2 --dry-run
 bash tools/v100/bench_multi_instance_8gpu.sh 2xTP4 --dry-run
 ```
@@ -81,6 +114,10 @@ bash tools/v100/bench_multi_instance_8gpu.sh 2xTP4 --dry-run
 压测由独立进程执行，避免 serve 与 benchmark 重启互相干扰；在仓库根目录另开一个终端：
 
 ```bash
+# 8 × TP1
+python3 tools/v100/bench_multi_instance.py --groups 8 \
+  --request-log profiles/bench/multi_instance_8xTP1.requests.jsonl
+
 # 4 × TP2
 python3 tools/v100/bench_multi_instance.py --groups 4 \
   --request-log profiles/bench/multi_instance_4xTP2.requests.jsonl
@@ -97,7 +134,7 @@ committed decode tok/s、客户端 TTFT、MTP acceptance（来自 `--request-log
 `request_done.speculative`）、queue wait 估计和采样到的队列压力，并把完整报告写到
 `profiles/bench/multi_instance_<UTC>.json`。默认 bearer token 与启动脚本一致
 （`ninfer-eval-key`），可用 `--api-key` 或 `NINFER_API_KEY` 覆盖。`--dry-run` 只打印请求计划
-与目标 URL，不发请求、不写文件。两份 8 卡 profile 只是可复现配置，容量、pinned host 预算和
+与目标 URL，不发请求、不写文件。三份 8 卡 profile 只是可复现配置，容量、pinned host 预算和
 吞吐尚未实测；不得把 2 卡或单实例数据当作 8 卡验收。
 
 ## 3. 共享边界与所有权
@@ -235,30 +272,53 @@ Prometheus 输出不增加任何 instance 行，单组文本输出与之前一�
   `prefix_cache_hit_tokens=8128`、`block_snapshot`，cold/warm 与 before/after 文本一致；
   MTP 3 drafts 下 8K warm 也一致，acceptance 20/30、10 rounds。未覆盖采样质量与 Vision。
 
-8 卡机在本任务窗口不可访问，以下全部**未验证**：
+4 卡与 8 卡多实例在本任务窗口不可访问，以下全部**未验证**：
 
+- 4 卡 `4×TP1`/`2×TP2` 的设备分配、共享 host tier、跨实例 manifest 与 MTP；没有吞吐或
+  显存测量。
+- 8 卡 `8×TP1` 的 8 份完整 27B 权重、每实例 KV、150 GiB host tier 与聚合吞吐。该 profile
+  需要 32GB 卡；16GB V100 放不下一份完整权重。它不使用 NCCL。
 - NCCL 多 communicator（每进程 4 个 TP2 或 2 个 TP4）在 8×V100 上的初始化、带宽与设备集合
   互斥。
 - TP4 跨实例 host restore 的显存与正确性，包括恢复后的 MTP 与 Vision。
-- 16×50K token 的聚合 committed decode tok/s（分别对 4×TP2 与 2×TP4）是否达到单实例 3.0×，
-  以及实际 TTFT、queue wait 和 acceptance；由 `tools/v100/bench_multi_instance.py` 记录，
-  尚无测量。
-- 4×TP2 在 `kv_capacity=1048576` 下的 32GB 显存余量；8 卡下每实例 180000-token KV 的余量。
+- 8×TP1 的 8 路 50K token、4×TP2/2×TP4 的 16×50K token 聚合 committed decode tok/s，以及
+  实际 TTFT、queue wait 和 acceptance；由 `tools/v100/bench_multi_instance.py` 记录，尚无测量。
+- 4×TP2 在 `kv_capacity=1048576` 下的 32GB 显存余量；8×TP1 每实例 262144-token KV 和
+  4×TP2/2×TP4 每实例 180000-token KV 的余量。
 - 153600 MiB（150 GiB）pinned host tier 在目标主机上的实际可分配性。
-- 多组 Vision：NVFP4 的 2×TP1/4×TP2 Vision prompt 未在本窗口验证。
-- 多组 MTP：2×TP1 已通过（见上）；8 卡 4×TP2/2×TP4 的多组 MTP 未验证。
+- 多组 Vision：NVFP4 的 2×TP1/4×TP2/8×TP1 Vision prompt 未在本窗口验证。
+- 多组 MTP：2×TP1 已通过（见上）；4 卡 `4×TP1`/`2×TP2` 与 8 卡 `8×TP1`/`4×TP2`/`2×TP4`
+  的多组 MTP 未验证。
 
-8 卡启动与压测脚本已通过静态检查（`bash -n`、`py_compile`、两条 `--dry-run`），但未在 8 卡
-上执行。2 卡 TP2 单组已做上述前后对比，但未覆盖 85K occupied context、多实例吞吐或
-LM Studio 对照；不得把静态检查、正确性测试、质量对比或这些单组数据当作多实例/验收性能证据。
+8 卡启动与压测脚本已通过静态检查（`bash -n`、`py_compile`、三条 `--dry-run`），但未在 8 卡
+上执行；4 卡 profile 只有文档命令，未执行。2 卡 TP2 单组已做上述前后对比，但未覆盖 85K
+occupied context、多实例吞吐或 LM Studio 对照；不得把静态检查、正确性测试、质量对比或这些
+单组数据当作多实例/验收性能证据。
 
 本仓库当前没有可引用的多实例吞吐测量；不得把单实例、短 prompt、draft 吞吐或上游数据当作
-多实例验收。8 卡验收通过前，`AGENTS.md` 的 4×16GB 单组路径仍是回归门禁。
+多实例验收。4/8 卡验收通过前，`AGENTS.md` 的 4×16GB 单组路径仍是回归门禁。
 
-## 8. 已知限制
+## 8. 社区测试请求（4 卡 / 8 卡）
+
+目前只有 `2xTP1` 通过真实集成。请在 8×V100-SXM2-32GB 上优先测试：
+
+```bash
+bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1
+bash tools/v100/bench_multi_instance_8gpu.sh 4xTP2
+bash tools/v100/bench_multi_instance_8gpu.sh 2xTP4
+```
+
+4 卡 `4xTP1`/`2xTP2` 按 §2 的 profile 表直接启动。每个结果请附启动命令、binary/artifact
+hash、`/metrics?format=json` 的 `instances` 数组、每实例 committed decode tok/s、TTFT/TPOT、
+MTP acceptance、queue wait、free KV pages、host tier 实际分配量，以及 32GB 卡的显存余量。
+`--dry-run`、静态检查或单实例数据不等于多实例验收；本项目不承诺修复周期或 SLA。
+
+## 9. 已知限制
 
 - 不抢占、不迁移正在 prefill/decode 的请求；只在新请求 admission 时改变 placement。
 - 多组不支持 DFlash；`--groups > 1 --spec dflash` 在启动时拒绝。
 - 一个实例段错误会带走整个进程；本设计不提供进程级隔离。
 - Vision 的 device 权重仍按实例私有，每个实例各持一份。
+- KV 只有 device KV 和 pinned host prefix-KV 两级；没有磁盘 KV tier、KV offload 或全局活跃
+  KV 池。
 - 运行时不能改变组数、每实例 lane 数或 host tier 预算。

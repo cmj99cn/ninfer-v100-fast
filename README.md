@@ -363,11 +363,27 @@ export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH   # 视你的 NCCL 位
 
 TP4（四卡）把 `--tp 2 --devices 0,1` 换成 `--tp 4 --devices 0,1,2,3` 即可，其余参数不变。
 
-#### 多实例分组（未验证）
+#### 多实例分组（部分验证）
 
-同一进程可以启动多个 Engine，各占一组互不重叠的卡，并共享一份只读 artifact 与 pinned host KV
-tier。`--group-devices` 用分号分组；省略 `--tp` 时由组宽推断。每实例的 `--max-concurrency` 与
-`--kv-capacity` 独立配置，`--global-pending-requests` 是共享等待队列上限（默认 16）。
+同一进程可以启动多个 Engine，各占一组互不重叠的卡，共享一份只读 artifact mmap 与一份 pinned
+host prefix-KV tier；device 权重与 device KV 仍每实例私有。host tier 只保存 prefix-cache 的
+完整 64-token block 和 snapshot，不是所有活跃请求的 KV；没有磁盘 KV tier 或 KV offload。
+前端只有一个 OpenAI/Anthropic 入口，`EnginePool` 按前缀命中、空闲容量和 aging 路由到实例，
+不是简单轮询。`--group-devices` 用分号分组；省略 `--tp` 时由组宽推断。每实例的
+`--max-concurrency` 与 `--kv-capacity` 独立配置，`--global-pending-requests` 是共享等待队列
+上限（默认 16）。
+
+| 卡数 | 组数 × TP | `--group-devices` | 状态 |
+|---:|---|---|---|
+| 2 | 2×TP1 | `"0;1"` | **真实集成测试已通过** |
+| 4 | 4×TP1 | `"0;1;2;3"` | 未验证 |
+| 4 | 2×TP2 | `"0,1;2,3"` | 未验证 |
+| 8 | 8×TP1 | `"0;1;2;3;4;5;6;7"` | 未验证；社区测试重点 |
+| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | 未验证；社区测试重点 |
+| 8 | 2×TP4 | `"0,1,2,3;4,5,6,7"` | 未验证；社区测试重点 |
+
+多组建议用 `--group-devices` 明确分组；`--devices` 也可按组顺序列出全部 rank，但 `ninfer`
+CLI 最多接受 4 个 ID。多组模式不支持 `--spec dflash`。
 
 2 卡本机（2×TP1；真实集成测试已通过）：
 
@@ -379,19 +395,27 @@ tier。`--group-devices` 用分号分组；省略 `--tp` 时由组宽推断。�
   --prefix-cache --host-cache-mib 1024
 ```
 
-8 卡机（4×TP2；本窗口不可访问，未验证）：
+8 卡 8×TP1（未验证；8 个完整实例，显存/内存压力最大）：
 
 ```bash
 ./build/apps/ninfer-serve /home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
-  --groups 4 --group-devices "0,1;2,3;4,5;6,7" --tp 2 \
-  --max-context 262144 --kv-capacity 1048576 --kv-dtype int8 \
-  --max-concurrency 4 --spec mtp --draft-tokens 3 \
-  --prefix-cache --host-cache-mib 150000
+  --groups 8 --group-devices "0;1;2;3;4;5;6;7" --tp 1 \
+  --max-context 262144 --kv-capacity 262144 --kv-dtype int8 \
+  --max-concurrency 1 --spec mtp --draft-tokens 3 \
+  --prefix-cache --host-cache-mib 153600
 ```
 
-多组模式不支持 `--spec dflash`。分组、路由、permit、manifest 生命周期与未验证清单见
-[`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md)。上述 profile 没有吞吐或
-显存实测数据，不得引用为验收结果。
+对应脚本 profile：`bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
+（加 `--dry-run` 只打印完整命令）。8 卡 4×TP2 / 2×TP4 以及 4 卡 4×TP1 / 2×TP2 的完整参数、
+路由和验证边界见 [`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md)。
+上述未验证 profile 没有吞吐或显存实测数据，不得引用为验收结果。
+
+**社区测试请求（8 卡）：** 请在 8×V100-SXM2-32GB 上优先测试 8×TP1、4×TP2、2×TP4，并提交
+启动命令、binary/artifact hash、`/metrics?format=json` 的 `instances` 数组、每实例 committed
+decode tok/s、TTFT/TPOT、MTP acceptance、queue wait、free KV pages、host tier 实际分配量，以及
+4×TP2/2×TP4 的 32GB 显存余量。8×TP1 需要 32GB 卡；16GB V100 放不下一份完整的 27B 权重。
+4 卡多实例（4×TP1/2×TP2）也未验证，欢迎一起提交。`--dry-run` 或静态检查不等于 8 卡验证；
+本项目不承诺修复周期或 SLA。
 
 ### 关键参数
 
@@ -439,6 +463,8 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 ## 已知限制
 
 - **多模态不可用**（问题 1）：当前制品 vision tower 不兼容，仅文本。
+- 多实例只有 2×TP1 通过真实集成测试；4 卡（4×TP1/2×TP2）和 8 卡（8×TP1/4×TP2/2×TP4）未验证。8×TP1 需要 32GB 卡，16GB V100 放不下一份完整的 27B 权重。
+- KV 只有每实例 device KV 和进程共享的 pinned host prefix-KV 两级；没有磁盘 KV tier、KV offload 或全局活跃 KV 池。
 - prefix cache 修复后未做长时间浸泡测试；超高压并发下的缓存行为仍在观察。
 - **BFCL 全量 200 条：ninfer 最新 27.0%（54/200）vs 1cat 38.5%（77/200），仍差 11.5pp**（逐样本 only-1cat=34 / only-ninfer=11）。**该问题仍未解决，暂停盲目主动修复，公开请求社区协作**；已排除 prompt/top_k/chunk/KV/parity/parser，剩余首要嫌疑是自转换 `.ninfer` 制品、NVFP4/attention 数值和 prefix-cache 状态（见“质量”节与 `BFCL_QUALITY_ISSUE.md`）。
 
@@ -855,12 +881,28 @@ export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH   # depends on your NC
 
 For TP4 (four GPUs), replace `--tp 2 --devices 0,1` with `--tp 4 --devices 0,1,2,3`; all other flags stay the same.
 
-#### Multi-instance groups (unverified)
+#### Multi-instance groups (partially validated)
 
 One process can serve several Engines, each on a disjoint device group, sharing one read-only
-artifact reader and one pinned host KV tier. `--group-devices` separates groups with semicolons and
-`--tp` is inferred from the group width when omitted. `--max-concurrency` and `--kv-capacity` are
-per instance; `--global-pending-requests` bounds the shared queue (default 16).
+artifact mmap and one pinned host prefix-KV tier; device weights and device KV remain private. The
+host tier stores only complete 64-token prefix-cache blocks and snapshots, not all active KV; there
+is no disk KV tier or KV offload. The single OpenAI/Anthropic frontend routes through `EnginePool`
+by prefix hit, free capacity, and aging, not simple round-robin. `--group-devices` separates groups
+with semicolons and `--tp` is inferred from the group width when omitted. `--max-concurrency` and
+`--kv-capacity` are per instance; `--global-pending-requests` bounds the shared queue (default 16).
+
+| Cards | Groups × TP | `--group-devices` | Status |
+|---:|---|---|---|
+| 2 | 2×TP1 | `"0;1"` | **real integration test passed** |
+| 4 | 4×TP1 | `"0;1;2;3"` | unverified |
+| 4 | 2×TP2 | `"0,1;2,3"` | unverified |
+| 8 | 8×TP1 | `"0;1;2;3;4;5;6;7"` | unverified; community focus |
+| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | unverified; community focus |
+| 8 | 2×TP4 | `"0,1,2,3;4,5,6,7"` | unverified; community focus |
+
+Prefer `--group-devices` for multi-group launches. `--devices` can also list all ranks in group
+order, but the `ninfer` CLI accepts at most four IDs. `--spec dflash` is rejected with multiple
+groups.
 
 Two-card host (2xTP1; the real integration test passed):
 
@@ -872,20 +914,29 @@ Two-card host (2xTP1; the real integration test passed):
   --prefix-cache --host-cache-mib 1024
 ```
 
-Eight-card host (4xTP2; not accessible in this window, unverified):
+Eight-card host (8xTP1; unverified, eight full instances, highest memory pressure):
 
 ```bash
 ./build/apps/ninfer-serve /home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
-  --groups 4 --group-devices "0,1;2,3;4,5;6,7" --tp 2 \
-  --max-context 262144 --kv-capacity 1048576 --kv-dtype int8 \
-  --max-concurrency 4 --spec mtp --draft-tokens 3 \
-  --prefix-cache --host-cache-mib 150000
+  --groups 8 --group-devices "0;1;2;3;4;5;6;7" --tp 1 \
+  --max-context 262144 --kv-capacity 262144 --kv-dtype int8 \
+  --max-concurrency 1 --spec mtp --draft-tokens 3 \
+  --prefix-cache --host-cache-mib 153600
 ```
 
-`--spec dflash` is rejected with multiple groups. See
-[`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md) for grouping, routing,
-permits, manifest lifecycle, and the unverified list. These profiles have no measured throughput
-or memory result and are not acceptance evidence.
+Script profiles: `bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
+(add `--dry-run` to print the full command). See
+[`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md) for the 8xTP1, 4xTP2,
+2xTP4, 4xTP1, and 2xTP2 parameters, routing, and validation boundaries. These unverified profiles
+have no measured throughput or memory result and are not acceptance evidence.
+
+**Community request (8 cards):** on an 8×V100-SXM2-32GB host, please prioritize 8xTP1, 4xTP2, and
+2xTP4 and report the launch command, binary/artifact hashes, the `/metrics?format=json`
+`instances` array, per-instance committed decode tok/s, TTFT/TPOT, MTP acceptance, queue wait,
+free KV pages, actual host-tier allocation, and 32GB memory headroom for 4xTP2/2xTP4. 8xTP1 needs
+32GB cards; a 16GB V100 cannot hold one full 27B copy. The 4-card profiles (4xTP1/2xTP2) are also
+unverified and welcome. `--dry-run` or static checks are not 8-card validation; no fix timeline or
+SLA is promised.
 
 ### Key Flags
 
@@ -935,6 +986,8 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 ## Known Limitations
 
 - **Multimodal is unavailable** (problem 1): the current artifact's vision tower is incompatible; text only.
+- Only 2×TP1 multi-instance has passed a real integration test; the 4-card (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified. 8×TP1 requires 32GB cards; a 16GB V100 cannot hold one full 27B copy.
+- KV has two tiers only: per-instance device KV and the process-shared pinned host prefix-KV tier. There is no disk KV tier, KV offload, or global active-KV pool.
 - After the prefix-cache fix, no long soak test has been run; cache behavior under very high concurrency is still being observed.
 - **BFCL full 200: ninfer latest 27.0% (54/200) vs 1cat 38.5% (77/200), an 11.5pp gap** (per-sample: only-1cat=34 / only-ninfer=11). **The issue remains unresolved; blind active fixing is paused and community help is requested.** Prompt/top_k/chunk/KV/parity/parser have been ruled out; the top remaining suspects are the self-converted `.ninfer` artifact, NVFP4/attention numerics, and prefix-cache state (see the “Quality” section and `BFCL_QUALITY_ISSUE.md`).
 

@@ -93,6 +93,29 @@ conclusions, or blind parity-switch/kernel sweeps. Include the hardware/toolchai
 binary and artifact hashes, exact commands, and result directory. No fix timeline or
 SLA is promised.
 
+## Multi-instance validation (4 and 8 cards)
+
+Only `2xTP1` multi-instance has passed a real integration test. The 4-card
+`4xTP1`/`2xTP2` and 8-card `8xTP1`/`4xTP2`/`2xTP4` profiles are unverified.
+`8xTP1` needs 32GB cards; a 16GB V100 cannot hold one full 27B copy.
+
+Run the documented profiles from
+[`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md). For
+the 8-card host:
+
+```bash
+bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1
+bash tools/v100/bench_multi_instance_8gpu.sh 4xTP2
+bash tools/v100/bench_multi_instance_8gpu.sh 2xTP4
+```
+
+Report the launch command, binary/artifact hashes, the
+`/metrics?format=json` `instances` array, per-instance committed decode tok/s,
+TTFT/TPOT, MTP acceptance, queue wait, free KV pages, actual host-tier
+allocation, and 32GB memory headroom. `--dry-run`, static checks, and
+single-instance results are not multi-instance validation. No fix timeline or
+SLA is promised.
+
 ## Pull request requirements
 
 A pull request description must include:
