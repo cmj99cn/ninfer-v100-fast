@@ -17,6 +17,9 @@ V100 profiles, but the BFCL quality gap and the limitations below are still open
 - MTP speculative decoding with up to three drafts.
 - Content-addressed multi-turn prefix cache, including shared host tier and
   cross-instance manifest reuse for 2×TP1.
+- Multi-instance serving documentation and 8-GPU profiles for 8×TP1, 4×TP2,
+  and 2×TP4, plus 4-card 4×TP1/2×TP2. Only 2×TP1 has passed a real integration
+  test; community validation is requested for the rest.
 - OpenAI-compatible and Anthropic-compatible serving surfaces, CLI, and metrics.
 - INT8 group-64 KV cache, NVFP4 text execution, and the self-converted
   Qwen3.8-27B NVFP4 `.ninfer` artifact route.
@@ -56,8 +59,12 @@ V100 profiles, but the BFCL quality gap and the limitations below are still open
 - Multimodal is unavailable on the current artifact; text-only is supported.
 - Long-duration prefix-cache soak testing under very high concurrency has not
   been completed.
-- 8-card multi-instance profiles have not been validated on this target; no
-  throughput or memory claims are made for them.
+- Only 2×TP1 multi-instance has passed a real integration test. The 4-card
+  (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified; no
+  throughput or memory claims are made for them. 8×TP1 requires 32GB cards.
+- KV caching has two tiers only: per-instance device KV and the process-shared
+  pinned host prefix-KV tier. There is no disk KV tier, KV offload, or global
+  active-KV pool.
 
 ### Verification
 
@@ -69,5 +76,8 @@ V100 profiles, but the BFCL quality gap and the limitations below are still open
   38.91 tok/s.
 - Quick before/after quality check: cold-start text, 8K prefix reuse, and MTP
   token IDs matched; no regression observed.
+- 8-GPU profile script: `bash -n`, `py_compile`, and `--dry-run` for 8xTP1,
+  4xTP2, and 2xTP4 passed. These are command-construction checks only; no
+  4-card or 8-card execution was performed.
 
 [0.1.0]: https://github.com/cmj99cn/ninfer-v100-fast/releases/tag/v0.1.0

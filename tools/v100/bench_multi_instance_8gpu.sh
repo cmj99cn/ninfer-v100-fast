@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# 8xV100 multi-instance serving profiles (4xTP2 or 2xTP4).
+# 8xV100 multi-instance serving profiles (8xTP1, 4xTP2, or 2xTP4).
+# 8xTP1 keeps eight full model copies and therefore requires 32GB cards.
 #
 # This script only constructs and runs the serve command. Benchmarking is a
 # separate process (tools/v100/bench_multi_instance.py) so the server stays up
-# across runs. Both profiles use the artifact selected by
+# across runs. All profiles use the artifact selected by
 # NINFER_V100X2_ARTIFACT/ARTIFACT (local NVFP4 default), INT8 group-64 KV, the
 # hybrid prefix cache with one shared pinned host tier, and MTP with at most
 # three drafts.
@@ -13,8 +14,10 @@
 # 2-GPU host.
 #
 # Usage:
+#   bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1 --dry-run
 #   bash tools/v100/bench_multi_instance_8gpu.sh 4xTP2 --dry-run
 #   bash tools/v100/bench_multi_instance_8gpu.sh 2xTP4 --dry-run
+#   bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1
 #   bash tools/v100/bench_multi_instance_8gpu.sh 4xTP2
 #   bash tools/v100/bench_multi_instance_8gpu.sh 2xTP4
 #
@@ -32,12 +35,12 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 [4xTP2|2xTP4] [--dry-run]" >&2
+  echo "usage: $0 [8xTP1|4xTP2|2xTP4] [--dry-run]" >&2
   exit 2
 }
 
 help() {
-  echo "usage: $0 [4xTP2|2xTP4] [--dry-run]"
+  echo "usage: $0 [8xTP1|4xTP2|2xTP4] [--dry-run]"
   echo "  --dry-run  print the complete serve command without starting anything"
   echo "  env: NINFER NINFER_V100X2_ARTIFACT HOST PORT API_KEY MAX_CONTEXT"
   echo "       GLOBAL_PENDING HOST_CACHE_MIB DRAFT_TOKENS REQUEST_LOG"
@@ -61,7 +64,7 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) dry_run=1 ;;
     -h|--help) help ;;
-    4xTP2|2xTP4)
+    8xTP1|4xTP2|2xTP4)
       [[ -z "$mode" ]] || usage
       mode=$arg
       ;;
@@ -71,6 +74,13 @@ done
 mode=${mode:-4xTP2}
 
 case "$mode" in
+  8xTP1)
+    groups=8
+    tp=1
+    conc=1
+    kv_capacity=262144
+    group_devices="0;1;2;3;4;5;6;7"
+    ;;
   4xTP2)
     groups=4
     tp=2
