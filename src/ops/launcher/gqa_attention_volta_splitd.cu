@@ -1,0 +1,388 @@
+// ninfer::ops::detail - experimental sm_70 D256 Split-D prefill attention route.
+//
+// Ported from taskeee/ninfer-v100-splitd-kernel (integration/gqa_attention_volta_splitd.cu)
+// and adapted for this tree's geometry registry and KV codec:
+//   * Geometry aliases renamed: CausalD256H24Kv4/H16Kv2 -> Gqa27/Gqa35/Gqa27Tp2/Gqa27Tp4;
+//   * the normalized D256 Hadamard on the int8-Q staging path is REMOVED -- this tree's
+//     int8 KV codec (gqa_attention_kv_quant.cuh) quantizes raw values with per-group
+//     absmax and never rotates, so Q must not cross a rotation either;
+//   * static_assert on QHeads widened to the registered local head counts (6/12/16/24)
+//     so TP2 and TP4 head-local geometries can select the route.
+//
+// Why this file exists: measurement on the reference machine (2026-09-28, 84,894-token
+// prompt) put the vendored llama.cpp MMA flash kernel at 41% of prefill wall clock with
+// only 2 CTAs/SM resident. The replacement is the 1CatAI D256 Split-D kernel, vendored
+// from fishlikeX/sm70-attn (ggml/src/ggml-cuda/fattn-sm70-d256-kernel.cuh, unmodified
+// device code as carried there), written for exactly this shape: sm_70, head_dim 256,
+// causal, prefill. Same machine, same-class A/B in llama.cpp: 176k prefill 372.94 ->
+// 521.93 tok/s (+39.9%).
+//
+// Interface fit (why the staging is this small):
+//   * the kernel builds its own causal mask from (kv_len, kv_offset), so the route no
+//     longer needs the [rows x n_kv] mask build;
+//   * it wants K/V as contiguous f16 with row stride kv_heads*D and head stride D, which
+//     is exactly the layout volta_flash_gather_kv_* kernels already produce;
+//   * it wants Q as f16 [row][head][D] padded to a multiple of kBlockM (64) -- the only
+//     new staging on our side, because our Q arrives as bf16 [D][heads][rows];
+//   * ElementOut is float, matching the f32 staging this route already converts from.
+//
+// Switch: NINFER_VOLTA_SPLITD=0 selects the vendored llama.cpp kernel. Default on.
+
+#include "fattn-sm70-d256-kernel.cuh" // vendored; defines FLASH_NAMESPACE, cutlass::half_t
+
+#include "core/device.h"
+#include "core/tensor.h"
+#include "ops/common/split_launch.h" // CurrentDeviceScope
+#include "ops/kernel/gqa_attention_geometry.cuh"
+#include "ops/launcher/kernel_attr_once.h" // ensure_func_attr_per_device
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+#include <map>
+
+namespace ninfer::ops::detail {
+namespace {
+
+constexpr int kHeadDim     = 256;
+constexpr int kD256BlockM  = 64;   // FLASH_NAMESPACE::Sm70D256SplitDTraits::kBlockM
+constexpr int kD256Threads = 256;  // ...::kNThreads
+// Cap matches the prefill chunk (8192). One splitd launch covers a whole Q chunk,
+// matching the upstream q8192 path: fewer stage/unstage roundtrips and better
+// latency hiding than many 1024-row launches.
+constexpr int kMaxRows = 8192;
+
+constexpr int round_up_rows(int rows) { return ((rows + kD256BlockM - 1) / kD256BlockM) * kD256BlockM; }
+
+// Every piece of Split-D state below (staging, smem opt-in, the pinned positions probe) is keyed
+// by CUDA device. This engine issues all ranks' work from a single host thread with that rank's
+// device made current (ops::detail::for_each_rank), so cudaGetDevice() IS the rank identity;
+// an unkeyed function-local static would have rank 1 bind to rank 0's buffers -- a real
+// cross-device race, since each launch then reads and writes the other rank's memory. Maps (not
+// a size-kMaximumDevices array) because device ids are physical and need not be < that count.
+int current_device() {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    return device;
+}
+
+// Upstream's SplitKV3 activation threshold (LLAMA_SM70_SPLITKV3_MIN_KV default). Overridable
+// here so the attention contract tests can be pointed at the merge path: their cases are far
+// below 2048 keys, so with the production threshold the merge kernel would never be exercised.
+constexpr int kSplitKv3MinKv = 2048;
+
+int split3_min_kv() {
+    static const int value = [] {
+        const char* env = std::getenv("NINFER_SM70_SPLITKV3_MIN_KV");
+        return env != nullptr ? std::atoi(env) : kSplitKv3MinKv;
+    }();
+    return value;
+}
+
+// bf16 Q [D][heads][rows] -> f16 [row][head][D] padded to q_pad, zero-filled past `rows`.
+// No rotation: this tree's int8 KV codec stores raw (unrotated) values, so the dot product
+// is already in the original basis.
+__launch_bounds__(256) __global__ void splitd_stage_q_kernel(
+        const __nv_bfloat16* __restrict__ q, cutlass::half_t* __restrict__ qs, int rows,
+        int q_pad, int heads) {
+    constexpr int kWarps = 8;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    auto* dst_base = reinterpret_cast<half*>(qs);
+
+    // Padding rows are read by the kernel (query_len == q_pad) and must be defined.
+    for (int unit = blockIdx.x * kWarps + warp; unit < q_pad * heads;
+         unit += gridDim.x * kWarps) {
+        const int row = unit / heads;
+        const int h   = unit - row * heads;
+        if (row < rows) { continue; }
+        half* dst = dst_base + (static_cast<std::size_t>(row) * heads + h) * kHeadDim;
+        for (int d = lane; d < kHeadDim; d += 32) { dst[d] = __float2half(0.0f); }
+    }
+
+    const int unit = blockIdx.x * kWarps + warp;
+    if (unit >= rows * heads) { return; }
+    const int row = unit / heads;
+    const int h   = unit - row * heads;
+    const auto* src = q + (static_cast<std::size_t>(row) * heads + h) * kHeadDim;
+    half* dst       = dst_base + (static_cast<std::size_t>(row) * heads + h) * kHeadDim;
+
+    for (int d = lane; d < kHeadDim; d += 32) {
+        dst[d] = __float2half(__bfloat162float(src[d]));
+    }
+}
+
+// f32 [row][head][D] (padded) -> bf16 [D][heads][rows], the layout the rest of the engine
+// expects from this route's output tensor.
+__global__ void splitd_unstage_out_kernel(const float* __restrict__ o,
+                                          __nv_bfloat16* __restrict__ out, int rows, int heads) {
+    const std::int64_t total = static_cast<std::int64_t>(rows) * heads * kHeadDim;
+    for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < total; i += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
+        const int d   = static_cast<int>(i % kHeadDim);
+        const int h   = static_cast<int>((i / kHeadDim) % heads);
+        const int row = static_cast<int>(i / (kHeadDim * static_cast<std::int64_t>(heads)));
+        out[i] = __float2bfloat16(o[(static_cast<std::size_t>(row) * heads + h) * kHeadDim + d]);
+    }
+}
+
+// Staging lives outside the engine workspace on purpose: it is fixed-shape and small
+// (1024 rows x 24 heads x 256 dims x 2 B == 12.6 MiB for Q, 25.2 MiB for the f32 output),
+// so threading it through the workspace planner would buy nothing.
+struct SplitDStaging {
+    cutlass::half_t* q = nullptr;
+    float*           o = nullptr;
+    // SplitKV3 partials: [split][row][D] plus per-row raw max/sum. The kernel documents
+    // row = (query_row * heads_q + head_q), which is the same flat order the merge kernel
+    // writes into the output staging, so no layout switch is needed between the two paths.
+    float*           partial_out = nullptr;
+    float*           partial_max = nullptr;
+    float*           partial_sum = nullptr;
+    int              heads = 0;
+};
+
+SplitDStaging& splitd_staging(int heads) {
+    static std::map<int, SplitDStaging> stagings;
+    SplitDStaging& staging = stagings[current_device()];
+    if (staging.q == nullptr || staging.heads != heads) {
+        const CurrentDeviceScope scope;  // allocate on this rank's device, restore the caller's
+        if (staging.q != nullptr) {
+            cudaFree(staging.q);
+            cudaFree(staging.o);
+            cudaFree(staging.partial_out);
+            cudaFree(staging.partial_max);
+            cudaFree(staging.partial_sum);
+            staging.q = nullptr;
+        }
+        const std::size_t elements = static_cast<std::size_t>(kMaxRows) * heads * kHeadDim;
+        const std::size_t rows3    = static_cast<std::size_t>(kMaxRows) * heads;
+        CUDA_CHECK(cudaMalloc(&staging.q, elements * sizeof(cutlass::half_t)));
+        CUDA_CHECK(cudaMalloc(&staging.o, elements * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&staging.partial_out, 3 * rows3 * kHeadDim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&staging.partial_max, 3 * rows3 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&staging.partial_sum, 3 * rows3 * sizeof(float)));
+        staging.heads = heads;
+    }
+    return staging;
+}
+
+// cudaFuncSetAttribute cannot run inside a CUDA graph capture (it would invalidate the
+// capture), and the engine captures during warmup. Raise it on the first call that is not
+// being captured; until then the caller keeps using the llama.cpp kernel. The opt-in is a
+// per-device kernel property, so it goes through the shared per-device once-guard rather than a
+// bare static (which would configure only whichever device ran first).
+bool splitd_smem_ready(cudaStream_t stream) {
+    using Traits = FLASH_NAMESPACE::Sm70D256SplitDTraits;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    (void)cudaStreamIsCapturing(stream, &capture);
+    if (capture != cudaStreamCaptureStatusNone) { return false; }
+    const auto kernel =
+        FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<cutlass::half_t, false, float, false,
+                                                       false, false>;
+    const auto kernel_s3 =
+        FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<cutlass::half_t, false, float, true,
+                                                       false, false>;
+    for (const void* kfn : {reinterpret_cast<const void*>(kernel),
+                            reinterpret_cast<const void*>(kernel_s3)}) {
+        ensure_func_attr_per_device(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    Traits::kSmemBytes);
+    }
+    return true;
+}
+
+} // namespace
+
+bool volta_splitd_requested() {
+    // On by default. The route verifies the positions layout per call and falls back to
+    // the llama.cpp kernel whenever the Split-D kernel's mask model does not apply.
+    // NINFER_VOLTA_SPLITD=0 is the kill switch back to the vendored llama.cpp kernel.
+    static const bool requested = [] {
+        const char* env = std::getenv("NINFER_VOLTA_SPLITD");
+        return env == nullptr || std::string(env) != "0";
+    }();
+    return requested;
+}
+
+// Verify once per attention launch that positions[0..width) are contiguous
+// [base, base+width). The Split-D kernel derives its causal mask from
+// (kv_len, kv_offset) alone and assumes the query rows sit at the tail of the key
+// range at contiguous absolute positions. The public attention contract allows
+// arbitrary positions (the llama.cpp route builds its mask from the positions tensor),
+// so we verify the layout once and fall back for the whole call rather than
+// compute a different attention. Doing this per Q-block would sync the stream
+// hundreds of times per prefill layer and destroy throughput.
+// Inside a graph capture the check is illegal; the capture path keeps the llama.cpp kernel.
+bool splitd_positions_are_contiguous(const void* positions, std::int32_t base,
+                                     std::int32_t width, cudaStream_t stream) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    (void)cudaStreamIsCapturing(stream, &capture);
+    if (capture != cudaStreamCaptureStatusNone) { return false; }
+    if (positions == nullptr || width <= 0) { return false; }
+    // Prefill shares one positions tensor across every layer of a chunk: the D2H+sync
+    // verify costs a full stream drain per call, so cache the positive result keyed by
+    // (pointer, base, width). Decode rewrites a small positions buffer in place each
+    // step, so only the large-width prefill regime is eligible. Cache and pinned staging
+    // are per device: with one host thread driving both ranks, a shared probe buffer would
+    // have one rank read positions another rank just overwrote.
+    struct ProbeCache {
+        const void*  positions = nullptr;
+        std::int32_t base      = -1;
+        std::int32_t width     = -1;
+        int*         host      = nullptr;
+        std::int32_t host_rows = 0;
+    };
+    constexpr std::int32_t kCacheMinWidth = 256;
+    static std::map<int, ProbeCache> probes;
+    ProbeCache& probe = probes[current_device()];
+    if (width >= kCacheMinWidth && positions == probe.positions && base == probe.base &&
+        width == probe.width) {
+        return true;
+    }
+    if (probe.host_rows < width) {
+        if (probe.host != nullptr) { cudaFreeHost(probe.host); }
+        probe.host = nullptr;
+        if (cudaMallocHost(&probe.host, static_cast<std::size_t>(width) * sizeof(int)) !=
+            cudaSuccess) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        probe.host_rows = width;
+    }
+    if (cudaMemcpyAsync(probe.host, positions, static_cast<std::size_t>(width) * sizeof(int),
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    for (int i = 0; i < width; ++i) {
+        if (probe.host[i] != base + i) { return false; }
+    }
+    if (width >= kCacheMinWidth) {
+        probe.positions = positions;
+        probe.base      = base;
+        probe.width     = width;
+    }
+    return true;
+}
+
+// One Q-block: stage Q, run the Split-D kernel over the gathered K/V, unstage the result.
+// `q` is the block's bf16 row base in [D][heads][rows] layout, `out` the matching output
+// row base; `k_f16`/`v_f16` are the gathered contiguous FP16 caches [key][kv_heads][D].
+// `kv_len` is the padded visible key count and `kv_offset` the absolute key position of
+// row 0 (the kernel derives its causal mask from those two). `positions_contiguous` must
+// already have been validated by splitd_positions_are_contiguous for the whole launch.
+template <typename Geometry>
+bool volta_splitd_block(const void* q_bf16, const void* k_f16, const void* v_f16, int rows,
+                        int kv_len, int kv_offset, bool positions_contiguous, float scale,
+                        void* out_bf16, cudaStream_t stream) {
+    using Traits = FLASH_NAMESPACE::Sm70D256SplitDTraits;
+    constexpr int kHeads = Geometry::QHeads;
+    constexpr int kKvHeads = Geometry::KVHeads;
+    constexpr int kGroup = Geometry::GroupSize;
+    static_assert(Geometry::QHeads / Geometry::KVHeads == Geometry::GroupSize, "gqa mismatch");
+    static_assert(Geometry::QHeads == 24 || Geometry::QHeads == 16 ||
+                      Geometry::QHeads == 12 || Geometry::QHeads == 6,
+                  "unregistered geometry");
+
+    if (rows <= 0 || rows > kMaxRows) { return false; }
+    if (!positions_contiguous) { return false; }
+    // for_each_rank has rank's device current here; the helpers key their state on it.
+    if (!splitd_smem_ready(stream)) { return false; }
+
+    {
+        static int hits = 0, split3_hits = 0, calls = 0;
+        ++calls;
+        const bool use3_dbg = split3_min_kv() > 0 && kv_len >= split3_min_kv() && kv_len > round_up_rows(rows);
+        if (use3_dbg) ++split3_hits;
+        ++hits;
+        if ((calls & 0xFF) == 1 && std::getenv("NINFER_SPLITD_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[splitd] calls=%d hit=%d split3=%d rows=%d kv_len=%d\n",
+                         calls, hits, split3_hits, rows, kv_len);
+        }
+    }
+
+    const int q_pad = round_up_rows(rows);
+    SplitDStaging& staging = splitd_staging(kHeads);
+
+    constexpr int kStageWarps = 8;
+    const int stage_blocks    = (rows * kHeads + kStageWarps - 1) / kStageWarps;
+    splitd_stage_q_kernel<<<stage_blocks, kStageWarps * 32, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q_bf16), staging.q, rows, q_pad, kHeads);
+    CUDA_CHECK(cudaGetLastError());
+
+    // SplitKV3: three-way KV split for long prefixes. The upstream fork measured +3.7% on a
+    // 176k prefill from it (it triples the CTA count so late chunks stop serializing their
+    // KV sweep on a saturated grid). Same activation rule as upstream: only for a single
+    // batch, above a key threshold, and only when there is a prefix to split (kv_len > q).
+    const float softmax_scale_log2 = scale * 1.4426950408889634f;
+    const bool use_split3 = split3_min_kv() > 0 && kv_len >= split3_min_kv() && kv_len > q_pad;
+    const auto kernel = use_split3
+        ? FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<cutlass::half_t, false, float, true,
+                                                        false, false>
+        : FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<cutlass::half_t, false, float, false,
+                                                        false, false>;
+    const dim3 grid(q_pad / kD256BlockM, use_split3 ? 3u : 1u,
+                    static_cast<unsigned>(kKvHeads * kGroup));
+    const dim3 block(kD256Threads);
+    kernel<<<grid, block, Traits::kSmemBytes, stream>>>(
+        reinterpret_cast<const cutlass::half_t*>(staging.q),
+        reinterpret_cast<const cutlass::half_t*>(k_f16),
+        reinterpret_cast<const cutlass::half_t*>(v_f16), staging.o,
+        // Q/out are laid out [row][head][D] (row stride heads*D, head stride D), which is
+        // what splitd_stage_q_kernel / splitd_unstage_out_kernel write and read, and what the
+        // SplitKV3 merge kernel writes too (its flat row is query_row*heads_q + head_q). The
+        // vendored launcher instead stages head-major (head stride q_pad*D) to match its own
+        // stage_q kernel; passing the strides explicitly means either layout works, but they
+        // MUST agree with the staging kernels -- an earlier revision passed head-major
+        // strides against row-major staging and fed the kernel shuffled rows (caught by
+        // ninfer_softmax_attention_test: T=66 keys=129 off by 3-11%).
+        /*q_batch_stride*/ static_cast<int>(static_cast<std::int64_t>(q_pad) * kHeads * kHeadDim),
+        /*q_row_stride  */ kHeads * kHeadDim,
+        /*q_head_stride */ kHeadDim,
+        /*k_outer_stride*/ 0,
+        /*k_row_stride  */ kKvHeads * kHeadDim,
+        /*k_head_stride */ kHeadDim,
+        /*v_outer_stride*/ 0,
+        /*v_row_stride  */ kKvHeads * kHeadDim,
+        /*v_head_stride */ kHeadDim, q_pad, kv_len, kHeads, kKvHeads, kv_offset,
+        /*softmax_scale_log2*/ softmax_scale_log2,
+        /*block_table*/ nullptr, /*page_size*/ 0, /*block_table_batch_stride*/ 0,
+        use_split3 ? staging.partial_out : nullptr,
+        use_split3 ? staging.partial_max : nullptr,
+        use_split3 ? staging.partial_sum : nullptr);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (use_split3) {
+        // Merge the three segments straight into the f32 staging the unstage kernel reads.
+        const std::int64_t rows3 = static_cast<std::int64_t>(q_pad) * kHeads;
+        FLASH_NAMESPACE::sm70_d256_splitkv3_merge_kernel
+            <<<dim3(static_cast<unsigned>(rows3)), dim3(kHeadDim), 0, stream>>>(
+                staging.partial_out, staging.partial_max, staging.partial_sum, staging.o, rows3,
+                softmax_scale_log2);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const int unstage_blocks = static_cast<int>(
+        (static_cast<std::int64_t>(rows) * kHeads * kHeadDim + 255) / 256);
+    splitd_unstage_out_kernel<<<unstage_blocks, 256, 0, stream>>>(
+        staging.o, static_cast<__nv_bfloat16*>(out_bf16), rows, kHeads);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+template bool volta_splitd_block<Gqa27Geometry>(const void*, const void*, const void*, int, int,
+                                                int, bool, float, void*, cudaStream_t);
+template bool volta_splitd_block<Gqa35Geometry>(const void*, const void*, const void*, int, int,
+                                                int, bool, float, void*, cudaStream_t);
+template bool volta_splitd_block<Gqa27Tp2Geometry>(const void*, const void*, const void*, int,
+                                                   int, int, bool, float, void*, cudaStream_t);
+template bool volta_splitd_block<Gqa27Tp4Geometry>(const void*, const void*, const void*, int,
+                                                   int, int, bool, float, void*, cudaStream_t);
+
+} // namespace ninfer::ops::detail

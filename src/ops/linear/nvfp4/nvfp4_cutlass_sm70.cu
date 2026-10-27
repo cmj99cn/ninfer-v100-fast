@@ -1,0 +1,515 @@
+#include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
+
+#include "core/device.h"
+#include "core/layout.h"
+#include "ops/linear/nvfp4/nvfp4_codec.cuh"
+
+#include "cutlass/bfloat16.h"
+#include "cutlass/cutlass.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/device/gemm.h"
+#include "cutlass/half.h"
+
+#include <cublas_v2.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <thread>
+#include <vector>
+#include <stdexcept>
+#include <unistd.h>
+
+namespace ninfer::ops::detail {
+namespace {
+
+// The artifact stores adjacent E2M1 values in each code byte and one E4M3 scale per K16 group.
+// Scales use the BlockScaleK16M128x4 swizzle. Materializing once is intentionally a wide-T
+// strategy: CUTLASS can reuse the resulting FP16 matrix across every token tile instead of
+// decoding the packed weights again for each tile.
+__global__ void dequant_nvfp4_row_to_fp16(const std::uint8_t* __restrict__ codes,
+                                           const std::uint8_t* __restrict__ scales, int n, int k,
+                                           float inverse_weight_divisor,
+                                           cutlass::half_t* __restrict__ out) {
+    const int row      = static_cast<int>(blockIdx.y);
+    const int byte_idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int bytes_per_row = k / 2;
+    if (row >= n || byte_idx >= bytes_per_row) { return; }
+    const int k0            = byte_idx * 2;
+    const int group         = byte_idx / 8;
+    const int scale_tile    = group / 4;
+    const int scale_lane    = group & 3;
+    const int row_inner     = row & 127;
+    const int scales_per_m128 = k / 64;
+    const std::int64_t scale_offset =
+        static_cast<std::int64_t>((row / 128) * scales_per_m128 + scale_tile) * 512 +
+        (row_inner & 31) * 16 + (row_inner >> 5) * 4 + scale_lane;
+    const float coefficient = decode_nvfp4_e4m3(scales[scale_offset]) * inverse_weight_divisor;
+    const float2 value = decode_nvfp4_e2m1x2(
+        codes[static_cast<std::int64_t>(row) * bytes_per_row + byte_idx]);
+    cutlass::half_t* out_row = out + static_cast<std::int64_t>(row) * k;
+    out_row[k0]     = cutlass::half_t(value.x * coefficient);
+    out_row[k0 + 1] = cutlass::half_t(value.y * coefficient);
+}
+
+__global__ void dequant_nvfp4_qpn_to_fp16(const std::uint8_t* __restrict__ codes,
+                                          const std::uint8_t* __restrict__ scales, int n, int k,
+                                          float inverse_weight_divisor,
+                                          cutlass::half_t* __restrict__ out) {
+    // Consecutive lanes read consecutive packed K16 tuples. The old row-wise traversal made
+    // adjacent lanes skip 256 input bytes and decoded every tuple twice. Each lane now loads
+    // its eight code bytes once and writes the complete, aligned 32-byte FP16 group.
+    const std::int64_t tuple = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int groups = k / 16;
+    if (tuple >= static_cast<std::int64_t>(n) * groups) { return; }
+    const int lane = static_cast<int>(tuple & 31);
+    const int group = static_cast<int>((tuple / 32) % groups);
+    const int row = static_cast<int>(tuple / (32 * groups)) * 32 +
+                    ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+    constexpr int inverse_order[16] = {0, 4, 1, 5, 2, 6, 3, 7,
+                                       8, 12, 9, 13, 10, 14, 11, 15};
+    const uint2 packed_words = __ldg(reinterpret_cast<const uint2*>(codes) + tuple);
+    const auto* packed = reinterpret_cast<const std::uint8_t*>(&packed_words);
+    const float coefficient = decode_nvfp4_e4m3(scales[tuple]) * inverse_weight_divisor;
+    alignas(16) cutlass::half_t values[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const int position  = inverse_order[j];
+        const float2 pair   = decode_nvfp4_e2m1x2(packed[position / 2]);
+        values[j] = cutlass::half_t(((position & 1) == 0 ? pair.x : pair.y) * coefficient);
+    }
+    auto* destination = reinterpret_cast<uint4*>(
+        out + static_cast<std::int64_t>(row) * k + group * 16);
+    destination[0] = reinterpret_cast<const uint4*>(values)[0];
+    destination[1] = reinterpret_cast<const uint4*>(values)[1];
+}
+
+__global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
+                                    cutlass::half_t* __restrict__ out, std::int64_t count) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) { out[i] = cutlass::half_t(__bfloat162float(in[i])); }
+}
+
+__global__ void fp32_to_bf16_kernel(const float* __restrict__ in,
+                                    __nv_bfloat16* __restrict__ out, std::int64_t count) {
+    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) { out[index] = __float2bfloat16(in[index]); }
+}
+
+int div_up_i(int a, int b) { return (a + b - 1) / b; }
+
+using ElementAccumulator     = float;
+using ElementComputeEpilogue = ElementAccumulator;
+using ElementInputA          = cutlass::half_t;
+using ElementInputB          = cutlass::half_t;
+using LayoutInputA           = cutlass::layout::RowMajor;
+using LayoutInputB           = cutlass::layout::ColumnMajor;
+using LayoutOutput           = cutlass::layout::RowMajor;
+using MMAOp                  = cutlass::arch::OpClassTensorOp;
+using SmArch                 = cutlass::arch::Sm70;
+using ShapeMMAWarp           = cutlass::gemm::GemmShape<64, 64, 32>;
+using ShapeMMAOp             = cutlass::gemm::GemmShape<8, 8, 4>;
+using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+constexpr int kNumStages = 2;
+template <class ElementOutput>
+using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
+    ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value, ElementAccumulator,
+    ElementComputeEpilogue>;
+template <class ElementOutput, int TileN = 128, class SwizzleTB = SwizzleThreadBlock,
+          int Stages = kNumStages>
+using GemmFor = cutlass::gemm::device::Gemm<ElementInputA, LayoutInputA, ElementInputB, LayoutInputB,
+                                         ElementOutput, LayoutOutput, ElementAccumulator, MMAOp,
+                                         SmArch, cutlass::gemm::GemmShape<128, TileN, 32>,
+                                         ShapeMMAWarp, ShapeMMAOp,
+                                         EpilogueOp<ElementOutput>, SwizzleTB, Stages>;
+using Gemm = GemmFor<cutlass::bfloat16_t>;
+
+// NINFER_SM70_PREFILL_GEMM selects the prefill GEMM configuration:
+//   0 = CUTLASS identity swizzle, 2 pipeline stages (default)
+//   1 = cuBLAS fp16 GEMM over the same dequantized operands
+// Stages stays at 2 and swizzling stays identity: cutlass's SM70 device::Gemm hard-codes
+// 2 stages and its kernel calls get_tile_offset(int), which only the identity swizzle
+// satisfies, so neither axis is selectable through this API.
+int prefill_gemm_variant() {
+    static const int variant = [] {
+        const char* env = std::getenv("NINFER_SM70_PREFILL_GEMM");
+        return env ? std::atoi(env) : 0;
+    }();
+    return variant;
+}
+
+// Diagnosis only: NINFER_VOLTA_DEQUANT=row|qpn forces which packed-weight dequant feeds the
+// fp16 GEMM operands, overriding the weight's declared layout. Used to tell a wrong/fast dequant
+// apart from a GEMM/split defect when bisecting the T>=256 non-determinism.
+int volta_dequant_override() {
+    static const int variant = [] {
+        const char* env = std::getenv("NINFER_VOLTA_DEQUANT");
+        if (env == nullptr) { return 0; }
+        if (std::strcmp(env, "row") == 0) { return 1; }
+        if (std::strcmp(env, "qpn") == 0) { return 2; }
+        return 0;
+    }();
+    return variant;
+}
+
+template <class ElementOutput>
+struct CublasOutType;
+template <>
+struct CublasOutType<cutlass::bfloat16_t> {
+    static constexpr cudaDataType_t value = CUDA_R_16BF;
+};
+template <>
+struct CublasOutType<float> {
+    static constexpr cudaDataType_t value = CUDA_R_32F;
+};
+
+template <class Allocator>
+struct CutlassWorkspace {
+    Tensor w_fp16;
+    Tensor x_fp16;
+    DeviceSpan gemm_workspace;
+};
+
+template <class Allocator>
+CutlassWorkspace<Allocator> allocate_cutlass_workspace(Allocator& allocator, std::int32_t n,
+                                                       std::int32_t k, std::int32_t cols,
+                                                       std::size_t gemm_workspace_bytes) {
+    CutlassWorkspace<Allocator> out;
+    out.w_fp16 = allocator.alloc(DType::FP16, {k, n});
+    out.x_fp16 = allocator.alloc(DType::FP16, {k, cols});
+    if (gemm_workspace_bytes > 0) { out.gemm_workspace = allocator.alloc_bytes(gemm_workspace_bytes); }
+    return out;
+}
+
+std::size_t workspace_bytes_impl(std::int32_t n, std::int32_t k, std::int32_t cols,
+                                 bool bf16_output) {
+    WorkspaceLayoutBuilder layout;
+    cutlass::gemm::GemmCoord problem_size(cols, n, k);
+    typename Gemm::Arguments arguments{
+        problem_size, {nullptr, k}, {nullptr, k}, {nullptr, n}, {nullptr, n},
+        {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
+    const std::size_t gemm_workspace_bytes = Gemm::get_workspace_size(arguments);
+    (void)allocate_cutlass_workspace(layout, n, k, cols, gemm_workspace_bytes);
+    if (bf16_output && prefill_gemm_variant() == 1) {
+        // cuBLAS on SM70 cannot write BF16 directly; launch_cublas stages [cols,n] FP32 output
+        // before converting it to the BF16 destination. An FP16 staging buffer would overflow
+        // for projections whose true BF16 result is outside FP16's range (real activations can
+        // exceed it), so the staging precision must cover BF16's exponent. The FP32 fused-SwiGLU
+        // form writes its FP32 projection directly and must not reserve this buffer.
+        (void)layout.alloc(DType::FP32, {cols, n});
+    }
+    return layout.peak_bytes(1);
+}
+
+// Diagnosis only: NINFER_DUMP_INPUT=<path> appends one aggregate stat line for the first few
+// dequantized weight/activation tiles so two processes at the same config can be compared.
+void dump_fp16_stats(const char* tag, const cutlass::half_t* data, std::int64_t count,
+                     int n, int k, int layout, int use_qpn, cudaStream_t stream) {
+    const char* path = std::getenv("NINFER_DUMP_INPUT");
+    if (path == nullptr) { return; }
+    static int calls = 0;
+    if (calls >= 24) { return; }
+    ++calls;
+    std::vector<cutlass::half_t> host(static_cast<std::size_t>(count));
+    if (cudaMemcpyAsync(host.data(), data,
+                        static_cast<std::size_t>(count) * sizeof(cutlass::half_t),
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+    int device = -1;
+    cudaGetDevice(&device);
+    double sum = 0.0;
+    double sumsq = 0.0;
+    double maxabs = 0.0;
+    for (std::int64_t i = 0; i < count; ++i) {
+        const double v = static_cast<double>(static_cast<float>(host[static_cast<std::size_t>(i)]));
+        sum += v;
+        sumsq += v * v;
+        const double a = std::fabs(v);
+        if (a > maxabs) { maxabs = a; }
+    }
+    std::FILE* f = std::fopen(path, "a");
+    if (f == nullptr) { return; }
+    std::fprintf(f,
+                 "[%s] pid=%d dev=%d n=%d k=%d layout=%d use_qpn=%d count=%lld "
+                 "sum=%.9g sumsq=%.9g maxabs=%.9g\n",
+                 tag, static_cast<int>(getpid()), device, n, k, layout, use_qpn,
+                 static_cast<long long>(count), sum, sumsq, maxabs);
+    std::fclose(f);
+}
+
+// Diagnosis only: aggregate stats of a BF16 GEMM output tile for cross-process comparison.
+void dump_bf16_stats(const char* tag, const __nv_bfloat16* data, std::int64_t count, int n,
+                     int cols, cudaStream_t stream) {
+    const char* path = std::getenv("NINFER_DUMP_INPUT");
+    if (path == nullptr) { return; }
+    static int calls = 0;
+    if (calls >= 32) { return; }
+    ++calls;
+    std::vector<__nv_bfloat16> host(static_cast<std::size_t>(count));
+    if (cudaMemcpyAsync(host.data(), data,
+                        static_cast<std::size_t>(count) * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+    int device = -1;
+    cudaGetDevice(&device);
+    double sum = 0.0;
+    double sumsq = 0.0;
+    double maxabs = 0.0;
+    for (std::int64_t i = 0; i < count; ++i) {
+        const double v = static_cast<double>(__bfloat162float(host[static_cast<std::size_t>(i)]));
+        sum += v;
+        sumsq += v * v;
+        const double a = std::fabs(v);
+        if (a > maxabs) { maxabs = a; }
+    }
+    std::FILE* f = std::fopen(path, "a");
+    if (f == nullptr) { return; }
+    std::fprintf(f,
+                 "[%s] pid=%d dev=%d n=%d cols=%d count=%lld sum=%.9g sumsq=%.9g maxabs=%.9g\n",
+                 tag, static_cast<int>(getpid()), device, n, cols,
+                 static_cast<long long>(count), sum, sumsq, maxabs);
+    std::fclose(f);
+}
+
+// Materializes the packed NVFP4 weight tile and the BF16 activation tile as FP16 so one
+// GEMM call can reuse them across every token tile of the chunk.
+void dequant_inputs(const Tensor& x, const Weight& w, cutlass::half_t* w_fp16,
+                    cutlass::half_t* x_fp16, cudaStream_t stream) {
+    const std::int32_t k    = x.ne[0];
+    const std::int32_t cols = x.ne[1];
+    const std::int32_t n    = w.n;
+    const dim3 block(256);
+    const int dequant_variant = volta_dequant_override();
+    const bool use_qpn = dequant_variant == 2 ||
+                         (dequant_variant == 0 && w.layout == QuantLayout::VoltaQpnPrepacked);
+    if (use_qpn) {
+        const dim3 grid(static_cast<unsigned>((static_cast<std::int64_t>(n) * (k / 16) + 255) / 256));
+        dequant_nvfp4_qpn_to_fp16<<<grid, block, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), n, k, 1.0F / w.weight_scale_divisor,
+            w_fp16);
+    } else {
+        const dim3 grid(static_cast<unsigned>(div_up_i(k / 2, 256)), static_cast<unsigned>(n), 1u);
+        dequant_nvfp4_row_to_fp16<<<grid, block, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), n, k, 1.0F / w.weight_scale_divisor,
+            w_fp16);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    const std::int64_t x_count = static_cast<std::int64_t>(cols) * k;
+    const int x_blocks         = static_cast<int>((x_count + 255) / 256);
+    bf16_to_fp16_kernel<<<x_blocks, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+                                                      x_fp16, x_count);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (std::getenv("NINFER_DUMP_INPUT") != nullptr) {
+        const int layout = static_cast<int>(w.layout);
+        const int qpn    = use_qpn ? 1 : 0;
+        dump_fp16_stats("w_fp16", w_fp16, static_cast<std::int64_t>(n) * k, n, k, layout, qpn,
+                        stream);
+        dump_fp16_stats("x_fp16", x_fp16, static_cast<std::int64_t>(cols) * k, k, cols, layout,
+                        qpn, stream);
+    }
+}
+
+template <class ElementOutput, int TileN, class SwizzleTB, int Stages>
+void launch_impl(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                 cudaStream_t stream) {
+    using Gemm = GemmFor<ElementOutput, TileN, SwizzleTB, Stages>;
+    const std::int32_t k    = x.ne[0];
+    const std::int32_t cols = x.ne[1];
+    const std::int32_t n    = w.n;
+    cutlass::gemm::GemmCoord problem_size(cols, n, k);
+    typename Gemm::Arguments sizing_arguments{
+        problem_size, {nullptr, k}, {nullptr, k}, {nullptr, n}, {nullptr, n},
+        {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
+    const std::size_t gemm_workspace_bytes =
+        Gemm::get_workspace_size(sizing_arguments);
+
+    auto scratch_scope = ws.scope();
+    CutlassWorkspace<WorkspaceArena> scratch =
+        allocate_cutlass_workspace(ws, n, k, cols, gemm_workspace_bytes);
+    auto* w_fp16 = static_cast<cutlass::half_t*>(scratch.w_fp16.data);
+    auto* x_fp16 = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
+
+    dequant_inputs(x, w, w_fp16, x_fp16, stream);
+
+    Gemm gemm_op;
+    typename Gemm::Arguments arguments{
+        problem_size, {x_fp16, k}, {w_fp16, k}, {static_cast<ElementOutput*>(out.data), n},
+        {static_cast<ElementOutput*>(out.data), n},
+        {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
+    cutlass::Status status = gemm_op.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) {
+        throw std::runtime_error("nvfp4_cutlass_sm70: CUTLASS can_implement failed");
+    }
+    status = gemm_op.initialize(arguments, scratch.gemm_workspace.data, stream);
+    if (status != cutlass::Status::kSuccess) {
+        throw std::runtime_error("nvfp4_cutlass_sm70: CUTLASS initialize failed");
+    }
+    status = gemm_op(stream);
+    if (status != cutlass::Status::kSuccess) {
+        throw std::runtime_error("nvfp4_cutlass_sm70: CUTLASS gemm() failed");
+    }
+    CUDA_CHECK(cudaGetLastError());
+    if constexpr (std::is_same_v<ElementOutput, cutlass::bfloat16_t>) {
+        dump_bf16_stats("out-cutlass", static_cast<const __nv_bfloat16*>(out.data),
+                        static_cast<std::int64_t>(cols) * n, n, cols, stream);
+    }
+}
+
+template <class ElementOutput>
+void launch_cublas(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                   cudaStream_t stream) {
+    const std::int32_t k    = x.ne[0];
+    const std::int32_t cols = x.ne[1];
+    const std::int32_t n    = w.n;
+    auto scratch_scope = ws.scope();
+    CutlassWorkspace<WorkspaceArena> scratch = allocate_cutlass_workspace(ws, n, k, cols, 0);
+    auto* w_fp16 = static_cast<cutlass::half_t*>(scratch.w_fp16.data);
+    auto* x_fp16 = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
+    dequant_inputs(x, w, w_fp16, x_fp16, stream);
+
+    // One thread interleaves both TP ranks' calls, switching the current device per
+    // call, so the cuBLAS handle must be per-device (a handle created on another
+    // device fails some GEMMs with STATUS_EXECUTION_FAILED).
+    int dev_id = 0;
+    cudaGetDevice(&dev_id);
+    if (dev_id < 0 || dev_id >= 8) {
+        throw std::runtime_error("nvfp4_cutlass_sm70: unexpected device ordinal");
+    }
+    static thread_local cublasHandle_t tls_handles[8] = {};
+    if (tls_handles[dev_id] == nullptr) {
+        cublasHandle_t h{};
+        if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) {
+            throw std::runtime_error("nvfp4_cutlass_sm70: cublasCreate failed");
+        }
+        tls_handles[dev_id] = h;
+    }
+    cublasHandle_t handle = tls_handles[dev_id];
+    if (cublasSetStream(handle, stream) != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error("nvfp4_cutlass_sm70: cublasSetStream failed");
+    }
+    // Buffers as dequant_inputs writes them: x is token-major [cols][k], w is
+    // out-major [n][k], out is row-major [cols][n]. The column-major product that
+    // reproduces Out[t, o] = sum_i W[o, i] * X[t, i] is:
+    //   C'(o, t) = sum_l Wmat(l, o) * Xmat(l, t), Wmat = w as col-major (k x n)
+    //   (transa=T, lda=k), Xmat = x as col-major (k x cols) (transb=N, ldb=k),
+    //   C' = out as col-major (n x cols), ldc = n.
+    const float alpha = 1.0F;
+    const float beta  = 0.0F;
+    const int peek_before = static_cast<int>(cudaPeekAtLastError());
+    static thread_local int trace_all = 0;
+    static thread_local int trace_small = 0;
+    const bool do_trace = std::getenv("NINFER_SM70_GEMM_TRACE") != nullptr;
+    trace_all++;
+    bool trace_this = do_trace && (trace_all <= 10 || (cols < 64 && trace_small < 8));
+    if (do_trace && cols < 64) { trace_small++; }
+    if (trace_this) {
+        fprintf(stderr, "[sm70-cublas] pid=%d tid=%zu dev=%d #%d m=%d n=%d k=%d peek_before=%d\n",
+            static_cast<int>(getpid()), static_cast<std::size_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 10000),
+            dev_id, trace_all, static_cast<int>(n), static_cast<int>(cols),
+            static_cast<int>(k), peek_before);
+    }
+    if constexpr (std::is_same_v<ElementOutput, cutlass::bfloat16_t>) {
+        // cuBLAS on SM70 rejects CUDA_R_16BF outputs (STATUS_NOT_SUPPORTED), so compute
+        // into FP32 scratch and convert. FP16 scratch is not wide enough: it overflows for
+        // projections whose BF16 result exceeds FP16's range, which real activations can reach.
+        Tensor out_fp32 = ws.alloc(DType::FP32, {cols, n});
+        cublasStatus_t status = cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N, n, cols, k, &alpha,
+            w_fp16, CUDA_R_16F, k, x_fp16, CUDA_R_16F, k, &beta,
+            out_fp32.data, CUDA_R_32F, n, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            cudaError_t sync_err = cudaStreamSynchronize(stream);
+            fprintf(stderr, "[sm70-cublas] FAILED status=%d sync_err=%d peek_after=%d\n",
+                    static_cast<int>(status), static_cast<int>(sync_err),
+                    static_cast<int>(cudaPeekAtLastError()));
+            status = cublasGemmEx(
+                handle, CUBLAS_OP_T, CUBLAS_OP_N, n, cols, k, &alpha,
+                w_fp16, CUDA_R_16F, k, x_fp16, CUDA_R_16F, k, &beta,
+                out_fp32.data, CUDA_R_32F, n, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            fprintf(stderr, "[sm70-cublas] retry status=%d\n", static_cast<int>(status));
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                throw std::runtime_error("nvfp4_cutlass_sm70: cublasGemmEx failed m=" + std::to_string(n) + " n=" + std::to_string(cols) + " k=" + std::to_string(k) + " ldc=n status=" + std::to_string(static_cast<int>(status)) + " peek_before=" + std::to_string(peek_before));
+            }
+        }
+        const std::int64_t count   = static_cast<std::int64_t>(cols) * n;
+        const int convert_blocks = static_cast<int>((count + 255) / 256);
+        fp32_to_bf16_kernel<<<convert_blocks, 256, 0, stream>>>(
+            static_cast<const float*>(out_fp32.data),
+            static_cast<__nv_bfloat16*>(out.data), count);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        cublasStatus_t status = cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N, n, cols, k, &alpha,
+            w_fp16, CUDA_R_16F, k, x_fp16, CUDA_R_16F, k, &beta,
+            out.data, CublasOutType<ElementOutput>::value, n,
+            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            cudaStreamSynchronize(stream);
+            fprintf(stderr, "[sm70-cublas] FAILED status=%d post_sync_cuda_err=%d\n",
+                    static_cast<int>(status), static_cast<int>(cudaGetLastError()));
+            throw std::runtime_error("nvfp4_cutlass_sm70: cublasGemmEx failed m=" + std::to_string(n) + " n=" + std::to_string(cols) + " k=" + std::to_string(k) + " ldc=n status=" + std::to_string(static_cast<int>(status)) + " peek_before=" + std::to_string(peek_before));
+        }
+    }
+    if (trace_this) {
+        fprintf(stderr, "[sm70-cublas] #%d done\n", trace_all);
+    }
+    if constexpr (std::is_same_v<ElementOutput, cutlass::bfloat16_t>) {
+        dump_bf16_stats("out-cublas", static_cast<const __nv_bfloat16*>(out.data),
+                        static_cast<std::int64_t>(cols) * n, n, cols, stream);
+    }
+}
+
+template <class ElementOutput>
+void launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+            cudaStream_t stream) {
+    // The same 64x64 warp contraction gains output-column reuse on the wide TP2 MLPs.
+    // Narrow calls and other registered geometries retain their measured 128-column tile.
+    const int variant = prefill_gemm_variant();
+    if (variant == 1) {
+        launch_cublas<ElementOutput>(x, w, out, ws, stream);
+        return;
+    }
+    const bool wide = x.ne[1] >= 2048 && ((w.n == 17408 && w.k == 5120) ||
+                                          (w.n == 5120 && w.k == 8704));
+    const int tile_n = wide ? 256 : 128;
+    if (tile_n == 256) {
+        launch_impl<ElementOutput, 256, SwizzleThreadBlock, 2>(x, w, out, ws, stream);
+    } else {
+        launch_impl<ElementOutput, 128, SwizzleThreadBlock, 2>(x, w, out, ws, stream);
+    }
+}
+
+} // namespace
+
+std::size_t nvfp4_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k,
+                                               std::int32_t cols) {
+    return workspace_bytes_impl(n, k, cols, true);
+}
+
+std::size_t nvfp4_cutlass_sm70_fp32_workspace_bytes(std::int32_t n, std::int32_t k,
+                                                    std::int32_t cols) {
+    return workspace_bytes_impl(n, k, cols, false);
+}
+
+void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                               cudaStream_t stream) {
+    launch<cutlass::bfloat16_t>(x, w, out, ws, stream);
+}
+
+void nvfp4_cutlass_sm70_fp32_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                    WorkspaceArena& ws, cudaStream_t stream) {
+    launch<float>(x, w, out, ws, stream);
+}
+
+} // namespace ninfer::ops::detail

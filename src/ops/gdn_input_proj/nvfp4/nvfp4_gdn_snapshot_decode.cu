@@ -1,0 +1,45 @@
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
+
+#include "core/device.h"
+#include "ops/gdn_input_proj/gdn_conv_output.cuh"
+#include "ops/linear/nvfp4/nvfp4_config.h"
+#include "ops/linear/nvfp4/nvfp4_gemv.cuh"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
+#include "ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cuh"
+
+namespace ninfer::ops::detail {
+
+void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
+                                      const Tensor& conv_weight, Tensor& conv_states,
+                                      const Tensor& valid_columns, const Tensor& initial_slot,
+                                      const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
+                                      Tensor& value, Tensor& z, cudaStream_t stream) {
+    using Geometry = Nvfp4GdnInputGeometry;
+    using Schedule = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
+
+    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
+    const float inverse   = 1.0F / weight.weight_scale_divisor;
+    const auto output     = make_gdn_conv_output<1>(
+        conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
+        SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
+                               static_cast<const std::int32_t*>(snapshot_base_slot.data),
+                               kGdnChannels});
+#ifdef NINFER_VOLTA_BUILD
+    // T=1 decode: the Volta QPN tensor-core route reads the same checkpoint-native codes/scales
+    // and runs the identical output policy (GdnConvOutput::store is token-indexed only through
+    // Tokens=1, hence the explicit t guard). The SIMT gemv fallback below was measured at
+    // 386us/layer on V100 against the QPN siblings' sub-100us -- keep it only for non-Volta.
+    if (static_cast<std::int32_t>(x.ne[1]) == 1 &&
+        nvfp4_volta_qpn_supported(Geometry::kOutputRows, Geometry::kInputRows, 1)) {
+        launch_nvfp4_volta_qpn_with_output(x, weight, output, Geometry::kOutputRows, inverse,
+                                           stream);
+        return;
+    }
+#endif
+    nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
+        output);
+    CUDA_CHECK(cudaGetLastError());
+}
+} // namespace ninfer::ops::detail
