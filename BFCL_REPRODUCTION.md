@@ -1,11 +1,11 @@
 # BFCL 质量差距：复现与已采取措施 / BFCL Quality Gap: Reproduction and Measures Taken
 
-本文记录 **截至 2026-10-23** 的完整复现方法、实验时间线、结果和踩过的坑。
+本文记录 **截至 2026-10-27** 的完整复现方法、实验时间线、结果和踩过的坑。
 This document records the full reproduction method, experiment timeline, results, and
-detours as of **2026-10-23**.
+detours as of **2026-10-27**.
 
 问题说明 / Issue summary: [`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md)
-状态 / Status: **未解决；主动修复已暂停 / Unresolved; active fixing paused**
+状态 / Status: **未解决；暂停盲目主动修复，公开请求社区协作 / Unresolved; blind active fixing paused, community help requested**
 
 > 不要把本文当作“已修复”的说明。它是一个可复现的负结果集合，用来让后来者少走弯路。
 > This is not a “fixed” note. It is a reproducible set of negative results, intended to
@@ -25,14 +25,15 @@ detours as of **2026-10-23**.
 - 关键设置：thinking OFF；`temperature=1.0`；`top_p=1.0`；`top_k=20`；`max_tokens=8192`；
   `stream=true`；`--prefix-cache`；并发 2；`--max-context 262144`。
 
-**不要用 `--limit 20` 下结论。** 它会把分数系统性抬高，并且掩盖 15pp 级差距。所有
+**不要用 `--limit 20` 下结论。** 它会把分数系统性抬高，并且掩盖 11.5pp 级差距。所有
 结论都必须基于 200 条全量。
 
 ### 2. 制品、binary 与 hash
 
 | 对象 | 路径 | SHA-256 |
 |---|---|---|
-| 本引擎当前 binary | `/home/cmj/ninfer-v100-fast/build/apps/ninfer-serve` | `10d1d99ad3d03882c43443b5e929c82c2da05c64f1fb29e4a58f2d1eef3be6fe` |
+| 本引擎最新 binary（2026-10-26/27 全量） | `/home/cmj/ninfer-v100-fast/build/apps/ninfer-serve` | `7eff3f02501f99a73703322df9e061c16cc95ce9c77dbaad4f3eb93fbacd8caa` |
+| 本引擎旧 binary（2026-10-19 全量） | `/home/cmj/ninfer-v100-fast/build/apps/ninfer-serve` | `10d1d99ad3d03882c43443b5e929c82c2da05c64f1fb29e4a58f2d1eef3be6fe` |
 | 当前 upstream binary | `/home/cmj/ninfer-upstream/build/apps/ninfer-serve` | `9c203ccfb9429241c90b7d5ce13cf56ba912acd28a757a87ced5d5f9806d945c` |
 | oldprompt 实验 binary | `/home/cmj/ninfer-upstream/build/apps/ninfer-serve-oldprompt` | `f33ca3d9564f3cf3109870a7dedc6952069baf1438c0d7982e3669ee06a1ee24` |
 | official V3 `.ninfer` | `/home/cmj/models/ninfer-artifacts/qwen3_8_27b_nvfp4.ninfer` | `74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82` |
@@ -225,7 +226,7 @@ pkill -9 -f 'build/apps/ninfer-serve'
 - 发现 vLLM 启动日志：模型 `generation_config.json` 覆盖默认值为
   `temperature=1.0, top_k=20, top_p=0.95`。
 - 显式 top_k=20：25/50；显式 top_k=0：27/50；默认：26/50。
-- 结论：**top_k 不是 15pp 差距的原因**；vLLM 本来也不是全词表采样。
+- 结论：**top_k 不是当前差距的原因**；vLLM 本来也不是全词表采样。
 
 #### 2026-10-23 04:10：暂停
 
@@ -233,6 +234,19 @@ pkill -9 -f 'build/apps/ninfer-serve'
 - 剩余首要嫌疑是 `.ninfer` 转换保真度；其次是 NVFP4/attention 数值和 prefix-cache
   状态。需要 logits 级证据，不能再盲扫参数。
 - 决策：暂停主动修复，转功能；保留本文和失败样本。
+
+#### 2026-10-26/27：SM70 修复后全量 200
+
+- 提交 `51557067 fix(v100): pass the full sm_70 test suite`；全量 ctest **135/135
+  通过**，15 个硬件/产物门控跳过。
+- 同一 BFCL 配置全量 200：**54/200 = 27.0%**；实际 2404 个请求，5959 秒；
+  平均延迟 2.471s，TTFT 804.9ms，TPOT 13.8ms，吞吐 38.91 tok/s。
+- 与 vLLM 逐样本：两边都过 43，只有 vLLM 过 34，只有 ninfer 过 11。
+- 与 c512 逐样本：两边都过 40，本次新过 14、新丢 10，净增 4、24 条翻转。
+- 这是当前 ninfer 全量最高记录，但只比此前最佳 25.0% 高 2pp；单 seed 不能支撑
+  6pp 级归因。结论是“没有回归、略有改善”，不是质量差距已解决。
+- binary SHA-256：`7eff3f02501f99a73703322df9e061c16cc95ce9c77dbaad4f3eb93fbacd8caa`。
+- 结果目录：`/home/cmj/eval-runs/bfcl/ninfer_sm70fix_s42_n200/20261026_094605`。
 
 ### 6. 结果文件怎么找
 
@@ -264,16 +278,20 @@ pkill -9 -f 'build/apps/ninfer-serve'
 9. **不要提交 API key**。这里的启动脚本用 `$API_KEY` 占位；生产环境用环境变量。
 10. **不要在无人值守时启动超过窗口的任务**。全量 200 约 2h；留足清理时间。
 
-### 8. 如果还要继续，最小下一步
+### 8. 如果还要继续：最小证据集（公开请求社区协作）
 
-不要先改 kernel。先做这三个证据采集：
+不要先改 kernel。先做这些证据采集：
 
-1. 对 26 个 vLLM-only 样本，抓首轮 prefill 最后位置 top-20 logits，找第一分叉 token。
+1. 对 **34 个 vLLM-only 样本**，抓首轮 prefill 最后位置 top-20 logits，找第一分叉 token。
 2. 同一请求开/关 `--prefix-cache`，比较第一分叉 token。
 3. 在同一 engine 里分别加载 official V3、our all-NVFP4，比较同一层输出；若可行，
    再做 HF safetensors 直接加载路径。
+4. 保留同一 BFCL 样本在 vLLM 与 ninfer 的完整 prompt token IDs，作为回归证据。
+5. 对失败样本逐条分类：格式错 / 函数名错 / 参数错 / 多轮状态错。
 
-只有证据指向某一层/某一 dtype 后，才值得改 kernel 或转换器。
+只有证据指向某一层/某一 dtype 后，才值得改 kernel 或转换器。请把复现信息、hash、
+命令和结果目录一并提交到 GitHub Issue/Discussion；不要只报分数，也不要用
+`--limit 20` 下结论。
 
 ---
 
@@ -291,13 +309,14 @@ pkill -9 -f 'build/apps/ninfer-serve'
   `--max-context 262144`.
 
 **Do not conclude from `--limit 20`.** It systematically overestimates and hides a
-15pp-scale gap. All conclusions must use the full 200 samples.
+11.5pp-scale gap. All conclusions must use the full 200 samples.
 
 ### 2. Artifacts, binaries, hashes
 
 | Object | Path | SHA-256 |
 |---|---|---|
-| Current ninfer binary | `/home/cmj/ninfer-v100-fast/build/apps/ninfer-serve` | `10d1d99ad3d03882c43443b5e929c82c2da05c64f1fb29e4a58f2d1eef3be6fe` |
+| Current ninfer binary (2026-10-26/27 full run) | `/home/cmj/ninfer-v100-fast/build/apps/ninfer-serve` | `7eff3f02501f99a73703322df9e061c16cc95ce9c77dbaad4f3eb93fbacd8caa` |
+| Previous ninfer binary (2026-10-19 full run) | `/home/cmj/ninfer-v100-fast/build/apps/ninfer-serve` | `10d1d99ad3d03882c43443b5e929c82c2da05c64f1fb29e4a58f2d1eef3be6fe` |
 | Current upstream binary | `/home/cmj/ninfer-upstream/build/apps/ninfer-serve` | `9c203ccfb9429241c90b7d5ce13cf56ba912acd28a757a87ced5d5f9806d945c` |
 | oldprompt binary | `/home/cmj/ninfer-upstream/build/apps/ninfer-serve-oldprompt` | `f33ca3d9564f3cf3109870a7dedc6952069baf1438c0d7982e3669ee06a1ee24` |
 | official V3 `.ninfer` | `/home/cmj/models/ninfer-artifacts/qwen3_8_27b_nvfp4.ninfer` | `74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82` |
@@ -499,7 +518,7 @@ binaries.
 - vLLM startup log revealed that the model `generation_config.json` overrides defaults
   to `temperature=1.0, top_k=20, top_p=0.95`.
 - Explicit top_k=20: 25/50; explicit top_k=0: 27/50; default: 26/50.
-- Conclusion: **top_k is not the cause of the 15pp gap**; vLLM was never doing
+- Conclusion: **top_k is not the cause of the current gap**; vLLM was never doing
   full-vocabulary sampling by default.
 
 #### 2026-10-23 04:10: paused
@@ -510,6 +529,21 @@ binaries.
   and prefix-cache state. We need logits-level evidence, not more parameter sweeps.
 - Decision: pause active fixing, shift to features, keep this document and the failing
   samples.
+
+#### 2026-10-26/27: full 200 after the SM70 fixes
+
+- Commit `51557067 fix(v100): pass the full sm_70 test suite`; full ctest **135/135
+  passed**, with 15 hardware/artifact-gated skips.
+- Same BFCL configuration, full 200: **54/200 = 27.0%**; 2404 actual requests, 5959s;
+  average latency 2.471s, TTFT 804.9ms, TPOT 13.8ms, throughput 38.91 tok/s.
+- Per-sample against vLLM: both pass 43, vLLM-only 34, ninfer-only 11.
+- Per-sample against c512: both pass 40, new passes 14, new losses 10, net +4 with
+  24 flips.
+- This is the current highest full-200 ninfer result, but only 2pp above the previous
+  best 25.0%; a single seed cannot support 6pp attribution. The result means “no
+  regression, modest improvement”, not “quality gap solved”.
+- Binary SHA-256: `7eff3f02501f99a73703322df9e061c16cc95ce9c77dbaad4f3eb93fbacd8caa`.
+- Results: `/home/cmj/eval-runs/bfcl/ninfer_sm70fix_s42_n200/20261026_094605`.
 
 ### 6. Where results live
 
@@ -547,16 +581,20 @@ Keep:
 10. **Do not exceed the unattended GPU window.** A full 200 takes about 2 hours; leave
     cleanup time.
 
-### 8. If you continue: smallest next steps
+### 8. If you continue: smallest evidence set (community help requested)
 
-Do not patch kernels first. Collect these three pieces of evidence:
+Do not patch kernels first. Collect these pieces of evidence:
 
-1. For the 26 vLLM-only samples, dump top-20 logits/probs at the last prefill position
+1. For the **34 vLLM-only samples**, dump top-20 logits/probs at the last prefill position
    and find the first divergent token.
 2. Run the same request with `--prefix-cache` on/off and compare the first divergent
    token.
 3. Load official V3 and our all-NVFP4 in the same engine and compare same-layer outputs;
    if possible, add a direct HF-safetensors path.
+4. Keep the full prompt token IDs for the same BFCL sample from vLLM and ninfer as a
+   regression check.
+5. Classify each failure: format / function name / arguments / multi-turn state.
 
 Only after the evidence points to a layer or dtype should you change a kernel or the
-converter.
+converter. Submit reproduction details, hashes, commands, and result directories in a
+GitHub Issue/Discussion; do not report only a score or use `--limit 20` for conclusions.

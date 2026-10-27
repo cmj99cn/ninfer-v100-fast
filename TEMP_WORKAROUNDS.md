@@ -229,6 +229,11 @@ chunk=8192（生产默认）→ `Let` 4/4 + 3/3。单独关掉该路线（`NINFE
 | ninfer chunk 128 | 46/200 = 23.0% |
 | 1cat vLLM（APC 开、temp=1.0） | 77/200 = 38.5% |
 
+> **更新（2026-10-27）**：SM70 修复后的最新全量为 **54/200 = 27.0%**，仍低于 1cat
+> 38.5%；这是当前最高记录，但只比此前最佳 25.0% 高 2pp。当前状态、已采取措施和社区
+> 请求见 [`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md)。上表是竞态修复后的历史
+> 对照，不应作为当前分数。
+
 配对 exact McNemar：chunk 128 vs 8192 → only-128=13 / only-8192=8，**p=0.38**；chunk 512 vs 8192 → 18/9，**p=0.12**；
 chunk 128 或 8192 vs 1cat → **only-1cat=39/40，p<1e-5**。⇒ **竞态修复并未关掉质量差距，且 chunk 尺寸无显著效应**
 （limit-20 的"50% vs 35%"是噪声）。**残余主因不在预填充 chunk**；嫌疑转向：KV dtype（1cat `fp8_e5m2` vs 本引擎 int8/g64）、

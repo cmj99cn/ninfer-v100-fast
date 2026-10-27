@@ -9,21 +9,33 @@
 ## 项目声明（请先读）
 
 1. **本仓库全部代码与文档由 AI 编写生成。** 仓库所有者不具备大模型技术背景，不理解模型算法与推理引擎内部实现。**请不要向所有者提问任何技术问题**——所有者没有能力回答，也没有时间回复。
-2. **问题与复现直接记录在 README 和专用文档中，不依赖 Issue。** 本项目不要求通过 Issue 提问；已知问题、复现命令、已排除方向和未解决问题都写在仓库文档里。提交代码或复现时请附带步骤、日志与环境信息，否则无法判断。
+2. **问题、复现和社区协作通过 GitHub Issues/Discussions 与仓库文档进行。** 欢迎提交可复现的质量问题、logits 证据或转换校验；请附带步骤、日志、硬件/软件版本和环境信息。本项目不承诺修复周期或 SLA。
 3. 本仓库是**全新项目**：以一次干净提交导入改进后的 NInfer 代码，不携带上游或其他 fork 的提交历史。上游与相关修改的历史见文末「鸣谢」与 `NOTICE`。
+
+---
+
+## 发布版本
+
+首个公开版本：**v0.1.0（2026-10-27）**。版本说明与已知限制见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ---
 
 ## 已知未解决问题：BFCL 多轮工具调用质量
 
 在相同源 NVFP4 权重、相同 BFCL-v3 子集、相同采样参数下，1cat-vLLM 通过
-**38.5%（77/200）**，本引擎为 **20.5–23.0%（41–46/200）**。截至 2026-10-23，这个问题
-**已经投入大量时间仍未被解决**：我们做了全量 200 条多 seed、prompt 回退、top_k 全词表、
-upstream/fork parity、KV dtype、prefill chunk、parser 严格性等 A/B，均不能解释差距。
-目前**暂停主动修复**，保留可复现实验和失败样本；下一步最值得查的是自转换
-`.ninfer` 制品与 vLLM 直接加载 HF safetensors 之间的转换/数值差异。
+**38.5%（77/200）**，本引擎最新全量结果为 **27.0%（54/200）**，仍差 **11.5pp**。
+这是目前 ninfer 全量 200 的最高记录（此前最佳 25.0%），但只比此前最佳高 2pp；
+逐样本与 c512 相比为 +14 / -10，净增 4 条、24 条翻转，单 seed 不能支撑 6pp 级归因。
+因此这是“没有回归、略有改善”，不是质量差距已解决。
 
-- 问题说明、已排除项、剩余假设：[`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md)
+我们已经做了全量 200 条多 seed、prompt 回退与 tokenizer 对齐、top_k 全词表、
+upstream/fork parity、KV int8/bf16、prefill chunk 128/512/8192、tool parser 严格性、
+official V3 与自转换 all-NVFP4 制品对比，以及 SM70 数值/测试修复；这些工作排除了
+大部分低成本假设，但没有解释剩余差距。目前**暂停盲目的主动修复**，保留可复现实验、
+失败样本和证据采集入口；最值得查的是自转换 `.ninfer` 制品、NVFP4/attention 数值和
+prefix-cache 状态。**公开请求社区协作定位质量问题**，具体要求见下。
+
+- 问题说明、已采取措施、剩余假设、社区请求：[`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md)
 - 详细复现、完整实验时间线、踩过的坑：[`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md)
 
 ---
@@ -63,7 +75,7 @@ upstream/fork parity、KV dtype、prefill chunk、parser 严格性等 A/B，均�
 
 ---
 
-## 当前进度（开发分支，截至 2026-10-19）
+## 当前进度（v0.1.0，截至 2026-10-27）
 
 ### 对齐测试参数（A/B 基准，两引擎同参）
 
@@ -158,60 +170,72 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 
 15 轮长上下文压力测试（8K tokens 起步、每轮追加代码块至约 39K）：全部成功，server 日志确认持续命中 `reuse=block_snapshot`，末轮缓存命中约 36800 tokens，命中后 prefill 仍保持 1200–1600 tok/s。
 
-### 质量（BFCL 多轮工具调用，未解决）
+### 质量（BFCL 多轮工具调用，未解决，公开请求社区协作）
 
-**状态：已投入大量时间，仍未解决；2026-10-23 起暂停主动修复。** 详细时间线和复现见
-[`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md)；问题清单和剩余假设见
-[`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md)。
+**最新全量结果（2026-10-26/27）：54/200 = 27.0%**，仍低于 1cat-vLLM 的
+**38.5%（77/200）**，差距 **11.5pp**。这是目前 ninfer 全量 200 的最高记录（此前最佳
+25.0%），但只高 2pp；与 c512 逐样本相比为 +14 / -10，净增 4 条、24 条翻转。单 seed
+不能支撑 6pp 级归因，因此结论是“没有回归、略有改善”，不是“质量差距已解决”。
 
-**BFCL-v3 多轮函数调用**（evalscope，`multi_turn_base` / `multi_turn_miss_func` /
-`multi_turn_miss_param` / `multi_turn_long_context` 各 50 条，共 200 条全量；
-`--limit 20` 会系统性高估分数且掩盖差距，**不可用于结论**）。
+本次运行的设置：BFCL-v3 `multi_turn_base` 全量 200 条，thinking OFF，
+`temperature=1.0`、`top_p=1.0`、`top_k=20`、`seed=42`，TP2，NVFP4 制品，
+`--prefix-cache` 开启。实际发出 2404 个请求，耗时 5959 秒；平均延迟 2.471s，
+TTFT 804.9ms，TPOT 13.8ms，吞吐 38.91 tok/s。结果目录：
+`/home/cmj/eval-runs/bfcl/ninfer_sm70fix_s42_n200/20261026_094605`。
 
-**全量 200 条结果**（thinking OFF、`temperature=1.0`、`top_p=1.0`、`top_k=20`、
-`seed=42`、`--prefix-cache` 开启；ninfer 使用自转换 all-NVFP4 制品）：
-
-| 配置 | 分数 | 与默认（8192/int8）的配对 McNemar |
+| 运行 | 分数 | 说明 |
 |---|---:|---|
-| ninfer，默认（`--prefill-chunk 8192`，int8 KV） | **20.5%（41/200）** | — |
-| ninfer，`--prefill-chunk 512` | 25.0%（50/200） | p=0.12 |
-| ninfer，`--prefill-chunk 128` | 23.0%（46/200） | p=0.38 |
-| ninfer，bf16 KV | 23.0%（46/200） | p=0.40 |
-| ninfer，fork parity + our all-NVFP4 | 23.0%（46/200） | — |
-| ninfer，fork parity + official V3（3 seeds 42/43/44） | **11.8%（71/600）** | 14.0 / 10.5 / 11.0 |
-| 当前 upstream + official V3（前 100，seed42/43） | **20.0% / 19.0%** | — |
-| oldprompt + official V3（前 50，3 seeds） | **29.3%（44/150）** | 17/14/13 |
-| 1cat-vLLM（同源 NVFP4，fp8_e5m2 KV） | **38.5%（77/200）** | only-1cat=40 / only-ninfer=4，p<1e-5 |
+| 1cat-vLLM（同源 NVFP4，fp8_e5m2 KV） | **38.5%（77/200）** | 外部对照 |
+| ninfer，最新全量 | **27.0%（54/200）** | 2026-10-26/27，seed 42 |
+| ninfer，此前最佳（chunk 512） | 25.0%（50/200） | 历史最佳 |
+| ninfer，默认（chunk 8192，int8 KV） | 20.5%（41/200） | 历史默认 |
+| ninfer，chunk 128 | 23.0%（46/200） | 无显著差异 |
+| ninfer，bf16 KV | 23.0%（46/200） | 无显著差异 |
+| ninfer，fork parity + all-NVFP4 | 23.0%（46/200） | 无显著差异 |
+| ninfer，fork parity + official V3（3 seeds） | 11.8%（71/600） | 制品差异显著 |
+| 当前 upstream + official V3（前 100） | 20.0% / 19.0% | seed 42/43 |
+| oldprompt + official V3（前 50，3 seeds） | 29.3%（44/150） | 旧 prompt 更差 |
 
-结论：**差距不是 prompt、采样 top_k、预填充 chunk、KV dtype（int8/bf16）、
-upstream/fork parity 或 tool parser 严格性造成的**。这些变量都做过全量或多 seed
-对照，不能解释 15–18pp 的差距。
+逐样本对比最新运行与 vLLM：两边都过 43 条，只有 vLLM 过 34 条，只有 ninfer 过 11 条。
+与 c512 对比：两边都过 40 条，本次新过 14 条、新丢 10 条。
 
-已排除的方向（详见复现文档）：
+我们为提升质量做过的工作：
 
-1. **prompt 渲染 bug（已修，`ce64d89a`）**：ninfer 的 OpenAI/Anthropic schema 曾用
-   `nlohmann::json`（默认键按字母重排）并注入 `"strict": false`，使发给模型的多轮
-   历史比 vLLM 多 **150 tokens**（5210 vs 5060）。修复后两侧 prompt **逐 token id
-   相同**（5060 tokens / 22746 B，尾部一致）。**模板/tokenizer 不是差距来源。**
-2. **旧 prompt 回退**：把 5 个 prompt 文件回退到 HEAD 并重建 binary，3 seeds 前 50 条
-   只有 **29.3%（44/150）**，低于当前 upstream 的 **38.7%（58/150）**。旧 prompt 更差，
-   不存在“回退 prompt 恢复旧 25%”的修复。
-3. **top_k / 全词表采样**：vLLM 模型的 `generation_config.json` 本身是
-   `top_k=20, top_p=0.95, temperature=1.0`；显式 top_k=20 为 **25/50**，显式
-   top_k=0（关闭截断）为 **27/50**，默认 26/50。采样不是差距来源。
-4. **prefill chunk / KV 量化**：chunk 128/512 与 bf16 KV 在全量 200 条下均无显著
-   差异（p=0.12/0.38/0.40）；此前 limit-20 的“chunk 128=50%”是小样本噪声。
-5. **upstream vs fork**：当前 upstream 前 50 条 3 seeds **38.7%（58/150）**，fork
-   **38.0%（57/150）**，无可测优势；旧 upstream 25% 的单点不可复现，旧 binary 已覆盖。
-6. **tool parser 严格性**：`TEMP_WORKAROUNDS.md` §10 复核后不是本基准失败主因；
-   malformed tool call 离线恢复 0/9，不能解释 26 个 vLLM-only 样本。
+1. **Prompt/tokenizer 对齐（`ce64d89a`）**：修复 OpenAI/Anthropic schema 的键序和
+   注入的 `"strict": false`，使发给模型的多轮历史与 vLLM **逐 token id 相同**
+   （5060 tokens / 22746 B，尾部一致）。
+2. **采样对齐**：vLLM 的 `generation_config.json` 本身是 `top_k=20, top_p=0.95,
+   temperature=1.0`；显式 top_k=20、top_k=0 与默认的差异不能解释差距。
+3. **Prefill/KV 对照**：chunk 128/512/8192、KV int8/bf16 在全量 200 下均无显著差异
+   （p=0.12/0.38/0.40）；`--limit 20` 的高分是小样本噪声。
+4. **Upstream/fork parity**：前 50 条 3 seeds，upstream 38.7% vs fork 38.0%，无可测优势。
+5. **Tool parser 复核**：malformed tool call 离线恢复 0/9，不能解释主要失败样本。
+6. **制品对比**：official V3 11.8% vs our all-NVFP4 23.0%，说明自转换 `.ninfer`
+   是主要变量之一，不能假设它与 HF safetensors 等价。
+7. **SM70 数值与测试修复**：修复 cuBLAS BF16 输出经 FP16 暂存的溢出（改为 FP32
+   暂存），补齐 A4/A8 能力门控、Q4/Q5 workspace、零容量 arena 等；全量 ctest
+   **135/135 通过**，15 个硬件/产物门控跳过。
+8. **Prefix cache 与多实例**：完成共享 host tier、跨实例 manifest、2×TP1 真实测试；
+   快速质量 A/B 的 cold/warm 文本与 MTP token 一致，未观察到回归。
 
 **仍未排除，且最值得查的：自转换 `.ninfer` 制品。** vLLM 直接加载
 `Qwen3.8-27B-QUASAR-NVFP4` 的 HF safetensors；本引擎先把它转换成 18 GiB 的
 `.ninfer`（embedding encoder、NVFP4/FP8 布局、norm/lm_head 的 dtype 都可能变化）。
-同一引擎换制品差异很大：official V3 **11.8%** vs our all-NVFP4 **23.0%**，说明
-制品转换本身就能移动 10pp 以上。其余候选是 NVFP4 GEMM/attention 数值和
-prefix-cache 下的状态差异；但没有 logits 证据前不应盲改 kernel。
+其次是 NVFP4 GEMM/attention 数值、prefix-cache 状态，以及 vLLM-only 样本的具体失败形态。
+没有 logits/第一分叉 token 证据前，不应盲改 kernel 或继续扫参数。
+
+**公开请求社区协作：** 如果你能复现，请提交 GitHub Issue/Discussion，并附以下证据：
+
+- 同一 BFCL 样本在 vLLM 与 ninfer 的完整 prompt token IDs；
+- 首轮 prefill 最后位置的 top-20 logits/probs，以及第一个分叉 token；
+- 同一请求开/关 `--prefix-cache` 的第一分叉点；
+- official V3、our all-NVFP4（以及可行的 HF safetensors 直接加载路径）的同层输出；
+- 逐样本失败分类：格式错 / 函数名错 / 参数错 / 多轮状态错。
+
+请不要只报“分数低”，不要用 `--limit 20` 下结论，也不要提交盲目的 parity 开关或
+kernel sweep。完整清单、复现命令和已排除项见
+[`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md) 与
+[`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md)。
 
 > **旧 25% 单点不要追**：它来自已被覆盖的旧 binary，prompt A/B 已排除 prompt 原因；
 > 用它做目标会重复我们走过的弯路。
@@ -416,7 +440,7 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 
 - **多模态不可用**（问题 1）：当前制品 vision tower 不兼容，仅文本。
 - prefix cache 修复后未做长时间浸泡测试；超高压并发下的缓存行为仍在观察。
-- **BFCL 全量 200 条：ninfer 20.5% vs 1cat 38.5%**（同序配对 only-1cat=40 / only-ninfer=4，p<1e-5）。**该问题已投入大量时间仍未解决，2026-10-23 起暂停主动修复**；已排除 prompt/top_k/chunk/KV/parity/parser，剩余首要嫌疑是自转换 `.ninfer` 制品（见“质量”节与 `BFCL_QUALITY_ISSUE.md`）。
+- **BFCL 全量 200 条：ninfer 最新 27.0%（54/200）vs 1cat 38.5%（77/200），仍差 11.5pp**（逐样本 only-1cat=34 / only-ninfer=11）。**该问题仍未解决，暂停盲目主动修复，公开请求社区协作**；已排除 prompt/top_k/chunk/KV/parity/parser，剩余首要嫌疑是自转换 `.ninfer` 制品、NVFP4/attention 数值和 prefix-cache 状态（见“质量”节与 `BFCL_QUALITY_ISSUE.md`）。
 
 ---
 
@@ -452,24 +476,36 @@ A Tesla V100 inference engine based on NInfer: single-process TP2/TP4, NVLink ac
 ## Project Statement (read first)
 
 1. **All code and documentation in this repository are generated by AI.** The repository owner has no large-model technical background and does not understand the model algorithms or the internals of the inference engine. **Please do not ask the owner technical questions**—the owner cannot answer them and has no time to reply.
-2. **Problems and reproductions are recorded directly in the README and dedicated documents; we do not rely on Issues.** This project does not require questions to be filed as Issues. Known problems, reproduction commands, ruled-out directions, and unresolved issues are all documented in the repository. When submitting code or a reproduction, include steps, logs, and environment details; otherwise it cannot be evaluated.
+2. **Problems, reproductions, and community collaboration go through GitHub Issues/Discussions and the repository documents.** Reproducible quality reports, logits evidence, and conversion checks are welcome; include steps, logs, hardware/software versions, and environment details. No fix timeline or SLA is promised.
 3. This repository is a **new project**: improved NInfer code is imported in one clean commit, without upstream or other fork commit history. See “Acknowledgements” and `NOTICE` for upstream and modification history.
+
+---
+
+## Release
+
+First public release: **v0.1.0 (2026-10-27)**. See [`CHANGELOG.md`](CHANGELOG.md) for release notes and known limitations.
 
 ---
 
 ## Known Unresolved Issue: BFCL Multi-Turn Tool-Calling Quality
 
 On the same source NVFP4 weights, the same BFCL-v3 subset, and the same sampling
-parameters, 1cat-vLLM scores **38.5% (77/200)** while this engine scores
-**20.5–23.0% (41–46/200)**. As of 2026-10-23, this issue **remains unresolved after a
-large amount of time**. We ran full 200-sample multi-seed A/Bs, prompt rollback,
-full-vocabulary top_k, upstream/fork parity, KV dtype, prefill chunk, and parser
-strictness; none explains the gap. Active fixing is **paused**; reproducible
-experiments and failing samples are kept. The highest-value remaining suspect is the
-conversion/numerical difference between our converted `.ninfer` artifact and vLLM
-loading the Hugging Face safetensors directly.
+parameters, 1cat-vLLM scores **38.5% (77/200)** while this engine's latest full run
+scores **27.0% (54/200)**, an **11.5pp** gap. This is the highest full-200 ninfer
+result so far (previous best 25.0%), but only 2pp above it; against c512 the per-sample
+result is +14 / -10, net +4 with 24 flips. A single seed cannot support 6pp attribution.
+The result therefore means “no regression, modest improvement”, not “quality gap solved”.
 
-- Problem statement, ruled-out items, remaining hypotheses: [`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md)
+We ran full 200-sample multi-seed A/Bs, prompt rollback and tokenizer alignment,
+full-vocabulary top_k, upstream/fork parity, KV int8/bf16, prefill chunk 128/512/8192,
+parser strictness, official V3 vs our all-NVFP4 artifact, and SM70 numerical/test fixes.
+These ruled out most low-cost hypotheses but did not explain the remaining gap. Active
+blind fixing is **paused**; reproducible experiments, failing samples, and an evidence
+collection path are kept. The highest-value remaining suspects are the self-converted
+`.ninfer` artifact, NVFP4/attention numerics, and prefix-cache state. **We are publicly
+asking the community to help localize the quality gap**; see below.
+
+- Problem statement, work done, remaining hypotheses, community request: [`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md)
 - Detailed reproduction, full experiment timeline, pitfalls: [`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md)
 
 ---
@@ -509,7 +545,7 @@ See [`TEMP_WORKAROUNDS.md`](TEMP_WORKAROUNDS.md) for all temporary changes and r
 
 ---
 
-## Current Status (dev branch, as of 2026-10-19)
+## Current Status (v0.1.0, as of 2026-10-27)
 
 ### Aligned Test Parameters (A/B baseline, same settings for both engines)
 
@@ -604,67 +640,79 @@ MTP is **2.0–2.3×** at every point, with 47–58% acceptance (2.4–2.7 tok/r
 
 15-turn long-context stress test (starting at 8K tokens, appending a code block each turn up to ~39K): all turns succeeded. Server logs confirm continuous `reuse=block_snapshot` hits; the last turn hit ~36800 cached tokens, and prefill still sustained 1200–1600 tok/s after the hit.
 
-### Quality (BFCL multi-turn tool calling, unresolved)
+### Quality (BFCL multi-turn tool calling, unresolved; community help requested)
 
-**Status: unresolved after a large amount of time; active fixing is paused as of 2026-10-23.** See
-[`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md) for the detailed timeline and reproduction, and
-[`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md) for the issue list and remaining hypotheses.
+**Latest full result (2026-10-26/27): 54/200 = 27.0%**, still below 1cat-vLLM's
+**38.5% (77/200)**, an **11.5pp** gap. This is the highest full-200 ninfer result so far
+(previous best 25.0%), but only 2pp above it; against c512 the per-sample result is
++14 / -10, net +4 with 24 flips. A single seed cannot support 6pp attribution. The
+result means “no regression, modest improvement”, not “quality gap solved”.
 
-**BFCL-v3 multi-turn function calling** (evalscope, `multi_turn_base` / `multi_turn_miss_func` /
-`multi_turn_miss_param` / `multi_turn_long_context`, 50 samples each, 200 total;
-`--limit 20` systematically overestimates scores and hides the gap, so it **must not be used for conclusions**).
+Run settings: BFCL-v3 `multi_turn_base`, full 200 samples, thinking OFF,
+`temperature=1.0`, `top_p=1.0`, `top_k=20`, `seed=42`, TP2, NVFP4 artifact,
+`--prefix-cache` enabled. Actual requests: 2404; wall time 5959s; average latency
+2.471s, TTFT 804.9ms, TPOT 13.8ms, throughput 38.91 tok/s. Results:
+`/home/cmj/eval-runs/bfcl/ninfer_sm70fix_s42_n200/20261026_094605`.
 
-**Full 200-sample results** (thinking OFF, `temperature=1.0`, `top_p=1.0`, `top_k=20`,
-`seed=42`, `--prefix-cache` enabled; ninfer uses the self-converted all-NVFP4 artifact):
-
-| Configuration | Score | Paired McNemar vs default (8192/int8) |
+| Run | Score | Notes |
 |---|---:|---|
-| ninfer, default (`--prefill-chunk 8192`, int8 KV) | **20.5% (41/200)** | — |
-| ninfer, `--prefill-chunk 512` | 25.0% (50/200) | p=0.12 |
-| ninfer, `--prefill-chunk 128` | 23.0% (46/200) | p=0.38 |
-| ninfer, bf16 KV | 23.0% (46/200) | p=0.40 |
-| ninfer, fork parity + our all-NVFP4 | 23.0% (46/200) | — |
-| ninfer, fork parity + official V3 (3 seeds 42/43/44) | **11.8% (71/600)** | 14.0 / 10.5 / 11.0 |
-| Current upstream + official V3 (first 100, seeds 42/43) | **20.0% / 19.0%** | — |
-| oldprompt + official V3 (first 50, 3 seeds) | **29.3% (44/150)** | 17/14/13 |
-| 1cat-vLLM (same source NVFP4, fp8_e5m2 KV) | **38.5% (77/200)** | only-1cat=40 / only-ninfer=4, p<1e-5 |
+| 1cat-vLLM (same source NVFP4, fp8_e5m2 KV) | **38.5% (77/200)** | external baseline |
+| ninfer, latest full run | **27.0% (54/200)** | 2026-10-26/27, seed 42 |
+| ninfer, previous best (chunk 512) | 25.0% (50/200) | historical best |
+| ninfer, default (chunk 8192, int8 KV) | 20.5% (41/200) | historical default |
+| ninfer, chunk 128 | 23.0% (46/200) | not significant |
+| ninfer, bf16 KV | 23.0% (46/200) | not significant |
+| ninfer, fork parity + all-NVFP4 | 23.0% (46/200) | not significant |
+| ninfer, fork parity + official V3 (3 seeds) | 11.8% (71/600) | artifact matters |
+| current upstream + official V3 (first 100) | 20.0% / 19.0% | seeds 42/43 |
+| oldprompt + official V3 (first 50, 3 seeds) | 29.3% (44/150) | old prompt is worse |
 
-Conclusion: **the gap is not caused by prompt, sampling top_k, prefill chunk, KV dtype
-(int8/bf16), upstream/fork parity, or tool-parser strictness.** All of these variables were
-tested on the full 200 or across multiple seeds and cannot explain the 15–18pp gap.
+Per-sample against vLLM: both pass 43, vLLM-only 34, ninfer-only 11. Against c512:
+both pass 40, new passes 14, new losses 10.
 
-Ruled-out directions (see the reproduction document for details):
+Work done to improve quality:
 
-1. **Prompt rendering bug (fixed in `ce64d89a`)**: ninfer's OpenAI/Anthropic schema used
-   `nlohmann::json` (keys sorted alphabetically by default) and injected `"strict": false`,
-   making the multi-turn history sent to the model **150 tokens** longer than vLLM's
-   (5210 vs 5060). After the fix, both prompts are **identical token by token**
-   (5060 tokens / 22746 B, identical tail). **Template/tokenizer is not the source of the gap.**
-2. **Old prompt rollback**: reverting five prompt files to HEAD and rebuilding the binary
-   scored only **29.3% (44/150)** on the first 50 across 3 seeds, below the current
-   upstream's **38.7% (58/150)**. The old prompt is worse; there is no “roll back the prompt
-   to recover the old 25%” fix.
-3. **top_k / full-vocabulary sampling**: vLLM's model `generation_config.json` already sets
-   `top_k=20, top_p=0.95, temperature=1.0`; explicit top_k=20 scored **25/50**, explicit
-   top_k=0 (disable truncation) scored **27/50**, and the default scored 26/50. Sampling is
-   not the source of the gap.
-4. **prefill chunk / KV quantization**: chunk 128/512 and bf16 KV show no significant
-   difference on the full 200 (p=0.12/0.38/0.40); the earlier limit-20 “chunk 128 = 50%” was
-   small-sample noise.
-5. **upstream vs fork**: current upstream first 50 across 3 seeds is **38.7% (58/150)**; fork
-   is **38.0% (57/150)**, with no measurable advantage. The old upstream 25% single point is
-   not reproducible, and the old binary has been overwritten.
-6. **tool-parser strictness**: rechecked in `TEMP_WORKAROUNDS.md` §10 and is not the main
-   cause of failures on this benchmark; offline recovery of malformed tool calls was 0/9 and
-   cannot explain the 26 vLLM-only samples.
+1. **Prompt/tokenizer alignment (`ce64d89a`)**: fixed the OpenAI/Anthropic schema key
+   order and the injected `"strict": false`, making the multi-turn history **identical
+   token by token** to vLLM (5060 tokens / 22746 B, identical tail).
+2. **Sampling alignment**: vLLM's `generation_config.json` already uses `top_k=20,
+   top_p=0.95, temperature=1.0`; explicit top_k=20, top_k=0, and default differences
+   cannot explain the gap.
+3. **Prefill/KV A/Bs**: chunk 128/512/8192 and KV int8/bf16 show no significant
+   difference on the full 200 (p=0.12/0.38/0.40); `--limit 20` scores were small-sample noise.
+4. **Upstream/fork parity**: first 50 across 3 seeds: upstream 38.7% vs fork 38.0%, no
+   measurable advantage.
+5. **Tool-parser recheck**: offline recovery of malformed calls was 0/9 and cannot explain
+   the main failures.
+6. **Artifact comparison**: official V3 11.8% vs our all-NVFP4 23.0%, so the self-converted
+   `.ninfer` is a major variable and cannot be assumed equivalent to HF safetensors.
+7. **SM70 numerical/test fixes**: fixed cuBLAS BF16 output staged through FP16 (now FP32),
+   added A4/A8 capability gating, Q4/Q5 workspace, zero-capacity arena fixes, etc.; full
+   ctest **135/135 passed**, 15 hardware/artifact-gated skips.
+8. **Prefix cache and multi-instance**: shared host tier, cross-instance manifests, and
+   2×TP1 real tests completed; quick cold/warm and MTP quality A/B showed no regression.
 
 **Still open, and the most important suspect: the self-converted `.ninfer` artifact.** vLLM
 loads the HF safetensors in `Qwen3.8-27B-QUASAR-NVFP4` directly; this engine first converts
 them into an 18 GiB `.ninfer` (embedding encoder, NVFP4/FP8 layouts, and norm/lm_head dtypes
-can all change). Changing only the artifact moves the same engine by a lot: official V3
-**11.8%** vs our all-NVFP4 **23.0%**, which means the conversion alone can shift more than
-10pp. Other candidates are NVFP4 GEMM/attention numerics and prefix-cache state differences;
-do not blindly change kernels without logits evidence.
+can all change). Other candidates are NVFP4 GEMM/attention numerics, prefix-cache state,
+and the concrete failure shape of vLLM-only samples. Do not blindly change kernels or keep
+sweeping parameters without logits / first-divergence evidence.
+
+**Public request for community help:** if you can reproduce this, please open a GitHub
+Issue/Discussion with:
+
+- full prompt token IDs for the same BFCL sample from vLLM and ninfer;
+- top-20 logits/probs at the last prefill position and the first divergent token;
+- the first divergence with `--prefix-cache` on vs off;
+- same-layer outputs for official V3, our all-NVFP4, and (if feasible) a direct
+  HF-safetensors path;
+- per-sample failure taxonomy: format / function name / arguments / multi-turn state.
+
+Do not report only a low score, do not use `--limit 20` for conclusions, and do not submit
+blind parity-switch or kernel sweeps. Full details, reproduction commands, and ruled-out
+items are in [`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md) and
+[`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md).
 
 > **Do not chase the old 25% single point**: it came from an overwritten old binary, and the
 > prompt A/B already ruled out the prompt. Using it as a target would repeat our detours.
@@ -888,7 +936,7 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 
 - **Multimodal is unavailable** (problem 1): the current artifact's vision tower is incompatible; text only.
 - After the prefix-cache fix, no long soak test has been run; cache behavior under very high concurrency is still being observed.
-- **BFCL full 200: ninfer 20.5% vs 1cat 38.5%** (same-order pairing: only-1cat=40 / only-ninfer=4, p<1e-5). **This issue has consumed a large amount of time and remains unresolved; active fixing is paused as of 2026-10-23.** Prompt/top_k/chunk/KV/parity/parser have been ruled out; the top remaining suspect is the self-converted `.ninfer` artifact (see the “Quality” section and `BFCL_QUALITY_ISSUE.md`).
+- **BFCL full 200: ninfer latest 27.0% (54/200) vs 1cat 38.5% (77/200), an 11.5pp gap** (per-sample: only-1cat=34 / only-ninfer=11). **The issue remains unresolved; blind active fixing is paused and community help is requested.** Prompt/top_k/chunk/KV/parity/parser have been ruled out; the top remaining suspects are the self-converted `.ninfer` artifact, NVFP4/attention numerics, and prefix-cache state (see the “Quality” section and `BFCL_QUALITY_ISSUE.md`).
 
 ---
 
