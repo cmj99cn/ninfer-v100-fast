@@ -541,7 +541,7 @@ int test_input_tokens_schema() {
                       Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"instructions", "x"}},
                       limits());
               }) == "unknown_parameter",
-              "input_tokens accepts only model and input");
+              "input_tokens rejects unrelated fields");
     return failures;
 }
 

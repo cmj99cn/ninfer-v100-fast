@@ -1,5 +1,9 @@
 # sm70 优化对比与移植清单：ninfer-V100X2 vs ninfer-v100-tpx
 
+> **Legacy comparison note (2026-10):** the current product target is
+> 2×V100-SXM2-32GB / NVFP4 / 262144. The 16GB/Q4_K_M references and 180000-capacity
+> measurements below are legacy porting evidence, not the current release acceptance.
+
 本文记录 V100X2 与姊妹分叉 tpx 在 sm70 加速优化上的差异，作为 V100X2 的**可移植优化清单**（porting backlog）。
 
 对比对象：
@@ -37,7 +41,8 @@ eager，180000 capacity，chunk 3072，512-token 窗口，65,536-token prompt，
   被探测选中；host 版仅作为无 P2P 时的回退。
 
 #2 prefill flash 重调、#3 QPN 流水、#4 融合残差仍未移植（#3/#4 仅影响 nvfp4/fp8 路线）。
-Q4_K_M 85K 验收数据未测：本机没有 `qwen3_8_27b_q4_k_m.ninfer` 与 85K 语料。
+Legacy Q4_K_M 85K 验收数据未测：本机没有 `qwen3_8_27b_q4_k_m.ninfer` 与 85K 语料；
+当前发布验收是 2×32GB NVFP4/262144。
 
 ## 共同基线
 
@@ -67,5 +72,5 @@ Q4_K_M prefill（GGML-K 解码→FP16 workspace→CUTLASS）、DFlash2 五层 dr
 
 注意事项：
 
-- tpx 的收益数字来自 32 GB SXM2、nvfp4、TP2；V100X2 是 16 GB 卡且默认 Q4_K_M，具体幅度需在 V100X2 上实测。
+- tpx 的收益数字来自 32 GB SXM2、nvfp4、TP2；legacy V100X2 是 16 GB 卡且默认 Q4_K_M，具体幅度需在 V100X2 上实测。
 - 方向一致（长上下文 decode 与 prefill 是瓶颈），所以优化空间确实存在。

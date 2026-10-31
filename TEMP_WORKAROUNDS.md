@@ -2,6 +2,10 @@
 
 > 生成时间：2026-10-14
 > 用途：所有非正式修复、临时绕过、降级配置的记录，后续逐一复核处理。
+>
+> **历史记录（2026-10）：** 当前发布目标是 2×V100-SXM2-32GB / NVFP4 / 262144。
+> 自转换 NVFP4 制品包含 Vision；GGUF Q4_K_M legacy 制品拒绝 Vision。以下条目保留为
+> 历史记录，执行前请先核对当前源码和 active 文档。
 
 ---
 
@@ -15,12 +19,15 @@
 - 制品：q6/q5/q4/q8 group-wise 量化、RoPE attention、**无独立 qkv 投影**
 - fork 契约：原生 FP16 linear + 传统 qkv 结构
 
-**影响**：文本推理正常；`--vision` 多模态不可用（加载仍会走 vision 分支并失败）。
+**影响**：这条记录针对官方 `neroued` 制品；当前自转换 NVFP4 制品已包含兼容的 Vision
+tower，`--vision` 可用。GGUF Q4_K_M legacy 制品仍拒绝 `--vision`。
+
+**状态（2026-10）**：已被当前 NVFP4 制品取代；保留为历史记录。
 
 **复核 TODO**：
-- [ ] 要么移植新 vision 架构（RoPE attention、无 qkv、量化 linear 路径）
-- [ ] 要么找匹配的老版本模型制品
-- [ ] `--vision` 开关在 text-only 制品上的行为需要定义（报错 vs 警告降级）
+- [ ] 如仍需支持官方 `neroued` 制品，移植新 vision 架构（RoPE attention、无 qkv、量化 linear 路径）
+- [ ] 或明确拒绝该制品，而不是保留降级路径
+- [ ] 保持 `--vision` 在 GGUF Q4_K_M 上明确报错
 
 ---
 

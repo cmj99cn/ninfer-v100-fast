@@ -38,7 +38,7 @@ representative tensor descriptor do not select the model or weights profile.
 > `neroued/Qwen3.8-27B-nvfp4-NInfer` 在当前构建下会以
 > `tensor descriptor does not match target contract: text/layers/0/gdn/query_key_value_z`
 > 失败。因此本分支改用自转换制品（见 `tools/convert/qwen3_8_27b/` 与
-> `models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer`）。下文 1.1/1.2 描述的
+> `/home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer`）。下文 1.1/1.2 描述的
 > v3 兼容性为**设计意图，未验证**，引用时请以实测为准。
 
 The reader also accepts the official single-file `NINFER\x00\x03` container published as
@@ -812,7 +812,11 @@ The converter validates the official checkpoint, frontend resources, complete ob
 numeric recipes before opening the output, then writes the sibling
 `qwen3_8_27b.ninfer.conversion.json` report.
 
-## 14. Preserved GGUF Q4_K_M artifact
+## 14. Preserved GGUF Q4_K_M artifact (legacy regression)
+
+The current release identity is `qwen3.8-27b/nvfp4` on 2×V100-SXM2-32GB. This
+`qwen3.8-27b/gguf-q4-k-m` identity is retained as a legacy regression path on the
+four-16-GB/TP4 configuration, not the current release profile.
 
 The V100 TP2 Text/MTP route registers `qwen3.8-27b/gguf-q4-k-m`. Its source is the explicitly
 selected `lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf`, with the companion

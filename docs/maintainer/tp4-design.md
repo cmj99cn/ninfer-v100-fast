@@ -1,8 +1,12 @@
 # TP4: Tensor Parallelism over up to four V100s
 
-Status: implemented.
+Status: implemented; legacy regression record.
 Scope: extend the Qwen3.8-27B engine from TP2 (2-GPU tensor parallelism) to TP4,
 targeting 4× Tesla V100-SXM2-16 GB (`sm_70`). The same code serves TP1, TP2, and TP4.
+
+> **Legacy regression note (2026-10):** the current product target is
+> 2×V100-SXM2-32GB / NVFP4 / 262144. This TP4 design record and its 4×16GB/Q4_K_M
+> measurements are retained as legacy regression evidence, not the current release acceptance.
 
 This document is the design record: what already generalized, the sites that assumed exactly
 two ranks, and the two subsystems — the cross-rank collectives and the CUDA-Graph path — that
@@ -30,8 +34,9 @@ out explicitly:
 
 A TP4 run uses `CUDA_VISIBLE_DEVICES=1,2,3,4` so the app sees devices `0,1,2,3`.
 
-**Why TP4 helps.** At TP2 the 27B Q4_K_M weights occupy ≈ 10.1 GiB per GPU. Splitting the same
-weights four ways drops that to ≈ 5.0 GiB per GPU, freeing roughly 5 GiB/GPU for KV cache →
+**Why TP4 helps.** In the legacy 4×16GB/Q4_K_M profile, TP2 weights occupy ≈ 10.1 GiB per GPU.
+Splitting the same weights four ways drops that to ≈ 5.0 GiB per GPU, freeing roughly 5 GiB/GPU for
+KV cache →
 substantially larger context capacity or higher occupancy on the same cards. TP4 is therefore a
 *capacity* play as much as a throughput one. Measured on the NVFP4 identity: weights fall to
 5.63 GiB/GPU with 8.29 GiB free after startup.
@@ -257,7 +262,7 @@ graph: measured (4×V100, capacity 65536, NVFP4 27B, int8 KV) tp2 ~116 MiB/rank 
 - **Cross-rank numerics.** TP2 and TP4 MTP greedy token streams are identical on the same prompt.
 - **TP2 regression gate.** The unified NCCL path serves TP2 too, and the TP2 graph test above
   passes on the rewritten implementation.
-- **End-to-end (NVFP4 identity; the Q4_K_M artifact is absent in this checkout).**
+- **Legacy end-to-end (NVFP4 identity; the Q4_K_M artifact is absent in this checkout).**
   Long context, capacity 65536, INT8 group-64 KV, MTP-3, 200 new tokens, ~60079-token prompt:
   TP4 **97.32 tok/s** eager (48.35% draft acceptance, prefill 2512 tok/s), TP4 85.33 tok/s
   captured, versus TP2 69.38 tok/s eager — ≈1.4× TP2 at length, above the 50 tok/s target.
@@ -273,7 +278,7 @@ graph: measured (4×V100, capacity 65536, NVFP4 27B, int8 KV) tp2 ~116 MiB/rank 
   grouping requirement and the capture-time current-device handling were the two concrete traps.
 - **Divisibility.** tp=4 divides every current section cleanly. A future model whose head counts
   are not divisible by 4 is rejected at plan time by the existing `% tp == 0` guards.
-- **Artifacts.** The checkout’s contract names the Q4_K_M identity, but that `.ninfer` artifact and
+- **Artifacts.** The legacy contract names the Q4_K_M identity, but that `.ninfer` artifact and
   its GGUF source are absent here; the TP4 mechanism and performance were therefore validated on
   the NVFP4 identity (same Engine route, same sharding). The exact Q4_K_M acceptance number was
   not measured in this checkout.

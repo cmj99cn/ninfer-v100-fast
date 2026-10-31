@@ -108,7 +108,7 @@ def main() -> None:
     parser.add_argument("--from-dumps",
                         help="compare existing <dir>/a and <dir>/b dumps instead of running the "
                              "binary (for CI / re-analysis without the target GPUs)")
-    parser.add_argument("--binary", default="build-v100/apps/ninfer")
+    parser.add_argument("--binary", default="build/apps/ninfer")
     parser.add_argument("--tp", type=int, default=2)
     parser.add_argument("--devices", default="0,1")
     parser.add_argument("--workdir", help="keep dumps under this directory instead of a temp dir")

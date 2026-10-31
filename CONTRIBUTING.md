@@ -96,8 +96,9 @@ SLA is promised.
 ## Multi-instance validation (4 and 8 cards)
 
 Only `2xTP1` multi-instance has passed a real integration test. The 4-card
-`4xTP1`/`2xTP2` and 8-card `8xTP1`/`4xTP2`/`2xTP4` profiles are unverified.
-`8xTP1` needs 32GB cards; a 16GB V100 cannot hold one full 27B copy.
+`4xTP1`/`2xTP2` profiles are unverified; the 8-card `8xTP1`/`4xTP2`/`2xTP4`
+profiles are community/out-of-contract and unverified. `4xTP1` and `8xTP1` need
+32GB cards; a 16GB V100 cannot hold one full 27B copy.
 
 Run the documented profiles from
 [`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md). For

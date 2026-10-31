@@ -318,7 +318,7 @@ Facts the next session needs:
   be computed from `LinearAttentionStatePoolSpec` (layers × (conv_channels·conv_width·dsz +
   key_dim·value_heads·value_head_dim·4)) or divided by slot count.
 - `copy_kv_block_h2d` no longer exists; anything still referencing it is part of the broken T4 branch.
-- Build dir: `build-v100/` (ninja). GPU runs: `CUDA_VISIBLE_DEVICES=1,2 GGML_CUDA_PDL=0`, TP2, MTP-3.
+- Build dir: `build/` (ninja). GPU runs: `CUDA_VISIBLE_DEVICES=1,2 GGML_CUDA_PDL=0`, TP2, MTP-3.
 
 #### Verification (T7)
 

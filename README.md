@@ -2,7 +2,7 @@
 
 # ninfer-v100-fast
 
-基于 NInfer 的 Tesla V100 推理引擎：单进程 TP2/TP4、NVLink 加速、多轮前缀缓存、长上下文 prefill 优化与 MTP 加速解码，目标是在 2×V100 上把 Qwen3.8-27B NVFP4 的吞吐与延迟做到当前硬件的极限。
+基于 NInfer 的 Tesla V100 推理引擎：单进程 TP2（TP4 为 4×16GB legacy 回归）、NVLink 加速、多轮前缀缓存、长上下文 prefill 优化与 MTP 加速解码，目标是在 2×V100-SXM2-32GB 上把 Qwen3.8-27B NVFP4 的吞吐与延迟做到当前硬件的极限。
 
 ---
 
@@ -46,7 +46,7 @@ prefix-cache 状态。**公开请求社区协作定位质量问题**，具体要
 
 | 目标 | 说明 |
 |---|---|
-| **TP2 / TP4 / NVLink** | 单进程张量并行，不依赖多进程代理；NVLink 上的轻量 all-reduce（mailbox）自动探测启用 |
+| **TP2 / NVLink** | 单进程 TP2 张量并行，不依赖多进程代理；NVLink 上的轻量 all-reduce（mailbox）自动探测启用。TP4 仅保留为 4×16GB legacy 回归 |
 | **缓冲命中做到极致** | `--prefix-cache` 内容寻址前缀缓存，多轮对话复用历史 KV，不重复 prefill |
 | **预填充速度做到极致** | 长文档 splitd prefill 内核（174K 上下文实测 +7.5%） |
 | **解码速度做到极致** | MTP 投机解码（`--spec mtp`）+ SM70 INT8 key-split 注意力内核 |
@@ -55,7 +55,7 @@ prefix-cache 状态。**公开请求社区协作定位质量问题**，具体要
 
 ## 开发思路
 
-1. **选基底**：对比多个 NInfer / vLLM / TRT fork 后，选择带**单进程 TP2/TP4** 的 `ninfer-v100`（jason-ni/ninfer-v100-tp4）作为基底——多进程双卡方案架构脆弱、无法扩展到 TP4，被直接放弃。
+1. **选基底**：对比多个 NInfer / vLLM / TRT fork 后，选择带**单进程 TP2/TP4** 的 `ninfer-v100`（jason-ni/ninfer-v100-tp4）作为基底——多进程双卡方案架构脆弱、无法扩展到 TP4，被直接放弃；TP4 现仅保留为 4×16GB legacy 回归。
 2. **移植长上下文 prefill**：将 1CatAI/1Cat-vLLM 的 **splitd prefill 内核**（D256 Split-D）移植到本基底（geometry 映射、去掉 Hadamard 旋转、增加 `NINFER_VOLTA_SPLITD=0` 开关、`NINFER_SM70_SPLITKV3_MIN_KV` 阈值），实测 174K prefill +7.5%。
 3. **修复前缀缓存**：生产化验证时发现 prefix cache 在多轮场景触发引擎崩溃（见下文问题 2），修复后 `--prefix-cache` 可长期稳定运行。
 4. **速度验证与调参**：系统性分离 prefill / decode 测量，确认 MTP 是解码的主要杠杆；确认 `NINFER_SM70_LONG_SPLIT_KEYS` 类 attention 调参在本基底无效（瓶颈不在该处），避免无意义调优。
@@ -65,7 +65,7 @@ prefix-cache 状态。**公开请求社区协作定位质量问题**，具体要
 
 | # | 问题 | 解决 |
 |---|---|---|
-| 1 | 官方 NVFP4 制品的 Vision tower 与本 fork 契约不兼容（量化格式、无独立 qkv、RoPE attention），加载即崩 | 加载时跳过 vision 绑定（text-only 制品）；多模态暂不可用，见 `TEMP_WORKAROUNDS.md` |
+| 1 | 官方 `neroued` NVFP4 制品的 Vision tower 与本 fork 契约不兼容（量化格式、无独立 qkv、RoPE attention），加载即崩 | 不使用官方制品；当前自转换 NVFP4 制品包含 Vision，GGUF Q4_K_M 制品拒绝 Vision。多实例 Vision 未验证，见 `TEMP_WORKAROUNDS.md` |
 | 2 | 开启 prefix cache 后多轮对话触发 `Paged KV trim extent would discard cache-owned pages`，之后所有请求 503，引擎不可用 | 两处修复：① `trim_pages` 遇到 cache-owned 页时收缩 trim 范围而不是抛异常；② `promote_page_at` 对已 cache-owned 的页幂等返回 |
 | 3 | 怀疑 decode 慢是 attention split 策略问题，尝试 `LONG_SPLIT_KEYS=1920` | A/B 实测无效，确认瓶颈不在此，停止该方向调优 |
 | 4 | decode 速度测量一直包含 prefill 时间，数字失真 | 改用 warmup + 多次迭代 + server 自报 timings 的方法分离测量 |
@@ -299,7 +299,7 @@ python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
 
 > 注意：
 > - 官方 `neroued/Qwen3.8-27B-nvfp4-NInfer` 制品与本 fork 的 GDN `query_key_value_z` 加载契约不兼容（加载即报 tensor descriptor 契约错误），**请不要使用**。
-> - 该制品为 **text-only** 路线，Vision tower 契约不兼容（见问题 1），请不要使用 `--vision` 参数。
+> - 官方 `neroued` 制品为 text-only 路线，Vision tower 契约不兼容（见问题 1），请不要使用它；当前自转换 NVFP4 制品包含 Vision，GGUF Q4_K_M 制品拒绝 `--vision`。
 
 ---
 
@@ -350,7 +350,7 @@ export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH   # 视你的 NCCL 位置
 
 ./build/apps/ninfer-serve \
-  ./models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
+  /home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
   --model-id qwen3.8-27b-nvfp4 \
   --host 0.0.0.0 --port 9010 \
   --api-key YOUR_API_KEY \
@@ -361,7 +361,7 @@ export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH   # 视你的 NCCL 位
   --no-thinking --greedy
 ```
 
-TP4（四卡）把 `--tp 2 --devices 0,1` 换成 `--tp 4 --devices 0,1,2,3` 即可，其余参数不变。
+TP4（四卡 16GB legacy 回归）把 `--tp 2 --devices 0,1` 换成 `--tp 4 --devices 0,1,2,3`；当前 2×32GB 发布路径使用 TP2。
 
 #### 多实例分组（部分验证）
 
@@ -378,9 +378,9 @@ host prefix-KV tier；device 权重与 device KV 仍每实例私有。host tier 
 | 2 | 2×TP1 | `"0;1"` | **真实集成测试已通过** |
 | 4 | 4×TP1 | `"0;1;2;3"` | 未验证 |
 | 4 | 2×TP2 | `"0,1;2,3"` | 未验证 |
-| 8 | 8×TP1 | `"0;1;2;3;4;5;6;7"` | 未验证；社区测试重点 |
-| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | 未验证；社区测试重点 |
-| 8 | 2×TP4 | `"0,1,2,3;4,5,6,7"` | 未验证；社区测试重点 |
+| 8 | 8×TP1 | `"0;1;2;3;4;5;6;7"` | 社区/非契约；未验证 |
+| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | 社区/非契约；未验证 |
+| 8 | 2×TP4 | `"0,1,2,3;4,5,6,7"` | 社区/非契约；未验证 |
 
 多组建议用 `--group-devices` 明确分组；`--devices` 也可按组顺序列出全部 rank，但 `ninfer`
 CLI 最多接受 4 个 ID。多组模式不支持 `--spec dflash`。
@@ -405,7 +405,7 @@ CLI 最多接受 4 个 ID。多组模式不支持 `--spec dflash`。
   --prefix-cache --host-cache-mib 153600
 ```
 
-对应脚本 profile：`bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
+对应脚本 profile（社区/非契约）：`bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
 （加 `--dry-run` 只打印完整命令）。8 卡 4×TP2 / 2×TP4 以及 4 卡 4×TP1 / 2×TP2 的完整参数、
 路由和验证边界见 [`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md)。
 上述未验证 profile 没有吞吐或显存实测数据，不得引用为验收结果。
@@ -413,7 +413,7 @@ CLI 最多接受 4 个 ID。多组模式不支持 `--spec dflash`。
 **社区测试请求（8 卡）：** 请在 8×V100-SXM2-32GB 上优先测试 8×TP1、4×TP2、2×TP4，并提交
 启动命令、binary/artifact hash、`/metrics?format=json` 的 `instances` 数组、每实例 committed
 decode tok/s、TTFT/TPOT、MTP acceptance、queue wait、free KV pages、host tier 实际分配量，以及
-4×TP2/2×TP4 的 32GB 显存余量。8×TP1 需要 32GB 卡；16GB V100 放不下一份完整的 27B 权重。
+4×TP2/2×TP4 的 32GB 显存余量。4×TP1 与 8×TP1 都需要 32GB 卡；16GB V100 放不下一份完整的 27B 权重。
 4 卡多实例（4×TP1/2×TP2）也未验证，欢迎一起提交。`--dry-run` 或静态检查不等于 8 卡验证；
 本项目不承诺修复周期或 SLA。
 
@@ -462,8 +462,8 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 
 ## 已知限制
 
-- **多模态不可用**（问题 1）：当前制品 vision tower 不兼容，仅文本。
-- 多实例只有 2×TP1 通过真实集成测试；4 卡（4×TP1/2×TP2）和 8 卡（8×TP1/4×TP2/2×TP4）未验证。8×TP1 需要 32GB 卡，16GB V100 放不下一份完整的 27B 权重。
+- **Vision**：当前自转换 NVFP4 制品包含 Vision；GGUF Q4_K_M 制品拒绝 `--vision`；多实例 Vision 未验证。
+- 多实例只有 2×TP1 通过真实集成测试；4 卡（4×TP1/2×TP2）和 8 卡（8×TP1/4×TP2/2×TP4）未验证，8 卡为社区/非契约。4×TP1 与 8×TP1 需要 32GB 卡，16GB V100 放不下一份完整的 27B 权重。
 - KV 只有每实例 device KV 和进程共享的 pinned host prefix-KV 两级；没有磁盘 KV tier、KV offload 或全局活跃 KV 池。
 - prefix cache 修复后未做长时间浸泡测试；超高压并发下的缓存行为仍在观察。
 - **BFCL 全量 200 条：ninfer 最新 27.0%（54/200）vs 1cat 38.5%（77/200），仍差 11.5pp**（逐样本 only-1cat=34 / only-ninfer=11）。**该问题仍未解决，暂停盲目主动修复，公开请求社区协作**；已排除 prompt/top_k/chunk/KV/parity/parser，剩余首要嫌疑是自转换 `.ninfer` 制品、NVFP4/attention 数值和 prefix-cache 状态（见“质量”节与 `BFCL_QUALITY_ISSUE.md`）。
@@ -495,7 +495,7 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 
 [中文](#ninfer-v100-fast)
 
-A Tesla V100 inference engine based on NInfer: single-process TP2/TP4, NVLink acceleration, multi-turn prefix caching, long-context prefill optimization, and MTP-accelerated decoding. The goal is to push Qwen3.8-27B NVFP4 throughput and latency to the limit of 2×V100 hardware.
+A Tesla V100 inference engine based on NInfer: single-process TP2 (TP4 remains a 4×16GB legacy regression), NVLink acceleration, multi-turn prefix caching, long-context prefill optimization, and MTP-accelerated decoding. The goal is to push Qwen3.8-27B NVFP4 throughput and latency to the limit of 2×V100-SXM2-32GB hardware.
 
 ---
 
@@ -542,7 +542,7 @@ On 2×Tesla V100-SXM2-32GB (NVLink), use **one engine** to satisfy all of the fo
 
 | Goal | Description |
 |---|---|
-| **TP2 / TP4 / NVLink** | Single-process tensor parallelism without multi-process proxies; lightweight NVLink all-reduce (mailbox) is auto-detected and enabled |
+| **TP2 / NVLink** | Single-process TP2 tensor parallelism without multi-process proxies; lightweight NVLink all-reduce (mailbox) is auto-detected and enabled. TP4 remains a 4×16GB legacy regression |
 | **Maximum cache hits** | `--prefix-cache` content-addressed prefix cache reuses historical KV across multi-turn conversations without re-prefill |
 | **Maximum prefill speed** | Long-document splitd prefill kernels (+7.5% measured at 174K context) |
 | **Maximum decode speed** | MTP speculative decoding (`--spec mtp`) + SM70 INT8 key-split attention kernels |
@@ -551,7 +551,7 @@ On 2×Tesla V100-SXM2-32GB (NVLink), use **one engine** to satisfy all of the fo
 
 ## Development Approach
 
-1. **Choose the base**: after comparing several NInfer / vLLM / TRT forks, we selected `ninfer-v100` (jason-ni/ninfer-v100-tp4) with **single-process TP2/TP4** as the base. Multi-process dual-GPU designs were fragile and could not scale to TP4, so they were rejected.
+1. **Choose the base**: after comparing several NInfer / vLLM / TRT forks, we selected `ninfer-v100` (jason-ni/ninfer-v100-tp4) with **single-process TP2/TP4** as the base. Multi-process dual-GPU designs were fragile and could not scale to TP4, so they were rejected; TP4 now remains a 4×16GB legacy regression.
 2. **Port long-context prefill**: port 1CatAI/1Cat-vLLM's **splitd prefill kernels** (D256 Split-D) to this base (geometry mapping, removing the Hadamard rotation, adding the `NINFER_VOLTA_SPLITD=0` switch and the `NINFER_SM70_SPLITKV3_MIN_KV` threshold). Measured +7.5% prefill at 174K.
 3. **Fix prefix caching**: during production validation, prefix caching triggered engine crashes in multi-turn scenarios (see problem 2 below). After the fixes, `--prefix-cache` runs stably for long periods.
 4. **Speed validation and tuning**: systematically separate prefill and decode measurements; confirm that MTP is the main decode lever; confirm that `NINFER_SM70_LONG_SPLIT_KEYS`-style attention tuning is ineffective on this base (the bottleneck is elsewhere) and stop meaningless tuning.
@@ -561,7 +561,7 @@ On 2×Tesla V100-SXM2-32GB (NVLink), use **one engine** to satisfy all of the fo
 
 | # | Problem | Solution |
 |---|---|---|
-| 1 | The Vision tower of the official NVFP4 artifact is incompatible with this fork's contract (quantization format, no separate qkv, RoPE attention); loading crashes immediately | Skip vision binding at load time (text-only artifact); multimodal is temporarily unavailable, see `TEMP_WORKAROUNDS.md` |
+| 1 | The Vision tower of the official `neroued` NVFP4 artifact is incompatible with this fork's contract (quantization format, no separate qkv, RoPE attention); loading crashes immediately | Do not use the official artifact; the current self-converted NVFP4 artifact includes Vision, while the GGUF Q4_K_M artifact rejects Vision. Multi-instance Vision is unverified; see `TEMP_WORKAROUNDS.md` |
 | 2 | With prefix cache enabled, multi-turn conversations trigger `Paged KV trim extent would discard cache-owned pages`; all subsequent requests return 503 and the engine becomes unusable | Two fixes: (1) when `trim_pages` encounters cache-owned pages, shrink the trim range instead of throwing; (2) `promote_page_at` returns idempotently for pages already owned by the cache |
 | 3 | Suspected that slow decode was caused by the attention split strategy; tried `LONG_SPLIT_KEYS=1920` | A/B showed no effect; confirmed the bottleneck is elsewhere and stopped tuning this direction |
 | 4 | Decode speed measurements always included prefill time, distorting the numbers | Switched to warmup + multiple iterations + server-reported timings to separate the measurements |
@@ -812,7 +812,7 @@ python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
 
 > Notes:
 > - The official `neroued/Qwen3.8-27B-nvfp4-NInfer` artifact is incompatible with this fork's GDN `query_key_value_z` loading contract (it fails immediately with a tensor descriptor contract error). **Do not use it.**
-> - This artifact is **text-only**; the Vision tower contract is incompatible (see problem 1). Do not pass `--vision`.
+> - The official `neroued` artifact is text-only; its Vision tower contract is incompatible (see problem 1). Do not use it. The current self-converted NVFP4 artifact includes Vision; the GGUF Q4_K_M artifact rejects `--vision`.
 
 ---
 
@@ -868,7 +868,7 @@ export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH   # depends on your NCCL location
 
 ./build/apps/ninfer-serve \
-  ./models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
+  /home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
   --model-id qwen3.8-27b-nvfp4 \
   --host 0.0.0.0 --port 9010 \
   --api-key YOUR_API_KEY \
@@ -879,7 +879,7 @@ export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH   # depends on your NC
   --no-thinking --greedy
 ```
 
-For TP4 (four GPUs), replace `--tp 2 --devices 0,1` with `--tp 4 --devices 0,1,2,3`; all other flags stay the same.
+For TP4 (four GPUs, legacy 4×16GB regression), replace `--tp 2 --devices 0,1` with `--tp 4 --devices 0,1,2,3`; the current 2×32GB release path uses TP2.
 
 #### Multi-instance groups (partially validated)
 
@@ -896,9 +896,9 @@ with semicolons and `--tp` is inferred from the group width when omitted. `--max
 | 2 | 2×TP1 | `"0;1"` | **real integration test passed** |
 | 4 | 4×TP1 | `"0;1;2;3"` | unverified |
 | 4 | 2×TP2 | `"0,1;2,3"` | unverified |
-| 8 | 8×TP1 | `"0;1;2;3;4;5;6;7"` | unverified; community focus |
-| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | unverified; community focus |
-| 8 | 2×TP4 | `"0,1,2,3;4,5,6,7"` | unverified; community focus |
+| 8 | 8×TP1 | `"0;1;2;3;4;5;6;7"` | community/out-of-contract; unverified |
+| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | community/out-of-contract; unverified |
+| 8 | 2×TP4 | `"0,1,2,3;4,5,6,7"` | community/out-of-contract; unverified |
 
 Prefer `--group-devices` for multi-group launches. `--devices` can also list all ranks in group
 order, but the `ninfer` CLI accepts at most four IDs. `--spec dflash` is rejected with multiple
@@ -924,7 +924,7 @@ Eight-card host (8xTP1; unverified, eight full instances, highest memory pressur
   --prefix-cache --host-cache-mib 153600
 ```
 
-Script profiles: `bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
+Script profiles (community/out-of-contract): `bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
 (add `--dry-run` to print the full command). See
 [`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md) for the 8xTP1, 4xTP2,
 2xTP4, 4xTP1, and 2xTP2 parameters, routing, and validation boundaries. These unverified profiles
@@ -933,9 +933,9 @@ have no measured throughput or memory result and are not acceptance evidence.
 **Community request (8 cards):** on an 8×V100-SXM2-32GB host, please prioritize 8xTP1, 4xTP2, and
 2xTP4 and report the launch command, binary/artifact hashes, the `/metrics?format=json`
 `instances` array, per-instance committed decode tok/s, TTFT/TPOT, MTP acceptance, queue wait,
-free KV pages, actual host-tier allocation, and 32GB memory headroom for 4xTP2/2xTP4. 8xTP1 needs
-32GB cards; a 16GB V100 cannot hold one full 27B copy. The 4-card profiles (4xTP1/2xTP2) are also
-unverified and welcome. `--dry-run` or static checks are not 8-card validation; no fix timeline or
+free KV pages, actual host-tier allocation, and 32GB memory headroom for 4xTP2/2xTP4. 4xTP1 and
+8xTP1 need 32GB cards; a 16GB V100 cannot hold one full 27B copy. The 4-card profiles (4xTP1/2xTP2)
+are also unverified and welcome. `--dry-run` or static checks are not 8-card validation; no fix timeline or
 SLA is promised.
 
 ### Key Flags
@@ -985,8 +985,8 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 
 ## Known Limitations
 
-- **Multimodal is unavailable** (problem 1): the current artifact's vision tower is incompatible; text only.
-- Only 2×TP1 multi-instance has passed a real integration test; the 4-card (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified. 8×TP1 requires 32GB cards; a 16GB V100 cannot hold one full 27B copy.
+- **Vision**: the current self-converted NVFP4 artifact includes Vision; the GGUF Q4_K_M artifact rejects `--vision`; multi-instance Vision is unverified.
+- Only 2×TP1 multi-instance has passed a real integration test; the 4-card (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified, and the 8-card profiles are community/out-of-contract. 4×TP1 and 8×TP1 require 32GB cards; a 16GB V100 cannot hold one full 27B copy.
 - KV has two tiers only: per-instance device KV and the process-shared pinned host prefix-KV tier. There is no disk KV tier, KV offload, or global active-KV pool.
 - After the prefix-cache fix, no long soak test has been run; cache behavior under very high concurrency is still being observed.
 - **BFCL full 200: ninfer latest 27.0% (54/200) vs 1cat 38.5% (77/200), an 11.5pp gap** (per-sample: only-1cat=34 / only-ninfer=11). **The issue remains unresolved; blind active fixing is paused and community help is requested.** Prompt/top_k/chunk/KV/parity/parser have been ruled out; the top remaining suspects are the self-converted `.ninfer` artifact, NVFP4/attention numerics, and prefix-cache state (see the “Quality” section and `BFCL_QUALITY_ISSUE.md`).

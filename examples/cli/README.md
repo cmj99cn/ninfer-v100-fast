@@ -1,9 +1,9 @@
 # Stable CLI examples
 
-> **本分支现状（2026-10，fork 维护者注）**：本仓库仅维护 `qwen3.8-27b`（NVFP4，**text-only**）
-> 在 2×V100-SXM2-32GB / TP2 上的部署。下文的 `models/qwen3_6_27b.ninfer`、`Qwen3.6-27B/35B-A3B`
-> 型号与所有 `--vision`/多模态（图像、视频）示例均为上游内容，**本分支未验证**；本制品不支持
-> Vision，请勿使用 `--vision`。文本类示例的做法仍然适用，替换为你的 `qwen3.8-27b` 制品即可。
+> **本分支现状（2026-10，fork 维护者注）**：本仓库当前维护 `qwen3.8-27b` NVFP4 在
+> 2×V100-SXM2-32GB / TP2 上的部署。自转换 NVFP4 制品包含 Vision，`--vision`/多模态示例可用；
+> GGUF Q4_K_M legacy 制品拒绝 `--vision`。下文的 `Qwen3.6-27B/35B-A3B` 型号与旧制品路径是
+> 上游内容，**本分支未验证**；请把 `$MODEL` 替换为你的 `qwen3.8-27b` NVFP4 制品。
 
 This directory contains committed, offline `--messages` inputs for exercising the product CLI from
 the repository root. It covers short text, chat history, images, video, mixed multimodal history,
@@ -19,7 +19,7 @@ Run from the repository root because media paths in the JSON files are repositor
 
 ```bash
 CLI=./build/apps/ninfer
-MODEL=models/qwen3_6_27b.ninfer
+MODEL=models/qwen3_8_27b_nvfp4.ninfer  # replace with your artifact path
 
 $CLI "$MODEL" \
   --messages examples/cli/messages/text_smoke_zh.json \
@@ -85,45 +85,44 @@ facts from two images and one video, then must end with `CHECKSUM=2238`.
 
 ## Long decode
 
-This case deliberately gets a generous budget. It is meant to run until the model's stop token, not
-to discover the smallest `max-new` value that happens to fit one output.
+These cases deliberately get a generous budget. They run until the model's stop token, not to
+discover the smallest `max-new` value that happens to fit one output.
 
 ```bash
-$CLI "$MODEL" --messages examples/cli/messages/long_decode_design_review.json \
-  --greedy --max-context 32768 --max-new 16384
+$CLI "$MODEL" --messages examples/cli/messages/long_decode_aime26_01.json \
+  --greedy --max-context 262144 --max-new 65536
 ```
 
-The answer must contain all eight requested design sections plus `设计自检`. Its memory table must
-separate raw KV payload, 6.25% metadata, and total KV. The structural/factual oracle is intentional:
-the generated prose is not required to be byte-identical.
+The answer must end with `\boxed{277}`. `long_decode_aime26_15.json` and
+`long_decode_aime26_30.json` use the same budget with answers `83` and `393`.
 
 ## Long context
 
 These prompt lengths include the chat template with thinking disabled. The inputs freeze meaningful
-NInfer documentation and source excerpts, with four unique records placed across the packet.
+source excerpts, with one retrieval needle placed across the packet.
 
 ```bash
-$CLI "$MODEL" --messages examples/cli/messages/long_8k.json \
+$CLI "$MODEL" --messages examples/cli/messages/long_niah_8k.json \
   --max-context 8192 --kv-dtype bf16 --prefill-chunk 1024 \
-  --no-thinking --greedy --max-new 64
+  --no-thinking --greedy --max-new 128
 
-$CLI "$MODEL" --messages examples/cli/messages/long_64k.json \
+$CLI "$MODEL" --messages examples/cli/messages/long_niah_64k.json \
   --max-context 65536 --kv-dtype int8 --prefill-chunk 1024 \
-  --no-thinking --greedy --max-new 64
+  --no-thinking --greedy --max-new 128
 
-$CLI "$MODEL" --messages examples/cli/messages/long_128k.json \
+$CLI "$MODEL" --messages examples/cli/messages/long_niah_128k.json \
   --max-context 131072 --kv-dtype int8 --prefill-chunk 1024 \
-  --no-thinking --greedy --max-new 64
+  --no-thinking --greedy --max-new 128
 
-$CLI "$MODEL" --messages examples/cli/messages/long_256k.json \
+$CLI "$MODEL" --messages examples/cli/messages/long_niah_256k.json \
   --max-context 262144 --kv-dtype int8 --prefill-chunk 1024 \
-  --no-thinking --greedy --max-new 64
+  --no-thinking --greedy --max-new 128
 ```
 
 All four must output:
 
 ```text
-ORCHID=37; COPPER=8142; HARBOR=KESTREL; COLOR=AMBER; SUM=8179
+ORCHID=493817; COLOR=COBALT
 ```
 
 The committed prompt token counts were validated against the Qwen3.6-27B and Qwen3.6-35B-A3B

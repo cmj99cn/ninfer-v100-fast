@@ -1,5 +1,8 @@
 # Tests
 
+> **Current target note (2026-10):** the release target is `qwen3.8-27b/nvfp4` on
+> 2×V100-SXM2-32GB. Qwen3.6 and 35B-A3B entries remain legacy/inherited regression coverage.
+
 The retained tests protect current `.ninfer`, numerical operator, target, runtime-transaction,
 benchmark-report, and external protocol behavior. Repository verification principles are defined in
 [`../AGENTS.md`](../AGENTS.md); Op contract and CUDA implementation guidance is in
@@ -35,9 +38,9 @@ benchmark-report, and external protocol behavior. Repository verification princi
   Responses Item/state/SSE behavior, and incremental tool-call behavior;
 - `test_request_log.cpp` and `test_http_error_handler.cpp` — generation lifecycle records,
   preparation rejections, protocol-shaped payload-limit errors, and application-error preservation;
-- `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
-- `test_bench_matrix.py` — schema-v9 report consumption by the Python matrix summarizer;
-- `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
+- `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v13 reports;
+- `test_bench_matrix.py` — schema-v13 report consumption by the Python matrix summarizer;
+- `test_serve_corpus.py` — serving request-log schema-v10 compatibility at the measurement consumer;
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
   container, family runtime tests cover dimension-driven GDN storage/view mechanics, and Op tests
   cover mathematical state transitions at their own boundary.
@@ -128,7 +131,7 @@ NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
 Without the corresponding variable CTest marks each C++ integration test as skipped. Neither test
 uses another numerical/execution path's generated tokens as a golden.
 
-The V100X2 gates accept the registered Qwen3.8 Q4_K_M or NVFP4 artifact, always on TP2.
+The V100X2 gates accept the registered Qwen3.8 NVFP4 artifact, or the legacy Q4_K_M artifact, on TP2.
 `NINFER_V100X2_SPEC=mtp` (default) selects MTP3; `dflash` selects DFlash7 and requires an
 artifact with the optional drafter. `NINFER_V100X2_PROPOSAL_HEAD=optimized` is MTP-only.
 The real gate checks exact graph/eager commits plus strict non-speculative teacher-forced
@@ -136,9 +139,9 @@ argmax at all 64 output positions; the prefix gate checks checkpoint, append, pa
 and exact-frontier state replay. DFlash does not use the MTP-only peer-egress diagnostic.
 
 ```bash
-NINFER_V100X2_ARTIFACT=/Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
+NINFER_V100X2_ARTIFACT=/home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
 NINFER_V100X2_SPEC=dflash \
-  ctest --test-dir build-v100 -R 'v100x2_(real|prefix_real)' --output-on-failure
+  ctest --test-dir build -R 'v100x2_(real|prefix_real)' --output-on-failure
 ```
 
 The capability-evaluation coordinator has its own environment and unittest entry point:
