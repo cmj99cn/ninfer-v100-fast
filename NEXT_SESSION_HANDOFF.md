@@ -150,13 +150,13 @@ fp8 相关测试全部通过。
    - MTP 的 sampling/draft-token 产出边界需要确认 FP16→logits 无层间 cast。
 4. **GDN 剩余叶子**：norm+gating 融合、conv snapshot/record、recurrent 的 FP16 入口已在
    `gdn_gating_proj_f16` / `causal_conv1d_f16` / `gdn_f16`，但融合 wrapper 仍只接受 BF16。
-5. **runtime 接线**：
-   - `src/targets/qwen3_6_27b/impl/config.h` 的 `TextConfig` 增加编译期 activation dtype
-     （建议 `NINFER_TEXT_DTYPE_F16` 宏，默认 BF16；单一二进制双实例需要改 ActiveTarget，暂不做）；
-   - `src/targets/qwen3_6/impl/runtime/workspace_recipe.h`（58 处 BF16 字面量）；
-   - `layouts_impl.h`（41 处）；`text_context_impl.h`（133 处）；
-   - `src/targets/qwen3_6_27b/impl/variant.cpp`（15 处，融合叶子、MTP workspace）。
-   BF16 与 FP16 必须是两个编译期变体，BF16 构建行为保持逐位不变。
+5. **runtime 接线**：已完成基础层，剩下 leaf / schedule：
+   - 已加 `src/targets/qwen3_6/impl/runtime/text_dtype.h` + CMake `NINFER_TEXT_DTYPE=bf16|f16`；
+   - `TextConfig`/`DFlashConfig` 已有 `activation_dtype`；
+   - `workspace_recipe.h` 全部文本 workspace 已改用 `Config::activation_dtype`；
+   - **仍待**：`layouts_impl.h`（41 处，尺寸同为 2 字节，语义上仍应对齐）、
+     `text_context_impl.h`（133 处，实际 Tensor dtype 与 op 调用）、
+     `variant.cpp`（15 处，融合叶子/MTP workspace/`linear_pair` 拆分）。
 6. **sampling / logits**：目前 logits 是 FP32，argmax/sampling 不需要 FP16；但要确认
    output head 的 FP16 输出到 logits 的边界。
 

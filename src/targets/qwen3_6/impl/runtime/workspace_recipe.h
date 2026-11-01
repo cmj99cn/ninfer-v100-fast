@@ -35,7 +35,7 @@ TextPrefillRoots text_prefill_roots(Allocator& allocator, std::int32_t tokens,
     out.ids       = vector(allocator, DType::I32, tokens);
     out.positions = vector(allocator, DType::I32, tokens);
     if (rope_axes != 0) { out.rope_positions = matrix(allocator, DType::I32, tokens, rope_axes); }
-    out.residual = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    out.residual = matrix(allocator, Config::activation_dtype, Config::hidden, tokens);
     if (scatter_tokens != 0) {
         out.scatter_indices = vector(allocator, DType::I32, scatter_tokens);
     }
@@ -62,11 +62,11 @@ template <class Config, class Allocator>
 TextAttentionProjectionRoots text_attention_projection(Allocator& allocator, std::int32_t tokens,
                                                        std::int32_t tp = 1) {
     return {
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
-        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size / tp, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::query_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::query_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::kv_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::kv_size / tp, tokens),
     };
 }
 
@@ -80,9 +80,9 @@ template <class Config, class Allocator>
 TextAttentionResultRoots text_attention_results(Allocator& allocator, std::int32_t tokens,
                                                 std::int32_t tp = 1) {
     return {
-        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size / tp, tokens),
-        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::query_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::kv_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::query_size / tp, tokens),
     };
 }
 
@@ -95,7 +95,7 @@ struct GdnControlRoots {
 template <class Config, class Allocator>
 GdnControlRoots gdn_control(Allocator& allocator, std::int32_t tokens, std::int32_t tp = 1) {
     return {
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
         matrix(allocator, DType::FP32, Config::gdn_value_heads / tp, tokens),
         matrix(allocator, DType::FP32, Config::gdn_value_heads / tp, tokens),
     };
@@ -111,10 +111,10 @@ struct GdnProjectionRoots {
 template <class Config, class Allocator>
 GdnProjectionRoots gdn_projection(Allocator& allocator, std::int32_t tokens, std::int32_t tp = 1) {
     return {
-        matrix(allocator, DType::BF16, Config::value_dim / tp, tokens),
-        matrix(allocator, DType::BF16, Config::key_dim / tp, tokens),
-        matrix(allocator, DType::BF16, Config::key_dim / tp, tokens),
-        matrix(allocator, DType::BF16, Config::value_dim / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::value_dim / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::key_dim / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::key_dim / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::value_dim / tp, tokens),
     };
 }
 
@@ -127,24 +127,24 @@ template <class Config, class Allocator>
 GdnPrefillConvRoots gdn_prefill_conv(Allocator& allocator, std::int32_t tokens,
                                      std::int32_t tp = 1) {
     return {
-        matrix(allocator, DType::BF16, Config::convolution_dim / tp, tokens),
-        matrix(allocator, DType::BF16, Config::convolution_dim / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::convolution_dim / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::convolution_dim / tp, tokens),
     };
 }
 
 template <class Config, class Allocator>
 Tensor gdn_recurrent_output(Allocator& allocator, std::int32_t tokens, std::int32_t tp = 1) {
-    return matrix(allocator, DType::BF16, Config::value_dim / tp, tokens);
+    return matrix(allocator, Config::activation_dtype, Config::value_dim / tp, tokens);
 }
 
 template <class Config, class Allocator>
 Tensor gdn_normalized_output(Allocator& allocator, std::int32_t tokens, std::int32_t tp = 1) {
-    return matrix(allocator, DType::BF16, Config::value_dim / tp, tokens);
+    return matrix(allocator, Config::activation_dtype, Config::value_dim / tp, tokens);
 }
 
 template <class Config, class Allocator>
 Tensor post_mixer_hidden(Allocator& allocator, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, Config::hidden, tokens);
+    return matrix(allocator, Config::activation_dtype, Config::hidden, tokens);
 }
 
 struct MtpStemRoots {
@@ -170,12 +170,12 @@ MtpStemRoots mtp_stem(Allocator& allocator, std::int32_t tokens, bool allocate_e
                       std::int32_t tp = 1) {
     MtpStemRoots out;
     if (allocate_embedding) {
-        out.embedding = matrix(allocator, DType::BF16, Config::hidden, tokens);
+        out.embedding = matrix(allocator, Config::activation_dtype, Config::hidden, tokens);
     }
-    out.normalized_embedding = matrix(allocator, DType::BF16, Config::hidden, tokens);
-    out.normalized_hidden    = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    out.normalized_embedding = matrix(allocator, Config::activation_dtype, Config::hidden, tokens);
+    out.normalized_hidden    = matrix(allocator, Config::activation_dtype, Config::hidden, tokens);
     if (tp == 1) {
-        out.packed_input = matrix(allocator, DType::BF16, Config::mtp_input_rows, tokens);
+        out.packed_input = matrix(allocator, Config::activation_dtype, Config::mtp_input_rows, tokens);
     }
     // At tp >= 4 each rank contracts a slice of one normalized half that is narrower than the half
     // itself. Because the hidden axis is the contiguous (ne[0]) axis of the half, that slice is not
@@ -183,10 +183,10 @@ MtpStemRoots mtp_stem(Allocator& allocator, std::int32_t tokens, bool allocate_e
     // before linear_row_parallel. At tp <= 2 the slice IS the whole half and no buffer is needed;
     // the recipe allocates it only when the runtime width actually narrows the shard.
     if (tp > 1 && Config::mtp_input_rows / tp < Config::hidden) {
-        out.fc_input = matrix(allocator, DType::BF16, Config::mtp_input_rows / tp, tokens);
+        out.fc_input = matrix(allocator, Config::activation_dtype, Config::mtp_input_rows / tp, tokens);
     }
-    out.residual         = matrix(allocator, DType::BF16, Config::hidden, tokens);
-    out.attention_hidden = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    out.residual         = matrix(allocator, Config::activation_dtype, Config::hidden, tokens);
+    out.attention_hidden = matrix(allocator, Config::activation_dtype, Config::hidden, tokens);
     return out;
 }
 
@@ -201,10 +201,10 @@ template <class Config, class Allocator>
 MtpAttentionProjectionRoots mtp_attention_projection(Allocator& allocator, std::int32_t tokens,
                                                      std::int32_t tp = 1) {
     return {
-        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size / tp, tokens),
-        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::query_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::kv_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::query_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::kv_size / tp, tokens),
     };
 }
 
@@ -218,9 +218,9 @@ template <class Config, class Allocator>
 MtpAttentionResultRoots mtp_attention_results(Allocator& allocator, std::int32_t tokens,
                                               std::int32_t tp = 1) {
     return {
-        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size / tp, tokens),
-        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::query_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::kv_size / tp, tokens),
+        matrix(allocator, Config::activation_dtype, Config::query_size / tp, tokens),
     };
 }
 
@@ -232,8 +232,8 @@ struct MtpPostAttentionRoots {
 template <class Config, class Allocator>
 MtpPostAttentionRoots mtp_post_attention(Allocator& allocator, std::int32_t tokens) {
     return {
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
     };
 }
 
@@ -245,8 +245,8 @@ struct DFlashContextRoots {
 template <class Config, class Allocator>
 DFlashContextRoots dflash_context(Allocator& allocator, std::int32_t tokens) {
     return {
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
     };
 }
 
@@ -259,9 +259,9 @@ struct DFlashContextLayerRoots {
 template <class Config, class Allocator>
 DFlashContextLayerRoots dflash_context_layer(Allocator& allocator, std::int32_t tokens) {
     return {
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, Config::activation_dtype, Config::kv_size, tokens),
+        matrix(allocator, Config::activation_dtype, Config::kv_size, tokens),
+        matrix(allocator, Config::activation_dtype, Config::kv_size, tokens),
     };
 }
 
@@ -276,7 +276,7 @@ DFlashProposalRoots dflash_proposal(Allocator& allocator, std::int32_t tokens) {
     return {
         vector(allocator, DType::I32, tokens),
         vector(allocator, DType::I32, tokens),
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
     };
 }
 
@@ -297,17 +297,17 @@ struct DFlashAttentionRoots {
 template <class Config, class Allocator>
 DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens) {
     return {
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, 2 * 2 * (Config::hidden / 16), tokens),
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::query_size, tokens),
+        matrix(allocator, Config::activation_dtype, Config::kv_size, tokens),
+        matrix(allocator, Config::activation_dtype, Config::kv_size, tokens),
+        matrix(allocator, Config::activation_dtype, Config::query_size, tokens),
+        matrix(allocator, Config::activation_dtype, Config::kv_size, tokens),
+        matrix(allocator, Config::activation_dtype, Config::query_size, tokens),
+        matrix(allocator, Config::activation_dtype, 2 * 2 * (Config::hidden / 16), tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
     };
 }
 
@@ -323,12 +323,12 @@ struct DFlashMlpRoots {
 template <class Config, class Allocator>
 DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens) {
     return {
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::intermediate, tokens),
-        matrix(allocator, DType::BF16, 2 * 2 * (Config::hidden / 16), tokens),
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::intermediate, tokens),
+        matrix(allocator, Config::activation_dtype, 2 * 2 * (Config::hidden / 16), tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
+        matrix(allocator, Config::activation_dtype, Config::hidden, tokens),
     };
 }
 
