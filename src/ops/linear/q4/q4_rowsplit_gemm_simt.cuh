@@ -189,7 +189,7 @@ using Q4SimtStoreEpilogue = Q4SimtStoreEpilogueOf<__nv_bfloat16>;
 
 template <class Schedule, bool Full, bool SplitOutput = false, int SplitRow = 0,
           class Epilogue = Q4SimtStoreEpilogue, bool TriggerPdl = false, bool JoinPdl = false,
-          class Act = __nv_bfloat16>
+          class Act = __nv_bfloat16, class Out = Act>
 __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
@@ -198,8 +198,8 @@ __global__ __launch_bounds__(
                                                                       uint8_t* __restrict__ codes,
                                                                   const std::
                                                                       uint8_t* __restrict__ scales,
-                                                                  Act* __restrict__ out,
-                                                                  Act* __restrict__ out_tail,
+                                                                  Out* __restrict__ out,
+                                                                  Out* __restrict__ out_tail,
                                                                   std::int32_t out_ld,
                                                                   std::int32_t out_tail_ld,
                                                                   std::int32_t rows, std::int32_t k,
@@ -335,7 +335,7 @@ __global__ __launch_bounds__(
 #endif
     }
 
-    if constexpr (std::is_same_v<Epilogue, Q4SimtStoreEpilogueOf<Act>>) {
+    if constexpr (std::is_same_v<Epilogue, Q4SimtStoreEpilogueOf<Out>>) {
 #pragma unroll
         for (int col = 0; col < kColsPerTile; ++col) {
             if (kFull || col < active_cols) {
@@ -343,16 +343,16 @@ __global__ __launch_bounds__(
                 if (lane == 0 && row_active) {
                     if constexpr (SplitOutput) {
                         if (row < SplitRow) {
-                            ActivationTraits<Act>::store(
+                            ActivationTraits<Out>::store(
                                 out + static_cast<std::int64_t>(col0 + col) * out_ld + row, sum);
                         } else {
-                            ActivationTraits<Act>::store(
+                            ActivationTraits<Out>::store(
                                 out_tail + static_cast<std::int64_t>(col0 + col) * out_tail_ld +
                                     row - SplitRow,
                                 sum);
                         }
                     } else {
-                        ActivationTraits<Act>::store(
+                        ActivationTraits<Out>::store(
                             out + static_cast<std::int64_t>(col0 + col) * out_ld + row, sum);
                     }
                 }

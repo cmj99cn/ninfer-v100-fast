@@ -5,6 +5,7 @@
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <algorithm>
 #include <cmath>
@@ -19,7 +20,8 @@ namespace {
 using namespace ninfer;
 using namespace ninfer::test::linear;
 
-int run_shape(std::int32_t n, std::int32_t k, std::int32_t t, std::uint32_t seed) {
+int run_shape(std::int32_t n, std::int32_t k, std::int32_t t, std::uint32_t seed,
+              bool bf16_out = false) {
     auto packed = make_q4g64_f16s_weight(n, k, seed);
     std::vector<__half> activation(static_cast<std::size_t>(k) * t);
     std::mt19937 rng(seed + 17U);
@@ -40,15 +42,21 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t t, std::uint32_t seed
         ops::linear_workspace_capacity_bytes(weight.qtype, n, k, ops::LinearPolicy::A16Only, t, t);
     DeviceArena workspace(capacity == 0 ? std::size_t{16} : capacity);
     Tensor x(x_bytes.p, DType::FP16, {k, t});
-    Tensor out(out_bytes.p, DType::FP16, {n, t});
+    Tensor out(out_bytes.p, bf16_out ? DType::BF16 : DType::FP16, {n, t});
     ops::linear(x, weight, out, ops::LinearPolicy::AllowA4, workspace, nullptr);
     if (cudaDeviceSynchronize() != cudaSuccess) {
         std::cerr << "Q4_F16: synchronize failed\n";
         return 1;
     }
 
-    std::vector<__half> actual(static_cast<std::size_t>(n) * t);
-    out_bytes.copy_to_host(actual.data(), out_bytes.bytes);
+    std::vector<std::uint16_t> actual_bits(static_cast<std::size_t>(n) * t);
+    out_bytes.copy_to_host(actual_bits.data(), out_bytes.bytes);
+    const auto actual_value = [&](std::size_t i) {
+        if (bf16_out) {
+            return static_cast<double>(__bfloat162float(__ushort_as_bfloat16(actual_bits[i])));
+        }
+        return static_cast<double>(__half2float(__ushort_as_half(actual_bits[i])));
+    };
 
     const std::int32_t rows[] = {0, 1, n / 2, n - 1};
     const std::int32_t cols[] = {0, t > 1 ? 1 : 0, t / 2, t - 1};
@@ -64,8 +72,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t t, std::uint32_t seed
                     static_cast<double>(
                         __half2float(activation[static_cast<std::size_t>(col) * k + i]));
             }
-            const double value = static_cast<double>(
-                __half2float(actual[static_cast<std::size_t>(col) * n + row]));
+            const double value = actual_value(static_cast<std::size_t>(col) * n + row);
             if (!std::isfinite(value)) { ++failures; continue; }
             const double error = value - reference;
             error_sq += error * error;
@@ -73,8 +80,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t t, std::uint32_t seed
         }
     }
     const double relative = std::sqrt(error_sq / std::max(reference_sq, 1e-30));
-    std::cout << "Q4_F16 n=" << n << " k=" << k << " t=" << t
-              << " relative_l2=" << relative << '\n';
+    std::cout << "Q4_F16" << (bf16_out ? "_BF16OUT" : "") << " n=" << n << " k=" << k
+              << " t=" << t << " relative_l2=" << relative << '\n';
     if (relative > 2e-2) { ++failures; }
     return failures;
 }
@@ -97,6 +104,9 @@ int main() {
             for (const std::int32_t t : tokens) {
                 failures += run_shape(shape[0], shape[1], t, seed++);
             }
+        }
+        for (const std::int32_t t : tokens) {
+            failures += run_shape(131072, 5120, t, seed++, true);
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Q4_F16 Linear\n";
         return failures == 0 ? 0 : 1;

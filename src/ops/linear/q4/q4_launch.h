@@ -77,6 +77,10 @@ void launch_q4_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStr
 // FP16 activation/output twins of the general SIMT route (Volta Q4 decode uses this route).
 void launch_q4_simt_r8_c4_f16(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q4_simt_r8_c8_f16(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q4_simt_r8_c4_f16_bf16out(const Tensor& x, const Weight& w, Tensor& out,
+                                      cudaStream_t stream);
+void launch_q4_simt_r8_c8_f16_bf16out(const Tensor& x, const Weight& w, Tensor& out,
+                                      cudaStream_t stream);
 void launch_q4_draft_head_small_t(const Tensor& x, const Weight& w, Tensor& out,
                                   cudaStream_t stream);
 void launch_q4_mma_r64_c32(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);

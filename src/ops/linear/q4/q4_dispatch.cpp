@@ -229,13 +229,19 @@ void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
 
 void q4_f16_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      cudaStream_t stream) {
-    if (x.dtype != DType::FP16 || out.dtype != DType::FP16) {
-        throw std::invalid_argument("q4 f16 linear: x/out must be FP16");
+    if (x.dtype != DType::FP16 || (out.dtype != DType::FP16 && out.dtype != DType::BF16)) {
+        throw std::invalid_argument("q4 f16 linear: x must be FP16 and out FP16 or BF16");
     }
     // Same permission semantics as the other FP16 routes: A16 is always admitted.
     (void)select_q4_launch(w.n, w.k, x.ne[1], LinearPolicy::A16Only);
 #ifdef NINFER_VOLTA_BUILD
-    if (x.ne[1] <= 4) {
+    if (out.dtype == DType::BF16) {
+        if (x.ne[1] <= 4) {
+            launch_q4_simt_r8_c4_f16_bf16out(x, w, out, stream);
+        } else {
+            launch_q4_simt_r8_c8_f16_bf16out(x, w, out, stream);
+        }
+    } else if (x.ne[1] <= 4) {
         launch_q4_simt_r8_c4_f16(x, w, out, stream);
     } else {
         launch_q4_simt_r8_c8_f16(x, w, out, stream);

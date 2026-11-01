@@ -71,7 +71,12 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
     const bool f16 = x.dtype == DType::FP16 && out.dtype == DType::FP16 &&
                      (w.qtype == QType::NVFP4 || w.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
                       w.qtype == QType::W8G32_F16S || w.qtype == QType::Q4G64_F16S);
-    if (!bf16 && !f16) {
+    // The vocabulary head terminates the activation stream: its logits stay BF16 because the
+    // sampler contract requires BF16, so an FP16 activation is admitted with a BF16 output.
+    const bool f16_logits =
+        x.dtype == DType::FP16 && out.dtype == DType::BF16 &&
+        (w.qtype == QType::FP8_E4M3FN_ROW_BF16S || w.qtype == QType::Q4G64_F16S);
+    if (!bf16 && !f16 && !f16_logits) {
         throw std::invalid_argument(
             "linear: x/out must be BF16, or FP16 with an NVFP4/FP8/W8/Q4 weight");
     }

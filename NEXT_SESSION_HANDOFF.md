@@ -152,6 +152,8 @@ fp8 相关测试全部通过。
    `gdn_gating_proj_f16` / `causal_conv1d_f16` / `gdn_f16`，但融合 wrapper 仍只接受 BF16。
 5. **runtime 接线**：已完成基础层，剩下 leaf / schedule：
    - 已加 `src/targets/qwen3_6/impl/runtime/text_dtype.h` + CMake `NINFER_TEXT_DTYPE=bf16|f16`；
+   - 输出头边界已定：FP8 output head 与 Q4 draft head 支持 FP16 activation → **BF16 logits**
+     （sampling 契约要求 BF16），因此 `ops::linear` 现允许 FP16-in/BF16-out 的 head 调用；
    - `TextConfig`/`DFlashConfig` 已有 `activation_dtype`；
    - `workspace_recipe.h` 全部文本 workspace 已改用 `Config::activation_dtype`；
    - **仍待**：`layouts_impl.h`（41 处，尺寸同为 2 字节，语义上仍应对齐）、

@@ -199,8 +199,8 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t output_rows, std::i
 void fp8_f16_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                       cudaStream_t stream) {
     (void)validate_fp8_weight(weight, "fp8 f16 linear");
-    if (x.dtype != DType::FP16 || out.dtype != DType::FP16) {
-        throw std::invalid_argument("fp8 f16 linear: x/out must be FP16");
+    if (x.dtype != DType::FP16 || (out.dtype != DType::FP16 && out.dtype != DType::BF16)) {
+        throw std::invalid_argument("fp8 f16 linear: x must be FP16 and out FP16 or BF16");
     }
     switch (policy) {
     case LinearPolicy::A16Only:
@@ -227,8 +227,13 @@ void fp8_f16_dispatch(const Tensor& x, const Weight& weight, Tensor& out, Linear
         auto* output = static_cast<std::uint8_t*>(out.data) +
                        static_cast<std::int64_t>(token_begin) * n * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::FP16, {k, active});
-        Tensor output_chunk(output, DType::FP16, {n, active});
-        launch_fp8_volta_qpn_f16(input_chunk, weight, output_chunk, stream);
+        if (out.dtype == DType::BF16) {
+            Tensor output_chunk(output, DType::BF16, {n, active});
+            launch_fp8_volta_qpn_f16_bf16out(input_chunk, weight, output_chunk, stream);
+        } else {
+            Tensor output_chunk(output, DType::FP16, {n, active});
+            launch_fp8_volta_qpn_f16(input_chunk, weight, output_chunk, stream);
+        }
     }
 #else
     (void)stream;
