@@ -105,6 +105,24 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
 std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
                                        ops::LinearPolicy policy, std::int32_t first,
                                        std::int32_t last) {
+    if constexpr (TextConfig::activation_dtype == DType::FP16) {
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::FP16, {2 * TextConfig::intermediate, last});
+        (void)layout.alloc(DType::FP16, {TextConfig::intermediate, last});
+        (void)layout.alloc(DType::FP16, {TextConfig::hidden, last});
+        {
+            auto scope = layout.scope();
+            (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(
+                gate_up_qtype, 2 * TextConfig::intermediate, TextConfig::hidden, policy, first,
+                last));
+        }
+        {
+            auto scope = layout.scope();
+            (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(
+                down_qtype, TextConfig::hidden, TextConfig::intermediate, policy, first, last));
+        }
+        return layout.peak_bytes(1);
+    }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
     {
@@ -314,8 +332,22 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope        = workspace.scope();
-    Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
+    auto scope = workspace.scope();
+    const int cols = hidden.ne[1];
+    if constexpr (TextConfig::activation_dtype == DType::FP16) {
+        Tensor gate_up = workspace.alloc(DType::FP16, {2 * TextConfig::intermediate, cols});
+        ops::linear(hidden, weights.gate_up, gate_up, text_policy(weights.gate_up), workspace,
+                    stream);
+        Tensor activation = workspace.alloc(DType::FP16, {TextConfig::intermediate, cols});
+        ops::silu_mul(gate_up.slice(0, 0, TextConfig::intermediate),
+                      gate_up.slice(0, TextConfig::intermediate, TextConfig::intermediate),
+                      activation, stream);
+        Tensor delta = workspace.alloc(DType::FP16, {TextConfig::hidden, cols});
+        ops::linear(activation, weights.down, delta, text_policy(weights.down), workspace, stream);
+        ops::residual_add(delta, residual, stream);
+        return;
+    }
+    Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
     ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
                        stream);
     ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
