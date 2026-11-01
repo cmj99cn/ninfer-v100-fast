@@ -20,4 +20,8 @@ namespace ninfer::ops::detail {
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                   WorkspaceArena* workspace, cudaStream_t stream);
 
+// FP16 activation/output form. The persistent weight stays FP8; only the activation boundary moves.
+void fp8_f16_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
+                      cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

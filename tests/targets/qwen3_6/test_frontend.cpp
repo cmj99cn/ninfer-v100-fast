@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -101,9 +102,30 @@ const fi::CompiledChatTemplate& multi_step_tool_template() {
     return value;
 }
 
+bool has_frontend_resources(const std::string& dir) {
+    namespace fs = std::filesystem;
+    return !dir.empty() && fs::exists(dir + "/tokenizer.json") &&
+           fs::exists(dir + "/tokenizer_config.json") &&
+           fs::exists(dir + "/generation_config.json");
+}
+
+// The official checkpoint is an external local prerequisite, not a repository fixture. Resolve it
+// from the operator's override first, then from this workspace's documented release source (whose
+// frontend resources are family-shared), and otherwise let `main` skip the test the same way every
+// other real-artifact test does.
 const char* official_model_dir() {
-    if (const char* configured = std::getenv("NINFER_QWEN3_6_27B_DIR")) { return configured; }
-    return "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16";
+    static const std::string resolved = [] {
+        std::vector<std::string> candidates;
+        if (const char* configured = std::getenv("NINFER_QWEN3_6_27B_DIR")) {
+            candidates.emplace_back(configured);
+        }
+        candidates.emplace_back("/home/cmj/models/Qwen3.8-27B-QUASAR-NVFP4");
+        for (std::string& candidate : candidates) {
+            if (has_frontend_resources(candidate)) { return candidate; }
+        }
+        return std::string{};
+    }();
+    return resolved.c_str();
 }
 
 const fi::Tokenizer& official_tokenizer() {
@@ -1586,6 +1608,10 @@ int test_media_preparation_cancellation() {
 } // namespace
 
 int main() {
+    if (official_model_dir()[0] == '\0') {
+        std::cout << "SKIP: no Qwen3.6-27B frontend resources; set NINFER_QWEN3_6_27B_DIR\n";
+        return 77;
+    }
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;

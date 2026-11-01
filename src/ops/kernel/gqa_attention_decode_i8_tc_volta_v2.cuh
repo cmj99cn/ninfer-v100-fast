@@ -88,10 +88,10 @@ inline constexpr std::size_t kGqaSmallTI8VoltaV2SmemBytes =
     + sizeof(std::int8_t) * 16;                                                       // iq4nl lut
 
 template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool IsI4NL,
-          typename CacheInput>
+          typename CacheInput, class Act = __nv_bfloat16>
 __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
     void gqa_attention_small_t_tc_volta_partial_i8_v2_kernel(
-    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
+    const Act* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
     std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
     const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
@@ -251,8 +251,8 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
                 physical_page     = __shfl_sync(FullMask, physical_page, 0);
                 const int page_offset = position & kPagedKVPageMask;
                 const int d           = grp * kGqaI4NLGroup + lane;
-                const float kv  = __bfloat162float(input.k[gqa_kv_new_index<Geometry>(kv_head, d, token)]);
-                const float vv  = __bfloat162float(input.v[gqa_kv_new_index<Geometry>(kv_head, d, token)]);
+                const float kv  = GqaActivation<Act>::load(input.k + gqa_kv_new_index<Geometry>(kv_head, d, token));
+                const float vv  = GqaActivation<Act>::load(input.v + gqa_kv_new_index<Geometry>(kv_head, d, token));
                 std::uint32_t k_byte, v_byte;
                 half k_sh, v_sh;
                 gqa_i4nl_encode_warp(kv, FullMask, lut_s, k_byte, k_sh);
@@ -288,10 +288,10 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
             const int page_offset = position & kPagedKVPageMask;
             const int d0          = grp * kGqaKvQuantGroup + lane;
             const int d1          = d0 + 32;
-            const float kv0 = __bfloat162float(input.k[gqa_kv_new_index<Geometry>(kv_head, d0, token)]);
-            const float kv1 = __bfloat162float(input.k[gqa_kv_new_index<Geometry>(kv_head, d1, token)]);
-            const float vv0 = __bfloat162float(input.v[gqa_kv_new_index<Geometry>(kv_head, d0, token)]);
-            const float vv1 = __bfloat162float(input.v[gqa_kv_new_index<Geometry>(kv_head, d1, token)]);
+            const float kv0 = GqaActivation<Act>::load(input.k + gqa_kv_new_index<Geometry>(kv_head, d0, token));
+            const float kv1 = GqaActivation<Act>::load(input.k + gqa_kv_new_index<Geometry>(kv_head, d1, token));
+            const float vv0 = GqaActivation<Act>::load(input.v + gqa_kv_new_index<Geometry>(kv_head, d0, token));
+            const float vv1 = GqaActivation<Act>::load(input.v + gqa_kv_new_index<Geometry>(kv_head, d1, token));
             float kamax = fmaxf(fabsf(kv0), fabsf(kv1));
             float vamax = fmaxf(fabsf(vv0), fabsf(vv1));
             kamax       = warp_max(kamax, FullMask);
@@ -330,7 +330,7 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
                 for (int part = 0; part < 8; ++part) {
                     const int d = lane + 32 * part;
                     q_s[row * Stride + d] =
-                        __float2half(__bfloat162float(q[gqa_q_index<Geometry>(q_head, d, token)]));
+                        GqaActivation<Act>::as_half(q + gqa_q_index<Geometry>(q_head, d, token));
                 }
                 continue;
             }

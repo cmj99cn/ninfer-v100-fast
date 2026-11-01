@@ -196,6 +196,46 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t output_rows, std::i
                : 0;
 }
 
+void fp8_f16_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
+                      cudaStream_t stream) {
+    (void)validate_fp8_weight(weight, "fp8 f16 linear");
+    if (x.dtype != DType::FP16 || out.dtype != DType::FP16) {
+        throw std::invalid_argument("fp8 f16 linear: x/out must be FP16");
+    }
+    switch (policy) {
+    case LinearPolicy::A16Only:
+    case LinearPolicy::AllowA8:
+    case LinearPolicy::AllowA4:
+        break;
+    }
+    const std::int32_t n = weight.n;
+    const std::int32_t k = weight.k;
+    if (x.ne[1] <= 0 || n <= 0 || k <= 0 ||
+        !is_fp8_linear_problem(n, k)) {
+        throw std::invalid_argument("fp8 f16 linear: unsupported shape");
+    }
+#ifdef NINFER_VOLTA_BUILD
+    // Every registered FP8 shape routes its narrow widths through QPN; the FP16 form inherits that
+    // route at every T by chunking. T=1 is admitted here even though the BF16 dispatcher prefers
+    // the SIMT GEMV at that width: the trade-off is a few percent on one row, and it keeps the
+    // activation dtype boundary in one kernel family.
+    constexpr std::int32_t kChunk = kFp8VoltaQpnMaxTokens;
+    for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
+        const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
+        auto* input = static_cast<std::uint8_t*>(x.data) +
+                      static_cast<std::int64_t>(token_begin) * k * sizeof(std::uint16_t);
+        auto* output = static_cast<std::uint8_t*>(out.data) +
+                       static_cast<std::int64_t>(token_begin) * n * sizeof(std::uint16_t);
+        Tensor input_chunk(input, DType::FP16, {k, active});
+        Tensor output_chunk(output, DType::FP16, {n, active});
+        launch_fp8_volta_qpn_f16(input_chunk, weight, output_chunk, stream);
+    }
+#else
+    (void)stream;
+    throw std::invalid_argument("fp8 f16 linear requires the sm_70 build");
+#endif
+}
+
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                   WorkspaceArena* workspace, cudaStream_t stream) {
     validate_fp8_weight(weight, "fp8 linear");

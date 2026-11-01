@@ -80,10 +80,10 @@ __device__ __forceinline__ int4 gqa_prefill_i8_dequant_f16x8(const std::int8_t* 
 
 // Eight independent quantization units per CTA; one warp owns one
 // (token, kv_head, 64-d group), with two dimensions per lane.
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, class Act = __nv_bfloat16>
 __launch_bounds__(256) __global__
-    void gqa_attention_prefill_fill_i8_kernel(const __nv_bfloat16* __restrict__ k,
-                                               const __nv_bfloat16* __restrict__ v,
+    void gqa_attention_prefill_fill_i8_kernel(const Act* __restrict__ k,
+                                               const Act* __restrict__ v,
                                                const std::int32_t* __restrict__ positions,
                                                Metadata metadata, std::int8_t* __restrict__ cache_k,
                                                std::int8_t* __restrict__ cache_v,
@@ -111,10 +111,10 @@ __launch_bounds__(256) __global__
 
     const std::int64_t src0 = gqa_kv_quant_src_index<Geometry>(kv_head, d0, token);
     const std::int64_t src1 = gqa_kv_quant_src_index<Geometry>(kv_head, d1, token);
-    const float k0          = __bfloat162float(k[src0]);
-    const float k1          = __bfloat162float(k[src1]);
-    const float v0          = __bfloat162float(v[src0]);
-    const float v1          = __bfloat162float(v[src1]);
+    const float k0          = GqaActivation<Act>::load(k + src0);
+    const float k1          = GqaActivation<Act>::load(k + src1);
+    const float v0          = GqaActivation<Act>::load(v + src0);
+    const float v1          = GqaActivation<Act>::load(v + src1);
 
     float k_abs = fmaxf(fabsf(k0), fabsf(k1));
     float v_abs = fmaxf(fabsf(v0), fabsf(v1));
@@ -145,10 +145,10 @@ __launch_bounds__(256) __global__
 
 // One warp per (token, kv_head, 32-group) for the IQ4_NL-G32 codec -- the same bit-exact encode
 // pipeline as the decode append blocks, through one CTA-resident LUT.
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, class Act = __nv_bfloat16>
 __launch_bounds__(256) __global__
-    void gqa_attention_prefill_fill_i4nl_kernel(const __nv_bfloat16* __restrict__ k,
-                                                const __nv_bfloat16* __restrict__ v,
+    void gqa_attention_prefill_fill_i4nl_kernel(const Act* __restrict__ k,
+                                                const Act* __restrict__ v,
                                                 const std::int32_t* __restrict__ positions,
                                                 Metadata metadata, std::int8_t* __restrict__ cache_k,
                                                 std::int8_t* __restrict__ cache_v,
@@ -180,8 +180,8 @@ __launch_bounds__(256) __global__
     const int d        = group * kGqaI4NLGroup + lane; // one value per lane across the whole 32-group
 
     const std::int64_t src = gqa_kv_quant_src_index<Geometry>(kv_head, d, token);
-    const float kx         = __bfloat162float(k[src]);
-    const float vx         = __bfloat162float(v[src]);
+    const float kx         = GqaActivation<Act>::load(k + src);
+    const float vx         = GqaActivation<Act>::load(v + src);
     std::uint32_t k_byte, v_byte;
     half k_sh, v_sh;
     gqa_i4nl_encode_warp(kx, FullMask, lut_s, k_byte, k_sh);
@@ -202,9 +202,9 @@ __launch_bounds__(256) __global__
 
 // Large appends are scheduled in absolute eight-token tiles. Eight divides P=64, so each CTA is
 // page-local while an unknown base offset costs at most one empty tail CTA in the launch envelope.
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, class Act = __nv_bfloat16>
 __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel(
-    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const Act* __restrict__ k, const Act* __restrict__ v,
     const std::int32_t* __restrict__ positions, Metadata metadata,
     std::int8_t* __restrict__ cache_k, std::int8_t* __restrict__ cache_v,
     __half* __restrict__ scale_k, __half* __restrict__ scale_v, std::int32_t width) {
@@ -234,10 +234,10 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
     if (valid) {
         const std::int64_t src0 = gqa_kv_quant_src_index<Geometry>(kv_head, d0, token);
         const std::int64_t src1 = gqa_kv_quant_src_index<Geometry>(kv_head, d1, token);
-        k0                      = __bfloat162float(k[src0]);
-        k1                      = __bfloat162float(k[src1]);
-        v0                      = __bfloat162float(v[src0]);
-        v1                      = __bfloat162float(v[src1]);
+        k0                      = GqaActivation<Act>::load(k + src0);
+        k1                      = GqaActivation<Act>::load(k + src1);
+        v0                      = GqaActivation<Act>::load(v + src0);
+        v1                      = GqaActivation<Act>::load(v + src1);
     }
     const float k_abs = warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
     const float v_abs = warp_max(fmaxf(fabsf(v0), fabsf(v1)), FullMask);
@@ -269,12 +269,12 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
     }
 }
 
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, class Act = __nv_bfloat16>
 __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
-    const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
+    const Act* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
-    const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
+    const std::int32_t* __restrict__ positions, float scale, Act* __restrict__ out,
     std::int32_t width) {
     constexpr int D             = kGqaPrefillHeadDim;
     constexpr int Br            = kGqaPrefillI8Br;
@@ -321,8 +321,8 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const int tokens  = metadata.valid_tokens(width);
     if (q_head >= Geometry::QHeads || q0 >= width) { return; }
     if (q0 >= tokens) {
-        gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
-                                               kGqaPrefillI8Threads);
+        gqa_prefill_zero_output_rows<Geometry, Act>(out, q_head, q0, min(q0 + Br, width), tid,
+                                                    kGqaPrefillI8Threads);
         return;
     }
     const int base_pos              = positions[0];
@@ -341,8 +341,8 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
         float x0      = 0.0f;
         float x1      = 0.0f;
         if (row < tile_rows) {
-            x0 = __bfloat162float(q[gqa_prefill_q_index<Geometry>(q_head, d0, q0 + row)]);
-            x1 = __bfloat162float(q[gqa_prefill_q_index<Geometry>(q_head, d1, q0 + row)]);
+            x0 = GqaActivation<Act>::load(q + gqa_prefill_q_index<Geometry>(q_head, d0, q0 + row));
+            x1 = GqaActivation<Act>::load(q + gqa_prefill_q_index<Geometry>(q_head, d1, q0 + row));
         }
         float absmax    = fmaxf(fabsf(x0), fabsf(x1));
         absmax          = warp_max(absmax, FullMask);
@@ -648,16 +648,16 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
         if (row0 < tile_rows) {
             *reinterpret_cast<unsigned*>(
                 &out[gqa_prefill_q_index<Geometry>(q_head, d0, q0 + row0)]) =
-                pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+                GqaActivation<Act>::pack2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
         }
         if (row1 < tile_rows) {
             *reinterpret_cast<unsigned*>(
                 &out[gqa_prefill_q_index<Geometry>(q_head, d0, q0 + row1)]) =
-                pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+                GqaActivation<Act>::pack2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
         }
     }
-    gqa_prefill_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid,
-                                           kGqaPrefillI8Threads);
+    gqa_prefill_zero_output_rows<Geometry, Act>(out, q_head, tokens, min(q0 + Br, width), tid,
+                                                kGqaPrefillI8Threads);
 }
 
 } // namespace ninfer::ops

@@ -7,6 +7,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/kernel/gqa_activation.cuh"
 #include "ops/kernel/gqa_attention_geometry.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 
@@ -60,8 +61,8 @@ __device__ __forceinline__ std::int64_t gqa_prefill_q_index(int q_head, int d, i
                                                static_cast<std::int64_t>(Geometry::QHeads) * token);
 }
 
-template <typename Geometry>
-__device__ __forceinline__ void gqa_prefill_zero_output_rows(__nv_bfloat16* out, int q_head,
+template <typename Geometry, class Act = __nv_bfloat16>
+__device__ __forceinline__ void gqa_prefill_zero_output_rows(Act* out, int q_head,
                                                              int row_begin, int row_end, int tid,
                                                              int threads) {
     if (row_begin >= row_end) { return; }
@@ -69,7 +70,7 @@ __device__ __forceinline__ void gqa_prefill_zero_output_rows(__nv_bfloat16* out,
     for (int element = tid; element < elements; element += threads) {
         const int row = row_begin + element / kGqaPrefillHeadDim;
         const int d   = element - (row - row_begin) * kGqaPrefillHeadDim;
-        out[gqa_prefill_q_index<Geometry>(q_head, d, row)] = __float2bfloat16(0.0f);
+        GqaActivation<Act>::store(out + gqa_prefill_q_index<Geometry>(q_head, d, row), 0.0f);
     }
 }
 

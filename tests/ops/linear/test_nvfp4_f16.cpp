@@ -37,7 +37,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t t, std::uint32_t seed
     Weight weight = packed.device_weight(w_bytes.p);
     const std::size_t capacity =
         ops::linear_workspace_capacity_bytes(weight.qtype, n, k, ops::LinearPolicy::A16Only, t, t);
-    DeviceArena workspace(capacity);
+    DeviceArena workspace(capacity == 0 ? std::size_t{16} : capacity);
     Tensor x(x_bytes.p, DType::FP16, {k, t});
     Tensor out(out_bytes.p, DType::FP16, {n, t});
     ops::linear(x, weight, out, ops::LinearPolicy::A16Only, workspace, nullptr);
@@ -50,7 +50,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t t, std::uint32_t seed
     out_bytes.copy_to_host(actual.data(), out_bytes.bytes);
 
     const std::int32_t rows[] = {0, 1, n / 2, n - 1};
-    const std::int32_t cols[] = {0, 1, t / 2, t - 1};
+    const std::int32_t cols[] = {0, t > 1 ? 1 : 0, t / 2, t - 1};
     double error_sq = 0.0;
     double reference_sq = 0.0;
     int failures = 0;
@@ -85,6 +85,11 @@ int main() {
     }
     try {
         int failures = 0;
+        failures += run_shape(14336, 5120, 1, 911U);
+        failures += run_shape(14336, 5120, 6, 912U);
+        failures += run_shape(14336, 5120, 32, 913U);
+        failures += run_shape(14336, 5120, 40, 914U);
+        failures += run_shape(14336, 5120, 127, 915U);
         failures += run_shape(14336, 5120, 4096, 901U);
         failures += run_shape(34816, 5120, 4096, 902U);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4_F16 Linear\n";

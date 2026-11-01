@@ -20,6 +20,8 @@ void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cu
 inline constexpr std::int32_t kNvfp4VoltaQpnRowsPerTile = 8;
 inline constexpr std::int32_t kNvfp4VoltaQpnMaxTokens   = 32;
 void launch_nvfp4_volta_qpn(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+// Same QPN schedule with an FP16 activation stream and FP16 output.
+void launch_nvfp4_volta_qpn_f16(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 [[nodiscard]] bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                              std::int32_t t) noexcept;
 

@@ -85,13 +85,29 @@ __device__ __forceinline__ void fp8_decode_quad(std::uint32_t word, half2& lo, h
 // nvfp4_volta_qpn_gemm.cuh, which got them first; this is the same pattern applied to the
 // simpler single-projection kernel. The shared reduce buffer is SPLITK * kTiles * 256 floats, so
 // SPLITK=16 at kTiles=4 is never instantiated (64 KB, over Volta's 48 KB static limit).
-template <int kTiles, int SPLITK, int NACC, bool Prepacked, class OutputPolicy>
+template <class T>
+struct Fp8QpnActivation;
+
+template <>
+struct Fp8QpnActivation<__nv_bfloat16> {
+    __device__ static half as_half(const __nv_bfloat16* p) {
+        return __float2half(__bfloat162float(*p));
+    }
+};
+
+template <>
+struct Fp8QpnActivation<half> {
+    __device__ static half as_half(const half* p) { return *p; }
+};
+
+template <int kTiles, int SPLITK, int NACC, bool Prepacked, class OutputPolicy,
+          class Act = __nv_bfloat16>
 __global__ __launch_bounds__(
     SPLITK * 32, (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK < 1
         ? 1
         : (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK) void fp8_volta_qpn_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const __nv_bfloat16* __restrict__ scales,
-    const __nv_bfloat16* __restrict__ x, int n, int k, int t, OutputPolicy output) {
+    const Act* __restrict__ x, int n, int k, int t, OutputPolicy output) {
     using S = Fp8VoltaQpnSchedule;
 
     __shared__ float cs[SPLITK][kTiles * S::kRowsPerTile * S::kColsPerCta];
@@ -162,14 +178,12 @@ __global__ __launch_bounds__(
                     const int row = tile * S::kRowsPerTile + r;
                     half2 a[4];
                     if (row < t) {
-                        const __nv_bfloat16* xrow = x + static_cast<std::int64_t>(row) * k + kbase;
-                        const uint4 raw           = *reinterpret_cast<const uint4*>(xrow);
-                        const auto* src           = reinterpret_cast<const __nv_bfloat16*>(&raw);
+                        const Act* xrow = x + static_cast<std::int64_t>(row) * k + kbase;
+                        const uint4 raw = *reinterpret_cast<const uint4*>(xrow);
+                        const auto* src = reinterpret_cast<const Act*>(&raw);
                         __half tmp[8];
 #pragma unroll
-                        for (int j = 0; j < 8; ++j) {
-                            tmp[j] = __float2half(__bfloat162float(src[j]));
-                        }
+                        for (int j = 0; j < 8; ++j) { tmp[j] = Fp8QpnActivation<Act>::as_half(src + j); }
 #pragma unroll
                         for (int j = 0; j < 4; ++j) {
                             a[j] = *reinterpret_cast<const half2*>(tmp + 2 * j);
@@ -230,7 +244,7 @@ __global__ __launch_bounds__(
 // Shared launcher. Every FP8 consumer -- plain Linear, the attention projections, the GDN input
 // projection -- differs only in where the epilogue puts its results, so they share one kernel and
 // supply their own output policy.
-template <class OutputPolicy>
+template <class OutputPolicy, class Act = __nv_bfloat16>
 void launch_fp8_volta_qpn_with_output(const Tensor& x, const Weight& w, OutputPolicy output,
                                       std::int32_t n, cudaStream_t stream) {
     using S              = Fp8VoltaQpnSchedule;
@@ -240,7 +254,7 @@ void launch_fp8_volta_qpn_with_output(const Tensor& x, const Weight& w, OutputPo
     const dim3 grid(static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta));
     const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
     const auto* scales = static_cast<const __nv_bfloat16*>(w.scales);
-    const auto* xd     = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* xd     = static_cast<const Act*>(x.data);
     const bool vocabulary = n >= 100000 && k == 5120;
     // Generation-2 winners from a private sweep (bench/ops/fp8_qpn8_splitk_sweep.cu, deleted):
     // SPLITK8 NACC1 wins at every kTiles on attn input, GDN input, and the 17408-K residual shape
@@ -250,15 +264,15 @@ void launch_fp8_volta_qpn_with_output(const Tensor& x, const Weight& w, OutputPo
     // everywhere, matching the NVFP4 SwiGLU kernel's finding: extra accumulator chains just cost
     // registers on a kernel that is already issue/DRAM-bound, not dependency-bound.
     const bool wide_k_headroom = k == 6144;
-#define NINFER_FP8_QPN_LAUNCH(TILES, SPLITK, NACC)                                      \
-    do {                                                                                 \
-        if (w.layout == QuantLayout::VoltaQpnPrepacked) {                                \
-            fp8_volta_qpn_gemm_kernel<TILES, SPLITK, NACC, true>                        \
-                <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, xd, n, k, t, output); \
-        } else {                                                                         \
-            fp8_volta_qpn_gemm_kernel<TILES, SPLITK, NACC, false>                       \
-                <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, xd, n, k, t, output); \
-        }                                                                                \
+#define NINFER_FP8_QPN_LAUNCH(TILES, SPLITK, NACC)                                         \
+    do {                                                                                    \
+        if (w.layout == QuantLayout::VoltaQpnPrepacked) {                                   \
+            fp8_volta_qpn_gemm_kernel<TILES, SPLITK, NACC, true, OutputPolicy, Act>         \
+                <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, xd, n, k, t, output);     \
+        } else {                                                                            \
+            fp8_volta_qpn_gemm_kernel<TILES, SPLITK, NACC, false, OutputPolicy, Act>        \
+                <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, xd, n, k, t, output);     \
+        }                                                                                   \
     } while (false)
     if (t <= S::kRowsPerTile) {
         if (vocabulary) {
