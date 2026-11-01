@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 
@@ -30,9 +31,9 @@ inline constexpr int kMtpQRowsTp4    = 1536;
 inline constexpr int kMtpKvRowsTp4   = 256;
 static_assert(kMtpAttnRowsTp4 == 2 * kMtpQRowsTp4 + 2 * kMtpKvRowsTp4);
 
-__global__ void mtp_pack_fc_input_kernel(const __nv_bfloat16* embedding_norm,
-                                         const __nv_bfloat16* hidden_norm, __nv_bfloat16* out,
-                                         std::int32_t rows) {
+template <class Act>
+__global__ void mtp_pack_fc_input_kernel(const Act* embedding_norm, const Act* hidden_norm,
+                                         Act* out, std::int32_t rows) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (row >= rows) { return; }
 
@@ -47,9 +48,8 @@ __global__ void mtp_pack_fc_input_kernel(const __nv_bfloat16* embedding_norm,
 // the hand-written form it replaces and the tp2 shard (<7168,3072,512>) is the same kernel at the
 // halved extents -- the "a split geometry is not a new kernel" rule every split form here
 // follows, applied to a pure index remap.
-template <int AttnRows, int QRows, int KvRows>
-__global__ void mtp_split_attn_in_kernel(const __nv_bfloat16* attn_in, __nv_bfloat16* q,
-                                         __nv_bfloat16* k, __nv_bfloat16* gate, __nv_bfloat16* v,
+template <int AttnRows, int QRows, int KvRows, class Act>
+__global__ void mtp_split_attn_in_kernel(const Act* attn_in, Act* q, Act* k, Act* gate, Act* v,
                                          std::int32_t tokens) {
     static_assert(AttnRows == 2 * QRows + 2 * KvRows);
     const std::int64_t idx = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
@@ -58,7 +58,7 @@ __global__ void mtp_split_attn_in_kernel(const __nv_bfloat16* attn_in, __nv_bflo
 
     const int row             = static_cast<int>(idx % AttnRows);
     const int token           = static_cast<int>(idx / AttnRows);
-    const __nv_bfloat16 value = attn_in[idx];
+    const Act value = attn_in[idx];
 
     if (row < QRows) {
         q[static_cast<std::int64_t>(token) * QRows + row] = value;

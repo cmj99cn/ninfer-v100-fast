@@ -7,15 +7,27 @@
 namespace ninfer::ops {
 namespace {
 
-void require_bf16_contiguous_nonnull(const Tensor& t, const char* op, const char* name) {
-    if (t.dtype != DType::BF16) {
-        throw std::invalid_argument(std::string(op) + ": " + name + " must be BF16");
+bool is_activation_dtype(DType dtype) {
+    return dtype == DType::BF16 || dtype == DType::FP16;
+}
+
+void require_activation_contiguous_nonnull(const Tensor& t, const char* op, const char* name) {
+    if (!is_activation_dtype(t.dtype)) {
+        throw std::invalid_argument(std::string(op) + ": " + name + " must be BF16 or FP16");
     }
     if (!t.is_contiguous()) {
         throw std::invalid_argument(std::string(op) + ": " + name + " must be contiguous");
     }
     if (t.data == nullptr) {
         throw std::invalid_argument(std::string(op) + ": " + name + " data must be non-null");
+    }
+}
+
+void require_same_activation_dtype(DType reference, const Tensor& t, const char* op,
+                                   const char* name) {
+    if (t.dtype != reference) {
+        throw std::invalid_argument(std::string(op) + ": " + name +
+                                    " must share the activation dtype");
     }
 }
 
@@ -31,9 +43,11 @@ void require_shape(const Tensor& t, std::int32_t n0, std::int32_t n1, const char
 void mtp_pack_fc_input(const Tensor& embedding_norm, const Tensor& hidden_norm, Tensor& out,
                        cudaStream_t stream) {
     constexpr const char* op = "mtp_pack_fc_input";
-    require_bf16_contiguous_nonnull(embedding_norm, op, "embedding_norm");
-    require_bf16_contiguous_nonnull(hidden_norm, op, "hidden_norm");
-    require_bf16_contiguous_nonnull(out, op, "out");
+    require_activation_contiguous_nonnull(embedding_norm, op, "embedding_norm");
+    require_activation_contiguous_nonnull(hidden_norm, op, "hidden_norm");
+    require_activation_contiguous_nonnull(out, op, "out");
+    require_same_activation_dtype(embedding_norm.dtype, hidden_norm, op, "hidden_norm");
+    require_same_activation_dtype(embedding_norm.dtype, out, op, "out");
     const std::int32_t rows   = embedding_norm.ne[0];
     const std::int32_t tokens = embedding_norm.ne[1];
     if (rows <= 0) { throw std::invalid_argument("mtp_pack_fc_input: D must be positive"); }
@@ -48,11 +62,15 @@ void mtp_pack_fc_input(const Tensor& embedding_norm, const Tensor& hidden_norm, 
 void mtp_split_attn_in(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate, Tensor& v,
                        cudaStream_t stream) {
     constexpr const char* op = "mtp_split_attn_in";
-    require_bf16_contiguous_nonnull(attn_in, op, "attn_in");
-    require_bf16_contiguous_nonnull(q, op, "q");
-    require_bf16_contiguous_nonnull(k, op, "k");
-    require_bf16_contiguous_nonnull(gate, op, "gate");
-    require_bf16_contiguous_nonnull(v, op, "v");
+    require_activation_contiguous_nonnull(attn_in, op, "attn_in");
+    require_activation_contiguous_nonnull(q, op, "q");
+    require_activation_contiguous_nonnull(k, op, "k");
+    require_activation_contiguous_nonnull(gate, op, "gate");
+    require_activation_contiguous_nonnull(v, op, "v");
+    require_same_activation_dtype(attn_in.dtype, q, op, "q");
+    require_same_activation_dtype(attn_in.dtype, k, op, "k");
+    require_same_activation_dtype(attn_in.dtype, gate, op, "gate");
+    require_same_activation_dtype(attn_in.dtype, v, op, "v");
     const std::int32_t tokens = attn_in.ne[1];
     if (tokens <= 0) { throw std::invalid_argument("mtp_split_attn_in: T must be positive"); }
     // Three registered row geometries: the tp1 object [14336,T] with 24 query/gate and 4 key/value

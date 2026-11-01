@@ -146,8 +146,7 @@ fp8 相关测试全部通过。
 3. **MTP**：W8 plain linear 与 Q4 draft head 的 FP16 已完成（见 4.4）。
    仍缺：
    - `linear_pair`（MTP k/v）：**计划在 `Variant` 层拆成两次 `ops::linear`**，不新增 pair FP16 kernel；
-   - `mtp_split_attn_in`（`src/ops/wrapper/mtp_pack.cpp`）与 `mtp_pack_fc_input` 仍只接受 BF16，
-     需要模板化；
+   - `mtp_split_attn_in` / `mtp_pack_fc_input` 的 FP16 已完成（kernel + wrapper + 测试）；
    - MTP 的 sampling/draft-token 产出边界需要确认 FP16→logits 无层间 cast。
 4. **GDN 剩余叶子**：norm+gating 融合、conv snapshot/record、recurrent 的 FP16 入口已在
    `gdn_gating_proj_f16` / `causal_conv1d_f16` / `gdn_f16`，但融合 wrapper 仍只接受 BF16。
