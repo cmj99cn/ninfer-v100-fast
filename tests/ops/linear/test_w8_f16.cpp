@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_pair.h"
 
 #include <cuda_fp16.h>
 #include <algorithm>
@@ -18,6 +19,65 @@ namespace {
 
 using namespace ninfer;
 using namespace ninfer::test::linear;
+
+int run_pair(std::int32_t k, std::int32_t t, std::uint32_t seed) {
+    constexpr std::int32_t kRows = 1024;
+    auto packed_a = make_w8g32_f16s_weight(kRows, k, seed);
+    auto packed_b = make_w8g32_f16s_weight(kRows, k, seed + 1U);
+    std::vector<__half> activation(static_cast<std::size_t>(k) * t);
+    std::mt19937 rng(seed + 17U);
+    std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
+    for (auto& value : activation) { value = __float2half_rn(dist(rng)); }
+
+    DeviceBuffer x_bytes(activation.size() * sizeof(__half));
+    x_bytes.copy_from_host(activation.data(), x_bytes.bytes);
+    DeviceBuffer a_bytes(packed_a.payload.size()), b_bytes(packed_b.payload.size());
+    a_bytes.copy_from_host(packed_a.payload.data(), a_bytes.bytes);
+    b_bytes.copy_from_host(packed_b.payload.data(), b_bytes.bytes);
+    DeviceBuffer out_a(static_cast<std::size_t>(kRows) * t * sizeof(__half));
+    DeviceBuffer out_b(static_cast<std::size_t>(kRows) * t * sizeof(__half));
+    out_a.fill(0xCD);
+    out_b.fill(0xCD);
+    Tensor x(x_bytes.p, DType::FP16, {k, t});
+    Tensor ta(out_a.p, DType::FP16, {kRows, t});
+    Tensor tb(out_b.p, DType::FP16, {kRows, t});
+    ops::linear_pair(x, packed_a.device_weight(a_bytes.p), packed_b.device_weight(b_bytes.p), ta, tb,
+                     nullptr);
+    if (cudaDeviceSynchronize() != cudaSuccess) { return 1; }
+    std::vector<__half> actual_a(static_cast<std::size_t>(kRows) * t);
+    std::vector<__half> actual_b(static_cast<std::size_t>(kRows) * t);
+    out_a.copy_to_host(actual_a.data(), out_a.bytes);
+    out_b.copy_to_host(actual_b.data(), out_b.bytes);
+    double error_sq = 0.0, reference_sq = 0.0;
+    int failures = 0;
+    const auto check = [&](const std::vector<__half>& actual,
+                           const test::quantized_weight::PackedWeight& packed) {
+        const std::int32_t rows[] = {0, kRows / 2, kRows - 1};
+        const std::int32_t cols[] = {0, t > 1 ? 1 : 0, t - 1};
+        for (const std::int32_t row : rows) {
+            for (const std::int32_t col : cols) {
+                double reference = 0.0;
+                for (std::int32_t i = 0; i < k; ++i) {
+                    reference += test::quantized_weight::logical_weight_fp64(packed, row, i) *
+                                 static_cast<double>(__half2float(
+                                     activation[static_cast<std::size_t>(col) * k + i]));
+                }
+                const double value = static_cast<double>(
+                    __half2float(actual[static_cast<std::size_t>(col) * kRows + row]));
+                if (!std::isfinite(value)) { ++failures; continue; }
+                const double error = value - reference;
+                error_sq += error * error;
+                reference_sq += reference * reference;
+            }
+        }
+    };
+    check(actual_a, packed_a);
+    check(actual_b, packed_b);
+    const double relative = std::sqrt(error_sq / std::max(reference_sq, 1e-30));
+    std::cout << "W8_F16_PAIR k=" << k << " t=" << t << " relative_l2=" << relative << '\n';
+    if (relative > 2e-2) { ++failures; }
+    return failures;
+}
 
 int run_shape(std::int32_t n, std::int32_t k, std::int32_t t, std::uint32_t seed) {
     auto packed = make_w8g32_f16s_weight(n, k, seed);
@@ -101,6 +161,9 @@ int main() {
                 failures += run_shape(shape[0], shape[1], t, seed++);
             }
         }
+        failures += run_pair(5120, 1, 970U);
+        failures += run_pair(5120, 4, 971U);
+        failures += run_pair(5120, 8, 972U);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " W8_F16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

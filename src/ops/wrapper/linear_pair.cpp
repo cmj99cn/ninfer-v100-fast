@@ -17,8 +17,9 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 
-void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, const char* label) {
-    if (tensor.dtype != DType::BF16 || tensor.ne[0] != rows || tensor.ne[1] != cols ||
+void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, const char* label,
+                    DType expected = DType::BF16) {
+    if (tensor.dtype != expected || tensor.ne[0] != rows || tensor.ne[1] != cols ||
         tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
         !aligned_to(tensor.data, 16)) {
         throw std::invalid_argument(std::string("linear_pair: invalid ") + label);
@@ -94,6 +95,19 @@ void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& seco
     const std::int32_t cols = x.ne[1];
     if (x.ne[0] != 5120 && x.ne[0] != 2048) {
         throw std::invalid_argument("linear_pair: x K must be 5120 or 2048");
+    }
+    if (x.dtype == DType::FP16) {
+        require_matrix(x, x.ne[0], cols, "x", DType::FP16);
+        require_matrix(first_out, 1024, cols, "first output", DType::FP16);
+        require_matrix(second_out, 1024, cols, "second output", DType::FP16);
+        require_weight(first_weight, x.ne[0], "first weight");
+        require_weight(second_weight, x.ne[0], "second weight");
+        require_nonoverlap(x, first_weight, second_weight, first_out, second_out);
+        // The W8 pair kernel has no FP16 form; two independent linear calls carry the same
+        // activation stream and are the registered MTP decomposition.
+        linear(x, first_weight, first_out, stream);
+        linear(x, second_weight, second_out, stream);
+        return;
     }
     require_matrix(x, x.ne[0], cols, "x");
     require_matrix(first_out, 1024, cols, "first output");
