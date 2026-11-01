@@ -19,6 +19,12 @@ namespace ninfer::ops::detail {
 void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                    cudaStream_t stream);
 
+// FP16 activation stream: chunked QPN over the same NVFP4 weight, writing FP16 qkv/z.
+void nvfp4_gdn_input_f16_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                cudaStream_t stream);
+void nvfp4_gdn_input_f16_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                      Tensor& z, cudaStream_t stream);
+
 void nvfp4_gdn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     cudaStream_t stream);
 

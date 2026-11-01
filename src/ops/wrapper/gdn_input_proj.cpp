@@ -30,8 +30,9 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 
-void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, const char* label) {
-    if (tensor.dtype != DType::BF16 || tensor.ne[0] != rows || tensor.ne[1] != cols ||
+void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, const char* label,
+                    DType expected = DType::BF16) {
+    if (tensor.dtype != expected || tensor.ne[0] != rows || tensor.ne[1] != cols ||
         tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
         !aligned_to(tensor.data, 16)) {
         throw std::invalid_argument(std::string("gdn_input_proj: invalid ") + label);
@@ -307,6 +308,25 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     validate_policy(policy);
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
+
+    if (x.dtype == DType::FP16) {
+        constexpr std::int32_t kHidden  = 5120;
+        constexpr std::int32_t kQkvRows = 10240;
+        constexpr std::int32_t kZRows   = 6144;
+        if (weight.qtype != QType::NVFP4) {
+            throw std::invalid_argument("gdn_input_proj: FP16 admits only the NVFP4 parent");
+        }
+        require_matrix(x, kHidden, cols, "x", DType::FP16);
+        require_matrix(qkv, kQkvRows, cols, "qkv", DType::FP16);
+        require_matrix(z, kZRows, cols, "z", DType::FP16);
+        require_single_parent_nonoverlap(x, qkv, z);
+        detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj");
+        if (weight.n != kQkvRows + kZRows || weight.k != kHidden) {
+            throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported weight shape");
+        }
+        detail::nvfp4_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
+        return;
+    }
 
     if (weight.qtype == QType::GGML_K) {
         require_ggml_k_parent(weight, 16384, policy);
@@ -1198,6 +1218,22 @@ void validate_fused_column_rank_semantics(const Tensor& x, const Weight& w, cons
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) {
         throw std::invalid_argument("gdn_input_proj column-parallel: T must be positive");
+    }
+    if (x.dtype == DType::FP16) {
+        if (w.qtype != QType::NVFP4) {
+            throw std::invalid_argument(
+                "gdn_input_proj column-parallel: FP16 admits only the NVFP4 parent");
+        }
+        require_matrix(x, kShardHidden, cols, "x", DType::FP16);
+        require_matrix(qkv, kFullQkvRows / tp, cols, "qkv", DType::FP16);
+        require_matrix(z, kFullZRows / tp, cols, "z", DType::FP16);
+        require_single_parent_nonoverlap(x, qkv, z);
+        detail::validate_nvfp4_weight(w, "nvfp4 gdn_input_proj column-parallel");
+        if (w.n != kFullFusedRows / tp || w.k != kShardHidden) {
+            throw std::invalid_argument(
+                "gdn_input_proj column-parallel: unsupported weight shard shape");
+        }
+        return;
     }
     require_matrix(x, kShardHidden, cols, "x");
     require_matrix(qkv, kFullQkvRows / tp, cols, "qkv");

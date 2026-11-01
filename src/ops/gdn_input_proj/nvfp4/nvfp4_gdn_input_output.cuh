@@ -4,6 +4,7 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 
@@ -61,6 +62,53 @@ struct Nvfp4GdnInputOutput {
     __device__ __forceinline__ void store_vector(std::int32_t parent_row, std::int32_t token,
                                                  uint4 values) const {
         store_vec(destination(parent_row, token), values);
+    }
+};
+
+
+// FP16 activation-stream siblings of the two GDN projection outputs.
+struct Nvfp4GdnInputF16Output {
+    static constexpr std::int32_t kQkvRows = Nvfp4GdnInputOutput::kQkvRows;
+    static constexpr std::int32_t kZRows   = Nvfp4GdnInputOutput::kZRows;
+
+    half* qkv;
+    half* z;
+
+    __device__ __forceinline__ half* destination(std::int32_t parent_row,
+                                                 std::int32_t token) const {
+        if (parent_row < kQkvRows) {
+            return qkv + static_cast<std::int64_t>(token) * kQkvRows + parent_row;
+        }
+        return z + static_cast<std::int64_t>(token) * kZRows + parent_row - kQkvRows;
+    }
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        *destination(parent_row, token) = __float2half_rn(value);
+    }
+};
+
+template <class Geometry>
+struct Nvfp4GdnInputF16ShardOutput {
+    static constexpr std::int32_t kKeyRows   = Nvfp4GdnInputSections<Geometry>::kKeyRows;
+    static constexpr std::int32_t kValueRows = Nvfp4GdnInputSections<Geometry>::kValueRows;
+    static constexpr std::int32_t kQkvRows   = 2 * kKeyRows + kValueRows;
+    static constexpr std::int32_t kZRows     = kValueRows;
+
+    half* qkv;
+    half* z;
+
+    __device__ __forceinline__ half* destination(std::int32_t parent_row,
+                                                 std::int32_t token) const {
+        if (parent_row < kQkvRows) {
+            return qkv + static_cast<std::int64_t>(token) * kQkvRows + parent_row;
+        }
+        return z + static_cast<std::int64_t>(token) * kZRows + parent_row - kQkvRows;
+    }
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        *destination(parent_row, token) = __float2half_rn(value);
     }
 };
 
