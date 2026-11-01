@@ -85,9 +85,20 @@ int main() {
     }
     try {
         int failures = 0;
-        failures += run_shape(14336, 5120, 1, 911U);
-        failures += run_shape(14336, 5120, 6, 912U);
-        failures += run_shape(14336, 5120, 32, 913U);
+        constexpr std::int32_t tokens[] = {1, 5, 8, 32, 128};
+        constexpr std::int32_t shapes[][2] = {
+            {14336, 5120},  // attention input
+            {16384, 5120},  // GDN input
+            {34816, 5120},  // MLP gate/up
+            {5120, 6144},   // attention output (residual)
+            {5120, 17408},  // MLP down (residual)
+        };
+        std::uint32_t seed = 900U;
+        for (const auto& shape : shapes) {
+            for (const std::int32_t t : tokens) {
+                failures += run_shape(shape[0], shape[1], t, seed++);
+            }
+        }
         failures += run_shape(14336, 5120, 40, 914U);
         failures += run_shape(14336, 5120, 127, 915U);
         failures += run_shape(14336, 5120, 4096, 901U);

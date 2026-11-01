@@ -1,5 +1,7 @@
 #include "ops/linear/w8/w8_dispatch.h"
 
+#include "ops/linear/w8/w8_launch.h"
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -317,6 +319,30 @@ void w8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
                  cudaStream_t stream) {
     const W8Launch launch = select_w8_launch(w.n, w.k, x.ne[1], policy);
     launch(x, w, out, stream);
+}
+
+void w8_f16_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                     cudaStream_t stream) {
+    if (x.dtype != DType::FP16 || out.dtype != DType::FP16) {
+        throw std::invalid_argument("w8 f16 linear: x/out must be FP16");
+    }
+    // LinearPolicy is a permission: a permissive policy admits A16, and the W8 A16 route is the
+    // only one with an FP16 activation form. Validate the shape domain against that table.
+    (void)select_w8_launch(w.n, w.k, x.ne[1], LinearPolicy::A16Only);
+#ifdef NINFER_VOLTA_BUILD
+    // The tuned sm_120a tables mix SIMT, MMA, and fused QPN routes; the generic warp-per-row SIMT
+    // kernel is the one that already exists for every shape on Volta, so the FP16 form uses it at
+    // every T. It is exact for any T and both registered W8 widths.
+    if (x.ne[1] <= 4) {
+        launch_w8_simt_r8_c4_f16(x, w, out, stream);
+    } else {
+        launch_w8_simt_r8_c8_f16(x, w, out, stream);
+    }
+#else
+    (void)policy;
+    (void)stream;
+    throw std::invalid_argument("w8 f16 linear requires the sm_70 build");
+#endif
 }
 
 } // namespace ninfer::ops::detail

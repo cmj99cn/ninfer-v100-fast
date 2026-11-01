@@ -17,8 +17,6 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr int kH = 24;
-constexpr int kHKV = 4;
 constexpr int kD = 256;
 constexpr int kPage = 64;
 constexpr int kGroup = 64;
@@ -46,36 +44,36 @@ std::int8_t encode_one(float x, float inv) {
     return static_cast<std::int8_t>(q);
 }
 
-std::int64_t code_index(int head, int position, int d) {
+std::int64_t code_index(int hkv, int head, int position, int d) {
     const int page = position / kPage;
     const int slot = position % kPage;
     return static_cast<std::int64_t>(d) +
            static_cast<std::int64_t>(kD) *
                (slot + static_cast<std::int64_t>(kPage) *
-                           (head + static_cast<std::int64_t>(kHKV) * page));
+                           (head + static_cast<std::int64_t>(hkv) * page));
 }
 
-std::int64_t scale_index(int head, int position, int group) {
+std::int64_t scale_index(int hkv, int head, int position, int group) {
     const int page = position / kPage;
     const int slot = position % kPage;
     return static_cast<std::int64_t>(group) +
            static_cast<std::int64_t>(kGroups) *
                (slot + static_cast<std::int64_t>(kPage) *
-                           (head + static_cast<std::int64_t>(kHKV) * page));
+                           (head + static_cast<std::int64_t>(hkv) * page));
 }
 
-HostCache encode_cache(const std::vector<__half>& k, const std::vector<__half>& v, int tokens,
-                       int pages) {
+HostCache encode_cache(const std::vector<__half>& k, const std::vector<__half>& v, int hkv,
+                       int tokens, int pages) {
     HostCache cache;
     const std::size_t elements =
-        static_cast<std::size_t>(kD) * kPage * kHKV * pages;
+        static_cast<std::size_t>(kD) * kPage * hkv * pages;
     cache.k_code.assign(elements, 0);
     cache.v_code.assign(elements, 0);
     const std::size_t scales =
-        static_cast<std::size_t>(kGroups) * kPage * kHKV * pages;
+        static_cast<std::size_t>(kGroups) * kPage * hkv * pages;
     cache.k_scale.assign(scales, 0U);
     cache.v_scale.assign(scales, 0U);
-    for (int head = 0; head < kHKV; ++head) {
+    for (int head = 0; head < hkv; ++head) {
         for (int token = 0; token < tokens; ++token) {
             for (int group = 0; group < kGroups; ++group) {
                 float k_abs = 0.0f;
@@ -85,7 +83,7 @@ HostCache encode_cache(const std::vector<__half>& k, const std::vector<__half>& 
                     const std::int64_t src =
                         static_cast<std::int64_t>(d) +
                         static_cast<std::int64_t>(kD) *
-                            (head + static_cast<std::int64_t>(kHKV) * token);
+                            (head + static_cast<std::int64_t>(hkv) * token);
                     k_abs = std::max(k_abs, std::fabs(__half2float(k[src])));
                     v_abs = std::max(v_abs, std::fabs(__half2float(v[src])));
                 }
@@ -95,17 +93,17 @@ HostCache encode_cache(const std::vector<__half>& k, const std::vector<__half>& 
                 const float vs = __half2float(vsh);
                 const float kinv = ks > 0.0f ? 1.0f / ks : 0.0f;
                 const float vinv = vs > 0.0f ? 1.0f / vs : 0.0f;
-                cache.k_scale[scale_index(head, token, group)] =
+                cache.k_scale[scale_index(hkv, head, token, group)] =
                     *reinterpret_cast<const std::uint16_t*>(&ksh);
-                cache.v_scale[scale_index(head, token, group)] =
+                cache.v_scale[scale_index(hkv, head, token, group)] =
                     *reinterpret_cast<const std::uint16_t*>(&vsh);
                 for (int i = 0; i < kGroup; ++i) {
                     const int d = group * kGroup + i;
                     const std::int64_t src =
                         static_cast<std::int64_t>(d) +
                         static_cast<std::int64_t>(kD) *
-                            (head + static_cast<std::int64_t>(kHKV) * token);
-                    const std::int64_t dst = code_index(head, token, d);
+                            (head + static_cast<std::int64_t>(hkv) * token);
+                    const std::int64_t dst = code_index(hkv, head, token, d);
                     cache.k_code[dst] =
                         encode_one(__half2float(k[src]), kinv);
                     cache.v_code[dst] =
@@ -117,28 +115,28 @@ HostCache encode_cache(const std::vector<__half>& k, const std::vector<__half>& 
     return cache;
 }
 
-double cache_value(const HostCache& cache, bool key, int head, int position, int d) {
-    const std::int64_t ci = code_index(head, position, d);
-    const std::int64_t si = scale_index(head, position, d / kGroup);
+double cache_value(const HostCache& cache, bool key, int hkv, int head, int position, int d) {
+    const std::int64_t ci = code_index(hkv, head, position, d);
+    const std::int64_t si = scale_index(hkv, head, position, d / kGroup);
     return static_cast<double>((key ? cache.k_code : cache.v_code)[ci]) *
            static_cast<double>(__half2float(__ushort_as_half((key ? cache.k_scale : cache.v_scale)[si])));
 }
 
-int run_case(int tokens, int start) {
+int run_case(int h, int hkv, int tokens, int start) {
     const int capacity = start + tokens;
     const int pages = (capacity + kPage - 1) / kPage;
-    const std::size_t qn = static_cast<std::size_t>(kD) * kH * tokens;
-    const std::size_t kvn = static_cast<std::size_t>(kD) * kHKV * tokens;
+    const std::size_t qn = static_cast<std::size_t>(kD) * h * tokens;
+    const std::size_t kvn = static_cast<std::size_t>(kD) * hkv * tokens;
     auto q = make_half(qn, 5001U + static_cast<std::uint32_t>(start));
     auto k = make_half(kvn, 5002U + static_cast<std::uint32_t>(start));
     auto v = make_half(kvn, 5003U + static_cast<std::uint32_t>(start));
 
-    const HostCache expected = encode_cache(k, v, tokens, pages);
+    const HostCache expected = encode_cache(k, v, hkv, tokens, pages);
 
     const std::size_t cache_elements =
-        static_cast<std::size_t>(kD) * kPage * kHKV * pages;
+        static_cast<std::size_t>(kD) * kPage * hkv * pages;
     const std::size_t scale_elements =
-        static_cast<std::size_t>(kGroups) * kPage * kHKV * pages;
+        static_cast<std::size_t>(kGroups) * kPage * hkv * pages;
     std::vector<std::int8_t> zero_codes(cache_elements, 0);
     std::vector<__half> zero_scales(scale_elements, __float2half_rn(0.0f));
     std::vector<std::int32_t> block_table(static_cast<std::size_t>(pages));
@@ -168,19 +166,19 @@ int run_case(int tokens, int start) {
     dbt.copy_from_host(block_table.data(), dbt.bytes());
     dpos.copy_from_host(positions.data(), dpos.bytes());
 
-    Tensor tk(dk.data(), DType::FP16, {kD, kHKV, tokens});
-    Tensor tv(dv.data(), DType::FP16, {kD, kHKV, tokens});
+    Tensor tk(dk.data(), DType::FP16, {kD, hkv, tokens});
+    Tensor tv(dv.data(), DType::FP16, {kD, hkv, tokens});
     Tensor tpos(dpos.data(), DType::I32, {tokens});
     PagedKVLayerView append_cache;
-    append_cache.k_pages = Tensor(dk_code.data(), DType::I8, {kD, kPage, kHKV, pages});
-    append_cache.v_pages = Tensor(dv_code.data(), DType::I8, {kD, kPage, kHKV, pages});
+    append_cache.k_pages = Tensor(dk_code.data(), DType::I8, {kD, kPage, hkv, pages});
+    append_cache.v_pages = Tensor(dv_code.data(), DType::I8, {kD, kPage, hkv, pages});
     append_cache.k_scale_pages =
-        Tensor(dk_scale.data(), DType::FP16, {kGroups, kPage, kHKV, pages});
+        Tensor(dk_scale.data(), DType::FP16, {kGroups, kPage, hkv, pages});
     append_cache.v_scale_pages =
-        Tensor(dv_scale.data(), DType::FP16, {kGroups, kPage, kHKV, pages});
+        Tensor(dv_scale.data(), DType::FP16, {kGroups, kPage, hkv, pages});
     append_cache.block_table = Tensor(dbt.data(), DType::I32, {pages});
     append_cache.head_dim = kD;
-    append_cache.num_kv_heads = kHKV;
+    append_cache.num_kv_heads = hkv;
     append_cache.quant_group = kGroup;
     append_cache.dtype = DType::I8;
 
@@ -192,16 +190,16 @@ int run_case(int tokens, int start) {
     const auto actual_k_scale = from_device<std::uint16_t>(dk_scale.data(), scale_elements);
     const auto actual_v_scale = from_device<std::uint16_t>(dv_scale.data(), scale_elements);
     int failures = 0;
-    for (int head = 0; head < kHKV; ++head) {
+    for (int head = 0; head < hkv; ++head) {
         for (int token = 0; token < tokens; ++token) {
             for (int group = 0; group < kGroups; ++group) {
-                const std::int64_t si = scale_index(head, token, group);
+                const std::int64_t si = scale_index(hkv, head, token, group);
                 if (actual_k_scale[si] != expected.k_scale[si] ||
                     actual_v_scale[si] != expected.v_scale[si]) {
                     ++failures;
                 }
                 for (int i = 0; i < kGroup; ++i) {
-                    const std::int64_t ci = code_index(head, token, group * kGroup + i);
+                    const std::int64_t ci = code_index(hkv, head, token, group * kGroup + i);
                     if (actual_k_code[ci] != expected.k_code[ci] ||
                         actual_v_code[ci] != expected.v_code[ci]) {
                         ++failures;
@@ -211,17 +209,17 @@ int run_case(int tokens, int start) {
         }
     }
     if (failures != 0) {
-        std::cerr << "gqa_attention_f16_i8: append mismatch T=" << tokens
-                  << " start=" << start << " count=" << failures << '\n';
+        std::cerr << "gqa_attention_f16_i8: append mismatch H=" << h << " HKV=" << hkv
+                  << " T=" << tokens << " start=" << start << " count=" << failures << '\n';
         return 1;
     }
 
-    Tensor tq(dq.data(), DType::FP16, {kD, kH, tokens});
-    Tensor tout(dout.data(), DType::FP16, {kD, kH, tokens});
+    Tensor tq(dq.data(), DType::FP16, {kD, h, tokens});
+    Tensor tout(dout.data(), DType::FP16, {kD, h, tokens});
     PagedKVLayerView cache = append_cache;
     const ops::GqaExecutionEnvelope envelope{1, static_cast<std::uint32_t>(capacity)};
     const std::size_t workspace_bytes =
-        ops::gqa_attention_workspace_capacity_bytes(kH, DType::I8, envelope, 1, tokens, tokens);
+        ops::gqa_attention_workspace_capacity_bytes(h, DType::I8, envelope, 1, tokens, tokens);
     DeviceArena workspace(workspace_bytes);
     ops::gqa_attention_cached(tq, tpos, 0.0625f, cache, envelope, workspace, tout, nullptr);
     cuda_synchronize();
@@ -229,8 +227,8 @@ int run_case(int tokens, int start) {
     const auto actual = from_device<std::uint16_t>(dout.data(), qn);
     double err2 = 0.0;
     double ref2 = 0.0;
-    for (int head = 0; head < kH; ++head) {
-        const int kv_head = head / (kH / kHKV);
+    for (int head = 0; head < h; ++head) {
+        const int kv_head = head / (h / hkv);
         for (int token = 0; token < tokens; ++token) {
             const int qpos = start + token;
             std::vector<double> scores(static_cast<std::size_t>(qpos + 1));
@@ -241,9 +239,9 @@ int run_case(int tokens, int start) {
                     const std::int64_t qi =
                         static_cast<std::int64_t>(d) +
                         static_cast<std::int64_t>(kD) *
-                            (head + static_cast<std::int64_t>(kH) * token);
+                            (head + static_cast<std::int64_t>(h) * token);
                     dot += static_cast<double>(__half2float(q[qi])) *
-                           cache_value(expected, true, kv_head, key, d);
+                           cache_value(expected, true, hkv, kv_head, key, d);
                 }
                 scores[static_cast<std::size_t>(key)] = dot * 0.0625;
                 max_score = std::max(max_score, scores[static_cast<std::size_t>(key)]);
@@ -257,12 +255,12 @@ int run_case(int tokens, int start) {
                 double ref = 0.0;
                 for (int key = 0; key <= qpos; ++key) {
                     ref += scores[static_cast<std::size_t>(key)] / sum *
-                           cache_value(expected, false, kv_head, key, d);
+                           cache_value(expected, false, hkv, kv_head, key, d);
                 }
                 const std::int64_t oi =
                     static_cast<std::int64_t>(d) +
                     static_cast<std::int64_t>(kD) *
-                        (head + static_cast<std::int64_t>(kH) * token);
+                        (head + static_cast<std::int64_t>(h) * token);
                 const double got = static_cast<double>(
                     __half2float(__ushort_as_half(actual[oi])));
                 const double err = got - ref;
@@ -272,8 +270,8 @@ int run_case(int tokens, int start) {
         }
     }
     const double rel = std::sqrt(err2 / std::max(ref2, 1.0e-30));
-    std::cout << "gqa_attention_f16_i8 T=" << tokens << " start=" << start
-              << " rel_l2=" << rel << '\n';
+    std::cout << "gqa_attention_f16_i8 H=" << h << " HKV=" << hkv << " T=" << tokens
+              << " start=" << start << " rel_l2=" << rel << '\n';
     if (!(rel < 5.0e-3)) { ++failures; }
     return failures;
 }
@@ -287,8 +285,11 @@ int main() {
     }
     try {
         int failures = 0;
-        failures += run_case(4, 0);
-        failures += run_case(64, 0);
+        for (const int tokens : {4, 64}) {
+            failures += run_case(24, 4, tokens, 0);
+            failures += run_case(12, 2, tokens, 0);
+            failures += run_case(16, 2, tokens, 0);
+        }
         std::cout << (failures ? "FAIL" : "OK") << " gqa_attention_f16_i8\n";
         return failures ? 1 : 0;
     } catch (const std::exception& error) {

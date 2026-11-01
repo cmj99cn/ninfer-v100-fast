@@ -42,7 +42,8 @@ void launch_q4_simt(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
     const std::int32_t out_ld = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
     const dim3 grid(static_cast<unsigned>(div_up(kQkRows, Schedule::kRowsPerCta)),
                     static_cast<unsigned>(div_up(cols, Schedule::kColsPerTile)), 1u);
-    q4_rowsplit_gemm_simt_kernel<Schedule, Full><<<grid, Schedule::kThreads, 0, stream>>>(
+    q4_rowsplit_gemm_simt_kernel<Schedule, Full, false, 0, Q4SimtStoreEpilogue, false, false,
+                                 __nv_bfloat16><<<grid, Schedule::kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
         nullptr, out_ld, 0, kQkRows, kHidden, cols, weight.padded_shape[1]);

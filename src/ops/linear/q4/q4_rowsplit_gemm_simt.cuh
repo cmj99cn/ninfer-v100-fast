@@ -16,6 +16,7 @@
 #include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/common/activation.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
@@ -114,9 +115,9 @@ __device__ __forceinline__ void q4_simt_issue_stage(uint4* __restrict__ shared_c
 // same body serve either a direct global-memory read (origin = x + col0*k + stage*kStageK,
 // stride = k) or a block-staged shared-memory read (origin = the shared tile, stride = kStageK)
 // without duplicating the dequant/FMA math -- see the staging rationale in the kernel below.
-template <class Schedule, bool FullStage, bool FullCols>
+template <class Schedule, bool FullStage, bool FullCols, class Act = __nv_bfloat16>
 __device__ __forceinline__ void
-q4_simt_consume_stage(const __nv_bfloat16* __restrict__ x_origin, std::int64_t x_col_stride,
+q4_simt_consume_stage(const Act* __restrict__ x_origin, std::int64_t x_col_stride,
                       int active_cols, int active_groups,
                       const uint4* __restrict__ shared_codes,
                       const std::uint32_t* __restrict__ shared_scales, int lane,
@@ -145,61 +146,60 @@ q4_simt_consume_stage(const __nv_bfloat16* __restrict__ x_origin, std::int64_t x
                     const uint4 values =
                         load_vec<uint4>(x_origin + static_cast<std::int64_t>(col) * x_col_stride +
                                         xk);
-                    const float2 x0 = bf16x2_bits_to_float2(values.x);
-                    const float2 x1 = bf16x2_bits_to_float2(values.y);
-                    const float2 x2 = bf16x2_bits_to_float2(values.z);
-                    const float2 x3 = bf16x2_bits_to_float2(values.w);
-                    acc[col]        = fmaf(weights[0], x0.x, acc[col]);
-                    acc[col]        = fmaf(weights[1], x0.y, acc[col]);
-                    acc[col]        = fmaf(weights[2], x1.x, acc[col]);
-                    acc[col]        = fmaf(weights[3], x1.y, acc[col]);
-                    acc[col]        = fmaf(weights[4], x2.x, acc[col]);
-                    acc[col]        = fmaf(weights[5], x2.y, acc[col]);
-                    acc[col]        = fmaf(weights[6], x3.x, acc[col]);
-                    acc[col]        = fmaf(weights[7], x3.y, acc[col]);
+                    const auto* xe = reinterpret_cast<const Act*>(&values);
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        acc[col] = fmaf(weights[e], ActivationTraits<Act>::load(xe + e), acc[col]);
+                    }
                 }
             }
         }
     }
 }
 
-struct Q4SimtStoreEpilogue {
+template <class Act>
+struct Q4SimtStoreEpilogueOf {
     template <bool SplitOutput, int SplitRow, int Cols>
     __device__ __forceinline__ void
-    operator()(__nv_bfloat16* out, __nv_bfloat16* out_tail, std::int32_t out_ld,
-               std::int32_t out_tail_ld, std::int32_t row, std::int32_t col0,
-               std::int32_t active_cols, const float (&values)[Cols]) const {
+    operator()(Act* out, Act* out_tail, std::int32_t out_ld, std::int32_t out_tail_ld,
+               std::int32_t row, std::int32_t col0, std::int32_t active_cols,
+               const float (&values)[Cols]) const {
 #pragma unroll
         for (int col = 0; col < Cols; ++col) {
             if (col >= active_cols) { continue; }
             if constexpr (SplitOutput) {
                 if (row < SplitRow) {
-                    out[static_cast<std::int64_t>(col0 + col) * out_ld + row] =
-                        __float2bfloat16(values[col]);
+                    ActivationTraits<Act>::store(
+                        out + static_cast<std::int64_t>(col0 + col) * out_ld + row, values[col]);
                 } else {
-                    out_tail[static_cast<std::int64_t>(col0 + col) * out_tail_ld + row - SplitRow] =
-                        __float2bfloat16(values[col]);
+                    ActivationTraits<Act>::store(
+                        out_tail + static_cast<std::int64_t>(col0 + col) * out_tail_ld + row -
+                            SplitRow,
+                        values[col]);
                 }
             } else {
-                out[static_cast<std::int64_t>(col0 + col) * out_ld + row] =
-                    __float2bfloat16(values[col]);
+                ActivationTraits<Act>::store(
+                    out + static_cast<std::int64_t>(col0 + col) * out_ld + row, values[col]);
             }
         }
     }
 };
 
+using Q4SimtStoreEpilogue = Q4SimtStoreEpilogueOf<__nv_bfloat16>;
+
 template <class Schedule, bool Full, bool SplitOutput = false, int SplitRow = 0,
-          class Epilogue = Q4SimtStoreEpilogue, bool TriggerPdl = false, bool JoinPdl = false>
+          class Epilogue = Q4SimtStoreEpilogue, bool TriggerPdl = false, bool JoinPdl = false,
+          class Act = __nv_bfloat16>
 __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
-        kLaunchBoundsMinBlocks) void q4_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
+        kLaunchBoundsMinBlocks) void q4_rowsplit_gemm_simt_kernel(const Act* __restrict__ x,
                                                                   const std::
                                                                       uint8_t* __restrict__ codes,
                                                                   const std::
                                                                       uint8_t* __restrict__ scales,
-                                                                  __nv_bfloat16* __restrict__ out,
-                                                                  __nv_bfloat16* __restrict__ out_tail,
+                                                                  Act* __restrict__ out,
+                                                                  Act* __restrict__ out_tail,
                                                                   std::int32_t out_ld,
                                                                   std::int32_t out_tail_ld,
                                                                   std::int32_t rows, std::int32_t k,
@@ -231,7 +231,7 @@ __global__ __launch_bounds__(
     // ~8.5 KiB of code/scale staging -- still inside the 48 KiB static budget, and free in
     // occupancy terms because this kernel is register-limited (ncu: Block Limit Registers 2)
     // well before shared memory binds.
-    __shared__ __align__(16) __nv_bfloat16 x_stage[kColsPerTile * Schedule::kStageK];
+    __shared__ __align__(16) Act x_stage[kColsPerTile * Schedule::kStageK];
     static_assert(kColsPerTile * Schedule::kStageK * static_cast<int>(sizeof(__nv_bfloat16)) +
                           Schedule::kSharedBytes <=
                       48 * 1024,
@@ -322,7 +322,7 @@ __global__ __launch_bounds__(
             }
         }
         __syncthreads();
-        q4_simt_consume_stage<Schedule, kFull, kFull>(x_stage, Schedule::kStageK, active_cols,
+        q4_simt_consume_stage<Schedule, kFull, kFull, Act>(x_stage, Schedule::kStageK, active_cols,
                                                       active_groups, shared_codes[warp][buffer],
                                                       shared_scales[warp][buffer], lane, acc);
         __syncthreads();
@@ -335,7 +335,7 @@ __global__ __launch_bounds__(
 #endif
     }
 
-    if constexpr (std::is_same_v<Epilogue, Q4SimtStoreEpilogue>) {
+    if constexpr (std::is_same_v<Epilogue, Q4SimtStoreEpilogueOf<Act>>) {
 #pragma unroll
         for (int col = 0; col < kColsPerTile; ++col) {
             if (kFull || col < active_cols) {
@@ -343,15 +343,17 @@ __global__ __launch_bounds__(
                 if (lane == 0 && row_active) {
                     if constexpr (SplitOutput) {
                         if (row < SplitRow) {
-                            out[static_cast<std::int64_t>(col0 + col) * out_ld + row] =
-                                __float2bfloat16(sum);
+                            ActivationTraits<Act>::store(
+                                out + static_cast<std::int64_t>(col0 + col) * out_ld + row, sum);
                         } else {
-                            out_tail[static_cast<std::int64_t>(col0 + col) * out_tail_ld + row -
-                                     SplitRow] = __float2bfloat16(sum);
+                            ActivationTraits<Act>::store(
+                                out_tail + static_cast<std::int64_t>(col0 + col) * out_tail_ld +
+                                    row - SplitRow,
+                                sum);
                         }
                     } else {
-                        out[static_cast<std::int64_t>(col0 + col) * out_ld + row] =
-                            __float2bfloat16(sum);
+                        ActivationTraits<Act>::store(
+                            out + static_cast<std::int64_t>(col0 + col) * out_ld + row, sum);
                     }
                 }
             }

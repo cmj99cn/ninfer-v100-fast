@@ -69,10 +69,11 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
                                LinearPolicy policy) {
     const bool bf16 = x.dtype == DType::BF16 && out.dtype == DType::BF16;
     const bool f16 = x.dtype == DType::FP16 && out.dtype == DType::FP16 &&
-                     (w.qtype == QType::NVFP4 || w.qtype == QType::FP8_E4M3FN_ROW_BF16S);
+                     (w.qtype == QType::NVFP4 || w.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
+                      w.qtype == QType::W8G32_F16S || w.qtype == QType::Q4G64_F16S);
     if (!bf16 && !f16) {
         throw std::invalid_argument(
-            "linear: x/out must be BF16, or FP16 with an NVFP4/FP8 weight");
+            "linear: x/out must be BF16, or FP16 with an NVFP4/FP8/W8/Q4 weight");
     }
     (void)checked_numel(x, "x");
     (void)checked_numel(out, "out");
@@ -114,7 +115,11 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::ggml_k_linear(x, w, out, stream);
         return;
     case QType::Q4G64_F16S:
-        detail::q4_dispatch(x, w, out, policy, workspace, stream);
+        if (x.dtype == DType::FP16) {
+            detail::q4_f16_dispatch(x, w, out, policy, stream);
+        } else {
+            detail::q4_dispatch(x, w, out, policy, workspace, stream);
+        }
         return;
     case QType::Q5G64_F16S:
         detail::q5_dispatch(x, w, out, policy, stream);
@@ -123,7 +128,11 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q6_dispatch(x, w, out, policy, stream);
         return;
     case QType::W8G32_F16S:
-        detail::w8_dispatch(x, w, out, policy, stream);
+        if (x.dtype == DType::FP16) {
+            detail::w8_f16_dispatch(x, w, out, policy, stream);
+        } else {
+            detail::w8_dispatch(x, w, out, policy, stream);
+        }
         return;
     case QType::BF16_CTRL:
         detail::bf16_dispatch(x, w, out, policy, stream);

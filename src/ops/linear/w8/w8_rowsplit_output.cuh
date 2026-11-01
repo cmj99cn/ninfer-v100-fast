@@ -12,12 +12,13 @@ enum class W8Epilogue {
     SwiGluSplitHalf,
 };
 
-struct W8OutputTile {
-    __nv_bfloat16* data;
+template <class T>
+struct W8OutputTileOf {
+    T* data;
     std::int32_t leading_dim;
     std::int32_t parent_row_begin;
 
-    __device__ __forceinline__ __nv_bfloat16* at(std::int32_t parent_row, std::int32_t col) const {
+    __device__ __forceinline__ T* at(std::int32_t parent_row, std::int32_t col) const {
         return data + static_cast<std::int64_t>(col) * leading_dim + parent_row - parent_row_begin;
     }
 
@@ -26,11 +27,14 @@ struct W8OutputTile {
     }
 };
 
+using W8OutputTile = W8OutputTileOf<__nv_bfloat16>;
+
 // Split-output callers must align CTA row tiles to every segment boundary so one tile never
 // straddles two final allocations.
 
-struct W8ContiguousOutput {
-    __nv_bfloat16* data;
+template <class T>
+struct W8ContiguousOutputOf {
+    T* data;
     std::int32_t leading_dim;
 
     __device__ __forceinline__ std::int32_t row_begin(std::int32_t block,
@@ -38,10 +42,12 @@ struct W8ContiguousOutput {
         return block * tile_rows;
     }
 
-    __device__ __forceinline__ W8OutputTile tile(std::int32_t /*parent_row_begin*/) const {
+    __device__ __forceinline__ W8OutputTileOf<T> tile(std::int32_t /*parent_row_begin*/) const {
         return {data, leading_dim, 0};
     }
 };
+
+using W8ContiguousOutput = W8ContiguousOutputOf<__nv_bfloat16>;
 
 template <std::int32_t Rows0, std::int32_t Rows1>
 struct W8SplitOutput2 {

@@ -40,7 +40,8 @@ void launch_q4_simt(const Tensor& x, const Weight& weight, Tensor& q, Tensor& ke
     const std::int32_t cols = x.ne[1];
     const dim3 grid(static_cast<unsigned>(div_up(kParentRows, Schedule::kRowsPerCta)),
                     static_cast<unsigned>(div_up(cols, Schedule::kColsPerTile)), 1u);
-    q4_rowsplit_gemm_simt_kernel<Schedule, Full, true, kSplitRow>
+    q4_rowsplit_gemm_simt_kernel<Schedule, Full, true, kSplitRow, Q4SimtStoreEpilogue, false,
+                                     false, __nv_bfloat16>
         <<<grid, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),

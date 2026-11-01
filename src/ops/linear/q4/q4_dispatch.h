@@ -13,4 +13,9 @@ Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  WorkspaceArena* workspace, cudaStream_t stream);
 
+
+// FP16 activation/output form. The persistent weight stays Q4; only the activation boundary moves.
+void q4_f16_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                     cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

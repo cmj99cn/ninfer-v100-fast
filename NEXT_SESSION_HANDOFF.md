@@ -102,6 +102,21 @@ host 侧：
 验证：`ninfer_linear_nvfp4_f16_test` 通过；nvfp4/linear_add/linear_pair/linear_swiglu/
 fp8 相关测试全部通过。
 
+### 4.4 FP16 W8 / Q4 linear（MTP 投影与 draft head）
+
+- 新增 `src/ops/common/activation.cuh`（`ActivationTraits<T>`，GQA 与 linear 共用）；
+  `gqa_activation.cuh` 改为别名。
+- W8：`w8_rowsplit_output.cuh` 的 tile/contiguous output 模板化；
+  `w8_rowsplit_gemm_simt.cuh/.cu` 增加 `Act`（Volta 上 `launch_w8_small_t` 实际走 SIMT）；
+  新增 `launch_w8_simt_r8_c4_f16/_c8_f16` 与 `w8_f16_dispatch`。
+- Q4：`q4_rowsplit_gemm_simt.cuh/.cu` 增加 `Act`（含 Volta 的 shared stage）；
+  新增 `launch_q4_simt_r8_c4_f16/_c8_f16` 与 `q4_f16_dispatch`（draft head）。
+- `linear.cpp`：FP16 + W8/Q4 分派到对应 f16 入口。
+- 新测试：
+  - `test_w8_f16.cpp`：MTP 四个投影形状，T=1/4/8，rel L2 < 3.3e-4；
+  - `test_q4_f16.cpp`：draft head 131072x5120，T=1/4/8，rel L2 < 3.0e-4。
+- 回归：W8/Q4 的 BF16 linear、swiglu、attn_input_proj、GDN input/snapshot/record 全过。
+
 ### 4.3 FP16 FP8 linear（output head / vocabulary）
 
 - `src/ops/linear/fp8/fp8_output.cuh`：新增 `Fp8Fp16ContiguousOutput`；
@@ -128,10 +143,12 @@ fp8 相关测试全部通过。
    **可选策略**：FP16 首版在 `Variant` 里把融合叶子拆成 `ops::linear` + 已支持 FP16 的
    elementwise（`silu_mul`/`residual_add`），先保证正确，再加融合 kernel 的 FP16 输出。
    注意 `split_launch` / column_parallel / row_parallel 也要一起处理。
-3. **MTP**：`mtp_format = W8G32_F16S`，draft head = `Q4G64_F16S`。
-   W8/Q4 的 `select_*_launch` 路由表把 MTP 形状（5120x10240、14336x5120、34816x5120、
-   5120x17408、draft_head）在 T≤40/48 全部送到 `w8_small_t` / `q4` small_t，
-   **不是 QPN**，所以不能照抄 NVFP4/FP8 的做法；需要模板化 W8/Q4 的 small_t（及 `linear_pair`）。
+3. **MTP**：W8 plain linear 与 Q4 draft head 的 FP16 已完成（见 4.4）。
+   仍缺：
+   - `linear_pair`（MTP k/v）：**计划在 `Variant` 层拆成两次 `ops::linear`**，不新增 pair FP16 kernel；
+   - `mtp_split_attn_in`（`src/ops/wrapper/mtp_pack.cpp`）与 `mtp_pack_fc_input` 仍只接受 BF16，
+     需要模板化；
+   - MTP 的 sampling/draft-token 产出边界需要确认 FP16→logits 无层间 cast。
 4. **GDN 剩余叶子**：norm+gating 融合、conv snapshot/record、recurrent 的 FP16 入口已在
    `gdn_gating_proj_f16` / `causal_conv1d_f16` / `gdn_f16`，但融合 wrapper 仍只接受 BF16。
 5. **runtime 接线**：
