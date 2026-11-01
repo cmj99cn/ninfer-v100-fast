@@ -532,6 +532,7 @@ ninfer_add_op_test(ninfer_gdn_input_proj_test
   SOURCES ops/test_gdn_input_proj.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_linear_test(ninfer_gdn_input_proj_f16_test ops/test_gdn_input_proj_f16.cpp)
+ninfer_add_linear_test(ninfer_gdn_input_proj_conv_f16_test ops/test_gdn_input_proj_conv_f16.cpp)
 ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
   SOURCES ops/test_gdn_input_proj_conv_snapshot.cpp
   LIBRARIES ninfer_ops)

@@ -40,8 +40,9 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, 
 }
 
 void require_conv_tensor(const Tensor& tensor, std::int32_t rows, std::int32_t width,
-                         std::int32_t batch, const char* op, const char* label) {
-    if (tensor.dtype != DType::BF16 || tensor.ne[0] != rows || tensor.ne[1] != width ||
+                         std::int32_t batch, const char* op, const char* label,
+                         DType expected = DType::BF16) {
+    if (tensor.dtype != expected || tensor.ne[0] != rows || tensor.ne[1] != width ||
         tensor.ne[2] != batch || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
         !aligned_to(tensor.data, 16)) {
         throw std::invalid_argument(std::string(op) + ": invalid " + label);
@@ -66,7 +67,8 @@ struct ConvGeometry {
     std::int32_t aggregate_columns;
 };
 
-ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden) {
+ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden,
+                                    DType act = DType::BF16) {
     constexpr std::int32_t kMaximumBatch = 8;
     constexpr std::int32_t kMaximumWidth = 16;
     const std::int32_t width             = x.ne[1];
@@ -74,11 +76,12 @@ ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden) {
     if (width <= 0 || batch <= 0 || batch > kMaximumBatch || (batch > 1 && width > kMaximumWidth)) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot: unsupported B/W domain");
     }
-    require_conv_tensor(x, hidden, width, batch, "gdn_input_proj_conv_snapshot", "x");
+    require_conv_tensor(x, hidden, width, batch, "gdn_input_proj_conv_snapshot", "x", act);
     return {width, batch, width * batch};
 }
 
-ConvGeometry require_record_input(const Tensor& x, std::int32_t hidden) {
+ConvGeometry require_record_input(const Tensor& x, std::int32_t hidden,
+                                  DType act = DType::BF16) {
     constexpr std::int32_t kMaximumBatch = 8;
     constexpr std::int32_t kMinimumWidth = 2;
     constexpr std::int32_t kMaximumWidth = 16;
@@ -87,16 +90,16 @@ ConvGeometry require_record_input(const Tensor& x, std::int32_t hidden) {
     if (width < kMinimumWidth || width > kMaximumWidth || batch <= 0 || batch > kMaximumBatch) {
         throw std::invalid_argument("gdn_input_proj_conv_record: unsupported B/T domain");
     }
-    require_conv_tensor(x, hidden, width, batch, "gdn_input_proj_conv_record", "x");
+    require_conv_tensor(x, hidden, width, batch, "gdn_input_proj_conv_record", "x", act);
     return {width, batch, width * batch};
 }
 
 void require_snapshot_operands(const Tensor& conv_weight, const Tensor& conv_states,
                                const Tensor& valid_columns, const Tensor& initial_state_slots,
                                const Tensor& snapshot_base_slots, std::int32_t channels,
-                               ConvGeometry geometry) {
+                               ConvGeometry geometry, DType act = DType::BF16) {
     require_matrix(conv_weight, channels, 4, "conv weight");
-    if (conv_states.dtype != DType::BF16 || conv_states.ne[0] != 3 ||
+    if (conv_states.dtype != act || conv_states.ne[0] != 3 ||
         conv_states.ne[1] != channels || conv_states.ne[2] < geometry.aggregate_columns ||
         conv_states.ne[3] != 1 || !conv_states.is_contiguous() ||
         !aligned_to(conv_states.data, 16)) {
@@ -124,9 +127,10 @@ Tensor flatten_columns(const Tensor& tensor, std::int32_t rows, ConvGeometry geo
 
 void require_record_operands(const Tensor& conv_weight, const Tensor& conv_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
-                             std::int32_t channels, ConvGeometry geometry) {
+                             std::int32_t channels, ConvGeometry geometry,
+                             DType act = DType::BF16) {
     require_matrix(conv_weight, channels, 4, "conv weight");
-    if (conv_states.dtype != DType::BF16 || conv_states.ne[0] != 3 ||
+    if (conv_states.dtype != act || conv_states.ne[0] != 3 ||
         conv_states.ne[1] != channels || conv_states.ne[2] <= 0 || conv_states.ne[3] != 1 ||
         !conv_states.is_contiguous() || !aligned_to(conv_states.data, 16)) {
         throw std::invalid_argument("gdn_input_proj_conv_record: invalid convolution state");
@@ -409,9 +413,10 @@ struct ProjectedWorkspace {
 
 template <class Allocator>
 ProjectedWorkspace allocate_projected_workspace(Allocator& allocator, std::int32_t channels,
-                                                std::int32_t tokens) {
+                                                std::int32_t tokens,
+                                                DType dtype = DType::BF16) {
     ProjectedWorkspace out;
-    out.projected = allocator.alloc(DType::BF16, {channels, tokens});
+    out.projected = allocator.alloc(dtype, {channels, tokens});
     return out;
 }
 
@@ -433,13 +438,13 @@ void compose_batched_snapshot(const Tensor& x, const Tensor& conv_weight, Tensor
     const std::int32_t channels = query_rows + key_rows + value_rows;
     auto scope                  = workspace.scope();
     ProjectedWorkspace scratch =
-        allocate_projected_workspace(workspace, channels, geometry.aggregate_columns);
+        allocate_projected_workspace(workspace, channels, geometry.aggregate_columns, x.dtype);
 
     Tensor x_flat = flatten_columns(x, x.ne[0], geometry);
     Tensor z_flat = flatten_columns(z, z.ne[0], geometry);
     project(x_flat, scratch.projected, z_flat);
 
-    Tensor projected(scratch.projected.data, DType::BF16,
+    Tensor projected(scratch.projected.data, x.dtype,
                      {channels, geometry.width, geometry.batch});
     detail::gdn_projected_conv_snapshot_launch(projected, conv_weight, conv_states, valid_columns,
                                                initial_state_slots, snapshot_base_slots, query, key,
@@ -499,6 +504,35 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
         constexpr std::int32_t kZRows      = 6144;
         constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
         constexpr std::int32_t kParentRows = kChannels + kZRows;
+        if (x.dtype == DType::FP16) {
+            constexpr const char* op = "gdn_input_proj_conv_snapshot";
+            const ConvGeometry geometry = require_snapshot_input(x, kHidden, DType::FP16);
+            detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj_conv_snapshot");
+            if (weight.n != kParentRows || weight.k != kHidden) {
+                throw std::invalid_argument(
+                    "nvfp4 gdn_input_proj_conv_snapshot: unsupported weight shape");
+            }
+            require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                                      snapshot_base_slots, kChannels, geometry, DType::FP16);
+            require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch, op, "query",
+                                DType::FP16);
+            require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch, op, "key",
+                                DType::FP16);
+            require_conv_tensor(value, kValueRows, geometry.width, geometry.batch, op, "value",
+                                DType::FP16);
+            require_conv_tensor(z, kZRows, geometry.width, geometry.batch, op, "z", DType::FP16);
+            require_snapshot_nonoverlap(x, conv_weight, conv_states, valid_columns,
+                                        initial_state_slots, snapshot_base_slots, query, key, value,
+                                        z, workspace);
+            compose_batched_snapshot(
+                x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                snapshot_base_slots, query, key, value, z, kQueryRows, kKeyRows, kValueRows, geometry,
+                workspace, stream,
+                [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
+                    gdn_input_proj(x_flat, weight, projected, z_flat, policy, workspace, stream);
+                });
+            return;
+        }
         const ConvGeometry geometry        = require_snapshot_input(x, kHidden);
         detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj_conv_snapshot");
         if (weight.n != kParentRows || weight.k != kHidden) {
@@ -672,6 +706,36 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         constexpr std::int32_t kZRows      = 6144;
         constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
         constexpr std::int32_t kParentRows = kChannels + kZRows;
+        if (x.dtype == DType::FP16) {
+            constexpr const char* op = "gdn_input_proj_conv_record";
+            const ConvGeometry geometry = require_record_input(x, kHidden, DType::FP16);
+            detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj_conv_record");
+            if (weight.n != kParentRows || weight.k != kHidden) {
+                throw std::invalid_argument(
+                    "nvfp4 gdn_input_proj_conv_record: unsupported weight shape");
+            }
+            require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                                    kChannels, geometry, DType::FP16);
+            require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch, op,
+                                "conv record", DType::FP16);
+            require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch, op, "query",
+                                DType::FP16);
+            require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch, op, "key",
+                                DType::FP16);
+            require_conv_tensor(value, kValueRows, geometry.width, geometry.batch, op, "value",
+                                DType::FP16);
+            require_conv_tensor(z, kZRows, geometry.width, geometry.batch, op, "z", DType::FP16);
+            require_record_nonoverlap(x, conv_weight, conv_states, valid_columns,
+                                      initial_state_slots, conv_record, query, key, value, z,
+                                      workspace);
+            compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                           conv_record, query, key, value, z, geometry, workspace, stream,
+                           [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
+                               gdn_input_proj(x_flat, weight, record_flat, z_flat, policy,
+                                              workspace, stream);
+                           });
+            return;
+        }
         const ConvGeometry geometry        = require_record_input(x, kHidden);
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
             throw std::invalid_argument("NVFP4 gdn_input_proj_conv_record admits only A16 or A4");
@@ -729,6 +793,36 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         constexpr std::int32_t kZRows      = 6144;
         constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
         constexpr std::int32_t kParentRows = kChannels + kZRows;
+        if (x.dtype == DType::FP16) {
+            constexpr const char* op = "gdn_input_proj_conv_record";
+            const ConvGeometry geometry = require_record_input(x, kHidden, DType::FP16);
+            detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj_conv_record");
+            if (weight.n != kParentRows || weight.k != kHidden) {
+                throw std::invalid_argument(
+                    "nvfp4 gdn_input_proj_conv_record: unsupported weight shape");
+            }
+            require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                                    kChannels, geometry, DType::FP16);
+            require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch, op,
+                                "conv record", DType::FP16);
+            require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch, op, "query",
+                                DType::FP16);
+            require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch, op, "key",
+                                DType::FP16);
+            require_conv_tensor(value, kValueRows, geometry.width, geometry.batch, op, "value",
+                                DType::FP16);
+            require_conv_tensor(z, kZRows, geometry.width, geometry.batch, op, "z", DType::FP16);
+            require_record_nonoverlap(x, conv_weight, conv_states, valid_columns,
+                                      initial_state_slots, conv_record, query, key, value, z,
+                                      workspace);
+            compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                           conv_record, query, key, value, z, geometry, workspace, stream,
+                           [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
+                               gdn_input_proj(x_flat, weight, record_flat, z_flat, policy,
+                                              workspace, stream);
+                           });
+            return;
+        }
         const ConvGeometry geometry        = require_record_input(x, kHidden);
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("FP8 gdn_input_proj_conv_record admits only A16 or A8");
@@ -1474,13 +1568,16 @@ ConvGeometry validate_snapshot_shard_rank(const Tensor& x, const Tensor& conv_we
                                           const Tensor& key, const Tensor& value, const Tensor& z,
                                           int tp) {
     constexpr const char* kOp   = "gdn_input_proj_conv_snapshot";
-    const ConvGeometry geometry = require_snapshot_input(x, kShardHidden);
+    const DType act             = x.dtype;
+    const ConvGeometry geometry = require_snapshot_input(x, kShardHidden, act);
     require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
-                              snapshot_base_slots, kFullConvChannels / tp, geometry);
-    require_conv_tensor(query, kFullConvQueryRows / tp, geometry.width, geometry.batch, kOp, "query");
-    require_conv_tensor(key, kFullConvKeyRows / tp, geometry.width, geometry.batch, kOp, "key");
-    require_conv_tensor(value, kFullConvValueRows / tp, geometry.width, geometry.batch, kOp, "value");
-    require_conv_tensor(z, kFullZRows / tp, geometry.width, geometry.batch, kOp, "z");
+                              snapshot_base_slots, kFullConvChannels / tp, geometry, act);
+    require_conv_tensor(query, kFullConvQueryRows / tp, geometry.width, geometry.batch, kOp, "query",
+                        act);
+    require_conv_tensor(key, kFullConvKeyRows / tp, geometry.width, geometry.batch, kOp, "key", act);
+    require_conv_tensor(value, kFullConvValueRows / tp, geometry.width, geometry.batch, kOp, "value",
+                        act);
+    require_conv_tensor(z, kFullZRows / tp, geometry.width, geometry.batch, kOp, "z", act);
     return geometry;
 }
 
@@ -1491,15 +1588,18 @@ ConvGeometry validate_record_shard_rank(const Tensor& x, const Tensor& conv_weig
                                         const Tensor& key, const Tensor& value, const Tensor& z,
                                         int tp) {
     constexpr const char* kOp   = "gdn_input_proj_conv_record";
-    const ConvGeometry geometry = require_record_input(x, kShardHidden);
+    const DType act             = x.dtype;
+    const ConvGeometry geometry = require_record_input(x, kShardHidden, act);
     require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
-                            kFullConvChannels / tp, geometry);
+                            kFullConvChannels / tp, geometry, act);
     require_conv_tensor(conv_record, kFullConvChannels / tp, geometry.width, geometry.batch, kOp,
-                        "conv record");
-    require_conv_tensor(query, kFullConvQueryRows / tp, geometry.width, geometry.batch, kOp, "query");
-    require_conv_tensor(key, kFullConvKeyRows / tp, geometry.width, geometry.batch, kOp, "key");
-    require_conv_tensor(value, kFullConvValueRows / tp, geometry.width, geometry.batch, kOp, "value");
-    require_conv_tensor(z, kFullZRows / tp, geometry.width, geometry.batch, kOp, "z");
+                        "conv record", act);
+    require_conv_tensor(query, kFullConvQueryRows / tp, geometry.width, geometry.batch, kOp, "query",
+                        act);
+    require_conv_tensor(key, kFullConvKeyRows / tp, geometry.width, geometry.batch, kOp, "key", act);
+    require_conv_tensor(value, kFullConvValueRows / tp, geometry.width, geometry.batch, kOp, "value",
+                        act);
+    require_conv_tensor(z, kFullZRows / tp, geometry.width, geometry.batch, kOp, "z", act);
     return geometry;
 }
 
@@ -1639,7 +1739,7 @@ void gdn_input_proj_conv_snapshot_column_parallel(
         WorkspaceArena& arena  = *workspace[slot];
         auto scope             = arena.scope();
         Tensor projected =
-            arena.alloc(DType::BF16, {conv_channels, geometry[slot].aggregate_columns});
+            arena.alloc(x[slot].dtype, {conv_channels, geometry[slot].aggregate_columns});
         compose_shard_conv(x[slot], projected, z_dst[slot], z_rows, geometry[slot],
                            [&](const Tensor& x_flat, Tensor& out, Tensor& z_flat) {
                                if (w.qtype == QType::GGML_K) {
@@ -1652,7 +1752,7 @@ void gdn_input_proj_conv_snapshot_column_parallel(
                                                                         policy, &arena, stream);
                                }
                            });
-        Tensor projected_3d(projected.data, DType::BF16,
+        Tensor projected_3d(projected.data, x[slot].dtype,
                             {conv_channels, geometry[slot].width, geometry[slot].batch});
         detail::gdn_projected_conv_snapshot_launch(
             projected_3d, conv_weight[slot], states[slot], valid_columns[slot],
@@ -1705,14 +1805,14 @@ void gdn_input_proj_conv_snapshot_column_parallel(
         WorkspaceArena& arena = *workspace[slot];
         auto scope            = arena.scope();
         Tensor projected =
-            arena.alloc(DType::BF16, {conv_channels, geometry[slot].aggregate_columns});
+            arena.alloc(x[slot].dtype, {conv_channels, geometry[slot].aggregate_columns});
         compose_shard_conv(x[slot], projected, z_dst[slot], z_rows, geometry[slot],
                            [&](const Tensor& x_flat, Tensor& out, Tensor& z_flat) {
                                detail::q4_q5_gdn_input_dispatch(x_flat, query_key_weight[slot],
                                                                 value_z_weight[slot], out, z_flat,
                                                                 arena, stream);
                            });
-        Tensor projected_3d(projected.data, DType::BF16,
+        Tensor projected_3d(projected.data, x[slot].dtype,
                             {conv_channels, geometry[slot].width, geometry[slot].batch});
         detail::gdn_projected_conv_snapshot_launch(
             projected_3d, conv_weight[slot], states[slot], valid_columns[slot],
