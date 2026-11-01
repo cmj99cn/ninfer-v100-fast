@@ -46,7 +46,10 @@ struct Options {
 
     bool raw_output      = false;
     bool print_token_ids = false;
+    bool print_prompt_token_ids = false;
+    std::uint32_t top_logits    = 0;
     bool enable_thinking = true;
+    bool preserve_thinking = false;
     // Drops the checkpoint's own `eos_token_id` set from the request stop policy, so decode runs
     // to the output-token budget or the remaining context capacity instead of terminating on the
     // model's end-of-turn token. Explicit --stop-token-id / --stop conditions still apply.

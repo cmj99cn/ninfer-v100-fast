@@ -108,10 +108,10 @@ int main() {
     failures +=
         expect_size(state.recurrent_slot_stride_elements(), 120, "state recurrent slot stride");
     for (std::size_t layer = 0; layer < state.layer_count(); ++layer) {
-        failures += check_shape(state.conv[layer], {10, 3, 1, 1}, "state.conv");
+        failures += check_shape(state.conv[layer], {3, 10, 1, 1}, "state.conv");
         failures += check_shape(state.recurrent[layer], {6, 5, 4, 1}, "state.recurrent");
         failures += check_shape(state.conv_slot(static_cast<std::uint32_t>(layer), 0),
-                                {10, 3, 1, 1}, "state.conv_slot");
+                                {3, 10, 1, 1}, "state.conv_slot");
         failures += check_shape(state.recurrent_slot(static_cast<std::uint32_t>(layer), 0),
                                 {6, 5, 4, 1}, "state.recurrent_slot");
         if (state.conv[layer].dtype != ninfer::DType::BF16) {
@@ -147,9 +147,9 @@ int main() {
     ninfer::LinearAttentionStatePool slotted({slotted_arena.base(), slotted_arena.capacity()},
                                              slotted_plan.layout);
     failures += expect_size(slotted.slot_count(), 3, "slotted.slot_count");
-    failures += check_shape(slotted.conv[0], {10, 3, 3, 1}, "slotted.conv");
+    failures += check_shape(slotted.conv[0], {3, 10, 3, 1}, "slotted.conv");
     failures += check_shape(slotted.recurrent[0], {6, 5, 4, 3}, "slotted.recurrent");
-    failures += check_shape(slotted.conv_slot(0, 2), {10, 3, 1, 1}, "slotted.conv_slot");
+    failures += check_shape(slotted.conv_slot(0, 2), {3, 10, 1, 1}, "slotted.conv_slot");
     failures += check_shape(slotted.recurrent_slot(0, 2), {6, 5, 4, 1}, "slotted.recurrent_slot");
 
     ninfer::Tensor conv0             = slotted.conv_slot(0, 0);
@@ -189,7 +189,7 @@ int main() {
         ++failures;
         std::cerr << "FP32 conv geometry did not retain its dtype\n";
     }
-    failures += check_shape(fp32_conv.conv[0], {7, 2, 2, 1}, "fp32_conv.conv");
+    failures += check_shape(fp32_conv.conv[0], {2, 7, 2, 1}, "fp32_conv.conv");
     failures += check_shape(fp32_conv.recurrent[0], {4, 3, 2, 2}, "fp32_conv.recurrent");
 
     return failures == 0 ? 0 : fail("linear attention state pool test failed");

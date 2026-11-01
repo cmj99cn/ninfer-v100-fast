@@ -59,6 +59,41 @@ __launch_bounds__(Threads) __global__
     }
 }
 
+template <int BlocksPerToken, int Threads>
+__launch_bounds__(Threads) __global__
+    void embed_gather_fp8_f16_kernel(const std::int32_t* ids, const std::uint8_t* codes,
+                                     const __nv_bfloat16* scales, __half* out) {
+    static_assert(kEmbedGatherFp8D % BlocksPerToken == 0);
+    constexpr int kValuesPerBlock = kEmbedGatherFp8D / BlocksPerToken;
+    static_assert(kValuesPerBlock % 4 == 0);
+    constexpr int kWordsPerBlock = kValuesPerBlock / 4;
+    const int token = static_cast<int>(blockIdx.x) / BlocksPerToken;
+    const int split = static_cast<int>(blockIdx.x) - token * BlocksPerToken;
+    __shared__ int row;
+    __shared__ float scale;
+    if (threadIdx.x == 0) {
+        row   = ids[token];
+        scale = __bfloat162float(scales[row]);
+    }
+    __syncthreads();
+    const int split_offset = split * kValuesPerBlock;
+    const auto* code_row   = codes + static_cast<std::int64_t>(row) * kEmbedGatherFp8D;
+    auto* output_column    = out + static_cast<std::int64_t>(token) * kEmbedGatherFp8D;
+    for (int word_index = static_cast<int>(threadIdx.x); word_index < kWordsPerBlock;
+         word_index += Threads) {
+        const int offset    = split_offset + word_index * 4;
+        const unsigned word = *reinterpret_cast<const unsigned*>(code_row + offset);
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            __nv_fp8x2_e4m3 values;
+            values.__x           = static_cast<std::uint16_t>(word >> (pair * 16));
+            const float2 decoded = static_cast<float2>(values);
+            reinterpret_cast<__half2*>(output_column + offset + pair * 2)[0] =
+                __floats2half2_rn(decoded.x * scale, decoded.y * scale);
+        }
+    }
+}
+
 __device__ __forceinline__ int unpack_q6_code(const std::uint8_t* nibble, const std::uint8_t* high,
                                               int index) {
     const std::uint8_t low_byte   = nibble[index >> 1];

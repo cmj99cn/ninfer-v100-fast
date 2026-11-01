@@ -4716,6 +4716,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.kv_capacity           = kv_capacity;
     switch (kv_dtype) {
     case DType::BF16: out.kv_cache = KvCacheStorage::BFloat16; break;
+    case DType::FP16: out.kv_cache = KvCacheStorage::Float16; break;
     case DType::I8:   out.kv_cache = KvCacheStorage::Int8Group64; break;
     default:          out.kv_cache = KvCacheStorage::Int4NLGroup32; break;
 }

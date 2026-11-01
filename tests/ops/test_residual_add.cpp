@@ -2,6 +2,7 @@
 #include "ops/op_tester.h"
 
 #include <cstdint>
+#include <cuda_fp16.h>
 #include <iostream>
 #include <vector>
 
@@ -87,6 +88,42 @@ int run_cancellation_case() {
     return failures;
 }
 
+std::uint16_t f32_to_f16_bits(float value) { return __half_as_ushort(__float2half_rn(value)); }
+float f16_bits_to_f32(std::uint16_t bits) { return __half2float(__ushort_as_half(bits)); }
+
+int run_f16_case(const char* label, std::int32_t rows, std::int32_t columns,
+                 std::uint32_t seed) {
+    const std::size_t count = static_cast<std::size_t>(rows) * columns;
+    std::vector<float> y(count), x(count);
+    fill_uniform(y, seed, -8.0f, 8.0f);
+    fill_uniform(x, seed + 1, -8.0f, 8.0f);
+    std::vector<std::uint16_t> y_bits(count), x_bits(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        y_bits[i] = f32_to_f16_bits(y[i]);
+        x_bits[i] = f32_to_f16_bits(x[i]);
+        y[i]      = f16_bits_to_f32(y_bits[i]);
+        x[i]      = f16_bits_to_f32(x_bits[i]);
+    }
+    const auto expected = residual_add_oracle(y, x);
+    GuardedDeviceBuffer device_y(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_x(count * sizeof(std::uint16_t));
+    device_y.copy_from_host(y_bits.data(), device_y.bytes());
+    device_x.copy_from_host(x_bits.data(), device_x.bytes());
+    Tensor y_tensor(device_y.data(), DType::FP16, {rows, columns});
+    Tensor x_tensor(device_x.data(), DType::FP16, {rows, columns});
+    ops::residual_add(y_tensor, x_tensor, nullptr);
+    cuda_synchronize();
+    const auto actual_bits = from_device<std::uint16_t>(device_x.data(), count);
+    std::vector<double> actual(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        actual[i] = static_cast<double>(f16_bits_to_f32(actual_bits[i]));
+    }
+    int failures = verify_pointwise(label, actual, expected, {0.0, 2e-3});
+    failures += verify_exact("residual_add f16 y unchanged",
+                             from_device<std::uint16_t>(device_y.data(), count), y_bits);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -102,6 +139,8 @@ int main() {
     failures += run_case("residual_add [2048,48]", 2048, 48, 202u);
     failures += run_case("residual_add [1152,128]", 1152, 128, 301u);
     failures += run_cancellation_case();
+    failures += run_f16_case("residual_add f16 [5120,48]", 5120, 48, 401u);
+    failures += run_f16_case("residual_add f16 [2048,17]", 2048, 17, 402u);
     std::cout << (failures ? "FAIL" : "OK") << " residual_add\n";
     return failures ? 1 : 0;
 }

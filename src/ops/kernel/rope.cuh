@@ -6,6 +6,7 @@
 // rotary coefficients across heads.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cmath>
 #include <cstdint>
@@ -323,6 +324,67 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
             const float s            = sin_cache[pair];
             data[base + pair]        = __float2bfloat16_rn(first * c - second * s);
             data[base + pair + half] = __float2bfloat16_rn(second * c + first * s);
+        }
+    }
+}
+
+__device__ __forceinline__ void apply_rope_head_f16(__half* data, std::int64_t token_stride,
+                                                    int head, int token, int lane, float c0,
+                                                    float c1, float s0, float s1) {
+    constexpr int kHeadDim = 256;
+    constexpr int kHalfPair = 16;
+    if (lane >= kHalfPair) { return; }
+    const std::int64_t base =
+        static_cast<std::int64_t>(token) * token_stride + static_cast<std::int64_t>(head) * kHeadDim;
+    auto* data2         = reinterpret_cast<__half2*>(data + base);
+    const float2 first  = __half22float2(data2[lane]);
+    const float2 second = __half22float2(data2[lane + kHalfPair]);
+    data2[lane] = __floats2half2_rn(first.x * c0 - second.x * s0, first.y * c1 - second.y * s1);
+    data2[lane + kHalfPair] =
+        __floats2half2_rn(second.x * c0 + first.x * s0, second.y * c1 + first.y * s1);
+}
+
+__global__ void rope_f16_text_kernel(const std::int32_t* positions, __half* q, __half* k,
+                                     std::int32_t q_heads, std::int32_t k_heads,
+                                     std::int32_t tokens, std::int64_t q_token_stride,
+                                     std::int64_t k_token_stride, std::int32_t axes,
+                                     float theta) {
+    constexpr int kHeadDim = 256;
+    constexpr int kHalf    = 32;
+    const int token        = static_cast<int>(blockIdx.x);
+    if (token >= tokens) { return; }
+    __shared__ float cos_cache[kHalf];
+    __shared__ float sin_cache[kHalf];
+    if (threadIdx.x < kHalf) {
+        const int pair    = static_cast<int>(threadIdx.x);
+        const int axis    = axes == 3 ? pair % 3 : 0;
+        const float freq  = powf(theta, -2.0f * static_cast<float>(pair) / 64.0f);
+        const float angle =
+            static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) * freq;
+        float sine = 0.0f, cosine = 0.0f;
+        sincosf(angle, &sine, &cosine);
+        sin_cache[pair] = sine;
+        cos_cache[pair] = cosine;
+    }
+    __syncthreads();
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    const int warp        = static_cast<int>(threadIdx.x) >> 5;
+    const int block_warps = static_cast<int>(blockDim.x) >> 5;
+    float c0 = 0.0f, c1 = 0.0f, s0 = 0.0f, s1 = 0.0f;
+    if (lane < kHalf / 2) {
+        const int pair = lane * 2;
+        c0 = cos_cache[pair];
+        c1 = cos_cache[pair + 1];
+        s0 = sin_cache[pair];
+        s1 = sin_cache[pair + 1];
+    }
+    for (int combined_head = warp; combined_head < q_heads + k_heads;
+         combined_head += block_warps) {
+        if (combined_head < q_heads) {
+            apply_rope_head_f16(q, q_token_stride, combined_head, token, lane, c0, c1, s0, s1);
+        } else {
+            apply_rope_head_f16(k, k_token_stride, combined_head - q_heads, token, lane, c0, c1,
+                                s0, s1);
         }
     }
 }

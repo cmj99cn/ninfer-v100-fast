@@ -30,8 +30,9 @@ std::int64_t numel_allow_zero(const Tensor& t) {
 } // namespace
 
 void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
-    if (y.dtype != DType::BF16 || x.dtype != DType::BF16) {
-        throw std::invalid_argument("residual_add: y/x must be BF16");
+    if (!((y.dtype == DType::BF16 && x.dtype == DType::BF16) ||
+          (y.dtype == DType::FP16 && x.dtype == DType::FP16))) {
+        throw std::invalid_argument("residual_add: y/x must share BF16 or FP16 dtype");
     }
     for (int d = 0; d < 4; ++d) {
         if (y.ne[d] != x.ne[d]) {
@@ -46,7 +47,11 @@ void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
         throw std::invalid_argument("residual_add: y/x data must be non-null");
     }
 
-    detail::residual_add_launch(y, x, stream); // single variant -> direct dispatch
+    if (x.dtype == DType::FP16) {
+        detail::residual_add_f16_launch(y, x, stream);
+    } else {
+        detail::residual_add_launch(y, x, stream);
+    }
 }
 
 } // namespace ninfer::ops

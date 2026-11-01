@@ -9,6 +9,7 @@
 #include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 
@@ -79,6 +80,14 @@ __launch_bounds__(256) __global__
     if (tid == 0 && (n & 1) != 0) {
         const std::int64_t i = n - 1;
         x[i]                 = __float2bfloat16_rn(__bfloat162float(x[i]) + __bfloat162float(y[i]));
+    }
+}
+
+__global__ void residual_add_f16_scalar_kernel(const __half* y, __half* x, std::int64_t n) {
+    const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < n; i += stride) {
+        x[i] = __float2half_rn(__half2float(x[i]) + __half2float(y[i]));
     }
 }
 

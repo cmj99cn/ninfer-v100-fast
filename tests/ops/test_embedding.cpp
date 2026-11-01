@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cuda_fp16.h>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -568,6 +569,28 @@ int test_w8() {
     return failures;
 }
 
+int run_fp8_f16_case(const std::string& label, Fp8Table& table,
+                     const std::vector<std::int32_t>& ids) {
+    GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+    device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer output(static_cast<std::size_t>(kFp8D) * ids.size() * sizeof(std::uint16_t));
+    Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor result(output.data(), DType::FP16, {kFp8D, static_cast<std::int32_t>(ids.size())});
+    Weight weight = table.weight();
+    ops::embedding(input, weight, result, nullptr);
+    cuda_synchronize();
+    const auto bits = from_device<std::uint16_t>(output.data(), kFp8D * ids.size());
+    std::vector<double> actual(bits.size());
+    for (std::size_t i = 0; i < bits.size(); ++i) {
+        actual[i] = static_cast<double>(__half2float(__ushort_as_half(bits[i])));
+    }
+    int failures = verify_pointwise(label, actual, table.oracle(ids), {0.05, 2e-3});
+    failures += output.verify_guards(label.c_str());
+    failures += verify_input(label.c_str(), device_ids, ids);
+    failures += table.verify_unchanged(label.c_str());
+    return failures;
+}
+
 int test_fp8() {
     Fp8Table table;
     int failures = 0;
@@ -577,6 +600,9 @@ int test_fp8() {
             "embedding FP8 [248320,5120] T=" + std::to_string(static_cast<unsigned long long>(t));
         failures += run_quantized_case(label.c_str(), table, repeated_ids(t), kFp8D);
     }
+    failures += run_fp8_f16_case("embedding FP8->FP16 T=1", table, repeated_ids(1));
+    failures += run_fp8_f16_case("embedding FP8->FP16 T=49", table, repeated_ids(49));
+    failures += run_fp8_f16_case("embedding FP8->FP16 T=1024", table, repeated_ids(1024));
     const std::vector<std::int32_t> ids = {0};
     GuardedDeviceBuffer device_ids(sizeof(std::int32_t));
     device_ids.copy_from_host(ids.data(), sizeof(std::int32_t));

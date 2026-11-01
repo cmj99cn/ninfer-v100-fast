@@ -91,4 +91,16 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
     CUDA_CHECK(cudaGetLastError());
 }
 
+void silu_and_mul_f16_launch(const Tensor& gate, const Tensor& up, Tensor& out,
+                             cudaStream_t stream) {
+    const std::int64_t n = out.numel();
+    constexpr int kBlock = 128;
+    const int grid = static_cast<int>(std::max<std::int64_t>(
+        1, div_up(n, static_cast<std::int64_t>(kBlock))));
+    silu_and_mul_f16_scalar_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const __half*>(gate.data), static_cast<const __half*>(up.data),
+        static_cast<__half*>(out.data), n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cuda_fp16.h>
 #include <iostream>
 #include <vector>
 
@@ -139,6 +140,44 @@ int run_edge_case() {
     return failures;
 }
 
+std::uint16_t f32_to_f16_bits(float value) { return __half_as_ushort(__float2half_rn(value)); }
+float f16_bits_to_f32(std::uint16_t bits) { return __half2float(__ushort_as_half(bits)); }
+
+int run_f16_case(const char* label, std::int32_t rows, std::int32_t columns,
+                 std::uint32_t seed) {
+    const std::size_t count = static_cast<std::size_t>(rows) * columns;
+    std::vector<float> gate(count), up(count);
+    fill_uniform(gate, seed, -12.0f, 12.0f);
+    fill_uniform(up, seed + 1, -8.0f, 8.0f);
+    std::vector<std::uint16_t> gate_bits(count), up_bits(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        gate_bits[i] = f32_to_f16_bits(gate[i]);
+        up_bits[i]   = f32_to_f16_bits(up[i]);
+        gate[i]      = f16_bits_to_f32(gate_bits[i]);
+        up[i]        = f16_bits_to_f32(up_bits[i]);
+    }
+    const auto expected = silu_mul_oracle(gate, up);
+    GuardedDeviceBuffer device_gate(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_up(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_out(count * sizeof(std::uint16_t));
+    device_gate.copy_from_host(gate_bits.data(), device_gate.bytes());
+    device_up.copy_from_host(up_bits.data(), device_up.bytes());
+    Tensor gate_tensor(device_gate.data(), DType::FP16, {rows, columns});
+    Tensor up_tensor(device_up.data(), DType::FP16, {rows, columns});
+    Tensor out_tensor(device_out.data(), DType::FP16, {rows, columns});
+    ops::silu_mul(gate_tensor, up_tensor, out_tensor, nullptr);
+    cuda_synchronize();
+    const auto out_bits = from_device<std::uint16_t>(device_out.data(), count);
+    std::vector<double> actual(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        actual[i] = static_cast<double>(f16_bits_to_f32(out_bits[i]));
+    }
+    int failures = verify_pointwise(label, actual, expected, {0.1, 2e-3});
+    failures += verify_exact("silu_mul f16 inputs unchanged",
+                             from_device<std::uint16_t>(device_gate.data(), count), gate_bits);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -152,6 +191,8 @@ int main() {
     failures += run_contiguous_case("silu_mul [17408,48]", 17408, 48, 102u);
     failures += run_strided_gate_up_case();
     failures += run_edge_case();
+    failures += run_f16_case("silu_mul f16 [17408,17]", 17408, 17, 401u);
+    failures += run_f16_case("silu_mul f16 [5120,48]", 5120, 48, 402u);
     std::cout << (failures ? "FAIL" : "OK") << " silu_mul\n";
     return failures ? 1 : 0;
 }

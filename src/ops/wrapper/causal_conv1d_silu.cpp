@@ -57,18 +57,18 @@ void require_weight_shape(const Tensor& weight, std::int32_t C) {
 }
 
 void require_state_shape(const Tensor& conv_state, std::int32_t C) {
-    if (conv_state.ne[0] != C || conv_state.ne[1] != 3 || conv_state.ne[2] != 1 ||
+    if (conv_state.ne[0] != 3 || conv_state.ne[1] != C || conv_state.ne[2] != 1 ||
         conv_state.ne[3] != 1) {
-        throw std::invalid_argument("causal_conv1d: conv_state must have shape [C,3]");
+        throw std::invalid_argument("causal_conv1d: conv_state must have shape [3,C]");
     }
 }
 
 void require_snapshot_state_shape(const Tensor& conv_states, std::int32_t C, std::int32_t width,
                                   std::int32_t batch) {
-    if (conv_states.ne[0] != C || conv_states.ne[1] != 3 || conv_states.ne[2] < width * batch ||
+    if (conv_states.ne[0] != 3 || conv_states.ne[1] != C || conv_states.ne[2] < width * batch ||
         conv_states.ne[3] != 1) {
         throw std::invalid_argument(
-            "causal_conv1d: conv_states must have shape [C,3,S] with S>=B*W");
+            "causal_conv1d: conv_states must have shape [3,C,S] with S>=B*W");
     }
 }
 

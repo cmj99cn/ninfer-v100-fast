@@ -8,6 +8,7 @@
 #include "ops/common/math.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 
@@ -116,6 +117,17 @@ __launch_bounds__(256) __global__
             const std::int64_t i = n - 1;
             out[i] = __float2bfloat16(silu(__bfloat162float(gate[i])) * __bfloat162float(up[i]));
         }
+    }
+}
+
+__global__ void silu_and_mul_f16_scalar_kernel(const __half* gate, const __half* up,
+                                               __half* out, std::int64_t n) {
+    const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < n; i += stride) {
+        const float g = __half2float(gate[i]);
+        const float u = __half2float(up[i]);
+        out[i] = __float2half_rn((g / (1.0f + expf(-g))) * u);
     }
 }
 

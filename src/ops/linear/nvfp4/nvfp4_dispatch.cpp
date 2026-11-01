@@ -142,4 +142,23 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     launch_nvfp4_w4a4(x, weight, out, scratch, stream);
 }
 
+void nvfp4_f16_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
+                        WorkspaceArena* workspace, cudaStream_t stream) {
+    validate_nvfp4_weight(weight, "nvfp4 f16 linear");
+    if (x.ne[1] < 128) {
+        throw std::invalid_argument("nvfp4 f16 linear: only the prefill route is implemented");
+    }
+    if (workspace == nullptr) {
+        throw std::invalid_argument("nvfp4 f16 linear requires caller workspace");
+    }
+    if (policy == LinearPolicy::AllowA4) {
+        throw std::invalid_argument("nvfp4 f16 linear: A4 policy is not implemented");
+    }
+#ifdef NINFER_VOLTA_BUILD
+    nvfp4_cutlass_sm70_f16_launch(x, weight, out, *workspace, stream);
+#else
+    throw std::invalid_argument("nvfp4 f16 linear requires the sm_70 build");
+#endif
+}
+
 } // namespace ninfer::ops::detail

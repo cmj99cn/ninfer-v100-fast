@@ -156,8 +156,8 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
 
     Tensor x(device_x.p, DType::BF16, {hidden, width, batch});
     Tensor conv_weight(device_conv_weight.p, DType::BF16, {channels, 4});
-    Tensor snapshot_state_view(snapshot_state.p, DType::BF16, {channels, 3, slots});
-    Tensor record_state_view(record_state.p, DType::BF16, {channels, 3, slots});
+    Tensor snapshot_state_view(snapshot_state.p, DType::BF16, {3, channels, slots});
+    Tensor record_state_view(record_state.p, DType::BF16, {3, channels, slots});
     Tensor valid;
     if (!dense) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
     Tensor initial(device_initial.p, DType::I32, {batch});
@@ -400,7 +400,7 @@ int run_fp8_oracle_case(DevicePackedWeight& parent, std::int32_t width, std::int
 
     Tensor x(device_x.p, DType::BF16, {kHidden, width, batch});
     Tensor conv_weight(device_conv_weight.p, DType::BF16, {kChannels, 4});
-    Tensor state(device_state.p, DType::BF16, {kChannels, 3, slots});
+    Tensor state(device_state.p, DType::BF16, {3, kChannels, slots});
     Tensor valid;
     if (!dense) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
     Tensor initial(device_initial.p, DType::I32, {batch});

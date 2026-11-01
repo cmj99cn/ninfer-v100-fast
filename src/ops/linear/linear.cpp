@@ -67,8 +67,10 @@ void validate_linear_policy(LinearPolicy policy) {
 // member exactly as it found an anonymous-namespace one.
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
                                LinearPolicy policy) {
-    if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument("linear: x/out must be BF16");
+    const bool bf16 = x.dtype == DType::BF16 && out.dtype == DType::BF16;
+    const bool f16  = x.dtype == DType::FP16 && out.dtype == DType::FP16 && w.qtype == QType::NVFP4;
+    if (!bf16 && !f16) {
+        throw std::invalid_argument("linear: x/out must be BF16, or FP16 with an NVFP4 weight");
     }
     (void)checked_numel(x, "x");
     (void)checked_numel(out, "out");
@@ -128,7 +130,11 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::fp16_dispatch(x, w, out, policy, stream);
         return;
     case QType::NVFP4:
-        detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
+        if (x.dtype == DType::FP16) {
+            detail::nvfp4_f16_dispatch(x, w, out, policy, workspace, stream);
+        } else {
+            detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
+        }
         return;
     case QType::FP8_E4M3FN_ROW_BF16S:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);

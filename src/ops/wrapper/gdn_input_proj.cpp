@@ -95,8 +95,8 @@ void require_snapshot_operands(const Tensor& conv_weight, const Tensor& conv_sta
                                const Tensor& snapshot_base_slots, std::int32_t channels,
                                ConvGeometry geometry) {
     require_matrix(conv_weight, channels, 4, "conv weight");
-    if (conv_states.dtype != DType::BF16 || conv_states.ne[0] != channels ||
-        conv_states.ne[1] != 3 || conv_states.ne[2] < geometry.aggregate_columns ||
+    if (conv_states.dtype != DType::BF16 || conv_states.ne[0] != 3 ||
+        conv_states.ne[1] != channels || conv_states.ne[2] < geometry.aggregate_columns ||
         conv_states.ne[3] != 1 || !conv_states.is_contiguous() ||
         !aligned_to(conv_states.data, 16)) {
         throw std::invalid_argument(
@@ -125,8 +125,8 @@ void require_record_operands(const Tensor& conv_weight, const Tensor& conv_state
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              std::int32_t channels, ConvGeometry geometry) {
     require_matrix(conv_weight, channels, 4, "conv weight");
-    if (conv_states.dtype != DType::BF16 || conv_states.ne[0] != channels ||
-        conv_states.ne[1] != 3 || conv_states.ne[2] <= 0 || conv_states.ne[3] != 1 ||
+    if (conv_states.dtype != DType::BF16 || conv_states.ne[0] != 3 ||
+        conv_states.ne[1] != channels || conv_states.ne[2] <= 0 || conv_states.ne[3] != 1 ||
         !conv_states.is_contiguous() || !aligned_to(conv_states.data, 16)) {
         throw std::invalid_argument("gdn_input_proj_conv_record: invalid convolution state");
     }

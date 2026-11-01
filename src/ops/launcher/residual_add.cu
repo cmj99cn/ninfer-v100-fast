@@ -46,4 +46,14 @@ void residual_add_launch(const Tensor& y, Tensor& x, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
+void residual_add_f16_launch(const Tensor& y, Tensor& x, cudaStream_t stream) {
+    const std::int64_t n = x.numel();
+    constexpr int kBlock = 256;
+    const int grid = static_cast<int>(std::min<std::int64_t>(
+        4096, std::max<std::int64_t>(1, div_up(n, static_cast<std::int64_t>(kBlock)))));
+    residual_add_f16_scalar_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const __half*>(y.data), static_cast<__half*>(x.data), n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

@@ -6,6 +6,7 @@
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 
@@ -250,6 +251,76 @@ __launch_bounds__(256) __global__
         float zv                 = 0.0f;
         if constexpr (Epilogue == RmsEpilogue::Gated) { zv = __bfloat162float(z[index]); }
         out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
+    }
+}
+
+__global__ void rmsnorm_f16_generic_kernel(const __half* x, const __half* weight, __half* out,
+                                           int d, float eps, bool unit_offset) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    const __half* xr = x + static_cast<std::int64_t>(row) * d;
+    __half* orow = out + static_cast<std::int64_t>(row) * d;
+    float sum = 0.0f;
+    for (int i = tid; i < d; i += static_cast<int>(blockDim.x)) {
+        const float v = __half2float(xr[i]);
+        sum += v * v;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    __shared__ float warp_sums[32];
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0) { warp_sums[warp] = sum; }
+    __syncthreads();
+    float total = 0.0f;
+    if (warp == 0) {
+        const int warps = static_cast<int>(blockDim.x) >> 5;
+        total = lane < warps ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            total += __shfl_down_sync(0xffffffffu, total, offset);
+        }
+        if (lane == 0) { warp_sums[0] = total; }
+    }
+    __syncthreads();
+    const float inv = rsqrtf(warp_sums[0] / static_cast<float>(d) + eps);
+    for (int i = tid; i < d; i += static_cast<int>(blockDim.x)) {
+        const float gain = __half2float(weight[i]) + (unit_offset ? 1.0f : 0.0f);
+        const float v = __half2float(xr[i]) * inv * gain;
+        orow[i] = __float2half_rn(v);
+    }
+}
+
+__global__ void rmsnorm_f16_gated_kernel(const __half* x, const __half* weight, const __half* z,
+                                         __half* out, int d, float eps) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    const __half* xr = x + static_cast<std::int64_t>(row) * d;
+    const __half* zr = z + static_cast<std::int64_t>(row) * d;
+    __half* orow = out + static_cast<std::int64_t>(row) * d;
+    float sum = 0.0f;
+    for (int i = tid; i < d; i += static_cast<int>(blockDim.x)) {
+        const float v = __half2float(xr[i]);
+        sum += v * v;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    __shared__ float warp_sums[32];
+    const int lane = tid & 31, warp = tid >> 5;
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    float total = 0.0f;
+    if (warp == 0) {
+        const int warps = static_cast<int>(blockDim.x) >> 5;
+        total = lane < warps ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) total += __shfl_down_sync(0xffffffffu, total, offset);
+        if (lane == 0) warp_sums[0] = total;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(warp_sums[0] / static_cast<float>(d) + eps);
+    for (int i = tid; i < d; i += static_cast<int>(blockDim.x)) {
+        const float g = __half2float(zr[i]);
+        const float silu = g / (1.0f + expf(-g));
+        orow[i] = __float2half_rn(__half2float(xr[i]) * inv * __half2float(weight[i]) * silu);
     }
 }
 

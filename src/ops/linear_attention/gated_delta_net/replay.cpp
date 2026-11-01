@@ -224,7 +224,7 @@ void validate_fold_states(const GdnReplayRecords& records,
         state.conv_dtype != DType::BF16) {
         throw std::invalid_argument(std::string(kOp) + ": state geometry does not match records");
     }
-    require_tensor(states.conv_layer0, DType::BF16, {record.conv_channels, 3, state.slot_count},
+    require_tensor(states.conv_layer0, DType::BF16, {3, record.conv_channels, state.slot_count},
                    256, kOp, "conv state layer 0");
     require_tensor(states.recurrent_layer0, DType::FP32,
                    {kStateDim, kStateDim, record.value_heads, state.slot_count}, 256, kOp,

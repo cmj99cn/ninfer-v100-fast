@@ -114,13 +114,17 @@ void require_frequency_override(const RopeFrequencyOverride& frequency, int axes
     }
 }
 
+bool out_dtype_is_f16(const Tensor& t) { return t.dtype == DType::FP16; }
+
 } // namespace
 
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
           const RopeFrequencyOverride& frequency, cudaStream_t stream) {
     require_common(positions, rotary_dim, theta);
-    if (q.dtype != DType::BF16 || k.dtype != DType::BF16) {
-        throw std::invalid_argument("rope: q/k must be BF16");
+    const bool bf16 = q.dtype == DType::BF16 && k.dtype == DType::BF16;
+    const bool f16  = q.dtype == DType::FP16 && k.dtype == DType::FP16;
+    if (!bf16 && !f16) {
+        throw std::invalid_argument("rope: q/k must share BF16 or FP16 dtype");
     }
     (void)numel_allow_zero(positions, "positions");
     const std::int64_t q_numel = numel_allow_zero(q, "q");
@@ -139,7 +143,14 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
     if (q.data == nullptr || k.data == nullptr) {
         throw std::invalid_argument("rope: q/k data must be non-null");
     }
-    detail::rope_launch(positions, rotary_dim, theta, q, k, frequency, stream);
+    if (out_dtype_is_f16(q)) {
+        if (frequency.inv_frequency != nullptr) {
+            throw std::invalid_argument("rope: FP16 frequency override is not implemented");
+        }
+        detail::rope_f16_launch(positions, rotary_dim, theta, q, k, stream);
+    } else {
+        detail::rope_launch(positions, rotary_dim, theta, q, k, frequency, stream);
+    }
 }
 
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
