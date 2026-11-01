@@ -9,8 +9,12 @@
 namespace ninfer::ops {
 
 void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream) {
-    if (src.dtype != DType::BF16 || dst.dtype != DType::BF16 || indices.dtype != DType::I32) {
-        throw std::invalid_argument("scatter: src/dst must be BF16 and indices must be I32");
+    const bool shared_activation =
+        (src.dtype == DType::BF16 && dst.dtype == DType::BF16) ||
+        (src.dtype == DType::FP16 && dst.dtype == DType::FP16);
+    if (!shared_activation || indices.dtype != DType::I32) {
+        throw std::invalid_argument(
+            "scatter: src/dst must share BF16 or FP16 dtype and indices must be I32");
     }
     if (src.ne[2] != 1 || src.ne[3] != 1 || dst.ne[2] != 1 || dst.ne[3] != 1 ||
         indices.ne[1] != 1 || indices.ne[2] != 1 || indices.ne[3] != 1 || src.ne[0] != dst.ne[0] ||
@@ -34,7 +38,8 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
                         Tensor& destination, cudaStream_t stream) {
     const std::int32_t width = source.ne[1];
     const std::int32_t batch = source.ne[2];
-    if (source.dtype != DType::BF16 || destination.dtype != DType::BF16 ||
+    if (!((source.dtype == DType::BF16 && destination.dtype == DType::BF16) ||
+          (source.dtype == DType::FP16 && destination.dtype == DType::FP16)) ||
         lanes.dtype != DType::I32 || valid_columns.dtype != DType::I32 || source.ne[0] <= 0 ||
         (source.ne[0] % 8) != 0 || width <= 0 || batch <= 0 || source.ne[3] != 1 ||
         destination.ne[0] != source.ne[0] || destination.ne[1] != width || destination.ne[2] <= 0 ||
@@ -59,8 +64,10 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
 
 void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tensor& destination,
                           cudaStream_t stream) {
-    if (source.dtype != DType::BF16 || destination.dtype != DType::BF16) {
-        throw std::invalid_argument("extract_bf16_columns: tensors must be BF16");
+    if (!((source.dtype == DType::BF16 && destination.dtype == DType::BF16) ||
+          (source.dtype == DType::FP16 && destination.dtype == DType::FP16))) {
+        throw std::invalid_argument(
+            "extract_bf16_columns: tensors must share BF16 or FP16 dtype");
     }
     if (source.ne[0] <= 0 || source.ne[1] <= 0 || destination.ne[0] <= 0 ||
         destination.ne[1] != source.ne[1] || source.ne[2] != 1 || source.ne[3] != 1 ||
@@ -76,7 +83,7 @@ void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tens
     if (source.data == destination.data) {
         throw std::invalid_argument("extract_bf16_columns: source and destination must not alias");
     }
-    const std::size_t element_bytes = dtype_size(DType::BF16);
+    const std::size_t element_bytes = dtype_size(source.dtype);
     const std::size_t width         = static_cast<std::size_t>(destination.ne[0]) * element_bytes;
     const std::size_t source_pitch  = static_cast<std::size_t>(source.ne[0]) * element_bytes;
     const std::size_t destination_pitch =

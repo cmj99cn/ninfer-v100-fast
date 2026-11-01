@@ -30,8 +30,10 @@ std::int64_t numel_allow_zero(const Tensor& t) {
 } // namespace
 
 void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream) {
-    if (gate.dtype != DType::BF16 || x.dtype != DType::BF16) {
-        throw std::invalid_argument("sigmoid_mul: gate/x must be BF16");
+    const bool bf16 = gate.dtype == DType::BF16 && x.dtype == DType::BF16;
+    const bool f16  = gate.dtype == DType::FP16 && x.dtype == DType::FP16;
+    if (!bf16 && !f16) {
+        throw std::invalid_argument("sigmoid_mul: gate/x must share BF16 or FP16 dtype");
     }
     for (int d = 0; d < 4; ++d) {
         if (gate.ne[d] != x.ne[d]) {

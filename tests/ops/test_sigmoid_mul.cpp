@@ -1,7 +1,10 @@
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ops/op_tester.h"
 
+#include <cuda_fp16.h>
+
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <iostream>
 #include <vector>
@@ -91,6 +94,50 @@ int run_edge_case() {
     return failures;
 }
 
+
+std::uint16_t f32_to_f16_bits(float value) {
+    const __half converted = __float2half_rn(value);
+    std::uint16_t bits = 0;
+    std::memcpy(&bits, &converted, sizeof(bits));
+    return bits;
+}
+
+float f16_bits_to_f32(std::uint16_t bits) {
+    __half converted;
+    std::memcpy(&converted, &bits, sizeof(bits));
+    return __half2float(converted);
+}
+
+int run_f16_case(const char* label, std::int32_t rows, std::int32_t columns, std::uint32_t seed) {
+    const std::size_t count = static_cast<std::size_t>(rows) * columns;
+    std::vector<float> gate(count), x(count);
+    fill_uniform(gate, seed, -12.0f, 12.0f);
+    fill_uniform(x, seed + 1, -8.0f, 8.0f);
+    std::vector<std::uint16_t> gate_bits(count), x_bits(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        gate_bits[i] = f32_to_f16_bits(gate[i]);
+        x_bits[i]    = f32_to_f16_bits(x[i]);
+        gate[i]      = f16_bits_to_f32(gate_bits[i]);
+        x[i]         = f16_bits_to_f32(x_bits[i]);
+    }
+    const auto expected = sigmoid_mul_oracle(gate, x);
+    GuardedDeviceBuffer device_gate(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_x(count * sizeof(std::uint16_t));
+    device_gate.copy_from_host(gate_bits.data(), device_gate.bytes());
+    device_x.copy_from_host(x_bits.data(), device_x.bytes());
+    Tensor gate_tensor(device_gate.data(), DType::FP16, {rows, columns});
+    Tensor x_tensor(device_x.data(), DType::FP16, {rows, columns});
+    ops::sigmoid_mul(gate_tensor, x_tensor, nullptr);
+    cuda_synchronize();
+    const auto out_bits = from_device<std::uint16_t>(device_x.data(), count);
+    std::vector<double> actual(count);
+    for (std::size_t i = 0; i < count; ++i) actual[i] = f16_bits_to_f32(out_bits[i]);
+    int failures = verify_pointwise(label, actual, expected, {2.0e-3, 1.2e-2});
+    failures += verify_exact("sigmoid_mul f16 gate unchanged",
+                             from_device<std::uint16_t>(device_gate.data(), count), gate_bits);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -104,6 +151,8 @@ int main() {
     failures += run_case("sigmoid_mul [6144,48]", 6144, 48, 102u);
     failures += run_case("sigmoid_mul [4096,17]", 4096, 17, 201u);
     failures += run_case("sigmoid_mul [4096,128]", 4096, 128, 301u);
+    failures += run_f16_case("sigmoid_mul f16 [6144,1]", 6144, 1, 401u);
+    failures += run_f16_case("sigmoid_mul f16 [4096,17]", 4096, 17, 402u);
     failures += run_edge_case();
     std::cout << (failures ? "FAIL" : "OK") << " sigmoid_mul\n";
     return failures ? 1 : 0;

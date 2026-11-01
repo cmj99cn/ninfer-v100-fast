@@ -26,6 +26,14 @@ void sigmoid_gate_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream)
     const std::int64_t n   = x.numel();
     constexpr int kBlock   = 256;
     constexpr int kMaxGrid = 4096;
+    if (gate.dtype == DType::FP16) {
+        const int grid = static_cast<int>(
+            std::min<std::int64_t>(kMaxGrid, std::max<std::int64_t>(1, div_up(n, static_cast<std::int64_t>(kBlock)))));
+        sigmoid_gate_mul_f16_scalar_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const __half*>(gate.data), static_cast<__half*>(x.data), n);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const auto gate_addr   = reinterpret_cast<std::uintptr_t>(gate.data);
     const auto x_addr      = reinterpret_cast<std::uintptr_t>(x.data);
     if (((gate_addr | x_addr) & (alignof(Bf16x8Pack) - 1)) == 0 && (n % 8) == 0) {
