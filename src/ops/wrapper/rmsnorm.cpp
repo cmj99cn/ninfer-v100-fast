@@ -51,8 +51,8 @@ void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_of
                   const Tensor* z, Tensor& out, cudaStream_t stream) {
     const bool bf16 = x.dtype == DType::BF16 && weight.dtype == DType::BF16 &&
                       out.dtype == DType::BF16 && (z == nullptr || z->dtype == DType::BF16);
-    const bool f16 = x.dtype == DType::FP16 && weight.dtype == DType::FP16 &&
-                     out.dtype == DType::FP16 && z == nullptr;
+    const bool f16 = x.dtype == DType::FP16 && out.dtype == DType::FP16 && z == nullptr &&
+                     (weight.dtype == DType::FP16 || weight.dtype == DType::BF16);
     if (!bf16 && !f16) {
         throw std::invalid_argument("rmsnorm: tensors must share BF16 (optionally gated) or FP16 dtype");
     }
@@ -103,8 +103,10 @@ void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
 void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
                    cudaStream_t stream) {
     if (x.dtype == DType::FP16) {
-        if (weight.dtype != DType::FP16 || z.dtype != DType::FP16 || out.dtype != DType::FP16) {
-            throw std::invalid_argument("gated_rmsnorm: FP16 tensors must share dtype");
+        if ((weight.dtype != DType::FP16 && weight.dtype != DType::BF16) ||
+            z.dtype != DType::FP16 || out.dtype != DType::FP16) {
+            throw std::invalid_argument(
+                "gated_rmsnorm: FP16 x/z/out require a FP16 or BF16 weight");
         }
         if (x.ne[0] != weight.ne[0] || x.ne[0] != z.ne[0] || x.ne[0] != out.ne[0]) {
             throw std::invalid_argument("gated_rmsnorm: invalid FP16 shape");

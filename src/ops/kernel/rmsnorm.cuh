@@ -2,6 +2,7 @@
 
 // ninfer::ops - RMSNorm kernels over contiguous BF16 rows.
 
+#include "ops/common/activation.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
 
@@ -254,8 +255,9 @@ __launch_bounds__(256) __global__
     }
 }
 
-__global__ void rmsnorm_f16_generic_kernel(const __half* x, const __half* weight, __half* out,
-                                           int d, float eps, bool unit_offset) {
+template <class W>
+__global__ void rmsnorm_f16_generic_kernel(const __half* x, const W* weight, __half* out, int d,
+                                           float eps, bool unit_offset) {
     const int row = static_cast<int>(blockIdx.x);
     const int tid = static_cast<int>(threadIdx.x);
     const __half* xr = x + static_cast<std::int64_t>(row) * d;
@@ -285,13 +287,14 @@ __global__ void rmsnorm_f16_generic_kernel(const __half* x, const __half* weight
     __syncthreads();
     const float inv = rsqrtf(warp_sums[0] / static_cast<float>(d) + eps);
     for (int i = tid; i < d; i += static_cast<int>(blockDim.x)) {
-        const float gain = __half2float(weight[i]) + (unit_offset ? 1.0f : 0.0f);
+        const float gain = ActivationTraits<W>::load(weight + i) + (unit_offset ? 1.0f : 0.0f);
         const float v = __half2float(xr[i]) * inv * gain;
         orow[i] = __float2half_rn(v);
     }
 }
 
-__global__ void rmsnorm_f16_gated_kernel(const __half* x, const __half* weight, const __half* z,
+template <class W>
+__global__ void rmsnorm_f16_gated_kernel(const __half* x, const W* weight, const __half* z,
                                          __half* out, int d, float eps) {
     const int row = static_cast<int>(blockIdx.x);
     const int tid = static_cast<int>(threadIdx.x);
@@ -320,7 +323,7 @@ __global__ void rmsnorm_f16_gated_kernel(const __half* x, const __half* weight, 
     for (int i = tid; i < d; i += static_cast<int>(blockDim.x)) {
         const float g = __half2float(zr[i]);
         const float silu = g / (1.0f + expf(-g));
-        orow[i] = __float2half_rn(__half2float(xr[i]) * inv * __half2float(weight[i]) * silu);
+        orow[i] = __float2half_rn(__half2float(xr[i]) * inv * ActivationTraits<W>::load(weight + i) * silu);
     }
 }
 
