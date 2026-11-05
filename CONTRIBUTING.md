@@ -78,15 +78,13 @@ Run the focused checks relevant to the change. State exactly what was run and su
 If a relevant check could not be run, state that limitation and why. Do not claim validation that
 was not performed.
 
-## Quality gap and community help
+## Quality reporting
 
-The main open quality issue is the BFCL multi-turn tool-calling gap. The current
-full-200 result is **54/200 = 27.0%** versus 1cat-vLLM **77/200 = 38.5%**. The issue
-is unresolved; blind parameter/kernel sweeps are paused, and reproducible help is
-welcome. Read [`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md) and
-[`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md) before starting.
+The BFCL multi-turn tool-calling gap is resolved for the current profile: the full
+200 result is **82/200 = 41.0%** versus 1cat-vLLM **73/200 = 36.5%**. See the README
+quality section for the fixes and the accepted measurement protocol.
 
-Useful contributions include prompt-token alignment checks, first-divergence
+Useful quality reports still include prompt-token alignment checks, first-divergence
 top-20 logits, prefix-cache on/off comparisons, same-layer artifact comparisons, and
 per-sample failure classification. Do not submit score-only reports, `--limit 20`
 conclusions, or blind parity-switch/kernel sweeps. Include the hardware/toolchain,

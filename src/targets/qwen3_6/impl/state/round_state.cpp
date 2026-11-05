@@ -64,7 +64,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
             {spec.output_rows, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
             "ordinary decode logits");
         ordinary.hidden =
-            add_tensor(builder, DType::BF16,
+            add_tensor(builder, spec.activation_dtype,
                        {spec.hidden, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
                        "ordinary decode hidden");
         if (spec.mixed_token_capacity > 0) {
@@ -85,7 +85,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
             mixed.prefill_kv_table_row =
                 add_tensor(builder, DType::I32, {1}, "mixed prefill KV row");
             mixed.prefill_tail_hidden =
-                add_tensor(builder, DType::BF16, {spec.hidden, 1}, "mixed prefill tail hidden");
+                add_tensor(builder, spec.activation_dtype, {spec.hidden, 1}, "mixed prefill tail hidden");
             mixed.bonus_logits =
                 add_tensor(builder, DType::BF16, {spec.output_rows, 1}, "mixed bonus logits");
             mixed.bonus_token = add_tensor(builder, DType::I32, {1}, "mixed bonus token");
@@ -190,7 +190,8 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             checked_i32(std::max<std::uint64_t>(1ULL, layout.spec.draft_window - 1ULL),
                         "RoundState MTP AR steps exceed int32");
         layout.mtp->position         = i32(1, "MTP prefill autoregressive position");
-        layout.mtp->ar_hidden        = add_tensor(builder, DType::BF16, {layout.spec.hidden, 1},
+        layout.mtp->ar_hidden        = add_tensor(builder, layout.spec.activation_dtype,
+                                                  {layout.spec.hidden, 1},
                                                   "MTP prefill autoregressive hidden");
         layout.mtp->draft_tokens     = i32(drafts, "MTP prefill draft tokens");
         layout.mtp->target_input_ids = i32(columns, "MTP prefill target input ids");
@@ -212,21 +213,24 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             add_tensor(builder, DType::BF16, {layout.spec.output_rows, columns, batch},
                        "MTP decode target logits");
         decode.target_hidden = add_tensor(
-            builder, DType::BF16, {layout.spec.hidden, columns, batch}, "MTP decode target hidden");
+            builder, layout.spec.activation_dtype, {layout.spec.hidden, columns, batch},
+                       "MTP decode target hidden");
         decode.target_continuation_hidden =
-            add_tensor(builder, DType::BF16, {layout.spec.hidden, batch},
+            add_tensor(builder, layout.spec.activation_dtype, {layout.spec.hidden, batch},
                        "MTP decode target continuation hidden");
         decode.proposal_logits = add_tensor(builder, DType::BF16, {layout.spec.output_rows, batch},
                                             "MTP decode proposal logits");
         decode.alignment_ids =
             add_tensor(builder, DType::I32, {columns, batch}, "MTP decode alignment ids");
         decode.alignment_hidden =
-            add_tensor(builder, DType::BF16, {layout.spec.hidden, columns, batch},
+            add_tensor(builder, layout.spec.activation_dtype, {layout.spec.hidden, columns, batch},
                        "MTP decode alignment hidden");
-        decode.ar_hidden = add_tensor(builder, DType::BF16, {layout.spec.hidden, batch},
+        decode.ar_hidden = add_tensor(builder, layout.spec.activation_dtype,
+                                          {layout.spec.hidden, batch},
                                       "MTP decode autoregressive hidden");
         decode.next_hidden =
-            add_tensor(builder, DType::BF16, {layout.spec.hidden, batch}, "MTP decode next hidden");
+            add_tensor(builder, layout.spec.activation_dtype, {layout.spec.hidden, batch},
+                       "MTP decode next hidden");
         decode.ar_positions      = add_tensor(builder, DType::I32, {batch, ar_steps},
                                               "MTP decode autoregressive positions");
         decode.ar_rope_positions = add_tensor(builder, DType::I32, {batch, ar_steps},
@@ -245,7 +249,8 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                 add_tensor(builder, DType::I32, {tokens}, "MTP mixed rope positions");
             mx.owner_kv_table_row =
                 add_tensor(builder, DType::I32, {1}, "MTP mixed owner KV row");
-            mx.owner_tail_hidden = add_tensor(builder, DType::BF16, {layout.spec.hidden, 1},
+            mx.owner_tail_hidden = add_tensor(builder, layout.spec.activation_dtype,
+                                                  {layout.spec.hidden, 1},
                                               "MTP mixed owner tail hidden");
             mx.owner_bonus_logits =
                 add_tensor(builder, DType::BF16, {layout.spec.output_rows, 1},

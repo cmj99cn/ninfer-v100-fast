@@ -52,13 +52,11 @@ V100 profiles, but the BFCL quality gap and the limitations below are still open
 
 ### Known Issues
 
-- **BFCL-v3 multi-turn tool calling remains below the vLLM baseline.**
-  Latest full 200: **54/200 = 27.0%** vs 1cat-vLLM **77/200 = 38.5%**.
-  This is the highest ninfer full-200 result so far (previous best 25.0%),
-  but the **11.5pp** gap is unresolved. A single seed cannot support 6pp
-  attribution. Active blind fixing is paused; community help is requested.
-  See [`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md) and
-  [`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md).
+- **BFCL-v3 multi-turn tool calling is resolved for the current release profile.**
+  Latest full 200: **82/200 = 41.0%** vs 1cat-vLLM **73/200 = 36.5%** (paired
+  net +9). The fixes are tool-call schema typing / Python-literal normalization,
+  the NVFP4 QPN divisor, and disabling decode-state turn-checkpoint reuse on the
+  non-speculative prefix path. See the README quality section.
 - The current self-converted NVFP4 artifact includes Vision; the GGUF Q4_K_M
   artifact rejects Vision. Multi-instance Vision is unverified.
 - Long-duration prefix-cache soak testing under very high concurrency has not

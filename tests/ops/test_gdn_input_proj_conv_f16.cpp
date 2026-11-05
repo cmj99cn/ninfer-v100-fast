@@ -88,6 +88,77 @@ __half output_at(const std::vector<__half>& q, const std::vector<__half>& key,
     return value[static_cast<std::size_t>(token) * kValueRows + channel - kQueryRows - kKeyRows];
 }
 
+int run_capacity_case(std::int32_t tokens, std::uint32_t seed) {
+    auto packed     = test::linear::make_nvfp4_weight(kParentRows, kHidden, seed);
+    Fixture fixture = make_fixture(tokens, seed + 1);
+
+    DeviceBuffer x_bytes(fixture.x.size() * sizeof(__half));
+    x_bytes.copy_from_host(fixture.x.data(), x_bytes.bytes);
+    DeviceBuffer w_bytes(packed.payload.size());
+    w_bytes.copy_from_host(packed.payload.data(), w_bytes.bytes);
+    DeviceBuffer conv_bytes(fixture.conv_bits.size() * sizeof(std::uint16_t));
+    conv_bytes.copy_from_host(fixture.conv_bits.data(), conv_bytes.bytes);
+    constexpr std::int32_t kCapacitySlots = 64;
+    std::vector<__half> zeros(static_cast<std::size_t>(3) * kChannels * kCapacitySlots,
+                              to_half(0.0f));
+    std::copy(fixture.initial_state.begin(), fixture.initial_state.end(), zeros.begin());
+    DeviceBuffer state_bytes(zeros.size() * sizeof(__half));
+    state_bytes.copy_from_host(zeros.data(), state_bytes.bytes);
+    DeviceBuffer q_bytes(static_cast<std::size_t>(kQueryRows) * tokens * sizeof(__half));
+    DeviceBuffer k_bytes(static_cast<std::size_t>(kKeyRows) * tokens * sizeof(__half));
+    DeviceBuffer v_bytes(static_cast<std::size_t>(kValueRows) * tokens * sizeof(__half));
+    DeviceBuffer z_bytes(static_cast<std::size_t>(kZRows) * tokens * sizeof(__half));
+    DeviceBuffer record_bytes(static_cast<std::size_t>(kChannels) * tokens * sizeof(__half));
+
+    Weight weight = packed.device_weight(w_bytes.p);
+    Tensor x(x_bytes.p, DType::FP16, {kHidden, tokens});
+    Tensor conv(conv_bytes.p, DType::BF16, {kChannels, 4});
+    Tensor state(state_bytes.p, DType::FP16, {3, kChannels, kCapacitySlots});
+    Tensor q(q_bytes.p, DType::FP16, {kQueryRows, tokens});
+    Tensor k(k_bytes.p, DType::FP16, {kKeyRows, tokens});
+    Tensor v(v_bytes.p, DType::FP16, {kValueRows, tokens});
+    Tensor z(z_bytes.p, DType::FP16, {kZRows, tokens});
+    Tensor record(record_bytes.p, DType::FP16, {kChannels, tokens});
+
+    const std::int32_t initial_slot  = 0;
+    const std::int32_t snapshot_base = 1;
+    DeviceBuffer initial_slot_bytes(sizeof(std::int32_t));
+    DeviceBuffer snapshot_base_bytes(sizeof(std::int32_t));
+    initial_slot_bytes.copy_from_host(&initial_slot, sizeof(std::int32_t));
+    snapshot_base_bytes.copy_from_host(&snapshot_base, sizeof(std::int32_t));
+    Tensor initial(initial_slot_bytes.p, DType::I32, {1});
+    Tensor snap_base(snapshot_base_bytes.p, DType::I32, {1});
+    Tensor no_valid(nullptr, DType::I32, {1});
+
+    const std::size_t snapshot_capacity =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, kParentRows, kHidden, ops::LinearPolicy::A16Only, 1, tokens, tokens,
+            DType::FP16);
+    DeviceArena snapshot_workspace(std::max<std::size_t>(snapshot_capacity, 1));
+    ops::gdn_input_proj_conv_snapshot(x, weight, conv, state, no_valid, initial, snap_base, q, k,
+                                      v, z, ops::LinearPolicy::A16Only, snapshot_workspace,
+                                      nullptr);
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        std::cerr << "GDN_CONV_F16: capacity snapshot synchronize failed T=" << tokens << '\n';
+        return 1;
+    }
+
+    // The record form owns T=2..16; a one-column snapshot is the T=1 case.
+    if (tokens < 2) { return 0; }
+    const std::size_t record_capacity =
+        ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+            QType::NVFP4, kParentRows, kHidden, ops::LinearPolicy::A16Only, 1, tokens, tokens,
+            DType::FP16);
+    DeviceArena record_workspace(std::max<std::size_t>(record_capacity, 1));
+    ops::gdn_input_proj_conv_record(x, weight, conv, state, no_valid, initial, record, q, k, v, z,
+                                    ops::LinearPolicy::A16Only, record_workspace, nullptr);
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        std::cerr << "GDN_CONV_F16: capacity record synchronize failed T=" << tokens << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -96,6 +167,14 @@ int main() {
         return 77;
     }
     try {
+        int capacity_failures = 0;
+        capacity_failures += run_capacity_case(1, 995U);
+        capacity_failures += run_capacity_case(6, 996U);
+        capacity_failures += run_capacity_case(16, 997U);
+        if (capacity_failures != 0) {
+            std::cout << "FAIL GDN conv capacity F16\n";
+            return 1;
+        }
         constexpr std::int32_t kTokens = 6;
         auto packed = test::linear::make_nvfp4_weight(kParentRows, kHidden, 991U);
         Fixture fixture = make_fixture(kTokens, 992U);

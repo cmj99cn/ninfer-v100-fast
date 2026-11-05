@@ -794,6 +794,12 @@ block tree 会匹配“结束于 64-token block 边界、且该边界上存在 s
 token；未命中时仍回退到 retained checkpoint 路径。参见
 `docs/maintainer/hybrid-prefix-cache-plan.md`。
 
+block snapshot 捕获 **prefill 路径**的 state image；tap frontier 对齐到
+`lcm(prefill_chunk, kBlockTokens)`，使恢复后的 suffix 与 cold prefill 使用同一 chunk 网格。
+non-speculative 路径不把 decode 路径产生的 rewrite checkpoint（turn/response closure）作为后续
+prefill 的起点；它在 block snapshot 与 cold prefill 之间选择，避免 decode/prefill 数值不等价被
+随机采样放大。
+
 ### 10.2 Non-page-aligned frontier
 
 例如 Main Text `P=64`、retained frontier `F=1000`：

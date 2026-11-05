@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -85,6 +86,26 @@ void embed_gather_dense_launch(const Tensor& ids, const Tensor& table, Tensor& o
     embed_gather_dense_kernel<<<grid_for(n), kBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(ids.data), static_cast<const __nv_bfloat16*>(table.data),
         static_cast<__nv_bfloat16*>(out.data), d, T);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void embed_gather_dense_f16_launch(const Tensor& ids, const Tensor& table, Tensor& out,
+                                   cudaStream_t stream) {
+    const std::int32_t d = out.ne[0];
+    const std::int32_t T = ids.ne[0];
+    const std::int64_t n = static_cast<std::int64_t>(d) * T;
+    const int grid       = grid_for(n);
+    if (table.dtype == DType::BF16) {
+        embed_gather_dense_f16_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(ids.data),
+            static_cast<const __nv_bfloat16*>(table.data), static_cast<__half*>(out.data), d, T);
+    } else if (table.dtype == DType::FP16) {
+        embed_gather_dense_f16_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(ids.data), static_cast<const __half*>(table.data),
+            static_cast<__half*>(out.data), d, T);
+    } else {
+        throw std::invalid_argument("embedding: FP16 output requires a BF16 or FP16 table");
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

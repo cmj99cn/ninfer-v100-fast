@@ -493,6 +493,11 @@ Malformed tool markup is flushed back as ordinary text without losing bytes, exc
 `content` instead: its dangling syntax is discarded, the finish reason stays `length`, and the
 text preceding the call is returned normally.
 
+Tool-call arguments are decoded against the declared tool schema: a parameter whose schema admits
+a string keeps the tag payload verbatim (a numeric-looking zip code stays a string), while other
+parameters are JSON-decoded. Python-style literals `True`, `False`, and `None` emitted by the
+checkpoint are accepted and normalized to JSON `true`, `false`, and `null`.
+
 ### Local response state and resources
 
 `store` defaults to `true`. Stored Responses live only in this server process and are bounded by an

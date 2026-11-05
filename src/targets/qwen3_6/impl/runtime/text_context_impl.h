@@ -33,6 +33,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -64,9 +65,12 @@ inline void dump_layer_last_token(int layer, const Tensor& x, cudaStream_t strea
                      static_cast<int>(getpid()), path, static_cast<int>(x.dtype),
                      static_cast<long long>(x.ne[0]), static_cast<long long>(x.ne[1]));
     }
-    if (x.data == nullptr || x.dtype != DType::BF16) { return; }
-    const int k = static_cast<int>(x.ne[0]);
-    const int t = static_cast<int>(x.ne[1]);
+    if (x.data == nullptr || (x.dtype != DType::BF16 && x.dtype != DType::FP16)) { return; }
+    // [K,T] stores one K-vector per token; [D,H,T] stores D*H values per token. Both have dim 0
+    // as the fastest axis, so the last token is one contiguous k-element block.
+    const bool tiled_3d = x.ne[2] > 1 && x.ne[3] == 1;
+    const int k = tiled_3d ? static_cast<int>(x.ne[0] * x.ne[1]) : static_cast<int>(x.ne[0]);
+    const int t = tiled_3d ? static_cast<int>(x.ne[2]) : static_cast<int>(x.ne[1]);
     if (k <= 0 || t <= 0) { return; }
     static FILE* file = std::fopen(path, "a");
     if (file == nullptr) { return; }
@@ -77,12 +81,13 @@ inline void dump_layer_last_token(int layer, const Tensor& x, cudaStream_t strea
         if (probe[p] < t) { idxs[n_idx++] = probe[p]; }
     }
     if (idxs[n_idx - 1] != t - 1) { idxs[n_idx++] = t - 1; }
-    std::vector<__nv_bfloat16> host(static_cast<std::size_t>(k));
+    std::vector<std::uint16_t> host(static_cast<std::size_t>(k));
+    const std::size_t elem_bytes = x.dtype == DType::FP16 ? sizeof(__half) : sizeof(__nv_bfloat16);
     for (int ii = 0; ii < n_idx; ++ii) {
         const int tok = idxs[ii];
-        const auto* base =
-            static_cast<const __nv_bfloat16*>(x.data) + static_cast<std::int64_t>(tok) * k;
-        if (cudaMemcpyAsync(host.data(), base, sizeof(__nv_bfloat16) * k,
+        const auto* base = static_cast<const std::uint16_t*>(x.data) +
+                           static_cast<std::int64_t>(tok) * k;
+        if (cudaMemcpyAsync(host.data(), base, elem_bytes * k,
                             cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
             return;
         }
@@ -94,9 +99,13 @@ inline void dump_layer_last_token(int layer, const Tensor& x, cudaStream_t strea
                       static_cast<int>(getpid()), layer, t, tok);
         line = head;
         for (int i = 0; i < k; ++i) {
+            const std::uint16_t bits = host[static_cast<std::size_t>(i)];
+            const float value =
+                x.dtype == DType::FP16
+                    ? __half2float(*reinterpret_cast<const __half*>(&bits))
+                    : __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&bits));
             char num[20];
-            std::snprintf(num, sizeof(num), " %.6g",
-                          __bfloat162float(host[static_cast<std::size_t>(i)]));
+            std::snprintf(num, sizeof(num), " %.6g", value);
             line += num;
         }
         line += '\n';
@@ -630,7 +639,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     nvtx::ScopedRange mtp_prefill_range(nvtx::Name::PrefillMtpChunk, nvtx::Category::Mtp,
                                         static_cast<std::uint64_t>(T));
     require_tensor_shape(ids, DType::I32, {T}, "MTP prefill ids");
-    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, T}, "MTP prefill hidden");
+    require_tensor_shape(hidden, kCfg.act, {kCfg.hidden, T}, "MTP prefill hidden");
     require_tensor_shape(positions, DType::I32, {T}, "MTP prefill positions");
     if (rope_positions.dtype != DType::I32 || rope_positions.ne[0] != T ||
         (rope_positions.ne[1] != 1 && rope_positions.ne[1] != 3) || rope_positions.ne[2] != 1 ||
@@ -642,7 +651,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         if (final_hidden == nullptr || logits == nullptr || draft_token == nullptr) {
             throw std::invalid_argument("MTP final prefill outputs are required");
         }
-        require_tensor_shape(*final_hidden, DType::BF16, {kCfg.hidden, 1},
+        require_tensor_shape(*final_hidden, kCfg.act, {kCfg.hidden, 1},
                              "MTP final prefill hidden");
         require_tensor_shape(*logits, DType::BF16, {kCfg.vocab, 1}, "MTP final prefill logits");
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP final prefill draft token");
@@ -653,8 +662,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     Tensor x_last;
     Tensor ah_last;
     if (final_chunk) {
-        x_last  = work_.alloc(DType::BF16, {kCfg.hidden, 1});
-        ah_last = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+        x_last  = work_.alloc(kCfg.act, {kCfg.hidden, 1});
+        ah_last = work_.alloc(kCfg.act, {kCfg.hidden, 1});
     }
 
     {
@@ -663,19 +672,19 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor ah;
         mtp_forward_stem(ids, hidden, input_embeddings, x, ah);
 
-        Tensor k_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
-        Tensor v_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
+        Tensor k_flat = work_.alloc(kCfg.act, {kCfg.kv_size, T});
+        Tensor v_flat = work_.alloc(kCfg.act, {kCfg.kv_size, T});
         Variant::mtp_kv_projection(ah, mtp_.payload->attention, k_flat, v_flat, work_, s);
         Tensor k  = k_flat.view({kCfg.head_dim, kCfg.n_kv, T});
         Tensor v  = v_flat.view({kCfg.head_dim, kCfg.n_kv, T});
-        Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
+        Tensor kn = work_.alloc(kCfg.act, {kCfg.head_dim, kCfg.n_kv, T});
         ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
         ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, rope_frequency_[0], s);
         ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
 
         if (final_chunk) {
             const std::size_t column_bytes =
-                static_cast<std::size_t>(kCfg.hidden) * dtype_size(DType::BF16);
+                static_cast<std::size_t>(kCfg.hidden) * dtype_size(kCfg.act);
             const auto* x_src = static_cast<const unsigned char*>(x.data) +
                                 static_cast<std::size_t>(T - 1) * column_bytes;
             const auto* ah_src = static_cast<const unsigned char*>(ah.data) +
@@ -688,13 +697,13 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     }
 
     if (final_chunk) {
-        Tensor q_flat    = work_.alloc(DType::BF16, {kCfg.q_size, 1});
-        Tensor gate_flat = work_.alloc(DType::BF16, {kCfg.q_size, 1});
+        Tensor q_flat    = work_.alloc(kCfg.act, {kCfg.q_size, 1});
+        Tensor gate_flat = work_.alloc(kCfg.act, {kCfg.q_size, 1});
         Variant::mtp_q_gate_projection(ah_last, mtp_.payload->attention, q_flat, gate_flat, work_,
                                        s);
         Tensor q    = q_flat.view({kCfg.head_dim, kCfg.n_q, 1});
         Tensor gate = gate_flat.view({kCfg.head_dim, kCfg.n_q, 1});
-        Tensor qn   = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
+        Tensor qn   = work_.alloc(kCfg.act, {kCfg.head_dim, kCfg.n_q, 1});
         ops::rmsnorm(q, *mtp_.q_norm, kCfg.rms_eps, true, qn, s);
         Tensor last_position = positions.slice(0, T - 1, 1);
         Tensor last_rope_position;
@@ -713,16 +722,16 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, rope_frequency_[0],
                   s);
 
-        Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
+        Tensor a = work_.alloc(kCfg.act, {kCfg.head_dim, kCfg.n_q, 1});
         ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0), envelope,
                                   work_, a, s);
         ops::sigmoid_mul(gate, a, s);
 
-        Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+        Tensor o = work_.alloc(kCfg.act, {kCfg.hidden, 1});
         ops::linear(a.view({kCfg.q_size, 1}), *mtp_.o_proj, o, s);
         ops::residual_add(o, x_last, s);
 
-        Tensor mh = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+        Tensor mh = work_.alloc(kCfg.act, {kCfg.hidden, 1});
         ops::rmsnorm(x_last, *mtp_.post_attn_norm, kCfg.rms_eps, true, mh, s);
         {
             auto post_mixer_scope = work_.scope();
@@ -735,7 +744,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 
 void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens) {
     const int T = hidden.ne[1];
-    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, T}, "proposal hidden");
+    require_tensor_shape(hidden, kCfg.act, {kCfg.hidden, T}, "proposal hidden");
     require_tensor_shape(proposal_tokens, DType::I32, {T}, "proposal tokens");
     require_tensor_window(logits, DType::BF16, kCfg.vocab, T, "proposal logits");
     if (proposal_head_ != nullptr) {
@@ -763,8 +772,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     }
     require_tensor_shape(ids, DType::I32, {T}, "MTP ids");
     require_tensor_shape(positions, DType::I32, {T}, "MTP positions");
-    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, T}, "MTP hidden");
-    require_tensor_shape(mtp_hidden, DType::BF16, {kCfg.hidden, T}, "MTP output hidden");
+    require_tensor_shape(hidden, kCfg.act, {kCfg.hidden, T}, "MTP hidden");
+    require_tensor_shape(mtp_hidden, kCfg.act, {kCfg.hidden, T}, "MTP output hidden");
     if (logits_column >= T) { throw std::invalid_argument("MTP logits column out of range"); }
     if (logits_column >= 0) {
         if (logits == nullptr || draft_token == nullptr) {
@@ -803,8 +812,8 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
     require_tensor_shape(position, DType::I32, {1}, "MTP AR position");
-    require_tensor_shape(previous_hidden, DType::BF16, {kCfg.hidden, 1}, "MTP AR previous hidden");
-    require_tensor_shape(mtp_hidden, DType::BF16, {kCfg.hidden, 1}, "MTP AR output hidden");
+    require_tensor_shape(previous_hidden, kCfg.act, {kCfg.hidden, 1}, "MTP AR previous hidden");
+    require_tensor_shape(mtp_hidden, kCfg.act, {kCfg.hidden, 1}, "MTP AR output hidden");
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, 1}, "MTP AR logits");
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP AR draft token");
 
@@ -837,7 +846,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "ordinary decode KV rows");
     require_tensor_shape(linear_state_slots, DType::I32, {batch},
                          "ordinary decode Linear Attention slots");
-    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, batch}, "ordinary decode hidden");
+    require_tensor_shape(hidden, kCfg.act, {kCfg.hidden, batch}, "ordinary decode hidden");
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, batch}, "ordinary decode logits");
 
     cudaStream_t stream = ctx_.stream;
@@ -851,7 +860,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
 
-        Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, batch});
+        Tensor x = work_.alloc(kCfg.act, {kCfg.hidden, batch});
         ops::embedding(ids, *embed_, x, stream);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
@@ -898,10 +907,10 @@ void TextContext::mixed_prefill_decode_batch(const Tensor& ids, const Tensor& ca
     require_tensor_shape(decode_kv_table_rows, DType::I32, {B}, "mixed decode KV rows");
     require_tensor_shape(decode_linear_state_slots, DType::I32, {B}, "mixed decode linear slots");
     require_tensor_shape(prefill_kv_table_rows, DType::I32, {1}, "mixed prefill KV row");
-    require_tensor_shape(decode_hidden, DType::BF16, {kCfg.hidden, B}, "mixed decode hidden");
+    require_tensor_shape(decode_hidden, kCfg.act, {kCfg.hidden, B}, "mixed decode hidden");
     require_tensor_shape(decode_logits, DType::BF16, {kCfg.vocab, B}, "mixed decode logits");
     if (prefill_finalize) {
-        require_tensor_shape(prefill_tail_hidden, DType::BF16, {kCfg.hidden, 1},
+        require_tensor_shape(prefill_tail_hidden, kCfg.act, {kCfg.hidden, 1},
                              "mixed prefill tail hidden");
     }
 
@@ -927,7 +936,7 @@ void TextContext::mixed_prefill_decode_batch(const Tensor& ids, const Tensor& ca
         mixed.finalize            = prefill_finalize;
         ScopedValue<const MixedOwnerState*> mixed_binding(active_mixed_, &mixed);
 
-        Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, T});
+        Tensor x = work_.alloc(kCfg.act, {kCfg.hidden, T});
         ops::embedding(ids, *embed_, x, stream);
         NullTap tap;
         run_layers(x, Phase::Mixed, tap);
@@ -942,7 +951,7 @@ void TextContext::mixed_prefill_decode_batch(const Tensor& ids, const Tensor& ca
         // Rewrite-checkpoint capture: the raw (pre-final-norm) owner hidden at the checkpoint's
         // flat column plus the owner's GDN state image.
         if (rewrite_checkpoint_column >= 0 && rewrite_checkpoint_hidden != nullptr) {
-            require_tensor_shape(*rewrite_checkpoint_hidden, DType::BF16, {kCfg.hidden, 1},
+            require_tensor_shape(*rewrite_checkpoint_hidden, kCfg.act, {kCfg.hidden, 1},
                                  "mixed rewrite checkpoint hidden");
             Tensor checkpoint_hidden = x.slice(1, rewrite_checkpoint_column, 1);
             CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden->data, checkpoint_hidden.data,
@@ -1040,7 +1049,7 @@ void TextContext::mixed_mtp_batch(const Tensor& ids, const Tensor& cache_positio
     require_tensor_shape(decode_linear_state_slots, DType::I32, {B}, "mixed MTP decode slots");
     require_tensor_shape(decode_valid_columns, DType::I32, {B}, "mixed MTP decode valid columns");
     require_tensor_shape(prefill_kv_table_rows, DType::I32, {1}, "mixed MTP prefill KV row");
-    require_tensor_shape(target_hidden, DType::BF16, {kCfg.hidden, decode_width, B},
+    require_tensor_shape(target_hidden, kCfg.act, {kCfg.hidden, decode_width, B},
                          "mixed MTP target hidden");
     require_tensor_shape(target_logits, DType::BF16, {kCfg.vocab, decode_width, B},
                          "mixed MTP target logits");
@@ -1048,7 +1057,7 @@ void TextContext::mixed_mtp_batch(const Tensor& ids, const Tensor& cache_positio
     if (prefill_finalize) {
         require_tensor_shape(prefill_bonus_logits, DType::BF16, {kCfg.vocab, 1},
                              "mixed MTP bonus logits");
-        require_tensor_shape(prefill_tail_hidden, DType::BF16, {kCfg.hidden, 1},
+        require_tensor_shape(prefill_tail_hidden, kCfg.act, {kCfg.hidden, 1},
                              "mixed MTP tail hidden");
     }
 
@@ -1075,7 +1084,7 @@ void TextContext::mixed_mtp_batch(const Tensor& ids, const Tensor& cache_positio
         mixed.finalize             = prefill_finalize;
         ScopedValue<const MixedOwnerState*> mixed_binding(active_mixed_, &mixed);
 
-        Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, T});
+        Tensor x = work_.alloc(kCfg.act, {kCfg.hidden, T});
         ops::embedding(ids, *embed_, x, stream);
         NullTap tap;
         run_layers(x, Phase::Mixed, tap);
@@ -1101,7 +1110,7 @@ void TextContext::mixed_mtp_batch(const Tensor& ids, const Tensor& cache_positio
                                        stream));
         }
         if (rewrite_checkpoint_column >= 0 && rewrite_checkpoint_hidden != nullptr) {
-            require_tensor_shape(*rewrite_checkpoint_hidden, DType::BF16, {kCfg.hidden, 1},
+            require_tensor_shape(*rewrite_checkpoint_hidden, kCfg.act, {kCfg.hidden, 1},
                                  "mixed MTP rewrite checkpoint hidden");
             Tensor checkpoint_hidden = x.slice(1, rewrite_checkpoint_column, 1);
             CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden->data, checkpoint_hidden.data,
@@ -1140,7 +1149,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "target verify batch KV rows");
     require_tensor_shape(linear_state_slots, DType::I32, {batch},
                          "target verify batch Linear Attention slots");
-    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, width, batch},
+    require_tensor_shape(hidden, kCfg.act, {kCfg.hidden, width, batch},
                          "target verify batch hidden");
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, width, batch},
                          "target verify batch logits");
@@ -1158,7 +1167,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
 
-        Tensor x        = work_.alloc(DType::BF16, {kCfg.hidden, columns});
+        Tensor x        = work_.alloc(kCfg.act, {kCfg.hidden, columns});
         Tensor flat_ids = ids.view({columns});
         ops::embedding(flat_ids, *embed_, x, stream);
         if constexpr (Tap::enabled) { tap.begin(x); }
@@ -1211,7 +1220,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
     }
     require_tensor_shape(ids, DType::I32, {width, batch}, "MTP decode batch ids");
-    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, width, batch},
+    require_tensor_shape(hidden, kCfg.act, {kCfg.hidden, width, batch},
                          "MTP decode batch target hidden");
     require_tensor_shape(cache_positions, DType::I32, {width, batch},
                          "MTP decode batch cache positions");
@@ -1219,7 +1228,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
                          "MTP decode batch RoPE positions");
     require_tensor_shape(valid_columns, DType::I32, {batch}, "MTP decode batch valid columns");
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "MTP decode batch KV rows");
-    require_tensor_shape(mtp_hidden, DType::BF16, {kCfg.hidden, width, batch},
+    require_tensor_shape(mtp_hidden, kCfg.act, {kCfg.hidden, width, batch},
                          "MTP decode batch hidden");
 
     ScopedValue<const Tensor*> backend_binding(active_backend_kv_table_rows_, &kv_table_rows);
@@ -1231,7 +1240,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
 
 void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens) {
     const std::int32_t batch = hidden.ne[1];
-    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, batch}, "MTP proposal batch hidden");
+    require_tensor_shape(hidden, kCfg.act, {kCfg.hidden, batch}, "MTP proposal batch hidden");
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, batch}, "MTP proposal batch logits");
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP proposal batch tokens");
     proposal_argmax(hidden, logits, draft_tokens);
@@ -1273,7 +1282,7 @@ void TextContext::owner_mtp_align(const Tensor& ids, const std::array<Tensor, kM
             Tensor next_token = io_.mtp->draft_tokens.slice(0, i, 1);
             std::array<Tensor, kMaximumDevices> next_hidden;
             for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-                next_hidden[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
+                next_hidden[r] = ws[r]->alloc(kCfg.act, {kCfg.hidden, 1});
             }
             const auto ar_visible = static_cast<std::uint32_t>(chunk_end_position + i);
             const ops::GqaExecutionEnvelope ar_envelope{ar_visible, ar_visible};
@@ -1301,7 +1310,7 @@ void TextContext::owner_mtp_align(const Tensor& ids, const std::array<Tensor, kM
     for (int i = 1; i < static_cast<int>(mtp_proposal_extent_); ++i) {
         Tensor prev_token  = io_.mtp->draft_tokens.slice(0, i - 1, 1);
         Tensor next_token  = io_.mtp->draft_tokens.slice(0, i, 1);
-        Tensor next_hidden = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+        Tensor next_hidden = work_.alloc(kCfg.act, {kCfg.hidden, 1});
         const auto ar_visible = static_cast<std::uint32_t>(chunk_end_position + i);
         const ops::GqaExecutionEnvelope ar_envelope{ar_visible, ar_visible};
         mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position, ar_envelope, next_hidden,
@@ -1394,6 +1403,28 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,
                                          work_, s);
 
+    auto debug_gdn_dump = [&](const char* name, const Tensor& t) {
+        const char* dir = std::getenv("NINFER_DEBUG_GDN_GB_DIR");
+        if (dir == nullptr || ph != Phase::Prefill || gidx != 0 || T <= 8) {
+            return;
+        }
+        const std::size_t bytes = static_cast<std::size_t>(t.numel()) * dtype_size(t.dtype);
+        std::vector<std::uint8_t> host(bytes);
+        cudaStreamSynchronize(s);
+        cudaMemcpy(host.data(), t.data, bytes, cudaMemcpyDeviceToHost);
+        char path[512];
+        std::snprintf(path, sizeof path, "%s/%s_L0_T%d.bin", dir, name, T);
+        std::FILE* f = std::fopen(path, "wb");
+        if (f != nullptr) {
+            std::fwrite(host.data(), 1, bytes, f);
+            std::fclose(f);
+        }
+    };
+    debug_gdn_dump("g", g);
+    debug_gdn_dump("beta", beta);
+    debug_gdn_dump("h", h);
+    debug_gdn_dump("x_in", x);
+
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
     Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     Tensor qc             = projection.query;
@@ -1437,16 +1468,21 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor qkv_c = conv.convolved;
         Tensor conv_state =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
+        debug_gdn_dump("conv_state_in", conv_state);
         ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
         ops::extract_bf16_columns(qkv_c, 0, qc, s);
         ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
         ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
+        debug_gdn_dump("qkv_c", qkv_c);
     }
 
     Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
     Tensor k_recurrent = kc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
 
     Tensor vv = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    debug_gdn_dump("q_rec", q_recurrent);
+    debug_gdn_dump("k_rec", k_recurrent);
+    debug_gdn_dump("vv", vv);
     Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     if (ph == Phase::Verify) {
@@ -1477,13 +1513,16 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     } else {
         Tensor recurrent_state =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
+        debug_gdn_dump("state_in", recurrent_state);
         ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
                              /*normalize_qk=*/true, work_, recurrent_state, o, s);
     }
 
+    debug_gdn_dump("o", o);
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+    debug_gdn_dump("on", on);
 
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
 }
@@ -1589,15 +1628,15 @@ void TextContext::gdn_mix_mixed(const GdnLayerW& w, Tensor& x, int gidx) {
     const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
     const bool record_for_replay = gdn_state_action_ == GdnStateAction::RecordForReplay;
 
-    Tensor z = work_.alloc(DType::BF16, {kCfg.value_dim, T});
-    Tensor o = work_.alloc(DType::BF16, {kCfg.value_dim, T});
+    Tensor z = work_.alloc(kCfg.act, {kCfg.value_dim, T});
+    Tensor o = work_.alloc(kCfg.act, {kCfg.value_dim, T});
 
     {
         auto scope = work_.scope();
         Tensor projection_input = h.slice(1, 0, decode_cols).view({kCfg.hidden, W, B});
-        Tensor qc_d             = work_.alloc(DType::BF16, {kCfg.key_dim, decode_cols});
-        Tensor kc_d             = work_.alloc(DType::BF16, {kCfg.key_dim, decode_cols});
-        Tensor vc_d             = work_.alloc(DType::BF16, {kCfg.value_dim, decode_cols});
+        Tensor qc_d             = work_.alloc(kCfg.act, {kCfg.key_dim, decode_cols});
+        Tensor kc_d             = work_.alloc(kCfg.act, {kCfg.key_dim, decode_cols});
+        Tensor vc_d             = work_.alloc(kCfg.act, {kCfg.value_dim, decode_cols});
         Tensor query_output     = qc_d.view({kCfg.key_dim, W, B});
         Tensor key_output       = kc_d.view({kCfg.key_dim, W, B});
         Tensor value_output     = vc_d.view({kCfg.value_dim, W, B});
@@ -1637,16 +1676,16 @@ void TextContext::gdn_mix_mixed(const GdnLayerW& w, Tensor& x, int gidx) {
     {
         auto scope = work_.scope();
         Tensor h_p = h.slice(1, decode_cols, c);
-        Tensor qkv = work_.alloc(DType::BF16, {2 * kCfg.key_dim + kCfg.value_dim, c});
+        Tensor qkv = work_.alloc(kCfg.act, {2 * kCfg.key_dim + kCfg.value_dim, c});
         Tensor z_p = z.slice(1, decode_cols, c);
         Variant::gdn_input_projection(h_p, *w.projection, qkv, z_p, Phase::Mixed, work_, s);
-        Tensor qkv_c = work_.alloc(DType::BF16, {2 * kCfg.key_dim + kCfg.value_dim, c});
+        Tensor qkv_c = work_.alloc(kCfg.act, {2 * kCfg.key_dim + kCfg.value_dim, c});
         Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx),
                                              active_mixed_->prefill_linear_slot);
         ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
-        Tensor qc_p = work_.alloc(DType::BF16, {kCfg.key_dim, c});
-        Tensor kc_p = work_.alloc(DType::BF16, {kCfg.key_dim, c});
-        Tensor vc_p = work_.alloc(DType::BF16, {kCfg.value_dim, c});
+        Tensor qc_p = work_.alloc(kCfg.act, {kCfg.key_dim, c});
+        Tensor kc_p = work_.alloc(kCfg.act, {kCfg.key_dim, c});
+        Tensor vc_p = work_.alloc(kCfg.act, {kCfg.value_dim, c});
         ops::extract_bf16_columns(qkv_c, 0, qc_p, s);
         ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc_p, s);
         ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc_p, s);
@@ -1661,7 +1700,7 @@ void TextContext::gdn_mix_mixed(const GdnLayerW& w, Tensor& x, int gidx) {
             recurrent_state, o_p, s);
     }
 
-    Tensor on = work_.alloc(DType::BF16, {kCfg.value_dim, T});
+    Tensor on = work_.alloc(kCfg.act, {kCfg.value_dim, T});
     Tensor o_view  = o.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     Tensor z_view  = z.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     Tensor on_view = on.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
@@ -1874,6 +1913,44 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
             Tensor x = roots.residual;
             ops::embedding(ids_device, *embed_, x, s);
+            // Diagnostic: replace the artifact's row-scaled FP8 embedding with the source BF16
+            // rows to isolate the embedding-quantization variable. Raw BF16 [prompt, hidden].
+            if (multimodal == nullptr) {
+                if (const char* embed_file = std::getenv("NINFER_DEBUG_EMBED_BF16_FILE")) {
+                    static std::vector<std::uint8_t> embed_rows;
+                    if (embed_rows.empty()) {
+                        std::FILE* f = std::fopen(embed_file, "rb");
+                        if (f != nullptr) {
+                            std::fseek(f, 0, SEEK_END);
+                            const long size = std::ftell(f);
+                            std::fseek(f, 0, SEEK_SET);
+                            if (size > 0) {
+                                embed_rows.resize(static_cast<std::size_t>(size));
+                                (void)std::fread(embed_rows.data(), 1, embed_rows.size(), f);
+                            }
+                            std::fclose(f);
+                        }
+                    }
+                    const std::size_t row_bytes =
+                        static_cast<std::size_t>(kCfg.hidden) * sizeof(std::uint16_t);
+                    if (embed_rows.size() >= (static_cast<std::size_t>(t0) + len) * row_bytes) {
+                        const auto* src = reinterpret_cast<const std::uint16_t*>(
+                            embed_rows.data() + static_cast<std::size_t>(t0) * row_bytes);
+                        std::vector<std::uint16_t> transposed(
+                            static_cast<std::size_t>(kCfg.hidden) * static_cast<std::size_t>(len));
+                        for (int t = 0; t < len; ++t) {
+                            for (int h = 0; h < kCfg.hidden; ++h) {
+                                transposed[static_cast<std::size_t>(h) * static_cast<std::size_t>(len) +
+                                           static_cast<std::size_t>(t)] =
+                                    src[static_cast<std::size_t>(t) * static_cast<std::size_t>(kCfg.hidden) +
+                                        static_cast<std::size_t>(h)];
+                            }
+                        }
+                        CUDA_CHECK(cudaMemcpyAsync(x.data, transposed.data(), transposed.size() * sizeof(std::uint16_t),
+                                                   cudaMemcpyHostToDevice, s));
+                    }
+                }
+            }
             if (!local_scatter_indices.empty()) {
                 Tensor indices_device = roots.scatter_indices;
                 copy_i32(local_scatter_indices.data(), indices_device, s);
@@ -1889,7 +1966,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
-                            : work_.alloc(DType::BF16, {kCfg.hidden, len});
+                            : work_.alloc(kCfg.act, {kCfg.hidden, len});
             ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
 
             if (is_last) {
@@ -1973,7 +2050,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     for (int i = 1; i < static_cast<int>(mtp_proposal_extent_); ++i) {
                         Tensor prev_token     = io_.mtp->draft_tokens.slice(0, i - 1, 1);
                         Tensor next_token     = io_.mtp->draft_tokens.slice(0, i, 1);
-                        Tensor next_hidden    = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+                        Tensor next_hidden    = work_.alloc(kCfg.act, {kCfg.hidden, 1});
                         const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
                         const ops::GqaExecutionEnvelope ar_envelope{ar_visible, ar_visible};
                         mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,
@@ -1992,7 +2069,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
             if (checkpoint_rel > 0 && t0 + len == checkpoint_rel &&
                 rewrite_checkpoint_hidden_output_ != nullptr) {
-                require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16,
+                require_tensor_shape(*rewrite_checkpoint_hidden_output_, kCfg.act,
                                      {kCfg.hidden, 1}, "rewrite checkpoint hidden output");
                 const Tensor checkpoint_hidden = xf.slice(1, len - 1, 1);
                 CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden_output_->data,
@@ -2710,9 +2787,11 @@ void TextContext::gdn_mix_parallel(const std::array<const GdnLayerW*, kMaximumDe
                                  /*normalize_qk=*/true, *ws[r], recurrent_state, o[r], s);
             if (gidx == 0 && rank == 0) { dump_layer_last_token(2005, o[r], s); }
         }
+        if (gidx == 0 && rank == 0) { dump_layer_last_token(3005, o[r], s); }
         // `gdn_norm` is the per-head-DIMENSION gain {128}: replicated, so each rank applies the
         // whole weight over its own 24 value heads.
         ops::gated_rmsnorm(o[r], *w[r]->gdn_norm, z[r], kCfg.rms_eps, on[r], s);
+        if (gidx == 0 && rank == 0) { dump_layer_last_token(3006, on[r], s); }
         if (gidx == 0 && rank == 0) { dump_layer_last_token(2006, on[r], s); }
     });
 
@@ -2863,7 +2942,7 @@ void TextContext::target_logits(const std::array<Tensor, kMaximumDevices>& hidde
         throw std::invalid_argument("target logits require at least one hidden column");
     }
     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-        require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, columns},
+        require_tensor_shape(hidden[r], kCfg.act, {kCfg.hidden, columns},
                              "target logits hidden");
     }
     logits_parallel(hidden, logits);
@@ -2925,7 +3004,7 @@ void TextContext::target_argmax_parallel(const std::array<Tensor, kMaximumDevice
     const std::int32_t columns              = hidden[0].ne[1];
     if (columns <= 0) { throw std::invalid_argument("target argmax requires columns"); }
     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-        require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, columns},
+        require_tensor_shape(hidden[r], kCfg.act, {kCfg.hidden, columns},
                              "target argmax hidden");
         require_tensor_shape(target_tokens[r], DType::I32, {columns},
                              "target argmax tokens");
@@ -3071,7 +3150,7 @@ PrefillChunkResult TextContext::prefill_impl_parallel(std::span<const int> ids,
             ids_device[r]    = roots.ids;
             positions[r]     = roots.positions;
             x[r]             = roots.residual;
-            staging[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, len});
+            staging[r]       = ws[r]->alloc(kCfg.act, {kCfg.hidden, len});
             rope_positions[r] = roots.rope_positions;
             scatter_indices_device[r] = roots.scatter_indices;
         }
@@ -3088,6 +3167,21 @@ PrefillChunkResult TextContext::prefill_impl_parallel(std::span<const int> ids,
                             rope_positions_host.data() + static_cast<std::size_t>(axis) * len);
             }
         }
+        std::vector<std::uint8_t> debug_embed_rows;
+        if (multimodal == nullptr) {
+            if (const char* embed_file = std::getenv("NINFER_DEBUG_EMBED_BF16_FILE")) {
+                if (std::FILE* f = std::fopen(embed_file, "rb")) {
+                    std::fseek(f, 0, SEEK_END);
+                    const long size = std::ftell(f);
+                    std::fseek(f, 0, SEEK_SET);
+                    if (size > 0) {
+                        debug_embed_rows.resize(static_cast<std::size_t>(size));
+                        (void)std::fread(debug_embed_rows.data(), 1, debug_embed_rows.size(), f);
+                    }
+                    std::fclose(f);
+                }
+            }
+        }
         for_each_rank(execution, [&](int rank) {
             const auto r   = static_cast<std::size_t>(rank);
             cudaStream_t s = stream_for(rank);
@@ -3097,6 +3191,26 @@ PrefillChunkResult TextContext::prefill_impl_parallel(std::span<const int> ids,
                 copy_i32(rope_positions_host.data(), rope_positions[r], s);
             }
             ops::embedding(ids_device[r], rank == 0 ? *embed_ : *embed_peer_[r], x[r], s);
+            const std::size_t debug_row_bytes =
+                static_cast<std::size_t>(kCfg.hidden) * sizeof(std::uint16_t);
+            if (!debug_embed_rows.empty() &&
+                debug_embed_rows.size() >=
+                    (static_cast<std::size_t>(base_i) + len) * debug_row_bytes) {
+                const auto* src = reinterpret_cast<const std::uint16_t*>(
+                    debug_embed_rows.data() + static_cast<std::size_t>(base_i) * debug_row_bytes);
+                std::vector<std::uint16_t> transposed(
+                    static_cast<std::size_t>(kCfg.hidden) * static_cast<std::size_t>(len));
+                for (int t = 0; t < len; ++t) {
+                    for (int h = 0; h < kCfg.hidden; ++h) {
+                        transposed[static_cast<std::size_t>(h) * static_cast<std::size_t>(len) +
+                                   static_cast<std::size_t>(t)] =
+                            src[static_cast<std::size_t>(t) * static_cast<std::size_t>(kCfg.hidden) +
+                                static_cast<std::size_t>(h)];
+                    }
+                }
+                CUDA_CHECK(cudaMemcpyAsync(x[r].data, transposed.data(), transposed.size() * sizeof(std::uint16_t),
+                                           cudaMemcpyHostToDevice, s));
+            }
             // Scatter the replicated vision embeddings into this rank's residual at the visual
             // positions; each rank reads its own local copy (no cross-device transfer).
             if (!local_scatter_indices.empty()) {
@@ -3134,7 +3248,7 @@ PrefillChunkResult TextContext::prefill_impl_parallel(std::span<const int> ids,
             const Tensor* ph = rank == 0 ? &prefill_hidden_ : tp_at(rank).prefill_hidden;
             xf[r] = ph != nullptr && ph->data != nullptr
                         ? matrix_window(*ph, len)
-                        : ws[r]->alloc(DType::BF16, {kCfg.hidden, len});
+                        : ws[r]->alloc(kCfg.act, {kCfg.hidden, len});
         }
         for_each_rank(execution, [&](int rank) {
             const auto r = static_cast<std::size_t>(rank);
@@ -3246,7 +3360,7 @@ PrefillChunkResult TextContext::prefill_impl_parallel(std::span<const int> ids,
                     Tensor next_token = io_.mtp->draft_tokens.slice(0, i, 1);
                     std::array<Tensor, kMaximumDevices> next_hidden;
                     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-                        next_hidden[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
+                        next_hidden[r] = ws[r]->alloc(kCfg.act, {kCfg.hidden, 1});
                     }
                     const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
                     const ops::GqaExecutionEnvelope ar_envelope{ar_visible, ar_visible};
@@ -3269,7 +3383,7 @@ PrefillChunkResult TextContext::prefill_impl_parallel(std::span<const int> ids,
 
         if (checkpoint_rel > 0 && len == checkpoint_rel &&
             rewrite_checkpoint_hidden_output_ != nullptr) {
-            require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16, {kCfg.hidden, 1},
+            require_tensor_shape(*rewrite_checkpoint_hidden_output_, kCfg.act, {kCfg.hidden, 1},
                                  "rewrite checkpoint hidden output");
             const Tensor checkpoint_hidden = xf[0].slice(1, len - 1, 1);
             const CurrentDevice restore;
@@ -3311,7 +3425,7 @@ void TextContext::ordinary_decode_batch_parallel(const Tensor& ids, const Tensor
         throw std::invalid_argument("ordinary decode batch size must be in [1,8]");
     }
     require_tensor_shape(ids, DType::I32, {batch}, "ordinary decode ids");
-    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, batch}, "ordinary decode hidden");
+    require_tensor_shape(hidden, kCfg.act, {kCfg.hidden, batch}, "ordinary decode hidden");
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, batch}, "ordinary decode logits");
     for (int rank = 1; rank < tp_count_; ++rank) {
         if (!tp_at(rank).io->ordinary.has_value()) {
@@ -3375,8 +3489,8 @@ void TextContext::ordinary_decode_batch_parallel(const Tensor& ids, const Tensor
         std::array<Tensor, kMaximumDevices> x;
         std::array<Tensor, kMaximumDevices> staging;
         for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-            x[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, batch});
-            staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, batch});
+            x[r]       = ws[r]->alloc(kCfg.act, {kCfg.hidden, batch});
+            staging[r] = ws[r]->alloc(kCfg.act, {kCfg.hidden, batch});
         }
         for_each_rank(execution, [&](int rank) {
             const auto r = static_cast<std::size_t>(rank);
@@ -3421,10 +3535,10 @@ void TextContext::mixed_prefill_decode_batch_parallel(
     require_tensor_shape(decode_kv_table_rows, DType::I32, {B}, "mixed decode KV rows");
     require_tensor_shape(decode_linear_state_slots, DType::I32, {B}, "mixed decode linear slots");
     require_tensor_shape(prefill_kv_table_rows, DType::I32, {1}, "mixed prefill KV row");
-    require_tensor_shape(decode_hidden, DType::BF16, {kCfg.hidden, B}, "mixed decode hidden");
+    require_tensor_shape(decode_hidden, kCfg.act, {kCfg.hidden, B}, "mixed decode hidden");
     require_tensor_shape(decode_logits, DType::BF16, {kCfg.vocab, B}, "mixed decode logits");
     if (prefill_finalize) {
-        require_tensor_shape(prefill_tail_hidden, DType::BF16, {kCfg.hidden, 1},
+        require_tensor_shape(prefill_tail_hidden, kCfg.act, {kCfg.hidden, 1},
                              "mixed prefill tail hidden");
     }
     // Every rank reads its OWN frame. The control tensors (tokens/positions/KV rows/slots) hold
@@ -3513,8 +3627,8 @@ void TextContext::mixed_prefill_decode_batch_parallel(
         std::array<Tensor, kMaximumDevices> x;
         std::array<Tensor, kMaximumDevices> staging;
         for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-            x[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, T});
-            staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, T});
+            x[r]       = ws[r]->alloc(kCfg.act, {kCfg.hidden, T});
+            staging[r] = ws[r]->alloc(kCfg.act, {kCfg.hidden, T});
         }
         for_each_rank(execution, [&](int rank) {
             const auto r = static_cast<std::size_t>(rank);
@@ -3541,7 +3655,7 @@ void TextContext::mixed_prefill_decode_batch_parallel(
         // Rewrite-checkpoint capture (M2). The hidden image is authoritative on rank 0; the GDN
         // state image is per-rank (TP-sharded state), so every rank copies its own slot.
         if (rewrite_checkpoint_column >= 0 && rewrite_checkpoint_hidden != nullptr) {
-            require_tensor_shape(*rewrite_checkpoint_hidden, DType::BF16, {kCfg.hidden, 1},
+            require_tensor_shape(*rewrite_checkpoint_hidden, kCfg.act, {kCfg.hidden, 1},
                                  "mixed rewrite checkpoint hidden");
             const Tensor checkpoint_hidden = x[0].slice(1, rewrite_checkpoint_column, 1);
             const CurrentDevice restore;
@@ -3603,7 +3717,7 @@ void TextContext::mixed_mtp_batch(
         require_tensor_shape(decode_valid_columns[r], DType::I32, {B},
                              "mixed MTP decode valid columns");
         require_tensor_shape(prefill_kv_table_rows[r], DType::I32, {1}, "mixed MTP prefill KV row");
-        require_tensor_shape(target_hidden[r], DType::BF16, {kCfg.hidden, decode_width, B},
+        require_tensor_shape(target_hidden[r], kCfg.act, {kCfg.hidden, decode_width, B},
                              "mixed MTP target hidden");
         require_tensor_shape(target_logits[r], DType::BF16, {kCfg.vocab, decode_width, B},
                              "mixed MTP target logits");
@@ -3612,7 +3726,7 @@ void TextContext::mixed_mtp_batch(
         if (prefill_finalize) {
             require_tensor_shape(prefill_bonus_logits[r], DType::BF16, {kCfg.vocab, 1},
                                  "mixed MTP bonus logits");
-            require_tensor_shape(prefill_tail_hidden[r], DType::BF16, {kCfg.hidden, 1},
+            require_tensor_shape(prefill_tail_hidden[r], kCfg.act, {kCfg.hidden, 1},
                                  "mixed MTP tail hidden");
         }
     }
@@ -3662,8 +3776,8 @@ void TextContext::mixed_mtp_batch(
         std::array<Tensor, kMaximumDevices> x;
         std::array<Tensor, kMaximumDevices> staging;
         for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-            x[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, T});
-            staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, T});
+            x[r]       = ws[r]->alloc(kCfg.act, {kCfg.hidden, T});
+            staging[r] = ws[r]->alloc(kCfg.act, {kCfg.hidden, T});
         }
         for_each_rank(execution, [&](int rank) {
             const auto r = static_cast<std::size_t>(rank);
@@ -3710,7 +3824,7 @@ void TextContext::mixed_mtp_batch(
             logits_parallel(tail_hidden, bonus_windows);
         }
         if (rewrite_checkpoint_column >= 0 && rewrite_checkpoint_hidden != nullptr) {
-            require_tensor_shape(*rewrite_checkpoint_hidden, DType::BF16, {kCfg.hidden, 1},
+            require_tensor_shape(*rewrite_checkpoint_hidden, kCfg.act, {kCfg.hidden, 1},
                                  "mixed MTP rewrite checkpoint hidden");
             const Tensor checkpoint_hidden = x[0].slice(1, rewrite_checkpoint_column, 1);
             const CurrentDevice restore;
@@ -3851,7 +3965,7 @@ void TextContext::mtp_forward_stem_parallel(const Tensor& ids, const std::array<
         if (roots[r].fc_input.data == nullptr) { continue; }
         const Tensor& src               = fc_input[r];
         Tensor& dst                     = roots[r].fc_input;
-        const std::size_t element_bytes = dtype_size(DType::BF16);
+        const std::size_t element_bytes = dtype_size(kCfg.act);
         const std::size_t width_bytes   = static_cast<std::size_t>(chunk) * element_bytes;
         CUDA_CHECK(cudaMemcpy2DAsync(dst.data, static_cast<std::size_t>(dst.nb[1]), src.data,
                                      static_cast<std::size_t>(src.nb[1]), width_bytes,
@@ -4023,7 +4137,7 @@ void TextContext::mtp_forward_core_parallel(const Tensor& ids, const std::array<
     const int T                             = ids.ne[0] * ids.ne[1];
     std::array<Tensor, kMaximumDevices> staging;
     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-        staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, T});
+        staging[r] = ws[r]->alloc(kCfg.act, {kCfg.hidden, T});
     }
     std::array<Tensor, kMaximumDevices> x;
     std::array<Tensor, kMaximumDevices> ah;
@@ -4039,7 +4153,7 @@ void TextContext::proposal_argmax_parallel(const std::array<Tensor, kMaximumDevi
     const std::int32_t T                    = hidden[0].ne[1];
     require_tensor_shape(proposal_tokens, DType::I32, {T}, "proposal tokens");
     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-        require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, T}, "proposal hidden");
+        require_tensor_shape(hidden[r], kCfg.act, {kCfg.hidden, T}, "proposal hidden");
         require_tensor_window(logits[r], DType::BF16, kCfg.vocab, T, "proposal logits");
     }
     if (proposal_head_ == nullptr) {
@@ -4142,7 +4256,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumDevices>&
         require_tensor_shape(kv_table_rows[r], DType::I32, {batch}, "target verify batch KV rows");
         require_tensor_shape(linear_state_slots[r], DType::I32, {batch},
                              "target verify batch Linear Attention slots");
-        require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, width, batch},
+        require_tensor_shape(hidden[r], kCfg.act, {kCfg.hidden, width, batch},
                              "target verify batch hidden");
         require_tensor_shape(logits[r], DType::BF16, {kCfg.vocab, width, batch},
                              "target verify batch logits");
@@ -4187,8 +4301,8 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumDevices>&
         std::array<Tensor, kMaximumDevices> x;
         std::array<Tensor, kMaximumDevices> staging;
         for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-            x[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, columns});
-            staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, columns});
+            x[r]       = ws[r]->alloc(kCfg.act, {kCfg.hidden, columns});
+            staging[r] = ws[r]->alloc(kCfg.act, {kCfg.hidden, columns});
         }
         for_each_rank(execution, [&](int rank) {
             const auto r      = static_cast<std::size_t>(rank);
@@ -4263,7 +4377,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumDevices>&
                              "DFlash target verify KV rows");
         require_tensor_shape(linear_state_slots[r], DType::I32, {batch},
                              "DFlash target verify state slots");
-        require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, width, batch},
+        require_tensor_shape(hidden[r], kCfg.act, {kCfg.hidden, width, batch},
                              "DFlash target verify hidden");
         require_tensor_shape(logits[r], DType::BF16, {kCfg.vocab, width, batch},
                              "DFlash target verify logits");
@@ -4302,8 +4416,8 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumDevices>&
         std::array<Tensor, kMaximumDevices> x;
         std::array<Tensor, kMaximumDevices> staging;
         for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-            x[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, width * batch});
-            staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, width * batch});
+            x[r] = ws[r]->alloc(kCfg.act, {kCfg.hidden, width * batch});
+            staging[r] = ws[r]->alloc(kCfg.act, {kCfg.hidden, width * batch});
         }
         for_each_rank(execution, [&](int rank) {
             const auto r      = static_cast<std::size_t>(rank);
@@ -4367,7 +4481,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids,
     }
     require_tensor_shape(ids, DType::I32, {width, batch}, "MTP decode batch ids");
     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-        require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, width, batch},
+        require_tensor_shape(hidden[r], kCfg.act, {kCfg.hidden, width, batch},
                              "MTP decode batch target hidden");
         require_tensor_shape(cache_positions[r], DType::I32, {width, batch},
                              "MTP decode batch cache positions");
@@ -4376,7 +4490,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids,
         require_tensor_shape(valid_columns[r], DType::I32, {batch},
                              "MTP decode batch valid columns");
         require_tensor_shape(kv_table_rows[r], DType::I32, {batch}, "MTP decode batch KV rows");
-        require_tensor_shape(mtp_hidden[r], DType::BF16, {kCfg.hidden, width, batch},
+        require_tensor_shape(mtp_hidden[r], kCfg.act, {kCfg.hidden, width, batch},
                              "MTP decode batch hidden");
     }
 
@@ -4399,7 +4513,7 @@ void TextContext::mtp_propose_batch(const std::array<Tensor, kMaximumDevices>& h
     if (!tensor_parallel()) { throw std::logic_error("tensor-parallel MTP proposal requires a peer"); }
     const std::int32_t batch = hidden[0].ne[1];
     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-        require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, batch},
+        require_tensor_shape(hidden[r], kCfg.act, {kCfg.hidden, batch},
                              "MTP proposal batch hidden");
         require_tensor_shape(logits[r], DType::BF16, {kCfg.vocab, batch},
                              "MTP proposal batch logits");
@@ -4435,8 +4549,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const std::array<Tensor, 
     require_tensor_shape(ids, DType::I32, {T}, "MTP ids");
     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
         require_tensor_shape(positions[r], DType::I32, {T}, "MTP positions");
-        require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, T}, "MTP hidden");
-        require_tensor_shape(mtp_hidden[r], DType::BF16, {kCfg.hidden, T}, "MTP output hidden");
+        require_tensor_shape(hidden[r], kCfg.act, {kCfg.hidden, T}, "MTP hidden");
+        require_tensor_shape(mtp_hidden[r], kCfg.act, {kCfg.hidden, T}, "MTP output hidden");
         const Tensor& rope = rope_positions[r];
         if (rope.dtype != DType::I32 || rope.ne[0] != T ||
             (rope.ne[1] != 1 && rope.ne[1] != 3) || rope.ne[2] != 1 || rope.ne[3] != 1 ||
@@ -4485,9 +4599,9 @@ void TextContext::mtp_forward_ar_step(const Tensor& token,
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP AR draft token");
     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
         require_tensor_shape(position[r], DType::I32, {1}, "MTP AR position");
-        require_tensor_shape(previous_hidden[r], DType::BF16, {kCfg.hidden, 1},
+        require_tensor_shape(previous_hidden[r], kCfg.act, {kCfg.hidden, 1},
                              "MTP AR previous hidden");
-        require_tensor_shape(mtp_hidden[r], DType::BF16, {kCfg.hidden, 1}, "MTP AR output hidden");
+        require_tensor_shape(mtp_hidden[r], kCfg.act, {kCfg.hidden, 1}, "MTP AR output hidden");
         require_tensor_shape(logits[r], DType::BF16, {kCfg.vocab, 1}, "MTP AR logits");
     }
     const ExecutionContext& execution       = ec();
@@ -4534,7 +4648,7 @@ void TextContext::mtp_prefill_chunk_parallel(const Tensor& ids, const std::array
                                         static_cast<std::uint64_t>(T));
     require_tensor_shape(ids, DType::I32, {T}, "MTP prefill ids");
     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-        require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, T}, "MTP prefill hidden");
+        require_tensor_shape(hidden[r], kCfg.act, {kCfg.hidden, T}, "MTP prefill hidden");
         require_tensor_shape(positions[r], DType::I32, {T}, "MTP prefill positions");
         require_tensor_shape(rope_positions[r], DType::I32, {T}, "MTP prefill rope positions");
     }
@@ -4553,14 +4667,14 @@ void TextContext::mtp_prefill_chunk_parallel(const Tensor& ids, const std::array
     std::array<Tensor, kMaximumDevices> x_last;
     std::array<Tensor, kMaximumDevices> ah_last;
     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-        staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, T});
+        staging[r] = ws[r]->alloc(kCfg.act, {kCfg.hidden, T});
         if (final_chunk) {
             // The final-chunk stage reduces ONE column, and `linear_row_parallel` requires the
             // staging buffer to match its output's shape exactly on both devices -- the chunk's
             // [hidden, T] staging would be the wrong shape for it.
-            last_staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
-            x_last[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
-            ah_last[r]      = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
+            last_staging[r] = ws[r]->alloc(kCfg.act, {kCfg.hidden, 1});
+            x_last[r]       = ws[r]->alloc(kCfg.act, {kCfg.hidden, 1});
+            ah_last[r]      = ws[r]->alloc(kCfg.act, {kCfg.hidden, 1});
         }
     }
 
@@ -4576,8 +4690,8 @@ void TextContext::mtp_prefill_chunk_parallel(const Tensor& ids, const std::array
         std::array<Tensor, kMaximumDevices> k_flat;
         std::array<Tensor, kMaximumDevices> v_flat;
         for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-            k_flat[r] = ws[r]->alloc(DType::BF16, {shard_kv_size(), T});
-            v_flat[r] = ws[r]->alloc(DType::BF16, {shard_kv_size(), T});
+            k_flat[r] = ws[r]->alloc(kCfg.act, {shard_kv_size(), T});
+            v_flat[r] = ws[r]->alloc(kCfg.act, {shard_kv_size(), T});
         }
         std::array<const Variant::MtpAttentionProjectionWeights*, kMaximumDevices> kv_attn_w;
         for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
@@ -4590,7 +4704,7 @@ void TextContext::mtp_prefill_chunk_parallel(const Tensor& ids, const std::array
             const MtpW& mtp = mtp_weights_for(rank);
             Tensor k        = k_flat[r].view({kCfg.head_dim, shard_kv_heads(), T});
             Tensor v        = v_flat[r].view({kCfg.head_dim, shard_kv_heads(), T});
-            Tensor kn       = ws[r]->alloc(DType::BF16, {kCfg.head_dim, shard_kv_heads(), T});
+            Tensor kn       = ws[r]->alloc(kCfg.act, {kCfg.head_dim, shard_kv_heads(), T});
             ops::rmsnorm(k, *mtp.k_norm, kCfg.rms_eps, true, kn, s);
             ops::rope(rope_positions[r], kCfg.rotary_dim, kCfg.rope_theta, kn,
                       rope_frequency_[r], s);
@@ -4598,7 +4712,7 @@ void TextContext::mtp_prefill_chunk_parallel(const Tensor& ids, const std::array
             ops::gqa_kv_append(kn, v, positions[r], pages.layer_view(0), s);
             if (final_chunk) {
                 const std::size_t column_bytes =
-                    static_cast<std::size_t>(kCfg.hidden) * dtype_size(DType::BF16);
+                    static_cast<std::size_t>(kCfg.hidden) * dtype_size(kCfg.act);
                 const auto* x_src = static_cast<const unsigned char*>(x[r].data) +
                                     static_cast<std::size_t>(T - 1) * column_bytes;
                 const auto* ah_src = static_cast<const unsigned char*>(ah[r].data) +
@@ -4616,8 +4730,8 @@ void TextContext::mtp_prefill_chunk_parallel(const Tensor& ids, const std::array
     std::array<Tensor, kMaximumDevices> q_flat;
     std::array<Tensor, kMaximumDevices> gate_flat;
     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-        q_flat[r]    = ws[r]->alloc(DType::BF16, {shard_q_size(), 1});
-        gate_flat[r] = ws[r]->alloc(DType::BF16, {shard_q_size(), 1});
+        q_flat[r]    = ws[r]->alloc(kCfg.act, {shard_q_size(), 1});
+        gate_flat[r] = ws[r]->alloc(kCfg.act, {shard_q_size(), 1});
     }
     std::array<const Variant::MtpAttentionProjectionWeights*, kMaximumDevices> qg_attn_w;
     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
@@ -4628,9 +4742,9 @@ void TextContext::mtp_prefill_chunk_parallel(const Tensor& ids, const std::array
     std::array<Tensor, kMaximumDevices> o;
     std::array<Tensor, kMaximumDevices> mh;
     for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
-        a[r]  = ws[r]->alloc(DType::BF16, {kCfg.head_dim, shard_q_heads(), 1});
-        o[r]  = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
-        mh[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
+        a[r]  = ws[r]->alloc(kCfg.act, {kCfg.head_dim, shard_q_heads(), 1});
+        o[r]  = ws[r]->alloc(kCfg.act, {kCfg.hidden, 1});
+        mh[r] = ws[r]->alloc(kCfg.act, {kCfg.hidden, 1});
     }
     for_each_rank(execution, [&](int rank) {
         const auto r    = static_cast<std::size_t>(rank);
@@ -4638,7 +4752,7 @@ void TextContext::mtp_prefill_chunk_parallel(const Tensor& ids, const std::array
         const MtpW& mtp = mtp_weights_for(rank);
         Tensor q        = q_flat[r].view({kCfg.head_dim, shard_q_heads(), 1});
         Tensor gate     = gate_flat[r].view({kCfg.head_dim, shard_q_heads(), 1});
-        Tensor qn       = ws[r]->alloc(DType::BF16, {kCfg.head_dim, shard_q_heads(), 1});
+        Tensor qn       = ws[r]->alloc(kCfg.act, {kCfg.head_dim, shard_q_heads(), 1});
         ops::rmsnorm(q, *mtp.q_norm, kCfg.rms_eps, true, qn, s);
         Tensor last_position = positions[r].slice(0, T - 1, 1);
         Tensor last_rope     = rope_positions[r].slice(0, T - 1, 1);
@@ -4675,7 +4789,7 @@ void TextContext::mtp_prefill_chunk_parallel(const Tensor& ids, const std::array
     }
     for_each_rank(execution, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
-        require_tensor_shape((*final_hidden)[r], DType::BF16, {kCfg.hidden, 1},
+        require_tensor_shape((*final_hidden)[r], kCfg.act, {kCfg.hidden, 1},
                              "MTP final prefill hidden");
         ops::rmsnorm(x_last[r], *mtp_weights_for(rank).norm, kCfg.rms_eps, true,
                      const_cast<Tensor&>((*final_hidden)[r]), stream_for(rank));

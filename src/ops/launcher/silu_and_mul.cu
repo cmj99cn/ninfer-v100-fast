@@ -97,6 +97,14 @@ void silu_and_mul_f16_launch(const Tensor& gate, const Tensor& up, Tensor& out,
     constexpr int kBlock = 128;
     const int grid = static_cast<int>(std::max<std::int64_t>(
         1, div_up(n, static_cast<std::int64_t>(kBlock))));
+    if (!gate.is_contiguous() || !up.is_contiguous()) {
+        silu_and_mul_f16_strided_input_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const __half*>(gate.data), static_cast<const __half*>(up.data),
+            static_cast<__half*>(out.data), n, gate.ne[0], gate.ne[1], gate.ne[2], gate.nb[0],
+            gate.nb[1], gate.nb[2], gate.nb[3], up.nb[0], up.nb[1], up.nb[2], up.nb[3]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     silu_and_mul_f16_scalar_kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<const __half*>(gate.data), static_cast<const __half*>(up.data),
         static_cast<__half*>(out.data), n);

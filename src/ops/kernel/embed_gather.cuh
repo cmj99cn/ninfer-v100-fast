@@ -116,6 +116,28 @@ __global__ void embed_gather_dense_kernel(const std::int32_t* ids, const __nv_bf
     }
 }
 
+__device__ __forceinline__ float embed_dense_to_float(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+__device__ __forceinline__ float embed_dense_to_float(__half value) {
+    return __half2float(value);
+}
+
+template <typename TableT>
+__global__ void embed_gather_dense_f16_kernel(const std::int32_t* ids, const TableT* table,
+                                              __half* out, std::int32_t d, std::int32_t T) {
+    const std::int64_t n      = static_cast<std::int64_t>(d) * T;
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < n; i += stride) {
+        const std::int32_t t = static_cast<std::int32_t>(i / d);
+        const std::int32_t k = static_cast<std::int32_t>(i - static_cast<std::int64_t>(t) * d);
+        out[i] = __float2half(embed_dense_to_float(
+            table[static_cast<std::int64_t>(ids[t]) * d + k]));
+    }
+}
+
 __global__ void embed_gather_q6_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                        const std::uint8_t* high, const std::uint8_t* scales,
                                        __nv_bfloat16* out, std::int32_t d, std::int32_t T,

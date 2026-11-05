@@ -96,7 +96,7 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
     const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
+    Act* partial_acc, float* partial_m, float* partial_l) {
     static_assert(TokenTile * Geometry::GroupSize <= 32,
                   "the key-split variant covers one 32-row Volta tile; wider token tiles stay on "
                   "the phase-1 kernel");
@@ -184,8 +184,9 @@ __launch_bounds__(kGqaSmallTI8VoltaV2Warps * 32, 1) __global__
             int token     = 0;
             gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] =
-                    __float2bfloat16(0.0f);
+                GqaActivation<Act>::store(
+                    &partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)],
+                    0.0f);
             }
         }
     };
@@ -616,8 +617,9 @@ auto load_tile = [&](int kb) {
             gqa_small_t_tc_row_to_qt<Geometry>(r, tokens, kv_head, qh, tk);
             if (!gqa_valid_q_head<Geometry>(kv_head, qh)) { continue; }
             const int d = warp * DSlice + c * 8 + volta_d_get_j(i);
-            partial_acc[gqa_partial_acc_index<Geometry>(qh, d, tk, split, tokens)] =
-                __float2bfloat16(acc_f[c][i]);
+            GqaActivation<Act>::store(
+                &partial_acc[gqa_partial_acc_index<Geometry>(qh, d, tk, split, tokens)],
+                acc_f[c][i]);
         }
     }
 #endif // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700

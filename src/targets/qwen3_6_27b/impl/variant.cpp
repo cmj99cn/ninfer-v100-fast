@@ -1,6 +1,7 @@
 #include "targets/qwen3_6_27b/impl/variant.h"
 
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/cast.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear.h"
@@ -13,6 +14,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <unistd.h>
+#include <vector>
 #include <stdexcept>
 #include <string>
 
@@ -22,6 +28,45 @@
 
 namespace ninfer::targets::qwen3_6_27b::detail {
 namespace {
+
+void mlp_probe_dump(int tag, const Tensor& x, cudaStream_t stream) {
+    if (std::getenv("NINFER_DUMP_MLP") == nullptr) { return; }
+    const char* path = std::getenv("NINFER_DUMP_LAYERS");
+    if (path == nullptr || x.data == nullptr) { return; }
+    if (x.dtype != DType::FP16 && x.dtype != DType::BF16) { return; }
+    const int k = static_cast<int>(x.ne[0]);
+    const int t = static_cast<int>(x.ne[1]);
+    if (k <= 0 || t <= 0) { return; }
+    static FILE* file = std::fopen(path, "a");
+    if (file == nullptr) { return; }
+    const int tok = t - 1;
+    std::vector<std::uint16_t> host(static_cast<std::size_t>(k));
+    const auto* base =
+        static_cast<const std::uint16_t*>(x.data) + static_cast<std::int64_t>(tok) * k;
+    if (cudaMemcpyAsync(host.data(), base, sizeof(std::uint16_t) * k, cudaMemcpyDeviceToHost,
+                        stream) != cudaSuccess) {
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+    char head[80];
+    std::snprintf(head, sizeof(head), "pid=%d layer=%d T=%d tok=%d",
+                  static_cast<int>(getpid()), tag, t, tok);
+    std::string line = head;
+    for (int i = 0; i < k; ++i) {
+        const std::uint16_t bits = host[static_cast<std::size_t>(i)];
+        const float value =
+            x.dtype == DType::FP16
+                ? __half2float(*reinterpret_cast<const __half*>(&bits))
+                : __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&bits));
+        char num[20];
+        std::snprintf(num, sizeof(num), " %.6g", value);
+        line += num;
+    }
+    line += '\n';
+    std::fwrite(line.data(), 1, line.size(), file);
+    std::fflush(file);
+}
+
 
 std::vector<GraphExecutionProfile>
 graph_profiles_through(std::uint32_t max_frontier,
@@ -74,14 +119,15 @@ std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
-                            width, width));
+                            width, width, TextConfig::activation_dtype));
     }
     const Weight& parent =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     return std::max(
         kMinimumLeafWorkspaceBytes,
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            parent.qtype, parent.n, parent.k, text_policy(parent), batch, width, width));
+            parent.qtype, parent.n, parent.k, text_policy(parent), batch, width, width,
+            TextConfig::activation_dtype));
 }
 
 std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
@@ -92,14 +138,15 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
-                            width, width));
+                            width, width, TextConfig::activation_dtype));
     }
     const Weight& parent =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     return std::max(
         kMinimumLeafWorkspaceBytes,
         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            parent.qtype, parent.n, parent.k, text_policy(parent), batch, width, width));
+            parent.qtype, parent.n, parent.k, text_policy(parent), batch, width, width,
+            TextConfig::activation_dtype));
 }
 
 std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
@@ -194,7 +241,32 @@ void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
-    if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
+    const auto split = std::get_if<SplitAttentionProjectionPayload>(&weights);
+    if constexpr (TextConfig::activation_dtype == DType::FP16) {
+        // No FP16 fused attention-input kernel exists. The projection is the same logical
+        // [Q|K|Gate|V] packed GEMM followed by the registered exact row remap; the two-weight
+        // storage form writes its Q|K and Gate|V halves into the packed buffer's own sections.
+        auto scope          = workspace.scope();
+        const std::int32_t q_heads  = query.ne[0] / TextConfig::head_dim;
+        const std::int32_t kv_heads = key.ne[0] / TextConfig::head_dim;
+        const std::int32_t columns  = hidden.ne[1];
+        Tensor q_heads_t = query.view({TextConfig::head_dim, q_heads, columns});
+        Tensor k_heads_t = key.view({TextConfig::head_dim, kv_heads, columns});
+        Tensor g_heads_t = gate.view({TextConfig::head_dim, q_heads, columns});
+        Tensor v_heads_t = value.view({TextConfig::head_dim, kv_heads, columns});
+        if (split != nullptr) {
+            throw std::invalid_argument(
+                "FP16 attention projection does not admit the split Q4/Q5 storage form; "
+                "the FP16 release target uses the fused NVFP4 parent");
+        }
+        const Weight& fused =
+            std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
+        Tensor packed = workspace.alloc(DType::FP16, {fused.n, columns});
+        ops::linear(hidden, fused, packed, text_policy(fused), workspace, stream);
+        ops::mtp_split_attn_in(packed, q_heads_t, k_heads_t, g_heads_t, v_heads_t, stream);
+        return;
+    }
+    if (split != nullptr) {
         ops::attn_input_proj(hidden, split->query_key, split->gate_value, query, gate, key, value,
                              workspace, stream);
         return;
@@ -207,6 +279,15 @@ void Variant::attention_projection(const Tensor& hidden,
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_6::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
+    if constexpr (TextConfig::activation_dtype == DType::FP16) {
+        // linear_add's fused epilogue is BF16-only. Compose the registered projection with the
+        // registered residual update; the residual is read exactly once, after the projection.
+        auto scope   = workspace.scope();
+        Tensor delta = workspace.alloc(DType::FP16, {residual.ne[0], residual.ne[1]});
+        ops::linear(attention, weight, delta, text_policy(weight), workspace, stream);
+        ops::residual_add(delta, residual, stream);
+        return;
+    }
     ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream);
 }
 
@@ -216,7 +297,8 @@ void Variant::mtp_attention_projection(const Tensor& hidden,
                                        WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope     = workspace.scope();
     const int cols = hidden.ne[1];
-    Tensor packed  = workspace.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, cols});
+    Tensor packed  = workspace.alloc(TextConfig::activation_dtype,
+                                     {TextConfig::mtp_attention_input_rows, cols});
     ops::linear(hidden, weights.packed, packed, stream);
     Tensor query_heads = query.view({TextConfig::head_dim, TextConfig::query_heads, cols});
     Tensor key_heads   = key.view({TextConfig::head_dim, TextConfig::kv_heads, cols});
@@ -310,6 +392,13 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
         ops::ggml_k_gdn_output(hidden, weight, residual, workspace, stream);
         return;
     }
+    if constexpr (TextConfig::activation_dtype == DType::FP16) {
+        auto scope   = workspace.scope();
+        Tensor delta = workspace.alloc(DType::FP16, {residual.ne[0], residual.ne[1]});
+        ops::linear(hidden, weight, delta, text_policy(weight), workspace, stream);
+        ops::residual_add(delta, residual, stream);
+        return;
+    }
     ops::linear_add(hidden, weight, residual, text_policy(weight), workspace, stream);
 }
 
@@ -358,13 +447,16 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
                              Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope     = workspace.scope();
     const int cols = hidden.ne[1];
-    Tensor gate_up = workspace.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, cols});
+    Tensor gate_up =
+        workspace.alloc(TextConfig::activation_dtype, {TextConfig::mtp_mlp_gate_up_rows, cols});
     ops::linear(hidden, weights.gate_up, gate_up, stream);
-    Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
+    Tensor activation =
+        workspace.alloc(TextConfig::activation_dtype, {TextConfig::intermediate, cols});
     ops::silu_mul(gate_up.slice(0, 0, TextConfig::intermediate),
                   gate_up.slice(0, TextConfig::intermediate, TextConfig::intermediate), activation,
                   stream);
-    Tensor delta = workspace.alloc(DType::BF16, {TextConfig::hidden, cols});
+    Tensor delta =
+        workspace.alloc(TextConfig::activation_dtype, {TextConfig::hidden, cols});
     ops::linear(activation, weights.down, delta, stream);
     ops::residual_add(delta, residual, stream);
 }
@@ -373,7 +465,8 @@ std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int3
                                                                        std::int32_t last) {
     validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, last});
+    (void)layout.alloc(TextConfig::activation_dtype,
+                       {TextConfig::mtp_attention_input_rows, last});
     return layout.peak_bytes(1);
 }
 
@@ -394,6 +487,43 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
+    if constexpr (TextConfig::activation_dtype == DType::FP16) {
+        // Packed [Q|K|Gate|V] projection output plus the projection's call-scoped scratch.
+        constexpr std::int32_t kPackedRows =
+            2 * (TextConfig::query_size + TextConfig::kv_size);
+        constexpr std::int32_t kSplitRows = TextConfig::query_size + TextConfig::kv_size;
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::FP16, {kPackedRows, last});
+        std::size_t scratch = 0;
+        switch (weights_profile) {
+        case WeightsProfile::Qwen36GroupwiseInt:
+        case WeightsProfile::Qwen38GroupwiseInt:
+            scratch = std::max(
+                ops::linear_workspace_capacity_bytes(QType::Q4G64_F16S, kSplitRows,
+                                                     TextConfig::hidden,
+                                                     ops::LinearPolicy::A16Only, first, last),
+                ops::linear_workspace_capacity_bytes(QType::Q5G64_F16S, kSplitRows,
+                                                     TextConfig::hidden,
+                                                     ops::LinearPolicy::A16Only, first, last));
+            break;
+        case WeightsProfile::Qwen38GgmlK:
+            scratch = ops::linear_workspace_capacity_bytes(
+                QType::GGML_K, kPackedRows, TextConfig::hidden, ops::LinearPolicy::A16Only,
+                first, last);
+            break;
+        case WeightsProfile::Qwen36Nvfp4:
+            scratch = ops::linear_workspace_capacity_bytes(
+                QType::NVFP4, kPackedRows, TextConfig::hidden, kNvfp4TextPolicy, first, last);
+            break;
+        case WeightsProfile::Qwen38Nvfp4:
+        case WeightsProfile::Qwen38Nvfp4QVis:
+            scratch = ops::linear_workspace_capacity_bytes(
+                QType::NVFP4, kPackedRows, TextConfig::hidden, kNvfp4TextPolicy, first, last);
+            break;
+        }
+        if (scratch != 0) { (void)layout.alloc_bytes(scratch); }
+        return layout.peak_bytes(1);
+    }
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -415,6 +545,37 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t first, std::int32_t last) {
     validate_token_interval(first, last);
+    if constexpr (TextConfig::activation_dtype == DType::FP16) {
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::FP16, {TextConfig::hidden, last});
+        std::size_t scratch = 0;
+        switch (weights_profile) {
+        case WeightsProfile::Qwen38GgmlK:
+            scratch = ops::linear_workspace_capacity_bytes(
+                QType::GGML_K, TextConfig::hidden, TextConfig::value_dim,
+                ops::LinearPolicy::A16Only, first, last);
+            break;
+        case WeightsProfile::Qwen36GroupwiseInt:
+        case WeightsProfile::Qwen38GroupwiseInt:
+            scratch = ops::linear_workspace_capacity_bytes(
+                QType::Q5G64_F16S, TextConfig::hidden, TextConfig::query_size,
+                ops::LinearPolicy::A16Only, first, last);
+            break;
+        case WeightsProfile::Qwen36Nvfp4:
+            scratch = ops::linear_workspace_capacity_bytes(
+                QType::NVFP4, TextConfig::hidden, TextConfig::query_size, kNvfp4TextPolicy,
+                first, last);
+            break;
+        case WeightsProfile::Qwen38Nvfp4:
+        case WeightsProfile::Qwen38Nvfp4QVis:
+            scratch = ops::linear_workspace_capacity_bytes(
+                QType::NVFP4, TextConfig::hidden, TextConfig::query_size, kNvfp4TextPolicy,
+                first, last);
+            break;
+        }
+        if (scratch != 0) { (void)layout.alloc_bytes(scratch); }
+        return layout.peak_bytes(1);
+    }
     switch (weights_profile) {
     case WeightsProfile::Qwen38GgmlK:
         return ops::linear_add_workspace_capacity_bytes(
@@ -470,24 +631,25 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             QType::GGML_K, 16384, TextConfig::hidden,
-                            ops::LinearPolicy::A16Only, batch_size, first, last));
+                            ops::LinearPolicy::A16Only, batch_size, first, last,
+                            TextConfig::activation_dtype));
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
-                            batch_size, first, last));
+                            batch_size, first, last, TextConfig::activation_dtype));
     case WeightsProfile::Qwen36Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
-                            first, last));
+                            first, last, TextConfig::activation_dtype));
     case WeightsProfile::Qwen38Nvfp4:
     case WeightsProfile::Qwen38Nvfp4QVis:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy,
-                            batch_size, first, last));
+                            batch_size, first, last, TextConfig::activation_dtype));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -501,24 +663,25 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             QType::GGML_K, 16384, TextConfig::hidden,
-                            ops::LinearPolicy::A16Only, batch_size, first, last));
+                            ops::LinearPolicy::A16Only, batch_size, first, last,
+                            TextConfig::activation_dtype));
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
-                            batch_size, first, last));
+                            batch_size, first, last, TextConfig::activation_dtype));
     case WeightsProfile::Qwen36Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
-                            first, last));
+                            first, last, TextConfig::activation_dtype));
     case WeightsProfile::Qwen38Nvfp4:
     case WeightsProfile::Qwen38Nvfp4QVis:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy,
-                            batch_size, first, last));
+                            batch_size, first, last, TextConfig::activation_dtype));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -528,6 +691,37 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
     validate_token_interval(first, last);
+    if constexpr (TextConfig::activation_dtype == DType::FP16) {
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::FP16, {TextConfig::hidden, last});
+        std::size_t scratch = 0;
+        switch (weights_profile) {
+        case WeightsProfile::Qwen38GgmlK:
+            scratch = ops::linear_workspace_capacity_bytes(
+                QType::GGML_K, TextConfig::hidden, TextConfig::value_dim,
+                ops::LinearPolicy::A16Only, first, last);
+            break;
+        case WeightsProfile::Qwen36GroupwiseInt:
+        case WeightsProfile::Qwen38GroupwiseInt:
+            scratch = ops::linear_workspace_capacity_bytes(
+                QType::Q5G64_F16S, TextConfig::hidden, TextConfig::value_dim,
+                ops::LinearPolicy::A16Only, first, last);
+            break;
+        case WeightsProfile::Qwen36Nvfp4:
+            scratch = ops::linear_workspace_capacity_bytes(
+                QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy,
+                first, last);
+            break;
+        case WeightsProfile::Qwen38Nvfp4:
+        case WeightsProfile::Qwen38Nvfp4QVis:
+            scratch = ops::linear_workspace_capacity_bytes(
+                QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy,
+                first, last);
+            break;
+        }
+        if (scratch != 0) { (void)layout.alloc_bytes(scratch); }
+        return layout.peak_bytes(1);
+    }
     switch (weights_profile) {
     case WeightsProfile::Qwen38GgmlK:
         return ops::linear_add_workspace_capacity_bytes(
@@ -683,7 +877,48 @@ void Variant::attention_projection(const std::array<Tensor, kMaximumDevices>& hi
                                    const std::array<Tensor, kMaximumDevices>& value, qwen3_6::TextPhase,
                                    const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
                                    const ExecutionContext& ec) {
-    if (std::holds_alternative<SplitAttentionProjectionPayload>(*w[0])) {
+    const bool split_storage = std::holds_alternative<SplitAttentionProjectionPayload>(*w[0]);
+    if constexpr (TextConfig::activation_dtype == DType::FP16) {
+        // Column-parallel packed projection followed by the exact per-rank [Q|K|Gate|V] remap.
+        // No fused FP16 attention-input kernel is registered.
+        const std::int32_t columns = hidden[0].ne[1];
+        std::array<Tensor, kMaximumDevices> packed{};
+        std::vector<WorkspaceArena::Scope> scopes;
+        scopes.reserve(static_cast<std::size_t>(ec.tp));
+        if (split_storage) {
+            throw std::invalid_argument(
+                "FP16 attention projection does not admit the split Q4/Q5 storage form; "
+                "the FP16 release target uses the fused NVFP4 parent");
+        }
+        const auto fused = require_same_alternative<FusedAttentionProjectionPayload>(
+            w, ec.tp, "attention projection");
+        const auto fused_weight =
+            weights_from(fused, ec.tp, &FusedAttentionProjectionPayload::query_key_gate_value);
+        for (int rank = 0; rank < ec.tp; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            if (hidden[r].ne[1] != columns) {
+                throw std::logic_error(
+                    "attention projection: ranks disagree on token count");
+            }
+            scopes.push_back(workspace[r]->scope());
+            packed[r] = workspace[r]->alloc(DType::FP16, {fused_weight[r].n, columns});
+        }
+        ops::linear_column_parallel(hidden, fused_weight, packed, text_policy(fused_weight[0]),
+                                    workspace, ec);
+        for_each_rank(ec, [&](int rank) {
+            const auto r       = static_cast<std::size_t>(rank);
+            const int q_heads  = query[r].ne[0] / TextConfig::head_dim;
+            const int kv_heads = key[r].ne[0] / TextConfig::head_dim;
+            Tensor q_heads_t = query[r].view({TextConfig::head_dim, q_heads, columns});
+            Tensor k_heads_t = key[r].view({TextConfig::head_dim, kv_heads, columns});
+            Tensor g_heads_t = gate[r].view({TextConfig::head_dim, q_heads, columns});
+            Tensor v_heads_t = value[r].view({TextConfig::head_dim, kv_heads, columns});
+            ops::mtp_split_attn_in(packed[r], q_heads_t, k_heads_t, g_heads_t, v_heads_t,
+                                   ec.dev[rank]->stream);
+        });
+        return;
+    }
+    if (split_storage) {
         const auto split = require_same_alternative<SplitAttentionProjectionPayload>(
             w, ec.tp, "attention projection");
         ops::attn_input_proj_column_parallel(
@@ -706,6 +941,25 @@ void Variant::attention_output_projection(const std::array<Tensor, kMaximumDevic
                                           const std::array<Tensor, kMaximumDevices>& staging, qwen3_6::TextPhase,
                                           const std::array<WorkspaceArena*, kMaximumDevices>& workspace,
                                           const ExecutionContext& ec, const ops::CollectiveComms& ev) {
+    if constexpr (TextConfig::activation_dtype == DType::FP16) {
+        // Row-parallel partials are all-reduced into `delta`; the replicated residual is then
+        // added exactly once on each rank, after the collective.
+        std::array<Tensor, kMaximumDevices> delta{};
+        std::vector<WorkspaceArena::Scope> scopes;
+        scopes.reserve(static_cast<std::size_t>(ec.tp));
+        for (int rank = 0; rank < ec.tp; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            scopes.push_back(workspace[r]->scope());
+            delta[r] = workspace[r]->alloc(DType::FP16, {residual[r].ne[0], residual[r].ne[1]});
+        }
+        ops::linear_row_parallel(attention, weight, delta, staging, text_policy(weight[0]),
+                                 workspace, ec, ev);
+        for_each_rank(ec, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::residual_add(delta[r], const_cast<Tensor&>(residual[r]), ec.dev[rank]->stream);
+        });
+        return;
+    }
     ops::linear_add_row_parallel(attention, weight, residual, staging, text_policy(weight[0]),
                                  workspace, ec, ev);
 }
@@ -786,6 +1040,56 @@ void Variant::gdn_output_projection(const std::array<Tensor, kMaximumDevices>& h
         ops::ggml_k_gdn_output(hidden, weight, residual, staging, workspace, ec, ev);
         return;
     }
+    if constexpr (TextConfig::activation_dtype == DType::FP16) {
+        if (std::getenv("NINFER_DEBUG_GDN_OUT_BF16") != nullptr) {
+            // Diagnostic only: run the registered BF16 fused output projection on BF16 copies of
+            // the activation and residual, then cast back. Isolates the FP16 output-projection
+            // path from the recurrent/gated-norm path.
+            std::array<Tensor, kMaximumDevices> hidden_bf{};
+            std::array<Tensor, kMaximumDevices> residual_bf{};
+            std::array<Tensor, kMaximumDevices> staging_bf{};
+            std::vector<WorkspaceArena::Scope> scopes;
+            scopes.reserve(static_cast<std::size_t>(ec.tp));
+            for (int rank = 0; rank < ec.tp; ++rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                scopes.push_back(workspace[r]->scope());
+                hidden_bf[r] =
+                    workspace[r]->alloc(DType::BF16, {hidden[r].ne[0], hidden[r].ne[1]});
+                residual_bf[r] =
+                    workspace[r]->alloc(DType::BF16, {residual[r].ne[0], residual[r].ne[1]});
+                staging_bf[r] =
+                    workspace[r]->alloc(DType::BF16, {residual[r].ne[0], residual[r].ne[1]});
+            }
+            for_each_rank(ec, [&](int rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                ops::cast_fp16_to_bf16(hidden[r], hidden_bf[r], ec.dev[rank]->stream);
+                ops::cast_fp16_to_bf16(residual[r], residual_bf[r], ec.dev[rank]->stream);
+            });
+            ops::linear_add_row_parallel(hidden_bf, weight, residual_bf, staging_bf,
+                                         text_policy(weight[0]), workspace, ec, ev);
+            for_each_rank(ec, [&](int rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                ops::cast_bf16_to_fp16(residual_bf[r], const_cast<Tensor&>(residual[r]),
+                                       ec.dev[rank]->stream);
+            });
+            return;
+        }
+        std::array<Tensor, kMaximumDevices> delta{};
+        std::vector<WorkspaceArena::Scope> scopes;
+        scopes.reserve(static_cast<std::size_t>(ec.tp));
+        for (int rank = 0; rank < ec.tp; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            scopes.push_back(workspace[r]->scope());
+            delta[r] = workspace[r]->alloc(DType::FP16, {residual[r].ne[0], residual[r].ne[1]});
+        }
+        ops::linear_row_parallel(hidden, weight, delta, staging, text_policy(weight[0]), workspace,
+                                 ec, ev);
+        for_each_rank(ec, [&](const int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::residual_add(delta[r], const_cast<Tensor&>(residual[r]), ec.dev[rank]->stream);
+        });
+        return;
+    }
     ops::linear_add_row_parallel(hidden, weight, residual, staging, text_policy(weight[0]),
                                  workspace, ec, ev);
 }
@@ -834,11 +1138,53 @@ void Variant::post_mixer(const std::array<Tensor, kMaximumDevices>& hidden,
     // The activation width is this rank's own gate/up shard, read off the weight rather than
     // assumed: `gate_up` is [2 * intermediate_shard, hidden], so half its rows is the shard.
     const std::int32_t shard_intermediate = w[0]->gate_up.n / 2;
+    const std::int32_t columns            = hidden[0].ne[1];
     std::array<Weight, kMaximumDevices> gate_up{};
     std::array<Weight, kMaximumDevices> down{};
     std::array<Tensor, kMaximumDevices> activation{};
     std::vector<WorkspaceArena::Scope> scopes;
     scopes.reserve(static_cast<std::size_t>(ec.tp));
+    if constexpr (TextConfig::activation_dtype == DType::FP16) {
+        // The fused linear_swiglu / linear_add leaves are BF16-only. Compose the four registered
+        // Ops; the down projection's all-reduce forms the partial sum, then the replicated
+        // residual is added on each rank after the collective.
+        std::array<Tensor, kMaximumDevices> gate_up_buffer{};
+        std::array<Tensor, kMaximumDevices> down_buffer{};
+        for (int rank = 0; rank < ec.tp; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            if (w[r]->gate_up.n != w[0]->gate_up.n) {
+                throw std::logic_error(
+                    "post_mixer: tensor-parallel gate/up shards disagree on width");
+            }
+            gate_up[r] = w[r]->gate_up;
+            down[r]    = w[r]->down;
+            scopes.push_back(workspace[r]->scope());
+            gate_up_buffer[r] = workspace[r]->alloc(DType::FP16, {w[r]->gate_up.n, columns});
+            activation[r] =
+                workspace[r]->alloc(DType::FP16, {shard_intermediate, columns});
+            down_buffer[r] = workspace[r]->alloc(DType::FP16, {TextConfig::hidden, columns});
+        }
+        const bool mlp_probe = std::getenv("NINFER_DUMP_MLP") != nullptr;
+        ops::linear_column_parallel(hidden, gate_up, gate_up_buffer, text_policy(gate_up[0]),
+                                    workspace, ec);
+        if (mlp_probe) { mlp_probe_dump(2010, gate_up_buffer[0], ec.dev[0]->stream); }
+        for_each_rank(ec, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::silu_mul(gate_up_buffer[r].slice(0, 0, shard_intermediate),
+                          gate_up_buffer[r].slice(0, shard_intermediate, shard_intermediate),
+                          activation[r], ec.dev[rank]->stream);
+        });
+        if (mlp_probe) { mlp_probe_dump(2011, activation[0], ec.dev[0]->stream); }
+        ops::linear_row_parallel(activation, down, down_buffer, staging, text_policy(down[0]),
+                                 workspace, ec, ev);
+        if (mlp_probe) { mlp_probe_dump(2012, down_buffer[0], ec.dev[0]->stream); }
+        for_each_rank(ec, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::residual_add(down_buffer[r], const_cast<Tensor&>(residual[r]),
+                              ec.dev[rank]->stream);
+        });
+        return;
+    }
     for (int rank = 0; rank < ec.tp; ++rank) {
         const auto r = static_cast<std::size_t>(rank);
         if (w[r]->gate_up.n != w[0]->gate_up.n) {
@@ -847,7 +1193,7 @@ void Variant::post_mixer(const std::array<Tensor, kMaximumDevices>& hidden,
         gate_up[r]    = w[r]->gate_up;
         down[r]       = w[r]->down;
         scopes.push_back(workspace[r]->scope());
-        activation[r] = workspace[r]->alloc(DType::BF16, {shard_intermediate, hidden[0].ne[1]});
+        activation[r] = workspace[r]->alloc(DType::BF16, {shard_intermediate, columns});
     }
     ops::linear_swiglu_column_parallel(hidden, gate_up, activation, text_policy(gate_up[0]),
                                        workspace, ec);
@@ -912,7 +1258,7 @@ void Variant::mtp_attention_projection(
         }
         packed_weight[r] = w[r]->packed;
         scopes.push_back(workspace[r]->scope());
-        packed[r] = workspace[r]->alloc(DType::BF16, {attn_rows, columns});
+        packed[r] = workspace[r]->alloc(TextConfig::activation_dtype, {attn_rows, columns});
     }
     ops::linear_column_parallel(hidden, packed_weight, packed, ec);
     // `mtp_split_attn_in` selects its section boundaries from the packed row count alone, so the
@@ -1007,9 +1353,12 @@ void Variant::mtp_post_mixer(const std::array<Tensor, kMaximumDevices>& hidden,
     for (int rank = 0; rank < ec.tp; ++rank) {
         const auto r = static_cast<std::size_t>(rank);
         scopes.push_back(workspace[r]->scope());
-        gate_up[r]    = workspace[r]->alloc(DType::BF16, {w[r]->gate_up.n, columns});
-        activation[r] = workspace[r]->alloc(DType::BF16, {shard_intermediate, columns});
-        delta[r]      = workspace[r]->alloc(DType::BF16, {TextConfig::hidden, columns});
+        gate_up[r] = workspace[r]->alloc(TextConfig::activation_dtype,
+                                          {w[r]->gate_up.n, columns});
+        activation[r] = workspace[r]->alloc(TextConfig::activation_dtype,
+                                             {shard_intermediate, columns});
+        delta[r] = workspace[r]->alloc(TextConfig::activation_dtype,
+                                        {TextConfig::hidden, columns});
     }
     ops::linear_column_parallel(
         hidden, weights_from(w, ec.tp, &MtpPostMixerWeights::gate_up), gate_up, ec);
@@ -1036,9 +1385,10 @@ std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                              std::int32_t last) {
     validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
+    (void)layout.alloc(TextConfig::activation_dtype,
+                       {TextConfig::mtp_mlp_gate_up_rows, last});
+    (void)layout.alloc(TextConfig::activation_dtype, {TextConfig::intermediate, last});
+    (void)layout.alloc(TextConfig::activation_dtype, {TextConfig::hidden, last});
     return layout.peak_bytes(1);
 }
 

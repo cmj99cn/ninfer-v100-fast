@@ -233,7 +233,7 @@ void launch_tc_partial_i8_one(const Tensor& q, CacheInput input, const Tensor& p
                         : static_cast<const std::int32_t*>(invocation.table_rows->data),
                     cache.block_tables.ne[0], invocation.width, invocation.full_width,
                     invocation.column_begin, logical_capacity, scale,
-                    static_cast<__nv_bfloat16*>(partial_acc.data),
+                    static_cast<Act*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
                 CUDA_CHECK(cudaGetLastError());
                 return;
@@ -254,7 +254,7 @@ void launch_tc_partial_i8_one(const Tensor& q, CacheInput input, const Tensor& p
                 : static_cast<const std::int32_t*>(invocation.table_rows->data),
             cache.block_tables.ne[0], invocation.width, invocation.full_width,
             invocation.column_begin, logical_capacity, scale,
-            static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_m.data),
+            static_cast<Act*>(partial_acc.data), static_cast<float*>(partial_m.data),
             static_cast<float*>(partial_l.data));
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -298,7 +298,7 @@ ensure_func_attr_per_device(
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
-                logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+                logical_capacity, scale, static_cast<Act*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     };
     if constexpr (TokenTile == 6) {
@@ -534,7 +534,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
         gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
                                                    Offset, Act>
             <<<reduce_grid, kReduceBlock, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(partial_acc.data),
+                static_cast<const Act*>(partial_acc.data),
                 static_cast<const float*>(partial_m.data),
                 static_cast<const float*>(partial_l.data),
                 static_cast<const std::int32_t*>(pos.data),

@@ -671,6 +671,65 @@ int test_dense() {
     return failures;
 }
 
+int test_dense_f16() {
+    const std::vector<std::int32_t> ids = {0, kDenseRows - 1, 17, 17, 1024, 1, 2299};
+    std::vector<std::uint16_t> bf16_table(static_cast<std::size_t>(kDenseRows) * kDenseD);
+    std::vector<std::uint16_t> f16_table(bf16_table.size());
+    for (std::int32_t row = 0; row < kDenseRows; ++row) {
+        for (std::int32_t d = 0; d < kDenseD; ++d) {
+            const float value = std::sin(static_cast<float>(row * 17 + d) * 0.03125f) +
+                                static_cast<float>((row + d) % 13 - 6) * 0.125f;
+            bf16_table[static_cast<std::size_t>(row) * kDenseD + d] = f32_to_bf16(value);
+            f16_table[static_cast<std::size_t>(row) * kDenseD + d] = f32_to_f16(value);
+        }
+    }
+    auto run = [&](const std::vector<std::uint16_t>& table, QType qtype) {
+        std::vector<std::uint16_t> expected(static_cast<std::size_t>(kDenseD) * ids.size());
+        for (std::size_t t = 0; t < ids.size(); ++t) {
+            for (std::int32_t d = 0; d < kDenseD; ++d) {
+                const std::uint16_t bits =
+                    table[static_cast<std::size_t>(ids[t]) * kDenseD + static_cast<std::size_t>(d)];
+                expected[t * kDenseD + static_cast<std::size_t>(d)] =
+                    qtype == QType::BF16_CTRL ? f32_to_f16(bf16_to_f32(bits)) : bits;
+            }
+        }
+        GuardedDeviceBuffer device_table(table.size() * sizeof(std::uint16_t));
+        device_table.copy_from_host(table.data(), table.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+        device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+        GuardedDeviceBuffer output(expected.size() * sizeof(std::uint16_t));
+        output.fill(0x7d);
+        Weight weight{};
+        weight.qtype           = qtype;
+        weight.layout          = QuantLayout::Contiguous;
+        weight.payload         = device_table.data();
+        weight.payload_bytes   = device_table.bytes();
+        weight.qdata           = device_table.data();
+        weight.ndim            = 2;
+        weight.shape[0]        = kDenseRows;
+        weight.shape[1]        = kDenseD;
+        weight.padded_shape[0] = kDenseRows;
+        weight.padded_shape[1] = kDenseD;
+        weight.n               = kDenseRows;
+        weight.k               = kDenseD;
+        Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+        Tensor result(output.data(), DType::FP16, {kDenseD, static_cast<std::int32_t>(ids.size())});
+        ops::embedding(input, weight, result, nullptr);
+        cuda_synchronize();
+        const char* label = qtype == QType::BF16_CTRL ? "embedding BF16->FP16 [2304,1152]"
+                                                       : "embedding FP16->FP16 [2304,1152]";
+        int failures = verify_exact(label, guarded_to_host<std::uint16_t>(output, expected.size()),
+                                    expected);
+        failures += output.verify_guards(label);
+        failures += verify_input(label, device_ids, ids);
+        failures += device_table.verify_guards(label);
+        return failures;
+    };
+    int failures = run(bf16_table, QType::BF16_CTRL);
+    failures += run(f16_table, QType::FP16_CTRL);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -682,6 +741,7 @@ int main() {
     int failures = 0;
     try {
         failures += test_dense();
+    failures += test_dense_f16();
         failures += test_q6();
         failures += test_w8();
         failures += test_fp8();

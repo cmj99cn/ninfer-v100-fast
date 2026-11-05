@@ -332,6 +332,60 @@ int run_single_case(const Geometry& geometry, int heads, int first_position, int
     return failures;
 }
 
+// FP16 Text rope: the same documented split-half rotation, evaluated from the exact FP16 values
+// the kernels read. Dense tensors keep the case focused on the dtype route; the BF16 cases above
+// continue to cover strided storage, passthrough, and padding.
+std::vector<float> make_f16_input(std::size_t elements, std::uint32_t seed) {
+    std::vector<float> input(elements);
+    std::mt19937 generator(seed);
+    std::uniform_real_distribution<float> distribution(-4.0F, 4.0F);
+    for (float& value : input) { value = f16_to_f32(f32_to_f16(distribution(generator))); }
+    return input;
+}
+
+int run_f16_rope_case(const Geometry& geometry, int q_heads, int k_heads, int first_position) {
+    const auto q = make_f16_input(dense_elements(geometry.head_dim, q_heads, geometry.tokens),
+                                  0x5001U);
+    const auto k = make_f16_input(dense_elements(geometry.head_dim, k_heads, geometry.tokens),
+                                  0x5002U);
+    const auto positions = make_positions(geometry.axes, geometry.tokens, first_position);
+    const auto q_expected = rope_oracle(q, positions, geometry, q_heads);
+    const auto k_expected = rope_oracle(k, positions, geometry, k_heads);
+    const auto q_bits     = to_device_f16(q);
+    const auto k_bits     = to_device_f16(k);
+    DeviceBuffer position_device = to_device(positions);
+    Tensor position_tensor(position_device.p, DType::I32, {geometry.tokens, geometry.axes});
+    Tensor q_tensor(q_bits.p, DType::FP16, {geometry.head_dim, q_heads, geometry.tokens});
+    Tensor k_tensor(k_bits.p, DType::FP16, {geometry.head_dim, k_heads, geometry.tokens});
+    ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, q_tensor, k_tensor, nullptr);
+    cuda_synchronize();
+    const std::string label = std::string(geometry.label) + " f16";
+    int failures            = 0;
+    failures += verify_reduction(
+        (label + " q").c_str(), from_device_f16(q_bits.p, q.size()), q_expected,
+        {/*relative_l2=*/2.0e-3, /*gross_absolute=*/5.0e-2,
+         /*gross_relative_to_max_reference=*/5.0e-3});
+    failures += verify_reduction(
+        (label + " k").c_str(), from_device_f16(k_bits.p, k.size()), k_expected,
+        {/*relative_l2=*/2.0e-3, /*gross_absolute=*/5.0e-2,
+         /*gross_relative_to_max_reference=*/5.0e-3});
+
+    const auto single = make_f16_input(dense_elements(geometry.head_dim, k_heads, geometry.tokens),
+                                       0x5003U);
+    const auto single_expected = rope_oracle(single, positions, geometry, k_heads);
+    const auto single_bits     = to_device_f16(single);
+    Tensor single_tensor(single_bits.p, DType::FP16,
+                         {geometry.head_dim, k_heads, geometry.tokens});
+    ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, single_tensor, nullptr);
+    cuda_synchronize();
+    failures += verify_reduction(
+        (label + " single").c_str(), from_device_f16(single_bits.p, single.size()),
+        single_expected,
+        {/*relative_l2=*/2.0e-3, /*gross_absolute=*/5.0e-2,
+         /*gross_relative_to_max_reference=*/5.0e-3});
+    return failures;
+}
+
 int run_vision_packed_case() {
     constexpr int kHeadDim = 72;
     constexpr int kHeads   = 16;
@@ -428,6 +482,10 @@ int main() {
     failures += run_pair_case({"35b text mrope", 256, 64, 3, 7, kTextTheta}, 16, 2, 2048, 16, 8);
 
     // MTP bulk K append uses the single-tensor form; proposal tail uses the pair form above.
+    failures += run_f16_rope_case({"27b f16 pair/single", 256, 64, 1, 5, kTextTheta}, 24, 4,
+                                  8192);
+    failures += run_f16_rope_case({"35b f16 pair/single", 256, 64, 1, 3, kTextTheta}, 16, 2,
+                                  16384);
     failures += run_single_case({"27b mtp k mrope", 256, 64, 3, 128, kTextTheta}, 4, 8192);
     failures += run_single_case({"35b mtp k text", 256, 64, 1, 5, kTextTheta}, 2, 16384, 8);
 

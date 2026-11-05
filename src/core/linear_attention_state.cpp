@@ -88,8 +88,10 @@ plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionSt
                       "LinearAttentionStatePool value_head_dim must be positive");
     validate_positive(spec.key_head_dim, "LinearAttentionStatePool key_head_dim must be positive");
     validate_positive(spec.slot_count, "LinearAttentionStatePool slot_count must be positive");
-    if (spec.conv_dtype != DType::BF16 && spec.conv_dtype != DType::FP32) {
-        throw std::invalid_argument("LinearAttentionStatePool conv_dtype must be BF16 or FP32");
+    if (spec.conv_dtype != DType::BF16 && spec.conv_dtype != DType::FP16 &&
+        spec.conv_dtype != DType::FP32) {
+        throw std::invalid_argument(
+            "LinearAttentionStatePool conv_dtype must be BF16, FP16, or FP32");
     }
 
     const Tensor conv_shape(nullptr, spec.conv_dtype,

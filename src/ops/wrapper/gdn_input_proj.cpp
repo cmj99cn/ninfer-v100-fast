@@ -988,7 +988,12 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
 
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width,
+    DType activation_dtype) {
+    if (activation_dtype == DType::FP16) {
+        throw std::invalid_argument(
+            "FP16 gdn_input_proj_conv_snapshot requires the fused NVFP4 parent");
+    }
     const bool q4_q5 = query_rows == 2048 && key_rows == 2048 && value_rows == 6144;
     const bool w8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
     if (!q4_q5 && !w8) {
@@ -1049,9 +1054,26 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
 
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width,
+    DType activation_dtype) {
     validate_policy(policy);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
+    if (activation_dtype == DType::FP16) {
+        // The FP16 snapshot route always composes an FP16 projected plane followed by the
+        // registered projection, so the fused single-launch capacity does not apply.
+        if (parent_qtype != QType::NVFP4 ||
+            parent_rows != detail::Nvfp4GdnInputGeometry::kOutputRows ||
+            input_rows != detail::Nvfp4GdnInputGeometry::kInputRows) {
+            throw std::invalid_argument(
+                "FP16 gdn_input_proj_conv_snapshot requires the fused NVFP4 [16384,5120] parent");
+        }
+        constexpr std::int32_t kChannels       = 10240;
+        const std::int32_t aggregate_columns   = batch_size * max_width;
+        const std::size_t projection_workspace = gdn_input_proj_workspace_capacity_bytes(
+            parent_qtype, parent_rows, input_rows, policy, batch_size * min_width,
+            aggregate_columns);
+        return composed_snapshot_capacity(kChannels, aggregate_columns, projection_workspace);
+    }
     if (parent_qtype == QType::GGML_K && parent_rows == 16384 && input_rows == 5120 &&
         policy == LinearPolicy::A16Only) {
         const std::size_t projection = linear_workspace_capacity_bytes(
@@ -1087,7 +1109,12 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
 
 std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width,
+    DType activation_dtype) {
+    if (activation_dtype == DType::FP16) {
+        throw std::invalid_argument(
+            "FP16 gdn_input_proj_conv_record requires the fused NVFP4 parent");
+    }
     const bool q4_q5 = query_rows == 2048 && key_rows == 2048 && value_rows == 6144;
     const bool w8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
     if (!q4_q5 && !w8) {
@@ -1112,9 +1139,23 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
 
 std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width,
+    DType activation_dtype) {
     validate_policy(policy);
     require_record_capacity_domain(batch_size, min_width, max_width);
+    if (activation_dtype == DType::FP16) {
+        if (parent_qtype != QType::NVFP4 ||
+            parent_rows != detail::Nvfp4GdnInputGeometry::kOutputRows ||
+            input_rows != detail::Nvfp4GdnInputGeometry::kInputRows) {
+            throw std::invalid_argument(
+                "FP16 gdn_input_proj_conv_record requires the fused NVFP4 [16384,5120] parent");
+        }
+        // compose_record projects directly into caller-owned conv_record; only the nested
+        // projection's transient storage is needed.
+        return gdn_input_proj_workspace_capacity_bytes(
+            parent_qtype, parent_rows, input_rows, policy, batch_size * min_width,
+            batch_size * max_width);
+    }
     if (parent_qtype == QType::GGML_K && parent_rows == 16384 && input_rows == 5120 &&
         policy == LinearPolicy::A16Only) {
         return linear_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows, policy,

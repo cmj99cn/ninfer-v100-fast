@@ -750,6 +750,13 @@ block 边界上且该边界存在 state snapshot 就能复用。它不是 token 
 未命中时仍回退到上面的 retained/rewrite-checkpoint 逻辑。参见
 `docs/maintainer/hybrid-prefix-cache-plan.md`。
 
+block snapshot 捕获的是 **prefill 路径**产生的 state image；tap frontier 按
+`lcm(prefill_chunk, kBlockTokens)` 对齐，保证恢复后的 suffix 仍落在全局 prefill chunk 网格上。
+non-speculative（`SpeculativeBackend::None`）请求计划**不再恢复** decode 路径产生的 rewrite
+checkpoint（turn/response closure）：同一批 token 由 decode 产生、再由 prefill 续接时数值不等价，
+在随机采样下会改变输出。该路径因此只使用 block snapshot 或 cold prefill。MTP/DFlash 的 bridge
+路径保留该 checkpoint（draft 由 target 验证，且 bridge 依赖其 hidden/state）。
+
 27B TP2 的 suffix、exact-hit 和 MTP bridge 采用同一套 reuse plan。Rank 0 独占 retained target hidden
 和 rewrite-checkpoint hidden 的权威副本；恢复时通过有序跨卡传输把选中的 hidden 暂存到 rank 1 已有的
 prefill buffer，不为每个 lane 增加第二份 hidden ledger。两个 rank 分别捕获、恢复自身的 GDN shard。

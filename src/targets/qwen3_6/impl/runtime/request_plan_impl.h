@@ -5,6 +5,7 @@
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -286,7 +287,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 plan->reuse        = ReusePath::AppendAtFrontier;
                 plan->reuse_base   = sequence.execution_frontier;
                 plan->reuse_reason = PrefixReuseReason::ReusedFrontier;
-            } else if (sequence.rewrite_checkpoint.valid &&
+            } else if (speculative_backend != SpeculativeBackend::None &&
+                       sequence.rewrite_checkpoint.valid &&
                        sequence.rewrite_checkpoint.frontier != 0 &&
                        sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
                        qwen3_6::detail::prefix_matches(prompt, sequence.ledger,

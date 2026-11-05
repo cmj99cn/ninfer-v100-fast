@@ -160,7 +160,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .value_head_dim = TextConfig::gdn_value_head_dim,
                              .key_head_dim   = TextConfig::gdn_key_head_dim,
                              .slot_count     = linear_state_slots,
-                             .conv_dtype     = DType::BF16,
+                             .conv_dtype     = TextConfig::activation_dtype,
                          },
                  });
     if (plan.speculative_backend != SpeculativeBackend::None) {
@@ -171,6 +171,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         // draft window.
         out.replay_records = plan_gdn_replay_records(
             builder, GdnReplayRecordSpec{
+                .activation_dtype = TextConfig::activation_dtype,
                          .layers          = TextConfig::gdn_layers(),
                          .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
                          .width           = static_cast<std::int32_t>(plan.draft_window + 1U),
@@ -231,6 +232,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
 
     out.round = qwen3_6::begin_round_state_layout(
         builder, qwen3_6::RoundStateSpec{
+                     .activation_dtype = TextConfig::activation_dtype,
                      .hidden         = TextConfig::hidden,
                      .output_rows    = TextConfig::output_rows,
                      .batch_capacity = plan.max_concurrency,
@@ -239,7 +241,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .enable_mtp     = plan.features.mtp(),
                      .enable_dflash  = plan.features.dflash()});
     out.prefill_hidden = add_tensor(
-        builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
+        builder, TextConfig::activation_dtype, {TextConfig::hidden, effective_prefill_chunk},
+        "step prefill hidden");
     qwen3_6::complete_round_state_layout(builder, out.round);
     const auto i32 = [&](std::size_t n, const char* label) {
         return add_tensor(builder, DType::I32, {static_cast<std::int32_t>(n)}, label);
@@ -254,15 +257,16 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
         "sampling config");
     out.tail_hidden = add_tensor(
-        builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
-        "tail hidden");
+        builder, TextConfig::activation_dtype,
+        {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)}, "tail hidden");
     out.rewrite_checkpoint_hidden = add_tensor(
-        builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
+        builder, TextConfig::activation_dtype,
+        {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "rewrite checkpoint hidden");
     const std::uint32_t prefix_slots = prefix_cache_snapshot_slots(plan);
     if (prefix_slots != 0) {
         out.prefix_snapshot_hidden = add_tensor(
-            builder, DType::BF16,
+            builder, TextConfig::activation_dtype,
             {TextConfig::hidden, static_cast<std::int32_t>(prefix_slots)},
             "prefix snapshot hidden");
     }
@@ -468,28 +472,28 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         if (plan.tp > 1) {
             // tp2 only: the final-chunk stage's own one-column all-reduce staging, distinct from
             // the chunk-wide [hidden, T] staging planned by tp_mtp_call_roots.
-            matrix(layout, DType::BF16, TextConfig::hidden, 1);
+            matrix(layout, TextConfig::activation_dtype, TextConfig::hidden, 1);
         }
-        matrix(layout, DType::BF16, TextConfig::hidden, 1);
-        matrix(layout, DType::BF16, TextConfig::hidden, 1);
+        matrix(layout, TextConfig::activation_dtype, TextConfig::hidden, 1);
+        matrix(layout, TextConfig::activation_dtype, TextConfig::hidden, 1);
         {
             auto bulk = layout.scope();
             mtp_stem(layout, last, preembedded);
-            matrix(layout, DType::BF16, TextConfig::kv_size, last);
-            matrix(layout, DType::BF16, TextConfig::kv_size, last);
+            matrix(layout, TextConfig::activation_dtype, TextConfig::kv_size, last);
+            matrix(layout, TextConfig::activation_dtype, TextConfig::kv_size, last);
             scratch(layout, Variant::mtp_kv_projection_workspace_capacity_bytes(first, last));
-            matrix(layout, DType::BF16, TextConfig::kv_size, last);
+            matrix(layout, TextConfig::activation_dtype, TextConfig::kv_size, last);
         }
-        matrix(layout, DType::BF16, TextConfig::query_size, 1);
-        matrix(layout, DType::BF16, TextConfig::query_size, 1);
+        matrix(layout, TextConfig::activation_dtype, TextConfig::query_size, 1);
+        matrix(layout, TextConfig::activation_dtype, TextConfig::query_size, 1);
         scratch(layout, Variant::mtp_q_gate_projection_workspace_capacity_bytes(1, 1));
-        matrix(layout, DType::BF16, TextConfig::query_size, 1);
+        matrix(layout, TextConfig::activation_dtype, TextConfig::query_size, 1);
         matrix(layout, DType::I32, 3, 1);
-        matrix(layout, DType::BF16, TextConfig::query_size, 1);
+        matrix(layout, TextConfig::activation_dtype, TextConfig::query_size, 1);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             TextConfig::query_heads, plan.kv_dtype, text_envelope, 1, 1, 1));
-        matrix(layout, DType::BF16, TextConfig::hidden, 1);
-        matrix(layout, DType::BF16, TextConfig::hidden, 1);
+        matrix(layout, TextConfig::activation_dtype, TextConfig::hidden, 1);
+        matrix(layout, TextConfig::activation_dtype, TextConfig::hidden, 1);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(1, 1));
         proposal_scratch(layout, 1);
     };
@@ -509,7 +513,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto tp_call_roots = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                                    std::int32_t logit_columns) {
         if (plan.tp <= 1) { return; }
-        matrix(layout, DType::BF16, TextConfig::hidden, tokens);
+        matrix(layout, TextConfig::activation_dtype, TextConfig::hidden, tokens);
         matrix(layout, DType::BF16, TextConfig::output_rows / plan.tp, logit_columns);
     };
 
@@ -522,7 +526,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto tp_mtp_call_roots = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                                        std::int32_t logit_columns) {
         if (plan.tp <= 1) { return; }
-        matrix(layout, DType::BF16, TextConfig::hidden, tokens);
+        matrix(layout, TextConfig::activation_dtype, TextConfig::hidden, tokens);
         matrix(layout, DType::BF16,
                (plan.proposal_head == ProposalHead::Optimized ? Variant::draft_head_rows
                                                               : TextConfig::output_rows) /
@@ -542,7 +546,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
          ++batch) {
         WorkspaceLayoutBuilder ordinary;
-        matrix(ordinary, DType::BF16, TextConfig::hidden, batch);
+        matrix(ordinary, TextConfig::activation_dtype, TextConfig::hidden, batch);
         tp_call_roots(ordinary, batch, batch);
         target_body(ordinary, batch, batch, qwen3_6::TextPhase::Verify, GdnWorkspacePath::Snapshot,
                     batch, 1, 1, text_envelope);
@@ -578,12 +582,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     1, 1, chunk, text_envelope);
         matrix(mtp_prefill, DType::I32, 1, chunk);
         if (plan.features.vision) {
-            matrix(mtp_prefill, DType::BF16, TextConfig::hidden, chunk);
+            matrix(mtp_prefill, TextConfig::activation_dtype, TextConfig::hidden, chunk);
             (void)workspace_recipe::visual_scatter_indices(mtp_prefill, chunk);
         }
         mtp_prefill_chunk(mtp_prefill, 1, chunk, plan.features.vision);
         for (std::int32_t i = 1; i < drafts; ++i) {
-            matrix(mtp_prefill, DType::BF16, TextConfig::hidden, 1);
+            matrix(mtp_prefill, TextConfig::activation_dtype, TextConfig::hidden, 1);
             mtp_full_call(mtp_prefill, 1, text_envelope, true);
         }
         out.mtp_prefill = finish(mtp_prefill);
@@ -609,7 +613,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
              ++batch) {
             const std::int32_t aggregate = batch * verify;
             WorkspaceLayoutBuilder target;
-            matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+            matrix(target, TextConfig::activation_dtype, TextConfig::hidden, aggregate);
             tp_call_roots(target, aggregate, aggregate);
             target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
                         GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
@@ -736,7 +740,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                  ++batch) {
                 const std::int32_t aggregate = verify * batch;
                 WorkspaceLayoutBuilder target;
-                matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+                matrix(target, TextConfig::activation_dtype, TextConfig::hidden, aggregate);
                 target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
                             GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
                 const std::size_t accept =

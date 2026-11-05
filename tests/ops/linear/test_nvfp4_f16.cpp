@@ -1,5 +1,6 @@
 #include "ops/linear/linear_test_common.h"
 #include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
+#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -35,6 +36,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t t, std::uint32_t seed
     out_bytes.fill(0xCD);
 
     Weight weight = packed.device_weight(w_bytes.p);
+    ops::detail::nvfp4_prepack_qpn_sm70(weight);
     const std::size_t capacity =
         ops::linear_workspace_capacity_bytes(weight.qtype, n, k, ops::LinearPolicy::A16Only, t, t);
     DeviceArena workspace(capacity == 0 ? std::size_t{16} : capacity);
@@ -92,6 +94,8 @@ int main() {
             {34816, 5120},  // MLP gate/up
             {5120, 6144},   // attention output (residual)
             {5120, 17408},  // MLP down (residual)
+            {17408, 5120},  // MLP gate/up tp2 column shard
+            {5120, 8704},   // MLP down tp2 row shard
         };
         std::uint32_t seed = 900U;
         for (const auto& shape : shapes) {
@@ -103,6 +107,8 @@ int main() {
         failures += run_shape(14336, 5120, 127, 915U);
         failures += run_shape(14336, 5120, 4096, 901U);
         failures += run_shape(34816, 5120, 4096, 902U);
+        failures += run_shape(17408, 5120, 18, 916U);
+        failures += run_shape(5120, 8704, 18, 917U);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4_F16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -63,7 +63,7 @@ std::int64_t scale_index(int hkv, int head, int position, int group) {
 }
 
 HostCache encode_cache(const std::vector<__half>& k, const std::vector<__half>& v, int hkv,
-                       int tokens, int pages) {
+                       int tokens, int pages, int start) {
     HostCache cache;
     const std::size_t elements =
         static_cast<std::size_t>(kD) * kPage * hkv * pages;
@@ -75,6 +75,7 @@ HostCache encode_cache(const std::vector<__half>& k, const std::vector<__half>& 
     cache.v_scale.assign(scales, 0U);
     for (int head = 0; head < hkv; ++head) {
         for (int token = 0; token < tokens; ++token) {
+            const int position = start + token;
             for (int group = 0; group < kGroups; ++group) {
                 float k_abs = 0.0f;
                 float v_abs = 0.0f;
@@ -93,9 +94,9 @@ HostCache encode_cache(const std::vector<__half>& k, const std::vector<__half>& 
                 const float vs = __half2float(vsh);
                 const float kinv = ks > 0.0f ? 1.0f / ks : 0.0f;
                 const float vinv = vs > 0.0f ? 1.0f / vs : 0.0f;
-                cache.k_scale[scale_index(hkv, head, token, group)] =
+                cache.k_scale[scale_index(hkv, head, position, group)] =
                     *reinterpret_cast<const std::uint16_t*>(&ksh);
-                cache.v_scale[scale_index(hkv, head, token, group)] =
+                cache.v_scale[scale_index(hkv, head, position, group)] =
                     *reinterpret_cast<const std::uint16_t*>(&vsh);
                 for (int i = 0; i < kGroup; ++i) {
                     const int d = group * kGroup + i;
@@ -103,7 +104,7 @@ HostCache encode_cache(const std::vector<__half>& k, const std::vector<__half>& 
                         static_cast<std::int64_t>(d) +
                         static_cast<std::int64_t>(kD) *
                             (head + static_cast<std::int64_t>(hkv) * token);
-                    const std::int64_t dst = code_index(hkv, head, token, d);
+                    const std::int64_t dst = code_index(hkv, head, position, d);
                     cache.k_code[dst] =
                         encode_one(__half2float(k[src]), kinv);
                     cache.v_code[dst] =
@@ -131,7 +132,7 @@ int run_case(int h, int hkv, int tokens, int start) {
     auto k = make_half(kvn, 5002U + static_cast<std::uint32_t>(start));
     auto v = make_half(kvn, 5003U + static_cast<std::uint32_t>(start));
 
-    const HostCache expected = encode_cache(k, v, hkv, tokens, pages);
+    const HostCache expected = encode_cache(k, v, hkv, tokens, pages, start);
 
     const std::size_t cache_elements =
         static_cast<std::size_t>(kD) * kPage * hkv * pages;
@@ -192,8 +193,9 @@ int run_case(int h, int hkv, int tokens, int start) {
     int failures = 0;
     for (int head = 0; head < hkv; ++head) {
         for (int token = 0; token < tokens; ++token) {
+            const int position = start + token;
             for (int group = 0; group < kGroups; ++group) {
-                const std::int64_t si = scale_index(hkv, head, token, group);
+                const std::int64_t si = scale_index(hkv, head, position, group);
                 if (actual_k_scale[si] != expected.k_scale[si] ||
                     actual_v_scale[si] != expected.v_scale[si]) {
                     ++failures;
@@ -290,6 +292,11 @@ int main() {
             failures += run_case(12, 2, tokens, 0);
             failures += run_case(16, 2, tokens, 0);
         }
+        // A long visible window forces the SmallT split-KV route (splits > 1), which is where
+        // the FP16 partial accumulator is written and reduced.
+        failures += run_case(24, 4, 1, 4096);
+        failures += run_case(12, 2, 1, 4096);
+        failures += run_case(16, 2, 6, 4096);
         std::cout << (failures ? "FAIL" : "OK") << " gqa_attention_f16_i8\n";
         return failures ? 1 : 0;
     } catch (const std::exception& error) {

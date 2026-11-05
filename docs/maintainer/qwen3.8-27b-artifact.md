@@ -112,12 +112,15 @@ integers.
 
 ### 3.1 Complete format assignment
 
-The Text backbone preserves the fixed mixed-precision allocation of the quantized Text source. The
-embedding is the only additional row-scaled FP8 quantization performed by NInfer.
+The authoritative object/format assignment is `tools/convert/qwen3_8_27b/inventory_nvfp4.py`. The
+current registered Text projection stack is all-NVFP4 (every full-attention/GDN/MLP parent), the
+token embedding is FP16 (a direct cast of the official BF16 source), and the output head is the only
+row-scaled FP8 object. The per-layer tables below retain the earlier mixed-precision layout and are
+being migrated to that inventory.
 
 | Role | Layer domain | Format | Layout | Value provenance |
 |---|---|---|---|---|
-| token embedding | global | `FP8_E4M3FN_ROW_BF16S` | `row-scale-v1` | encode official BF16 source |
+| token embedding | global | `FP16` | `contiguous-le-v1` | cast official BF16 source to FP16 |
 | full-attention input projection | all full-attention layers | `FP8_E4M3FN_ROW_BF16S` | `row-scale-v1` | preserve source FP8 words |
 | full-attention output projection | all full-attention layers | `FP8_E4M3FN_ROW_BF16S` | `row-scale-v1` | preserve source FP8 words |
 | GDN input projection | all GDN layers | `FP8_E4M3FN_ROW_BF16S` | `row-scale-v1` | preserve source FP8 words |
@@ -234,7 +237,7 @@ The artifact preserves exactly these official-source files as `raw-bytes-v1` res
 
 | Order | Object name | Shape | Format |
 |---:|---|---|---|
-| 0 | `text/token_embedding` | `[248320,5120]` | `FP8_E4M3FN_ROW_BF16S` |
+| 0 | `text/token_embedding` | `[248320,5120]` | `FP16` |
 | after all layers | `text/final_norm` | `[5120]` | `BF16` |
 | next | `text/output_head` | `[248320,5120]` | `FP8_E4M3FN_ROW_BF16S` |
 
@@ -531,11 +534,13 @@ For every source-derived FP8 matrix, the converter validates an E4M3FN `.weight 
 and concatenation operate on `(code row, scale word)` pairs. The resulting logical words are encoded
 with `row-scale-v1`; no floating-point decode, scale recomputation, or requantization is permitted.
 
-### 10.4 Embedding FP8 encoder
+### 10.4 Token embedding FP16 cast and output-head FP8 encoder
 
-Only `text/token_embedding` uses the target-specific encoder profile
-`MAXABS_BF16S_RECIP_E4M3FN_RNE_V1`. The input is the official BF16 matrix. Every BF16 word expands
-exactly to binary32, and each row is encoded independently. All operations below use
+The token embedding is a direct BF16-to-FP16 cast of the official
+`model.language_model.embed_tokens.weight`; it is not row-scaled or FP8-encoded. The
+`text/output_head` uses the target-specific encoder profile
+`MAXABS_BF16S_RECIP_E4M3FN_RNE_V1` against the quantized-source BF16 `lm_head.weight`. Every BF16
+word expands exactly to binary32, and each row is encoded independently. All operations below use
 round-to-nearest, ties-to-even, with no flush-to-zero:
 
 ```text
@@ -600,7 +605,7 @@ P(l) = model.language_model.layers.{l}.
 
 | Artifact object | Source | Transform |
 |---|---|---|
-| `text/token_embedding` | official `model.language_model.embed_tokens.weight [248320,5120]` BF16 | apply Section 10.4 |
+| `text/token_embedding` | official `model.language_model.embed_tokens.weight [248320,5120]` BF16 | cast BF16 words to FP16 (Section 10.4) |
 | `text/final_norm` | quantized-source `model.language_model.norm.weight [5120]` BF16 | preserve words |
 | `text/output_head` | quantized-source `lm_head.weight [248320,5120]` E4M3FN and `weight_scale [248320,1]` BF16 | preserve words |
 

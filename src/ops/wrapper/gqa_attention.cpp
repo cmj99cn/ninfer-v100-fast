@@ -296,11 +296,11 @@ struct SmallTWorkspace {
 };
 
 template <class Allocator>
-SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_heads,
-                                           std::int32_t tokens, std::int32_t splits,
-                                           std::int32_t batch_size = 1) {
+SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, DType acc_dtype,
+                                           std::int32_t q_heads, std::int32_t tokens,
+                                           std::int32_t splits, std::int32_t batch_size = 1) {
     return {
-        workspace.alloc(DType::BF16, {kHeadDim, q_heads, tokens, splits * batch_size}),
+        workspace.alloc(acc_dtype, {kHeadDim, q_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
     };
@@ -380,7 +380,7 @@ void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceA
         auto chunk_scope         = workspace.scope();
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], count, cache_dtype, envelope);
-        SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], count, splits);
+        SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.dtype, q.ne[1], count, splits);
         Tensor q_chunk          = q.slice(2, begin, count);
         Tensor position_chunk   = positions.slice(0, begin, count);
         Tensor out_chunk        = out.slice(2, begin, count);
@@ -399,7 +399,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], count, cache.dtype, envelope);
         SmallTWorkspace partial =
-            allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
+            allocate_small_t_workspace(workspace, q.dtype, q.ne[1], count, splits, q.ne[3]);
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                              cache, envelope, begin, count, partial.acc, partial.m,
                                              partial.l, out, stream);
@@ -509,7 +509,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q_heads, width, cache_dtype, envelope);
         WorkspaceLayoutBuilder layout;
-        (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size);
+        (void)allocate_small_t_workspace(layout, DType::BF16, q_heads, width, splits, batch_size);
         return layout.peak_bytes(1);
     };
     const auto exact_capacity = [&](std::int32_t width) {
@@ -626,7 +626,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], width, cache.dtype, envelope);
         SmallTWorkspace partial =
-            allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
+            allocate_small_t_workspace(workspace, q.dtype, q.ne[1], width, splits, batch);
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                              scale, cache, envelope, 0, width, partial.acc,
                                              partial.m, partial.l, out, stream);
@@ -687,7 +687,7 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     if (detail::gqa_attention_uses_small_t(q.ne[2])) {
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
-        SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);
+        SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.dtype, q.ne[1], q.ne[2], splits);
         detail::gqa_attention_cached_small_t_launch(q, positions, scale, cache, envelope,
                                                     partial.acc, partial.m, partial.l, out, stream);
         return;

@@ -156,7 +156,9 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
           const RopeFrequencyOverride& frequency, cudaStream_t stream) {
     require_common(positions, rotary_dim, theta);
-    if (x.dtype != DType::BF16) { throw std::invalid_argument("rope: tensor must be BF16"); }
+    if (x.dtype != DType::BF16 && x.dtype != DType::FP16) {
+        throw std::invalid_argument("rope: tensor must be BF16 or FP16");
+    }
     (void)numel_allow_zero(positions, "positions");
     const std::int64_t x_numel  = numel_allow_zero(x, "tensor");
     const std::int32_t tokens   = x.ne[2];
@@ -169,6 +171,13 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
     if (x_numel == 0) { return; }
     require_positions_storage(positions);
     if (x.data == nullptr) { throw std::invalid_argument("rope: tensor data must be non-null"); }
+    if (x.dtype == DType::FP16) {
+        if (frequency.inv_frequency != nullptr) {
+            throw std::invalid_argument("rope: FP16 frequency override is not implemented");
+        }
+        detail::rope_f16_single_launch(positions, rotary_dim, theta, x, stream);
+        return;
+    }
     detail::rope_single_launch(positions, rotary_dim, theta, x, frequency, stream);
 }
 

@@ -28,4 +28,10 @@ void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor
                                    const Tensor& snapshot_base_slots, Tensor& out,
                                    cudaStream_t stream);
 
+// FP16 activation stream with either an FP16 or a BF16 persistent conv weight. The convolution
+// history (state_in/state_out) and the output follow the activation dtype; state_in and
+// state_out may alias.
+void causal_conv1d_silu_f16_launch(const Tensor& x, const Tensor& weight, const Tensor& state_in,
+                                   Tensor& state_out, Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

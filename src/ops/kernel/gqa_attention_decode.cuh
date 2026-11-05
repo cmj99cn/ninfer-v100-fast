@@ -197,7 +197,7 @@ __device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, in
 template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset,
           class Out = __nv_bfloat16>
 __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kernel(
-    const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
+    const Out* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
     std::int32_t split_count, Out* out) {
@@ -307,8 +307,9 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
             float values[8];
 #pragma unroll
             for (int item = 0; item < 8; ++item) {
-                values[item] = __bfloat162float(partial_acc[gqa_partial_acc_index<Geometry>(
-                    q_head, d, token, split + item * kSplitGroups, tokens)]);
+                values[item] = GqaActivation<Out>::load(
+                    &partial_acc[gqa_partial_acc_index<Geometry>(
+                        q_head, d, token, split + item * kSplitGroups, tokens)]);
             }
 #pragma unroll
             for (int item = 0; item < 8; ++item) {
@@ -316,9 +317,9 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
             }
         }
         for (; split < active_split_count; split += kSplitGroups) {
-            numerator += __bfloat162float(
-                             partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split,
-                                                                         tokens)]) *
+            numerator += GqaActivation<Out>::load(
+                             &partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split,
+                                                                          tokens)]) *
                          weights[split];
         }
     }

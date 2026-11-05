@@ -18,6 +18,7 @@ inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
 
 struct RoundStateSpec {
+    DType activation_dtype       = DType::BF16;
     std::int32_t hidden          = 0;
     std::int32_t output_rows     = 0;
     std::uint32_t batch_capacity = 1;

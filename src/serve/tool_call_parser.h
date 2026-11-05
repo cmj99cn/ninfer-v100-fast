@@ -3,6 +3,7 @@
 #include "serve/request.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -24,9 +25,36 @@ struct ParsedToolCallOutput {
 // on an output/context limit) an opening <tool_call> with no closing tag is reported through
 // `unterminated_tool_call` and withheld from `content` rather than falling back to the whole
 // text. When false the historical byte-preserving fallback is retained.
-ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
-                                                 std::size_t max_tool_name_length,
-                                                 bool drop_unterminated = false);
+//
+// The Qwen syntax carries each top-level argument as untyped text between <parameter> tags.
+// `contracts` retains, per declared tool parameter, whether an explicit JSON Schema type admits a
+// string or requires JSON decoding. Without a contract the legacy decode is used.
+struct ToolArgumentTypeContracts {
+    enum class Encoding : std::uint8_t {
+        Json,
+        String,
+    };
+
+    struct Parameter {
+        std::string name;
+        Encoding encoding = Encoding::Json;
+    };
+
+    struct Tool {
+        std::string name;
+        std::vector<Parameter> parameters;
+        bool unambiguous = true;
+    };
+
+    std::vector<Tool> tools;
+};
+
+[[nodiscard]] ToolArgumentTypeContracts
+build_tool_argument_type_contracts(const GenerationRequest& request);
+
+ParsedToolCallOutput parse_qwen_tool_call_output(
+    const std::string& text, std::size_t max_tool_name_length,
+    const ToolArgumentTypeContracts& contracts = {}, bool drop_unterminated = false);
 
 // Terminal disposition of the region withheld behind a possible Qwen <tool_call>.
 enum class ToolCallTerminal {

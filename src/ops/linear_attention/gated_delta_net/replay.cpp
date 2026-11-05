@@ -94,6 +94,10 @@ void require_scale(float scale, const char* op) {
     }
 }
 
+bool is_activation_dtype(DType dtype) {
+    return dtype == DType::BF16 || dtype == DType::FP16;
+}
+
 void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                             const Tensor& beta, float scale, const Tensor& states,
                             const Tensor& valid_columns, const Tensor& initial_slots,
@@ -124,9 +128,16 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
         throw std::invalid_argument(std::string(kOp) + ": state slot count must be positive");
     }
 
-    require_tensor(q, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "q");
-    require_tensor(k, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "k");
-    require_tensor(v, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "v");
+    const DType activation = q.dtype;
+    if (!is_activation_dtype(activation) || k.dtype != activation || v.dtype != activation ||
+        key_record.dtype != activation || value_record.dtype != activation ||
+        out.dtype != activation) {
+        throw std::invalid_argument(std::string(kOp) +
+                                    ": q/k/v/records/out must share BF16 or FP16");
+    }
+    require_tensor(q, activation, {kStateDim, qk_heads, width, rows}, 8, kOp, "q");
+    require_tensor(k, activation, {kStateDim, qk_heads, width, rows}, 8, kOp, "k");
+    require_tensor(v, activation, {kStateDim, value_heads, width, rows}, 2, kOp, "v");
     require_tensor(g, DType::FP32, {value_heads, width, rows}, 4, kOp, "g");
     require_tensor(beta, DType::FP32, {value_heads, width, rows}, 4, kOp, "beta");
     require_tensor(states, DType::FP32, {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp,
@@ -135,12 +146,12 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     if (valid_columns.data != nullptr) {
         require_tensor(valid_columns, DType::I32, {rows}, 4, kOp, "valid columns");
     }
-    require_tensor(key_record, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp,
+    require_tensor(key_record, activation, {kStateDim, qk_heads, width, rows}, 8, kOp,
                    "key record");
-    require_tensor(value_record, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp,
+    require_tensor(value_record, activation, {kStateDim, value_heads, width, rows}, 2, kOp,
                    "value record");
     require_tensor(gate_record, DType::FP32, {2, value_heads, width, rows}, 8, kOp, "gate record");
-    require_tensor(out, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "out");
+    require_tensor(out, activation, {kStateDim, value_heads, width, rows}, 2, kOp, "out");
     require_scale(scale, kOp);
 
     const std::array<const Tensor*, 12> tensors{&q,
@@ -188,21 +199,21 @@ bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
 void validate_fold_records(const GdnReplayRecords& records) {
     constexpr const char* kOp       = "gdn_replay_fold";
     const GdnReplayRecordSpec& spec = records.spec;
-    if (!is_registered_fold_geometry(spec) || spec.record_capacity <= 0 ||
-        spec.record_capacity > kMaximumRows || spec.width < 2 || spec.width > 16 ||
-        spec.key_dim != kStateDim || spec.value_dim != kStateDim) {
+    if (!is_registered_fold_geometry(spec) || !is_activation_dtype(spec.activation_dtype) ||
+        spec.record_capacity <= 0 || spec.record_capacity > kMaximumRows || spec.width < 2 ||
+        spec.width > 16 || spec.key_dim != kStateDim || spec.value_dim != kStateDim) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported record geometry");
     }
     if (spec.layers > std::numeric_limits<std::int32_t>::max() / spec.record_capacity) {
         throw std::overflow_error(std::string(kOp) + ": record outer extent overflows");
     }
     const std::int32_t outer = spec.layers * spec.record_capacity;
-    require_tensor(records.conv, DType::BF16, {spec.conv_channels, spec.width, outer}, 256, kOp,
-                   "conv records");
-    require_tensor(records.key, DType::BF16, {kStateDim, spec.qk_heads, spec.width, outer}, 256,
-                   kOp, "key records");
-    require_tensor(records.value, DType::BF16, {kStateDim, spec.value_heads, spec.width, outer},
-                   256, kOp, "value records");
+    require_tensor(records.conv, spec.activation_dtype,
+                   {spec.conv_channels, spec.width, outer}, 256, kOp, "conv records");
+    require_tensor(records.key, spec.activation_dtype,
+                   {kStateDim, spec.qk_heads, spec.width, outer}, 256, kOp, "key records");
+    require_tensor(records.value, spec.activation_dtype,
+                   {kStateDim, spec.value_heads, spec.width, outer}, 256, kOp, "value records");
     require_tensor(records.gate, DType::FP32, {2, spec.value_heads, spec.width, outer}, 256, kOp,
                    "gate records");
 
@@ -221,11 +232,11 @@ void validate_fold_states(const GdnReplayRecords& records,
         state.conv_channels != record.conv_channels || state.conv_width != 3 ||
         state.value_heads != record.value_heads || state.value_head_dim != kStateDim ||
         state.key_head_dim != kStateDim || state.slot_count <= 0 ||
-        state.conv_dtype != DType::BF16) {
+        state.conv_dtype != record.activation_dtype) {
         throw std::invalid_argument(std::string(kOp) + ": state geometry does not match records");
     }
-    require_tensor(states.conv_layer0, DType::BF16, {3, record.conv_channels, state.slot_count},
-                   256, kOp, "conv state layer 0");
+    require_tensor(states.conv_layer0, record.activation_dtype,
+                   {3, record.conv_channels, state.slot_count}, 256, kOp, "conv state layer 0");
     require_tensor(states.recurrent_layer0, DType::FP32,
                    {kStateDim, kStateDim, record.value_heads, state.slot_count}, 256, kOp,
                    "recurrent state layer 0");

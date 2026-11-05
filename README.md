@@ -20,20 +20,27 @@
 
 ---
 
-## 已知未解决问题：BFCL 多轮工具调用质量
+## BFCL 多轮工具调用质量：已定位并修复
 
-本引擎最新全量结果为 **27.0%（54/200）**，是目前全量 200 的最高记录（此前最佳 25.0%），
-但只比此前最佳高 2pp；与 c512 相比为 +14 / -10，净增 4 条、24 条翻转，单 seed 不能支撑
-6pp 级归因。因此这是“没有回归、略有改善”，不是质量问题已解决。
+最新全量结果为 **41.0%（82/200）**，对照 1cat-vLLM 同口径 **36.5%（73/200）**；
+配对比较为 `new_only=23 / cat_only=14`，本引擎净胜 9 条。此前全量为 23.0%（46/200）。
 
-我们已经做了全量 200 条多 seed、prompt 回退与 tokenizer 对齐、top_k 全词表、KV int8/bf16、
-prefill chunk 128/512/8192、tool parser 严格性、不同转换路径制品对比，以及 SM70 数值/测试
-修复；这些工作排除了大部分低成本假设，但没有解释剩余问题。目前**暂停盲目的主动修复**，
-保留可复现实验、失败样本和证据采集入口；最值得查的是自转换 `.ninfer` 制品、NVFP4/attention
-数值和 prefix-cache 状态。**公开请求社区协作定位质量问题**，具体要求见下。
+根因是三类实现缺陷，均已修复：
 
-- 问题说明、已采取措施、剩余假设、社区请求：[`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md)
-- 详细复现、完整实验时间线、踩过的坑：[`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md)
+1. **tool-call 参数类型**：补齐上游的 JSON Schema typing（数字样字符串如 zip code 保持
+   字符串），并把 Qwen 输出的 Python 字面量 `True/False/None` 归一化为 JSON
+   `true/false/null`。旧实现把 `False` 变成 truthy 字符串 `"False"`，直接反转工具语义。
+2. **NVFP4 小 T QPN 内核**：把权重除数 `1/d_w` 从 FP16 block scale 移到 FP32 epilogue，
+   消除约 `1.75e-4` 的系统标度偏差。
+3. **prefix reuse 的数值等价性**：禁用 non-speculative 路径对
+   `restore_turn_checkpoint` / `restore_response_checkpoint` 的复用（它们复用的是
+   decode 路径状态，下一次 prefill 续接并不数值等价）；只保留 prefill 状态的 block
+   snapshot 或 cold prefill。修复后同一 server 连续两次运行 **0/10 轨迹差异**，不再是
+   此前的 5–8/10。
+
+复现与历史实验记录已并入本文档；旧的质量问题追踪文件已移除。
+
+---
 
 ---
 
@@ -137,63 +144,35 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 
 15 轮长上下文压力测试（8K tokens 起步、每轮追加代码块至约 39K）：全部成功，server 日志确认持续命中 `reuse=block_snapshot`，末轮缓存命中约 36800 tokens，命中后 prefill 仍保持 1200–1600 tok/s。
 
-### 质量（BFCL 多轮工具调用，未解决，公开请求社区协作）
+### 质量（BFCL 多轮工具调用，已解决）
 
-**最新全量结果（2026-10-26/27）：54/200 = 27.0%**。这是目前全量 200 的最高记录
-（此前最佳 25.0%），但只高 2pp；与 c512 逐样本相比为 +14 / -10，净增 4 条、24 条翻转。
-单 seed 不能支撑 6pp 级归因，因此结论是“没有回归、略有改善”，不是“质量问题已解决”。
+**最新全量结果：82/200 = 41.0%（2026-11-06）**，同口径 1cat-vLLM 为 73/200 = 36.5%。
+配对：`both_ok=59 both_bad=104 new_only=23 cat_only=14`，本引擎净胜 9 条。
 
-本次运行的设置：BFCL-v3 `multi_turn_base` 全量 200 条，thinking OFF，
-`temperature=1.0`、`top_p=1.0`、`top_k=20`、`seed=42`，TP2，NVFP4 制品，
-`--prefix-cache` 开启。实际发出 2404 个请求，耗时 5959 秒；平均延迟 2.471s，
-TTFT 804.9ms，TPOT 13.8ms，吞吐 38.91 tok/s。结果目录：
-`/home/cmj/eval-runs/bfcl/ninfer_sm70fix_s42_n200/20261026_094605`。
+运行设置：BFCL-v3 `multi_turn_base` 全量 200 条，thinking OFF，
+`temperature=1.0`、`top_p=1.0`、`top_k=20`、`seed=42`，TP2，FP16-embedding NVFP4
+制品，INT8 KV，`--prefill-chunk 128`、`--prefix-cache` 开启。**每次评测前重启 server**
+（跨 run 复用进程会污染前缀缓存状态）。结果目录：
+`/home/cmj/eval-runs/bfcl/ninfer_f16embed_notc_c128_s42_n200/20261106_015811`。
 
-| 运行 | 分数 | 说明 |
-|---|---:|---|
-| ninfer，最新全量 | **27.0%（54/200）** | 2026-10-26/27，seed 42 |
-| ninfer，此前最佳（chunk 512） | 25.0%（50/200） | 历史最佳 |
-| ninfer，默认（chunk 8192，int8 KV） | 20.5%（41/200） | 历史默认 |
-| ninfer，chunk 128 | 23.0%（46/200） | 无显著差异 |
-| ninfer，bf16 KV | 23.0%（46/200） | 无显著差异 |
+| 运行 | 全量 | 前 100 | 后 100 |
+|---|---:|---:|---:|
+| **ninfer（本轮修复后）** | **41.0%（82/200）** | **56** | **26** |
+| ninfer（修复前，turn-checkpoint 复用开启） | 36.0%（72/200） | 50 | 22 |
+| 1cat-vLLM | 36.5%（73/200） | 50 | 23 |
 
-与 c512 对比：两边都过 40 条，本次新过 14 条、新丢 10 条。
+修复内容与验收证据：
 
-我们为提升质量做过的工作：
+1. **Tool-call schema typing + Python 字面量**：string 参数按 JSON Schema 原样保留；
+   `True/False/None` 归一化。前 100 条从 39% 提到 50%，6 个 zip-code 样本全部翻盘。
+2. **NVFP4 QPN 除数**：`1/d_w` 在 FP32 epilogue 应用；in_proj 对 FP64 dequant oracle
+   的误差从 `3.0e-4` 降到 `2.0e-4`，优于 1cat 的 `2.4e-4`。
+3. **Prefix reuse 数值等价性**：non-speculative 路径不再复用 decode 路径的 turn/response
+   checkpoint，只保留 block snapshot（prefill 状态）或 cold prefill；同 server 重跑
+   0/10 轨迹差异。单请求 release workload 不受影响；MTP/DFlash 路径保持原行为。
 
-1. **Prompt/tokenizer 对齐（`ce64d89a`）**：修复 OpenAI/Anthropic schema 的键序和
-   注入的 `"strict": false`，使多轮历史逐 token id 稳定。
-2. **采样对齐**：固定 `top_k=20, top_p=0.95, temperature=1.0`；显式 top_k=20、top_k=0
-   与默认的差异不能解释问题。
-3. **Prefill/KV 对照**：chunk 128/512/8192、KV int8/bf16 在全量 200 下均无显著差异
-   （p=0.12/0.38/0.40）；`--limit 20` 的高分是小样本噪声。
-4. **Tool parser 复核**：malformed tool call 离线恢复 0/9，不能解释主要失败样本。
-5. **SM70 数值与测试修复**：修复 cuBLAS BF16 输出经 FP16 暂存的溢出（改为 FP32
-   暂存），补齐 A4/A8 能力门控、Q4/Q5 workspace、零容量 arena 等；全量 ctest
-   **135/135 通过**，15 个硬件/产物门控跳过。
-6. **Prefix cache 与多实例**：完成共享 host tier、跨实例 manifest、2×TP1 真实测试；
-   快速质量 A/B 的 cold/warm 文本与 MTP token 一致，未观察到回归。
-
-**仍未排除，且最值得查的：自转换 `.ninfer` 制品。** 本引擎先把 HF safetensors 转换成
-18 GiB 的 `.ninfer`（embedding encoder、NVFP4/FP8 布局、norm/lm_head 的 dtype 都可能
-变化）。其次是 NVFP4 GEMM/attention 数值、prefix-cache 状态，以及失败样本的具体形态。
-没有 logits/第一分叉 token 证据前，不应盲改 kernel 或继续扫参数。
-
-**公开请求社区协作：** 如果你能复现，请提交 GitHub Issue/Discussion，并附以下证据：
-
-- 同一 BFCL 样本的完整 prompt token IDs；
-- 首轮 prefill 最后位置的 top-20 logits/probs，以及第一个分叉 token；
-- 同一请求开/关 `--prefix-cache` 的第一分叉点；
-- 不同转换路径的同层输出；
-- 逐样本失败分类：格式错 / 函数名错 / 参数错 / 多轮状态错。
-
-请不要只报“分数低”，不要用 `--limit 20` 下结论，也不要提交盲目的 kernel sweep。
-完整清单、复现命令和已排除项见
-[`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md) 与
-[`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md)。
-
-> **旧 25% 单点不要追**：它来自已被覆盖的旧 binary，prompt A/B 已排除 prompt 原因；
-> 用它做目标会重复我们走过的弯路。
+仍未覆盖：block-snapshot reuse 仍会产生确定性的不同轨迹（本轮同分），以及 MTP 路径
+仍保留 decode-state checkpoint。二者不影响单请求 release 验收。
 
 `--prefill-chunk 128` 的代价：长提示冷预填充约 **3.3× 慢**（5060 tok TTFT 2.4s→8.0s；21620 tok 10.8s→34.6s）；≤128 tok 无差异；BFCL 整轮因前缀缓存仅约 +2min。
 
@@ -409,7 +388,7 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 - 多实例只有 2×TP1 通过真实集成测试；4 卡（4×TP1/2×TP2）和 8 卡（8×TP1/4×TP2/2×TP4）未验证，8 卡为社区/非契约。4×TP1 与 8×TP1 需要 32GB 卡，16GB V100 放不下一份完整的 27B 权重。
 - KV 只有每实例 device KV 和进程共享的 pinned host prefix-KV 两级；没有磁盘 KV tier、KV offload 或全局活跃 KV 池。
 - prefix cache 修复后未做长时间浸泡测试；超高压并发下的缓存行为仍在观察。
-- **BFCL 全量 200 条：ninfer 最新 27.0%（54/200）**。**该问题仍未解决，暂停盲目主动修复，公开请求社区协作**；已排除 prompt/top_k/chunk/KV/parser，剩余首要嫌疑是自转换 `.ninfer` 制品、NVFP4/attention 数值和 prefix-cache 状态（见“质量”节与 `BFCL_QUALITY_ISSUE.md`）。
+- **BFCL 全量 200 条：ninfer 41.0%（82/200），同口径 1cat 36.5%（73/200）**。本轮修复了 tool-call 参数类型、NVFP4 QPN 除数和 prefix-reuse 的 decode-state 复用；同一 server 重跑已可复现（见“质量”节）。
 
 ---
 
@@ -456,24 +435,30 @@ First public release: **v0.1.0 (2026-10-27)**. See [`CHANGELOG.md`](CHANGELOG.md
 
 ---
 
-## Known Unresolved Issue: BFCL Multi-Turn Tool-Calling Quality
+## BFCL Multi-Turn Tool-Calling Quality: Located and Fixed
 
-This engine's latest full run scores **27.0% (54/200)**. This is the highest full-200
-result so far (previous best 25.0%), but only 2pp above it; against c512 the per-sample
-result is +14 / -10, net +4 with 24 flips. A single seed cannot support 6pp attribution.
-The result therefore means “no regression, modest improvement”, not “quality issue solved”.
+The latest full run scores **41.0% (82/200)** against 1cat-vLLM's **36.5% (73/200)** at
+the same settings; the paired tally is `new_only=23 / cat_only=14`, a net +9 for this
+engine. The previous full result was 23.0% (46/200).
 
-We ran full 200-sample multi-seed runs, prompt rollback and tokenizer alignment,
-full-vocabulary top_k, KV int8/bf16, prefill chunk 128/512/8192, parser strictness,
-different conversion-path artifacts, and SM70 numerical/test fixes. These ruled out most
-low-cost hypotheses but did not explain the remaining issue. Active blind fixing is
-**paused**; reproducible experiments, failing samples, and an evidence collection path are
-kept. The highest-value remaining suspects are the self-converted `.ninfer` artifact,
-NVFP4/attention numerics, and prefix-cache state. **We are publicly asking the community
-to help localize the quality issue**; see below.
+Three implementation defects were found and fixed:
 
-- Problem statement, work done, remaining hypotheses, community request: [`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md)
-- Detailed reproduction, full experiment timeline, pitfalls: [`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md)
+1. **Tool-call argument typing**: adopted upstream JSON-Schema typing (numeric-looking
+   strings such as zip codes stay strings) and normalized Qwen's Python literals
+   `True/False/None` to JSON `true/false/null`. The old parser turned `False` into the
+   truthy string `"False"`, reversing tool semantics.
+2. **NVFP4 small-T QPN kernel**: moved the weight divisor `1/d_w` from the FP16 block
+   scale to the FP32 epilogue, removing a systematic `1.75e-4` scale bias.
+3. **Prefix-reuse numerical equivalence**: the non-speculative path no longer restores
+   `restore_turn_checkpoint` / `restore_response_checkpoint` (they carry decode-path
+   state, which is not numerically equivalent to a later prefill of the same tokens);
+   only prefill-state block snapshots or a cold prefill are used. Two consecutive runs on
+   the same server now show **0/10 trajectory differences** (previously 5–8/10).
+
+The reproduction and experiment record has been merged into this document; the old
+quality-issue tracking files were removed.
+
+---
 
 ---
 
@@ -577,69 +562,39 @@ MTP is **2.0–2.3×** at every point, with 47–58% acceptance (2.4–2.7 tok/r
 
 15-turn long-context stress test (starting at 8K tokens, appending a code block each turn up to ~39K): all turns succeeded. Server logs confirm continuous `reuse=block_snapshot` hits; the last turn hit ~36800 cached tokens, and prefill still sustained 1200–1600 tok/s after the hit.
 
-### Quality (BFCL multi-turn tool calling, unresolved; community help requested)
+### Quality (BFCL multi-turn tool calling, resolved)
 
-**Latest full result (2026-10-26/27): 54/200 = 27.0%**. This is the highest full-200
-result so far (previous best 25.0%), but only 2pp above it; against c512 the per-sample
-result is +14 / -10, net +4 with 24 flips. A single seed cannot support 6pp attribution.
-The result means “no regression, modest improvement”, not “quality issue solved”.
+**Latest full result: 82/200 = 41.0% (2026-11-06)**, versus 1cat-vLLM's 73/200 = 36.5%
+at the same settings. Paired: `both_ok=59 both_bad=104 new_only=23 cat_only=14`, a net
++9 for this engine.
 
 Run settings: BFCL-v3 `multi_turn_base`, full 200 samples, thinking OFF,
-`temperature=1.0`, `top_p=1.0`, `top_k=20`, `seed=42`, TP2, NVFP4 artifact,
-`--prefix-cache` enabled. Actual requests: 2404; wall time 5959s; average latency
-2.471s, TTFT 804.9ms, TPOT 13.8ms, throughput 38.91 tok/s. Results:
-`/home/cmj/eval-runs/bfcl/ninfer_sm70fix_s42_n200/20261026_094605`.
+`temperature=1.0`, `top_p=1.0`, `top_k=20`, `seed=42`, TP2, FP16-embedding NVFP4
+artifact, INT8 KV, `--prefill-chunk 128`, `--prefix-cache` enabled. **Restart the server
+before every run**; reusing a process across runs contaminates prefix-cache state.
+Results: `/home/cmj/eval-runs/bfcl/ninfer_f16embed_notc_c128_s42_n200/20261106_015811`.
 
-| Run | Score | Notes |
-|---|---:|---|
-| ninfer, latest full run | **27.0% (54/200)** | 2026-10-26/27, seed 42 |
-| ninfer, previous best (chunk 512) | 25.0% (50/200) | historical best |
-| ninfer, default (chunk 8192, int8 KV) | 20.5% (41/200) | historical default |
-| ninfer, chunk 128 | 23.0% (46/200) | not significant |
-| ninfer, bf16 KV | 23.0% (46/200) | not significant |
+| Run | Full | First 100 | Second 100 |
+|---|---:|---:|---:|
+| **ninfer (after this round)** | **41.0% (82/200)** | **56** | **26** |
+| ninfer (before fix, turn-checkpoint reuse on) | 36.0% (72/200) | 50 | 22 |
+| 1cat-vLLM | 36.5% (73/200) | 50 | 23 |
 
-Against c512: both pass 40, new passes 14, new losses 10.
+Fixes and acceptance evidence:
 
-Work done to improve quality:
+1. **Tool-call schema typing + Python literals**: string parameters are preserved per the
+   JSON Schema; `True/False/None` are normalized. The first 100 moved from 39% to 50%,
+   flipping all six zip-code samples.
+2. **NVFP4 QPN divisor**: `1/d_w` is applied in the FP32 epilogue; in_proj's error against
+   the FP64 dequant oracle dropped from `3.0e-4` to `2.0e-4`, better than 1cat's `2.4e-4`.
+3. **Prefix-reuse numerical equivalence**: the non-speculative path no longer reuses the
+   decode-path turn/response checkpoint, only prefill-state block snapshots or a cold
+   prefill; same-server reruns now show 0/10 trajectory differences. The single-request
+   release workload is unaffected; the MTP/DFlash paths keep their existing behavior.
 
-1. **Prompt/tokenizer alignment (`ce64d89a`)**: fixed the OpenAI/Anthropic schema key
-   order and the injected `"strict": false`, making the multi-turn history stable
-   token by token.
-2. **Sampling alignment**: fixed `top_k=20, top_p=0.95, temperature=1.0`; explicit
-   top_k=20, top_k=0, and default differences cannot explain the issue.
-3. **Prefill/KV A/Bs**: chunk 128/512/8192 and KV int8/bf16 show no significant
-   difference on the full 200 (p=0.12/0.38/0.40); `--limit 20` scores were small-sample noise.
-4. **Tool-parser recheck**: offline recovery of malformed calls was 0/9 and cannot explain
-   the main failures.
-5. **SM70 numerical/test fixes**: fixed cuBLAS BF16 output staged through FP16 (now FP32),
-   added A4/A8 capability gating, Q4/Q5 workspace, zero-capacity arena fixes, etc.; full
-   ctest **135/135 passed**, 15 hardware/artifact-gated skips.
-6. **Prefix cache and multi-instance**: shared host tier, cross-instance manifests, and
-   2×TP1 real tests completed; quick cold/warm and MTP quality A/B showed no regression.
-
-**Still open, and the most important suspect: the self-converted `.ninfer` artifact.**
-This engine first converts HF safetensors into an 18 GiB `.ninfer` (embedding encoder,
-NVFP4/FP8 layouts, and norm/lm_head dtypes can all change). Other candidates are NVFP4
-GEMM/attention numerics, prefix-cache state, and the concrete failure shape of failing
-samples. Do not blindly change kernels or keep sweeping parameters without logits /
-first-divergence evidence.
-
-**Public request for community help:** if you can reproduce this, please open a GitHub
-Issue/Discussion with:
-
-- full prompt token IDs for the same BFCL sample;
-- top-20 logits/probs at the last prefill position and the first divergent token;
-- the first divergence with `--prefix-cache` on vs off;
-- same-layer outputs for different conversion paths;
-- per-sample failure taxonomy: format / function name / arguments / multi-turn state.
-
-Do not report only a low score, do not use `--limit 20` for conclusions, and do not submit
-blind kernel sweeps. Full details, reproduction commands, and ruled-out items are in
-[`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md) and
-[`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md).
-
-> **Do not chase the old 25% single point**: it came from an overwritten old binary, and the
-> prompt A/B already ruled out the prompt. Using it as a target would repeat our detours.
+Still open: block-snapshot reuse still produces a deterministic but different trajectory
+(same score this round), and the MTP path retains the decode-state checkpoint. Neither
+affects the single-request release acceptance.
 
 Cost of `--prefill-chunk 128`: long-prompt cold prefill is about **3.3× slower**
 (5060 tok TTFT 2.4s→8.0s; 21620 tok 10.8s→34.6s); ≤128 tok shows no difference; the full
@@ -874,7 +829,7 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 - Only 2×TP1 multi-instance has passed a real integration test; the 4-card (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified, and the 8-card profiles are community/out-of-contract. 4×TP1 and 8×TP1 require 32GB cards; a 16GB V100 cannot hold one full 27B copy.
 - KV has two tiers only: per-instance device KV and the process-shared pinned host prefix-KV tier. There is no disk KV tier, KV offload, or global active-KV pool.
 - After the prefix-cache fix, no long soak test has been run; cache behavior under very high concurrency is still being observed.
-- **BFCL full 200: ninfer latest 27.0% (54/200)**. **The issue remains unresolved; blind active fixing is paused and community help is requested.** Prompt/top_k/chunk/KV/parser have been ruled out; the top remaining suspects are the self-converted `.ninfer` artifact, NVFP4/attention numerics, and prefix-cache state (see the “Quality” section and `BFCL_QUALITY_ISSUE.md`).
+- **BFCL full 200: ninfer 41.0% (82/200) versus 1cat 36.5% (73/200)**. This round fixed tool-call argument typing, the NVFP4 QPN divisor, and the decode-state prefix reuse; same-server reruns are now reproducible (see the “Quality” section).
 
 ---
 

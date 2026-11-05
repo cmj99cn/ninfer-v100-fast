@@ -86,7 +86,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
+    Act* partial_acc, float* partial_m, float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta == 4, "this kernel always splits the head dim 4 ways -- see file comment");
 
@@ -186,8 +186,9 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
             int token     = 0;
             gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] =
-                    __float2bfloat16(0.0f);
+                GqaActivation<Act>::store(
+                    &partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)],
+                    0.0f);
             }
         }
     };
@@ -557,9 +558,9 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
 #pragma unroll
                 for (int c = 0; c < DChunksLocal; ++c) {
                     const int d = dim_warp * DSlice + c * 8;
-                    __nv_bfloat16 out8[8];
+                    Act out8[8];
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) { out8[i] = __float2bfloat16(acc_f[c][i]); }
+                    for (int i = 0; i < 8; ++i) { GqaActivation<Act>::store(&out8[i], acc_f[c][i]); }
                     const std::int64_t dst =
                         gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens);
                     store_vec(&partial_acc[dst], *reinterpret_cast<const int4*>(out8));

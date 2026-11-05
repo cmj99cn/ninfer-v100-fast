@@ -179,13 +179,13 @@ Paged KV trim extent would discard cache-owned pages
 **背景**：与 1cat-vLLM 的 `qwen3coder_tool_parser.py` 对比，两边对**标准 XML 输出**
 `<tool_call><function=NAME><parameter=P>value</parameter></function></tool_call>`
 解析结果一致（实测 BFCL 轨迹里 `ls {"a":true}` 两边都被正确解析成结构化 tool_calls）。
-但 ninfer 实现更严，存在以下缺口（当前 BFCL 口径下**不是**失败主因，非阻塞）：
+以下缺口里，**参数类型错误曾是 BFCL 的主要失败原因之一**（1cat-only 样本中 14/39 把布尔/数字样字符串解析错）；其余外壳/恢复类缺口仍非主因。
 
 | 维度 | ninfer | 1cat |
 |---|---|---|
 | 外壳 | 必须 `<tool_call>…</tool_call>` | `<tool_call>` **或裸 `<function=…>`**（back-off） |
 | 体内格式 | 仅 XML | XML **+ `<tool_call>` 内 JSON body** `{"name","arguments"}` |
-| 参数类型 | `trim`+`JSON.parse`（不看 schema） | 按工具 schema `coerce_to_schema_type` 强制转换 |
+| 参数类型 | 按 schema 区分 string/JSON；Python 字面量 `True/False/None` 归一化 | 按工具 schema `coerce_to_schema_type` 强制转换 |
 | 缺闭合标签 | 直接失败 | 可恢复缺失的 `</parameter>`/`</function>` |
 | 值内假标签 | 贪婪取首个 `</parameter>`（值内同串会误切） | 结构化边界判断，忽略值内 `<parameter=` |
 | 部分失败 | 任一 block 坏 → **整体回退成 content（丢弃全部 tool_calls）** | 过滤坏的、保留好的 |
@@ -198,7 +198,7 @@ Paged KV trim extent would discard cache-owned pages
 **复核 TODO**：
 - [ ] 支持裸 `<function=…>`（无 `<tool_call>` 外壳）的 back-off
 - [ ] 支持 `<tool_call>` 内 JSON body `{"name","arguments"}`
-- [ ] 参数值按工具 schema 做类型转换（而非一律 JSON.parse）
+- [x] 参数值按工具 schema 做类型转换（已实现 string/JSON schema typing + Python 字面量归一化）
 - [ ] 缺失 `</parameter>`/`</function>` 时尽量恢复，而非整体回退
 - [ ] 部分 block 解析失败时保留已成功的 tool_calls
 - [ ] 参数值内联 `<parameter=`/`</parameter>` 的结构化边界处理
@@ -227,7 +227,7 @@ chunk=8192（生产默认）→ `Let` 4/4 + 3/3。单独关掉该路线（`NINFE
 与修复后一致。**BFCL**（limit 20）默认 chunk=8192：修复后两次全新进程均为 **7/20 = 35%**，且
 **通过集合完全相同** `[2,4,6,12,13,14,20]` ⇒ 非确定已消除（这是本次修复的目标）。
 
-**遗留（真实且巨大；非 chunk 尺寸所致）**：改用**全量** BFCL `multi_turn_base`（200 条、逐样本配对、同一序）重测：
+**历史（竞态修复后、质量修复前）**：全量 BFCL `multi_turn_base`（200 条、逐样本配对、同一序）重测：
 
 | config（修复后，每格全新进程） | acc |
 |---|---|
@@ -236,10 +236,9 @@ chunk=8192（生产默认）→ `Let` 4/4 + 3/3。单独关掉该路线（`NINFE
 | ninfer chunk 128 | 46/200 = 23.0% |
 | 1cat vLLM（APC 开、temp=1.0） | 77/200 = 38.5% |
 
-> **更新（2026-10-27）**：SM70 修复后的最新全量为 **54/200 = 27.0%**，仍低于 1cat
-> 38.5%；这是当前最高记录，但只比此前最佳 25.0% 高 2pp。当前状态、已采取措施和社区
-> 请求见 [`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md)。上表是竞态修复后的历史
-> 对照，不应作为当前分数。
+> **更新（2026-11-06，已解决）**：修复 tool-call 参数类型、NVFP4 QPN 除数和 no-spec
+> decode-state prefix reuse 后，最新全量为 **82/200 = 41.0%**，同口径 1cat 为
+> 73/200 = 36.5%。上表是竞态修复后的历史对照，不应作为当前分数。
 
 配对 exact McNemar：chunk 128 vs 8192 → only-128=13 / only-8192=8，**p=0.38**；chunk 512 vs 8192 → 18/9，**p=0.12**；
 chunk 128 或 8192 vs 1cat → **only-1cat=39/40，p<1e-5**。⇒ **竞态修复并未关掉质量差距，且 chunk 尺寸无显著效应**

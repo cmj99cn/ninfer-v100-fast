@@ -65,7 +65,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-        __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
+        Act* partial_acc, float* partial_m, float* partial_l) {
 // Same fork rationale as gqa_attention_small_t_tc_partial_bf16_kernel: ldmatrix (sm_75+)
 // and mma.s8/mma.m16n8k16 (sm_80+) have no Volta equivalent, and the tensor-core body's
 // producer/consumer warp split has no SIMT analogue worth preserving, so this is a
@@ -186,8 +186,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             int token     = 0;
             gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, TokenTile)] =
-                    __float2bfloat16(0.0f);
+                GqaActivation<Act>::store(
+                    &partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split,
+                                                                 TokenTile)],
+                    0.0f);
             }
         }
     };
@@ -615,7 +617,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             gqa_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head, token);
             const std::int64_t dst =
                 gqa_partial_acc_index<Geometry>(q_head, d0, token, split, TokenTile);
-            *reinterpret_cast<unsigned*>(&partial_acc[dst]) = pack_bf16x2(acc[n][0], acc[n][1]);
+            *reinterpret_cast<unsigned*>(&partial_acc[dst]) = GqaActivation<Act>::pack2(acc[n][0], acc[n][1]);
         }
         if (row1 < RowCount) {
             int q_head = 0;
@@ -623,7 +625,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             gqa_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head, token);
             const std::int64_t dst =
                 gqa_partial_acc_index<Geometry>(q_head, d0, token, split, TokenTile);
-            *reinterpret_cast<unsigned*>(&partial_acc[dst]) = pack_bf16x2(acc[n][2], acc[n][3]);
+            *reinterpret_cast<unsigned*>(&partial_acc[dst]) = GqaActivation<Act>::pack2(acc[n][2], acc[n][3]);
         }
     }
 #else // __CUDA_ARCH__ < 800: Volta SIMT decode, no tensor cores.
@@ -708,8 +710,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             int token     = 0;
             gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, TokenTile)] =
-                    __float2bfloat16(0.0f);
+                GqaActivation<Act>::store(
+                    &partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split,
+                                                                 TokenTile)],
+                    0.0f);
             }
         }
     };
@@ -923,9 +927,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         }
         const std::int64_t dst_base =
             gqa_partial_acc_index<Geometry>(q_head, lane * kDPerLane, token, split, TokenTile);
-        __nv_bfloat16 out8[kDPerLane];
+        Act out8[kDPerLane];
 #pragma unroll
-        for (int i = 0; i < kDPerLane; ++i) { out8[i] = __float2bfloat16(acc[i]); }
+        for (int i = 0; i < kDPerLane; ++i) { GqaActivation<Act>::store(&out8[i], acc[i]); }
         store_vec(&partial_acc[dst_base], *reinterpret_cast<const int4*>(out8));
     }
 #endif // __CUDA_ARCH__ >= 800
