@@ -39,7 +39,12 @@ int run_case(std::int32_t weight_rows, std::int32_t qkv_rows, std::int32_t z_row
     z_bytes.fill(0xCD);
 
     Weight weight = packed.device_weight(w_bytes.p);
-    DeviceArena workspace(std::size_t{16});
+    // A16 requires no transient, but the FP16 form takes the wide-T CUTLASS route at T >= 33.
+    const std::size_t workspace_bytes = std::max<std::size_t>(
+        ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, weight_rows, kHidden,
+                                                     ops::LinearPolicy::AllowA4, tokens, tokens),
+        16);
+    DeviceArena workspace(workspace_bytes);
     Tensor x(x_bytes.p, DType::FP16, {kHidden, tokens});
     Tensor qkv(qkv_bytes.p, DType::FP16, {qkv_rows, tokens});
     Tensor z(z_bytes.p, DType::FP16, {z_rows, tokens});

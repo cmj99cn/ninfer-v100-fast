@@ -133,23 +133,36 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
         throw std::invalid_argument("nvfp4 gdn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
+    std::size_t capacity = 0;
     if (resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::W4A4) {
-        return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4GdnInputGeometry::kInputRows);
+        capacity =
+            nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4GdnInputGeometry::kInputRows);
     }
 #ifdef NINFER_VOLTA_BUILD
+    // The FP16 activation stream has no W4A4 form, so an AllowA4 caller still takes the A16
+    // wide-T CUTLASS route past the crossover. Reserve the larger of the two so one capacity
+    // serves both activation dtypes.
     const bool cutlass_cap =
         kVoltaInputCap == 1 || (kVoltaInputCap == 0 && max_tokens >= kVoltaCutlassMinT);
     if (cutlass_cap) {
-        return nvfp4_gdn_input_cutlass_workspace_bytes(max_tokens);
+        capacity = std::max(capacity, nvfp4_gdn_input_cutlass_workspace_bytes(max_tokens));
     }
 #endif
-    return 0;
+    return capacity;
 }
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
     if (x.dtype == DType::FP16) {
         (void)policy;
+#ifdef NINFER_VOLTA_BUILD
+        // Same wide-T cross-over as the BF16 A16 route: one dequant + one GEMM over the whole call
+        // beats repeated <=32-token QPN launches for prefill/MTP-wide widths.
+        if (workspace != nullptr && qkv.dtype == DType::FP16 && x.ne[1] >= kVoltaCutlassMinT) {
+            nvfp4_gdn_input_cutlass_f16_launch(x, weight, qkv, z, *workspace, stream);
+            return;
+        }
+#endif
         (void)workspace;
         nvfp4_gdn_input_f16_launch(x, weight, qkv, z, stream);
         return;
@@ -175,6 +188,12 @@ void nvfp4_gdn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tenso
                                     cudaStream_t stream) {
     if (x.dtype == DType::FP16) {
         (void)policy;
+#ifdef NINFER_VOLTA_BUILD
+        if (workspace != nullptr && qkv.dtype == DType::FP16 && x.ne[1] >= kVoltaCutlassMinT) {
+            nvfp4_gdn_input_cutlass_f16_launch_shard(x, weight, qkv, z, *workspace, stream);
+            return;
+        }
+#endif
         (void)workspace;
         nvfp4_gdn_input_f16_launch_shard(x, weight, qkv, z, stream);
         return;
