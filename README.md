@@ -22,7 +22,8 @@
 
 ## BFCL 多轮工具调用质量：已定位并修复
 
-最新全量结果为 **41.0%（82/200）**；修复前为 36.0%（72/200），更早基线为 23.0%（46/200）。
+最新全量结果为 **41.0%（82/200）**，对照 1cat-vLLM 同口径 **36.5%（73/200）**；
+配对比较为 `new_only=23 / cat_only=14`，本引擎净胜 9 条。此前全量为 23.0%（46/200）。
 
 根因是三类实现缺陷，均已修复：
 
@@ -81,7 +82,7 @@
 ## 当前进度（fp16-text-runtime 分支，截至 2026-11-06）
 
 本分支在 v0.1.0 之上完成 FP16 text runtime，并修复 BFCL 多轮质量：全量
-82/200 = 41.0%，MTP 72/200 = 36.0%；尚未打 tag。
+82/200 = 41.0%（1cat 36.5%），MTP 72/200 = 36.0%；尚未打 tag。
 
 ### 测试参数
 
@@ -148,7 +149,8 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 
 ### 质量（BFCL 多轮工具调用，已解决）
 
-**最新全量结果：82/200 = 41.0%（2026-11-06）**，修复前为 72/200 = 36.0%。
+**最新全量结果：82/200 = 41.0%（2026-11-06）**，同口径 1cat-vLLM 为 73/200 = 36.5%。
+配对：`both_ok=59 both_bad=104 new_only=23 cat_only=14`，本引擎净胜 9 条。
 
 运行设置：BFCL-v3 `multi_turn_base` 全量 200 条，thinking OFF，
 `temperature=1.0`、`top_p=1.0`、`top_k=20`、`seed=42`，TP2，FP16-embedding NVFP4
@@ -160,17 +162,18 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 |---|---:|---:|---:|
 | **ninfer（本轮修复后）** | **41.0%（82/200）** | **56** | **26** |
 | ninfer（修复前，turn-checkpoint 复用开启） | 36.0%（72/200） | 50 | 22 |
+| 1cat-vLLM | 36.5%（73/200） | 50 | 23 |
 
 修复内容与验收证据：
 
 1. **Tool-call schema typing + Python 字面量**：string 参数按 JSON Schema 原样保留；
    `True/False/None` 归一化。前 100 条从 39% 提到 50%，6 个 zip-code 样本全部翻盘。
 2. **NVFP4 QPN 除数**：`1/d_w` 在 FP32 epilogue 应用；in_proj 对 FP64 dequant oracle
-   的误差从 `3.0e-4` 降到 `2.0e-4`。
+   的误差从 `3.0e-4` 降到 `2.0e-4`，优于 1cat 的 `2.4e-4`。
 3. **Prefix reuse 数值等价性**：non-speculative 路径不再恢复 rewrite checkpoint（turn/response
    closure），只保留 block snapshot（prefill 状态）或 cold prefill；同 server 重跑
    0/10 轨迹差异。`bf8595c3` 把同一禁用扩展到 MTP：MTP 保留 checkpoint 时全量
-   69/200 = 34.5%，禁用后 72/200 = 36.0%（配对净 +3）；
+   69/200 = 34.5%，禁用后 72/200 = 36.0%（配对净 +3），与 1cat 36.5% 基本持平；
    DFlash 暂保留（未测）。
 
 仍未覆盖：block-snapshot reuse 仍会产生确定性的不同轨迹（本轮同分），以及 DFlash 路径
@@ -390,7 +393,7 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 - 多实例只有 2×TP1 通过真实集成测试；4 卡（4×TP1/2×TP2）和 8 卡（8×TP1/4×TP2/2×TP4）未验证，8 卡为社区/非契约。4×TP1 与 8×TP1 需要 32GB 卡，16GB V100 放不下一份完整的 27B 权重。
 - KV 只有每实例 device KV 和进程共享的 pinned host prefix-KV 两级；没有磁盘 KV tier、KV offload 或全局活跃 KV 池。
 - prefix cache 修复后未做长时间浸泡测试；超高压并发下的缓存行为仍在观察。
-- **BFCL 全量 200 条：ninfer 41.0%（82/200）**。本轮修复了 tool-call 参数类型、NVFP4 QPN 除数和 prefix-reuse 的 rewrite checkpoint 复用（no-spec 与 MTP 均禁用）；同一 server 重跑已可复现（见“质量”节）。
+- **BFCL 全量 200 条：ninfer 41.0%（82/200），同口径 1cat 36.5%（73/200）**。本轮修复了 tool-call 参数类型、NVFP4 QPN 除数和 prefix-reuse 的 rewrite checkpoint 复用（no-spec 与 MTP 均禁用）；同一 server 重跑已可复现（见“质量”节）。
 
 ---
 
@@ -399,7 +402,7 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 - [Neroued/ninfer](https://github.com/Neroued/ninfer) — NInfer 原始项目，本仓库的引擎基座。
 - [wamansou/ninfer-tp2-1m](https://github.com/wamansou/ninfer-tp2-1m) — 双卡张量并行与 YaRN 扩展。
 - [jason-ni/ninfer-v100-tp4](https://github.com/jason-ni/ninfer-v100-tp4) — V100 TP4 单进程并行基底（本仓库代码直接来源）。
-- splitd（D256 Split-D）长上下文 prefill 内核（vendored；来源与许可见 `third_party/llama_cpp_sm70_d256/`）。
+- [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) — splitd（D256 Split-D）长上下文 prefill 内核的来源，已 vendored 到 `third_party/llama_cpp_sm70_d256/`。
 - [dollarwong/ninfer-v100](https://github.com/dollarwong/ninfer-v100) — V100 上的 NInfer 单卡部署与跨引擎基准 fork（调研参考，未直接复用其代码）。
 - [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) — 默认模型的 NVFP4 量化权重源。
 - [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) — `.ninfer` 制品格式的参考（本 fork 契约不兼容，仅作格式参照）。
@@ -439,8 +442,9 @@ First public release: **v0.1.0 (2026-10-27)**. See [`CHANGELOG.md`](CHANGELOG.md
 
 ## BFCL Multi-Turn Tool-Calling Quality: Located and Fixed
 
-The latest full run scores **41.0% (82/200)**, up from 36.0% (72/200) before this fix and
-23.0% (46/200) at the previous baseline.
+The latest full run scores **41.0% (82/200)** against 1cat-vLLM's **36.5% (73/200)** at
+the same settings; the paired tally is `new_only=23 / cat_only=14`, a net +9 for this
+engine. The previous full result was 23.0% (46/200).
 
 Three implementation defects were found and fixed:
 
@@ -501,7 +505,7 @@ See [`TEMP_WORKAROUNDS.md`](TEMP_WORKAROUNDS.md) for all temporary changes and r
 ## Current Status (fp16-text-runtime branch, as of 2026-11-06)
 
 This branch adds the FP16 text runtime on top of v0.1.0 and fixes BFCL
-multi-turn quality: 82/200 = 41.0%; MTP 72/200 = 36.0%. Not yet tagged.
+multi-turn quality: 82/200 = 41.0% (1cat 36.5%); MTP 72/200 = 36.0%. Not yet tagged.
 
 ### Test Parameters
 
@@ -568,7 +572,9 @@ MTP is **2.0–2.3×** at every point, with 47–58% acceptance (2.4–2.7 tok/r
 
 ### Quality (BFCL multi-turn tool calling, resolved)
 
-**Latest full result: 82/200 = 41.0% (2026-11-06)**, up from 72/200 = 36.0% before this fix.
+**Latest full result: 82/200 = 41.0% (2026-11-06)**, versus 1cat-vLLM's 73/200 = 36.5%
+at the same settings. Paired: `both_ok=59 both_bad=104 new_only=23 cat_only=14`, a net
++9 for this engine.
 
 Run settings: BFCL-v3 `multi_turn_base`, full 200 samples, thinking OFF,
 `temperature=1.0`, `top_p=1.0`, `top_k=20`, `seed=42`, TP2, FP16-embedding NVFP4
@@ -580,6 +586,7 @@ Results: `/home/cmj/eval-runs/bfcl/ninfer_f16embed_notc_c128_s42_n200/20261106_0
 |---|---:|---:|---:|
 | **ninfer (after this round)** | **41.0% (82/200)** | **56** | **26** |
 | ninfer (before fix, turn-checkpoint reuse on) | 36.0% (72/200) | 50 | 22 |
+| 1cat-vLLM | 36.5% (73/200) | 50 | 23 |
 
 Fixes and acceptance evidence:
 
@@ -587,12 +594,12 @@ Fixes and acceptance evidence:
    JSON Schema; `True/False/None` are normalized. The first 100 moved from 39% to 50%,
    flipping all six zip-code samples.
 2. **NVFP4 QPN divisor**: `1/d_w` is applied in the FP32 epilogue; in_proj's error against
-   the FP64 dequant oracle dropped from `3.0e-4` to `2.0e-4`.
+   the FP64 dequant oracle dropped from `3.0e-4` to `2.0e-4`, better than 1cat's `2.4e-4`.
 3. **Prefix-reuse numerical equivalence**: the non-speculative path no longer restores the
    rewrite checkpoint (turn/response closure), only prefill-state block snapshots or a cold
    prefill; same-server reruns now show 0/10 trajectory differences. `bf8595c3` extends the
    same disable to MTP: MTP scored 69/200 = 34.5% with the checkpoint and 72/200 = 36.0%
-   without it (paired net +3). DFlash is left unchanged (untested).
+   without it (paired net +3), essentially at 1cat's 36.5%. DFlash is left unchanged (untested).
 
 Still open: block-snapshot reuse still produces a deterministic but different trajectory
 (same score this round), and the DFlash path retains the rewrite checkpoint. Neither
@@ -831,7 +838,7 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 - Only 2×TP1 multi-instance has passed a real integration test; the 4-card (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified, and the 8-card profiles are community/out-of-contract. 4×TP1 and 8×TP1 require 32GB cards; a 16GB V100 cannot hold one full 27B copy.
 - KV has two tiers only: per-instance device KV and the process-shared pinned host prefix-KV tier. There is no disk KV tier, KV offload, or global active-KV pool.
 - After the prefix-cache fix, no long soak test has been run; cache behavior under very high concurrency is still being observed.
-- **BFCL full 200: ninfer 41.0% (82/200)**. This round fixed tool-call argument typing, the NVFP4 QPN divisor, and the rewrite-checkpoint prefix reuse (disabled for no-spec and MTP); same-server reruns are now reproducible (see the “Quality” section).
+- **BFCL full 200: ninfer 41.0% (82/200) versus 1cat 36.5% (73/200)**. This round fixed tool-call argument typing, the NVFP4 QPN divisor, and the rewrite-checkpoint prefix reuse (disabled for no-spec and MTP); same-server reruns are now reproducible (see the “Quality” section).
 
 ---
 
@@ -840,7 +847,7 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 - [Neroued/ninfer](https://github.com/Neroued/ninfer) — the original NInfer project and the engine base of this repository.
 - [wamansou/ninfer-tp2-1m](https://github.com/wamansou/ninfer-tp2-1m) — dual-GPU tensor parallelism and YaRN extension.
 - [jason-ni/ninfer-v100-tp4](https://github.com/jason-ni/ninfer-v100-tp4) — V100 TP4 single-process parallel base (direct source of this repository's code).
-- splitd (D256 Split-D) long-context prefill kernel (vendored; source and license under `third_party/llama_cpp_sm70_d256/`).
+- [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) — source of the splitd (D256 Split-D) long-context prefill kernel, vendored into `third_party/llama_cpp_sm70_d256/`.
 - [dollarwong/ninfer-v100](https://github.com/dollarwong/ninfer-v100) — NInfer single-GPU deployment and cross-engine benchmark fork on V100 (research reference; its code was not directly reused).
 - [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) — NVFP4 quantized weight source for the default model.
 - [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) — reference for the `.ninfer` artifact format (incompatible with this fork's contract; format reference only).
