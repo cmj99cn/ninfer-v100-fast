@@ -467,8 +467,9 @@ these defaults when the field is zero:
 Not yet implemented: `--prefix-cache-file` (M3 persistence), explicit client breakpoints
 (OpenAI/Anthropic `cache_control`/markers), and a `--use-original-prefix-caching` switch. The hybrid
 cache is **additive**, not a replacement: `admit_block_snapshot` is tried first and, on no usable
-hit, planning falls through to the existing owner/checkpoint paths (`AppendAtFrontier`, rewrite
-checkpoint) unchanged — unlike HPC §14.1, the legacy machinery is still constructed.
+hit, planning falls through to the existing owner/checkpoint paths (`AppendAtFrontier`, and the
+rewrite checkpoint only for DFlash) unchanged — unlike HPC §14.1, the legacy machinery is still
+constructed.
 
 ---
 

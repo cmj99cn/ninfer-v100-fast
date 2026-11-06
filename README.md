@@ -167,12 +167,14 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
    `True/False/None` 归一化。前 100 条从 39% 提到 50%，6 个 zip-code 样本全部翻盘。
 2. **NVFP4 QPN 除数**：`1/d_w` 在 FP32 epilogue 应用；in_proj 对 FP64 dequant oracle
    的误差从 `3.0e-4` 降到 `2.0e-4`，优于 1cat 的 `2.4e-4`。
-3. **Prefix reuse 数值等价性**：non-speculative 路径不再复用 decode 路径的 turn/response
-   checkpoint，只保留 block snapshot（prefill 状态）或 cold prefill；同 server 重跑
-   0/10 轨迹差异。单请求 release workload 不受影响；MTP/DFlash 路径保持原行为。
+3. **Prefix reuse 数值等价性**：non-speculative 路径不再恢复 rewrite checkpoint（turn/response
+   closure），只保留 block snapshot（prefill 状态）或 cold prefill；同 server 重跑
+   0/10 轨迹差异。`bf8595c3` 把同一禁用扩展到 MTP：MTP 保留 checkpoint 时全量
+   69/200 = 34.5%，禁用后 72/200 = 36.0%（配对净 +3），与 1cat 36.5% 基本持平；
+   DFlash 暂保留（未测）。
 
-仍未覆盖：block-snapshot reuse 仍会产生确定性的不同轨迹（本轮同分），以及 MTP 路径
-仍保留 decode-state checkpoint。二者不影响单请求 release 验收。
+仍未覆盖：block-snapshot reuse 仍会产生确定性的不同轨迹（本轮同分），以及 DFlash 路径
+仍保留 rewrite checkpoint。二者不影响单请求 release 验收。
 
 `--prefill-chunk 128` 的代价：长提示冷预填充约 **3.3× 慢**（5060 tok TTFT 2.4s→8.0s；21620 tok 10.8s→34.6s）；≤128 tok 无差异；BFCL 整轮因前缀缓存仅约 +2min。
 
@@ -388,7 +390,7 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 - 多实例只有 2×TP1 通过真实集成测试；4 卡（4×TP1/2×TP2）和 8 卡（8×TP1/4×TP2/2×TP4）未验证，8 卡为社区/非契约。4×TP1 与 8×TP1 需要 32GB 卡，16GB V100 放不下一份完整的 27B 权重。
 - KV 只有每实例 device KV 和进程共享的 pinned host prefix-KV 两级；没有磁盘 KV tier、KV offload 或全局活跃 KV 池。
 - prefix cache 修复后未做长时间浸泡测试；超高压并发下的缓存行为仍在观察。
-- **BFCL 全量 200 条：ninfer 41.0%（82/200），同口径 1cat 36.5%（73/200）**。本轮修复了 tool-call 参数类型、NVFP4 QPN 除数和 prefix-reuse 的 decode-state 复用；同一 server 重跑已可复现（见“质量”节）。
+- **BFCL 全量 200 条：ninfer 41.0%（82/200），同口径 1cat 36.5%（73/200）**。本轮修复了 tool-call 参数类型、NVFP4 QPN 除数和 prefix-reuse 的 rewrite checkpoint 复用（no-spec 与 MTP 均禁用）；同一 server 重跑已可复现（见“质量”节）。
 
 ---
 
@@ -587,13 +589,14 @@ Fixes and acceptance evidence:
    flipping all six zip-code samples.
 2. **NVFP4 QPN divisor**: `1/d_w` is applied in the FP32 epilogue; in_proj's error against
    the FP64 dequant oracle dropped from `3.0e-4` to `2.0e-4`, better than 1cat's `2.4e-4`.
-3. **Prefix-reuse numerical equivalence**: the non-speculative path no longer reuses the
-   decode-path turn/response checkpoint, only prefill-state block snapshots or a cold
-   prefill; same-server reruns now show 0/10 trajectory differences. The single-request
-   release workload is unaffected; the MTP/DFlash paths keep their existing behavior.
+3. **Prefix-reuse numerical equivalence**: the non-speculative path no longer restores the
+   rewrite checkpoint (turn/response closure), only prefill-state block snapshots or a cold
+   prefill; same-server reruns now show 0/10 trajectory differences. `bf8595c3` extends the
+   same disable to MTP: MTP scored 69/200 = 34.5% with the checkpoint and 72/200 = 36.0%
+   without it (paired net +3), essentially at 1cat's 36.5%. DFlash is left unchanged (untested).
 
 Still open: block-snapshot reuse still produces a deterministic but different trajectory
-(same score this round), and the MTP path retains the decode-state checkpoint. Neither
+(same score this round), and the DFlash path retains the rewrite checkpoint. Neither
 affects the single-request release acceptance.
 
 Cost of `--prefill-chunk 128`: long-prompt cold prefill is about **3.3× slower**
@@ -829,7 +832,7 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 - Only 2×TP1 multi-instance has passed a real integration test; the 4-card (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified, and the 8-card profiles are community/out-of-contract. 4×TP1 and 8×TP1 require 32GB cards; a 16GB V100 cannot hold one full 27B copy.
 - KV has two tiers only: per-instance device KV and the process-shared pinned host prefix-KV tier. There is no disk KV tier, KV offload, or global active-KV pool.
 - After the prefix-cache fix, no long soak test has been run; cache behavior under very high concurrency is still being observed.
-- **BFCL full 200: ninfer 41.0% (82/200) versus 1cat 36.5% (73/200)**. This round fixed tool-call argument typing, the NVFP4 QPN divisor, and the decode-state prefix reuse; same-server reruns are now reproducible (see the “Quality” section).
+- **BFCL full 200: ninfer 41.0% (82/200) versus 1cat 36.5% (73/200)**. This round fixed tool-call argument typing, the NVFP4 QPN divisor, and the rewrite-checkpoint prefix reuse (disabled for no-spec and MTP); same-server reruns are now reproducible (see the “Quality” section).
 
 ---
 
