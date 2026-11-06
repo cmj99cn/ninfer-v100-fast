@@ -79,7 +79,10 @@
 
 ---
 
-## 当前进度（v0.1.0，截至 2026-10-27）
+## 当前进度（fp16-text-runtime 分支，截至 2026-11-06）
+
+本分支在 v0.1.0 之上完成 FP16 text runtime，并修复 BFCL 多轮质量：全量
+82/200 = 41.0%（1cat 36.5%），MTP 72/200 = 36.0%；尚未打 tag。
 
 ### 测试参数
 
@@ -499,7 +502,10 @@ See [`TEMP_WORKAROUNDS.md`](TEMP_WORKAROUNDS.md) for all temporary changes and r
 
 ---
 
-## Current Status (v0.1.0, as of 2026-10-27)
+## Current Status (fp16-text-runtime branch, as of 2026-11-06)
+
+This branch adds the FP16 text runtime on top of v0.1.0 and fixes BFCL
+multi-turn quality: 82/200 = 41.0% (1cat 36.5%); MTP 72/200 = 36.0%. Not yet tagged.
 
 ### Test Parameters
 
