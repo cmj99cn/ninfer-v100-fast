@@ -287,7 +287,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 plan->reuse        = ReusePath::AppendAtFrontier;
                 plan->reuse_base   = sequence.execution_frontier;
                 plan->reuse_reason = PrefixReuseReason::ReusedFrontier;
-            } else if (speculative_backend != SpeculativeBackend::None &&
+            } else if (speculative_backend == SpeculativeBackend::DFlash &&
                        sequence.rewrite_checkpoint.valid &&
                        sequence.rewrite_checkpoint.frontier != 0 &&
                        sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
