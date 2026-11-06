@@ -72,7 +72,10 @@ def _divisor_spec(site: str) -> TensorSpec:
 
 def _build_text_core_specs() -> tuple[TensorSpec, ...]:
     specs: list[TensorSpec] = [
-        tensor_spec("text/token_embedding", (248320, 5120), FP8),
+        # The vocabulary embedding is a pure gather and carries no decode bandwidth penalty,
+        # so the FP16 endpoint is the source-precision choice for the FP16 runtime. The output
+        # head remains row-scaled FP8 because it is read once per generated token.
+        tensor_spec("text/token_embedding", (248320, 5120), FP16),
     ]
     for layer in range(64):
         prefix = f"text/layers/{layer}/"
@@ -387,11 +390,11 @@ def validate_inventory() -> None:
         len(NVFP4_TENSOR_SPECS),
         len(FP8_TENSOR_SPECS),
         len(INPUT_SCALE_DIVISOR_SPECS),
-    ) != (915, 2, 12, 333, 1262, 1268, 256, 2, 256):
+    ) != (915, 2, 12, 333, 1262, 1268, 256, 1, 256):
         raise ValueError("registered Qwen3.8 NVFP4 inventory is incomplete")
     if FORMAT_COUNTS != {
         BF16: 534,
-        FP16: 111,
+        FP16: 112,
         FP32: 352,
         I32: 1,
         Q4: 1,
@@ -399,14 +402,14 @@ def validate_inventory() -> None:
         Q6: 0,
         W8: 5,
         NVFP4: 256,
-        FP8: 2,
+        FP8: 1,
     }:
         raise ValueError(f"unexpected numeric allocation: {FORMAT_COUNTS}")
     if LAYOUT_COUNTS != {
-        CONTIGUOUS_LAYOUT: 998,
+        CONTIGUOUS_LAYOUT: 999,
         ROW_SPLIT_LAYOUT: 6,
         BLOCK_SCALE_LAYOUT: 256,
-        ROW_SCALE_LAYOUT: 2,
+        ROW_SCALE_LAYOUT: 1,
     }:
         raise ValueError(f"unexpected layout allocation: {LAYOUT_COUNTS}")
 

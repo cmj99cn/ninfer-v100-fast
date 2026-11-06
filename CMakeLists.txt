@@ -39,6 +39,13 @@ if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
 endif()
 
 # --- Global settings ---------------------------------------------------------
+set(NINFER_TEXT_DTYPE "bf16" CACHE STRING
+    "Text activation dtype: bf16 or f16 (INT8 KV and BF16 weights are unaffected)")
+if(NINFER_TEXT_DTYPE STREQUAL "f16")
+  add_compile_definitions(NINFER_TEXT_DTYPE_F16)
+elseif(NOT NINFER_TEXT_DTYPE STREQUAL "bf16")
+  message(FATAL_ERROR "NINFER_TEXT_DTYPE must be bf16 or f16")
+endif()
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)

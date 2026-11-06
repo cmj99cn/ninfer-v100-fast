@@ -121,6 +121,7 @@ ninfer_add_test(ninfer_qwen3_6_frontend_test
 target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+set_tests_properties(ninfer_qwen3_6_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)
@@ -443,6 +444,33 @@ ninfer_add_op_test(ninfer_mtp_split_test
 ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gqa_attention_f16_dense_test
+  SOURCES ops/test_gqa_attention_f16_dense.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gqa_attention_f16_paged_test
+  SOURCES ops/test_gqa_attention_f16_paged.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gqa_attention_f16_cache_test
+  SOURCES ops/test_gqa_attention_f16_cache.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gqa_attention_f16_i8_test
+  SOURCES ops/test_gqa_attention_f16_i8.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_f16_test
+  SOURCES ops/test_gdn_f16.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_rope_f16_test
+  SOURCES ops/test_rope_f16.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gqa_kv_append_f16_test
+  SOURCES ops/test_gqa_kv_append_f16.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_gating_proj_f16_test
+  SOURCES ops/test_gdn_gating_proj_f16.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_causal_conv1d_f16_test
+  SOURCES ops/test_causal_conv1d_f16.cpp
+  LIBRARIES ninfer_ops)
 # The visible-key domain past the pre-YaRN 262144 bound: its own target because it needs multi-GiB
 # KV pools and a long FP64 oracle, and skips per case when the device cannot hold one.
 ninfer_add_op_test(ninfer_gqa_attention_long_context_test
@@ -480,12 +508,16 @@ ninfer_add_op_test(ninfer_speculative_round_test
   SOURCES ops/test_speculative_round.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_linear_test(ninfer_linear_q4_a16_test ops/linear/test_q4_a16.cpp)
+ninfer_add_linear_test(ninfer_linear_q4_f16_test ops/linear/test_q4_f16.cpp)
 ninfer_add_linear_test(ninfer_linear_q5_a16_test ops/linear/test_q5_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_q6_a16_test ops/linear/test_q6_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
+ninfer_add_linear_test(ninfer_linear_w8_f16_test ops/linear/test_w8_f16.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
+ninfer_add_linear_test(ninfer_linear_nvfp4_f16_test ops/linear/test_nvfp4_f16.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
 ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
+ninfer_add_linear_test(ninfer_linear_fp8_f16_test ops/linear/test_fp8_f16.cpp)
 ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
@@ -499,6 +531,8 @@ ninfer_add_op_test(ninfer_attn_input_proj_test
 ninfer_add_op_test(ninfer_gdn_input_proj_test
   SOURCES ops/test_gdn_input_proj.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_linear_test(ninfer_gdn_input_proj_f16_test ops/test_gdn_input_proj_f16.cpp)
+ninfer_add_linear_test(ninfer_gdn_input_proj_conv_f16_test ops/test_gdn_input_proj_conv_f16.cpp)
 ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
   SOURCES ops/test_gdn_input_proj_conv_snapshot.cpp
   LIBRARIES ninfer_ops)

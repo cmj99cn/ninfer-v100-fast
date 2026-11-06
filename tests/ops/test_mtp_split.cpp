@@ -1882,7 +1882,7 @@ int run_conv_case(const ExecutionContext& ec, const ConvCase& test_case) {
 
         const Tensor t_x(x.p, DType::BF16, {kHidden, width, batch});
         const Tensor t_conv_w(conv_w.p, DType::BF16, {kGdnChannels, 4});
-        Tensor t_states(states.p, DType::BF16, {kGdnChannels, 3, slots});
+        Tensor t_states(states.p, DType::BF16, {3, kGdnChannels, slots});
         const Tensor t_initial(initial.p, DType::I32, {batch});
         const Tensor t_base(base.p, DType::I32, {batch});
         const Tensor t_valid = test_case.mixed_widths ? Tensor(valid_d.p, DType::I32, {batch})
@@ -1913,7 +1913,7 @@ int run_conv_case(const ExecutionContext& ec, const ConvCase& test_case) {
         // conv_record uses the same operands but a read-only state pool, so it is re-run from the
         // pristine state upload.
         states = to_device_bf16(conv_state_host);
-        Tensor t_states_ro(states.p, DType::BF16, {kGdnChannels, 3, slots});
+        Tensor t_states_ro(states.p, DType::BF16, {3, kGdnChannels, slots});
         cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
         if (split_storage) {
             ops::gdn_input_proj_conv_record(t_x, w.weight, vz.weight, t_conv_w, t_states_ro,
@@ -1976,7 +1976,7 @@ int run_conv_case(const ExecutionContext& ec, const ConvCase& test_case) {
     const std::array<Tensor, ninfer::kMaximumDevices> t_conv_w =
         make_pair(conv_w_d, DType::BF16, {kShardConvChannels, 4});
     const std::array<Tensor, ninfer::kMaximumDevices> t_states =
-        make_pair(states_d, DType::BF16, {kShardConvChannels, 3, slots});
+        make_pair(states_d, DType::BF16, {3, kShardConvChannels, slots});
     const std::array<Tensor, ninfer::kMaximumDevices> t_initial = make_pair(initial_d, DType::I32, {batch});
     const std::array<Tensor, ninfer::kMaximumDevices> t_base    = make_pair(base_d, DType::I32, {batch});
     const std::array<Tensor, ninfer::kMaximumDevices> t_valid =

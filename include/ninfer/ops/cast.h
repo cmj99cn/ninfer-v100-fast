@@ -30,4 +30,9 @@ namespace ninfer::ops {
  */
 void cast_fp32_to_bf16(const Tensor& source, Tensor& destination, cudaStream_t stream);
 
+// Exact widening/narrowing casts used by the FP16 text-path prototype. BF16 -> FP16 is exact for
+// every finite BF16 value inside FP16's range; FP16 -> BF16 rounds to nearest even.
+void cast_bf16_to_fp16(const Tensor& source, Tensor& destination, cudaStream_t stream);
+void cast_fp16_to_bf16(const Tensor& source, Tensor& destination, cudaStream_t stream);
+
 } // namespace ninfer::ops

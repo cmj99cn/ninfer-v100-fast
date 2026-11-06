@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 
@@ -38,6 +39,24 @@ __global__ void cast_fp32_to_bf16_scalar_kernel(const float* source, __nv_bfloat
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < count; i += stride) {
         destination[i] = __float2bfloat16_rn(source[i]);
+    }
+}
+
+__global__ void cast_bf16_to_fp16_scalar_kernel(const __nv_bfloat16* source,
+                                                __half* destination, std::int64_t count) {
+    const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < count; i += stride) {
+        destination[i] = __float2half_rn(__bfloat162float(source[i]));
+    }
+}
+
+__global__ void cast_fp16_to_bf16_scalar_kernel(const __half* source,
+                                                __nv_bfloat16* destination, std::int64_t count) {
+    const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < count; i += stride) {
+        destination[i] = __float2bfloat16_rn(__half2float(source[i]));
     }
 }
 

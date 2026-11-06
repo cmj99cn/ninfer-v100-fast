@@ -97,6 +97,64 @@ inline void round_to_bf16(std::vector<float>& v) {
     for (auto& x : v) x = bf16_to_f32(f32_to_bf16(x));
 }
 
+// --- fp16 <-> f32 (round-to-nearest-even) -----------------------------------
+inline float f16_to_f32(std::uint16_t bits) {
+    const bool negative = (bits & 0x8000u) != 0;
+    const int exponent  = (bits >> 10) & 0x1f;
+    const int mantissa  = bits & 0x03ff;
+    float magnitude     = 0.0f;
+    if (exponent == 0) {
+        magnitude = std::ldexp(static_cast<float>(mantissa), -24);
+    } else if (exponent == 31) {
+        magnitude = mantissa == 0 ? std::numeric_limits<float>::infinity()
+                                  : std::numeric_limits<float>::quiet_NaN();
+    } else {
+        magnitude = std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f, exponent - 15);
+    }
+    return negative ? -magnitude : magnitude;
+}
+
+inline std::uint16_t f32_to_f16(float value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const std::uint32_t sign = (bits >> 16) & 0x8000u;
+    const std::uint32_t exp  = (bits >> 23) & 0xffu;
+    std::uint32_t mantissa   = bits & 0x007fffffu;
+    if (exp == 0xffu) {
+        return static_cast<std::uint16_t>(sign | (mantissa == 0 ? 0x7c00u : 0x7e00u));
+    }
+    const int half_exp = static_cast<int>(exp) - 127 + 15;
+    if (half_exp >= 31) { return static_cast<std::uint16_t>(sign | 0x7c00u); }
+    if (half_exp <= 0) {
+        if (half_exp < -10) { return static_cast<std::uint16_t>(sign); }
+        mantissa |= 0x00800000u;
+        const int shift             = 14 - half_exp;
+        std::uint32_t half_mantissa = mantissa >> shift;
+        const std::uint32_t halfway = 1u << (shift - 1);
+        const std::uint32_t tail    = mantissa & ((1u << shift) - 1u);
+        if (tail > halfway || (tail == halfway && (half_mantissa & 1u) != 0u)) { ++half_mantissa; }
+        return static_cast<std::uint16_t>(sign | half_mantissa);
+    }
+    std::uint32_t half_mantissa = mantissa >> 13;
+    const std::uint32_t tail    = mantissa & 0x1fffu;
+    std::uint32_t rounded_exp   = static_cast<std::uint32_t>(half_exp);
+    if (tail > 0x1000u || (tail == 0x1000u && (half_mantissa & 1u) != 0u)) {
+        ++half_mantissa;
+        if (half_mantissa == 0x400u) {
+            half_mantissa = 0;
+            ++rounded_exp;
+            if (rounded_exp >= 31) { return static_cast<std::uint16_t>(sign | 0x7c00u); }
+        }
+    }
+    return static_cast<std::uint16_t>(sign | (rounded_exp << 10) | half_mantissa);
+}
+
+// Round an fp32 buffer to the fp16 grid in place, so a CPU reference computes
+// from EXACTLY the values the kernel will read.
+inline void round_to_f16(std::vector<float>& v) {
+    for (auto& x : v) x = f16_to_f32(f32_to_f16(x));
+}
+
 // --- seeded honest inputs ---------------------------------------------------
 inline void fill_uniform(std::vector<float>& v, std::uint32_t seed, float lo, float hi) {
     std::mt19937 g(seed);
@@ -142,6 +200,12 @@ inline DeviceBuffer to_device_bf16(const std::vector<float>& h) {
     return to_device(b);
 }
 
+inline DeviceBuffer to_device_f16(const std::vector<float>& h) {
+    std::vector<std::uint16_t> b(h.size());
+    for (std::size_t i = 0; i < h.size(); ++i) b[i] = f32_to_f16(h[i]);
+    return to_device(b);
+}
+
 inline DeviceBuffer to_device_f32(const std::vector<float>& h) { return to_device(h); }
 
 inline DeviceBuffer to_device_i32(const std::vector<int>& h) {
@@ -161,6 +225,20 @@ inline std::vector<double> from_device_bf16(const void* device, std::size_t n) {
     const std::vector<std::uint16_t> b = from_device<std::uint16_t>(device, n);
     std::vector<double> o(n);
     for (std::size_t i = 0; i < n; ++i) o[i] = double(bf16_to_f32(b[i]));
+    return o;
+}
+
+inline std::vector<double> from_device_f16(const DeviceBuffer& d, std::size_t n) {
+    const std::vector<std::uint16_t> b = from_device<std::uint16_t>(d, n);
+    std::vector<double> o(n);
+    for (std::size_t i = 0; i < n; ++i) o[i] = double(f16_to_f32(b[i]));
+    return o;
+}
+
+inline std::vector<double> from_device_f16(const void* device, std::size_t n) {
+    const std::vector<std::uint16_t> b = from_device<std::uint16_t>(device, n);
+    std::vector<double> o(n);
+    for (std::size_t i = 0; i < n; ++i) o[i] = double(f16_to_f32(b[i]));
     return o;
 }
 

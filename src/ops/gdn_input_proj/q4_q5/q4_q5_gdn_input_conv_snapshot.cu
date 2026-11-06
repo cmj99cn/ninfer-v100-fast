@@ -194,7 +194,8 @@ void launch_q4_small_t(const Tensor& x, const Weight& qk_weight,
         CUDA_CHECK(pdl::launch_dependent(
             {q4_grid, dim3(Q4Schedule::kThreads), 0, stream},
             q4_rowsplit_gemm_simt_kernel<Q4Schedule, false, false, 0,
-                                         Q4GdnSmallTEpilogue<Tokens, Publish>, TriggerPdl, JoinPdl>,
+                                         Q4GdnSmallTEpilogue<Tokens, Publish>, TriggerPdl, JoinPdl,
+                                         __nv_bfloat16, __nv_bfloat16>,
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(qk_weight.qdata),
             static_cast<const std::uint8_t*>(qk_weight.scales),
@@ -202,7 +203,8 @@ void launch_q4_small_t(const Tensor& x, const Weight& qk_weight,
             Tokens, kHidden, Q4GdnSmallTEpilogue<Tokens, Publish>{qk_epilogue}));
     } else {
         q4_rowsplit_gemm_simt_kernel<Q4Schedule, false, false, 0,
-                                     Q4GdnSmallTEpilogue<Tokens, Publish>, TriggerPdl, JoinPdl>
+                                     Q4GdnSmallTEpilogue<Tokens, Publish>, TriggerPdl, JoinPdl, __nv_bfloat16,
+                                     __nv_bfloat16>
             <<<q4_grid, Q4Schedule::kThreads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),
                 static_cast<const std::uint8_t*>(qk_weight.qdata),

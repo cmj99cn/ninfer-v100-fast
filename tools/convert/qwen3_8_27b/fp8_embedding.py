@@ -193,10 +193,51 @@ def iter_reader_payload(
     yield encode_direct(scales, "BF16")
 
 
+def iter_fp16_payload(
+    reader: ShardReader,
+    source_name: str,
+    shape: Sequence[int],
+    *,
+    rows_per_chunk: int = 256,
+) -> Iterator[bytes]:
+    """Stream a BF16 safetensors matrix as a contiguous FP16 payload."""
+
+    try:
+        chunk_rows = operator.index(rows_per_chunk)
+    except TypeError:
+        raise ValueError("rows_per_chunk must be a positive integer") from None
+    if isinstance(rows_per_chunk, bool) or chunk_rows <= 0:
+        raise ValueError("rows_per_chunk must be a positive integer")
+    if len(shape) != 2 or shape[0] <= 0 or shape[1] <= 0:
+        raise ValueError("FP16 payload shape must be [rows, columns]")
+    n, k = shape
+    if source_name not in reader.weight_map:
+        raise ValueError(f"embedding source is missing {source_name}")
+
+    shard = reader.weight_map[source_name]
+    reader.close()
+    with safe_open(
+        str(reader.model_dir / shard), framework="pt", device="cpu"
+    ) as handle:
+        source = handle.get_slice(source_name)
+        actual_shape = tuple(source.get_shape())
+        actual_dtype = str(source.get_dtype())
+        if actual_shape != (n, k) or actual_dtype != "BF16":
+            raise ValueError(
+                f"{source_name}: source signature {(actual_shape, actual_dtype)} "
+                f"!= {((n, k), 'BF16')}"
+            )
+        for begin in range(0, n, chunk_rows):
+            end = min(begin + chunk_rows, n)
+            rows = source[begin:end].to(torch.float16).contiguous()
+            yield rows.view(torch.uint16).numpy().tobytes()
+
+
 __all__ = [
     "ENCODER_PROFILE",
     "RowScaledFp8Words",
     "encode_bf16_rows",
+    "iter_fp16_payload",
     "iter_reader_payload",
     "quantize_bf16_rows",
 ]

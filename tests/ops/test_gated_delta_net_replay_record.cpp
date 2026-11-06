@@ -22,13 +22,17 @@ constexpr std::int32_t kStateDim    = 128;
 constexpr std::uint16_t kBf16Poison = 0xffffU;
 constexpr std::uint32_t kFp32Poison = 0xffffffffU;
 
-std::vector<std::uint16_t> make_bf16(std::size_t count, std::uint32_t seed) {
+std::vector<std::uint16_t> make_activation(std::size_t count, std::uint32_t seed, DType dtype) {
     std::vector<float> values(count);
     fill_uniform(values, seed, -0.08F, 0.08F);
-    round_to_bf16(values);
+    if (dtype == DType::FP16) {
+        round_to_f16(values);
+    } else {
+        round_to_bf16(values);
+    }
     std::vector<std::uint16_t> bits(count);
     for (std::size_t index = 0; index < count; ++index) {
-        bits[index] = f32_to_bf16(values[index]);
+        bits[index] = dtype == DType::FP16 ? f32_to_f16(values[index]) : f32_to_bf16(values[index]);
     }
     return bits;
 }
@@ -41,7 +45,8 @@ int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs
 }
 
 int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width,
-             std::int32_t batch, std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
+             std::int32_t batch, std::vector<std::int32_t> valid_columns, std::uint32_t seed,
+             DType dtype = DType::BF16) {
     const std::int32_t kQkHeads = qk_heads;
     const bool dense            = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
@@ -53,9 +58,9 @@ int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width
     const std::size_t state_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * value_heads * slots;
 
-    const std::vector<std::uint16_t> q_bits = make_bf16(qk_elements, seed);
-    std::vector<std::uint16_t> k_bits       = make_bf16(qk_elements, seed + 1);
-    std::vector<std::uint16_t> v_bits       = make_bf16(value_elements, seed + 2);
+    const std::vector<std::uint16_t> q_bits = make_activation(qk_elements, seed, dtype);
+    std::vector<std::uint16_t> k_bits       = make_activation(qk_elements, seed + 1, dtype);
+    std::vector<std::uint16_t> v_bits       = make_activation(value_elements, seed + 2, dtype);
     std::vector<float> g(gate_elements);
     std::vector<float> beta(gate_elements);
     fill_uniform(g, seed + 3, -1.2F, -0.02F);
@@ -99,9 +104,9 @@ int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width
     value_record.fill(0xff);
     gate_record.fill(0xff);
 
-    Tensor q(device_q.p, DType::BF16, {kStateDim, kQkHeads, width, batch});
-    Tensor k(device_k.p, DType::BF16, {kStateDim, kQkHeads, width, batch});
-    Tensor v(device_v.p, DType::BF16, {kStateDim, value_heads, width, batch});
+    Tensor q(device_q.p, dtype, {kStateDim, kQkHeads, width, batch});
+    Tensor k(device_k.p, dtype, {kStateDim, kQkHeads, width, batch});
+    Tensor v(device_v.p, dtype, {kStateDim, value_heads, width, batch});
     Tensor g_tensor(device_g.p, DType::FP32, {value_heads, width, batch});
     Tensor beta_tensor(device_beta.p, DType::FP32, {value_heads, width, batch});
     Tensor snapshot_states(snapshot_state.p, DType::FP32,
@@ -111,10 +116,10 @@ int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width
     if (!dense) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
     Tensor initial(device_initial.p, DType::I32, {batch});
     Tensor bases(device_bases.p, DType::I32, {batch});
-    Tensor snapshot_output(snapshot_out.p, DType::BF16, {kStateDim, value_heads, width, batch});
-    Tensor record_output(record_out.p, DType::BF16, {kStateDim, value_heads, width, batch});
-    Tensor key_record_tensor(key_record.p, DType::BF16, {kStateDim, kQkHeads, width, batch});
-    Tensor value_record_tensor(value_record.p, DType::BF16, {kStateDim, value_heads, width, batch});
+    Tensor snapshot_output(snapshot_out.p, dtype, {kStateDim, value_heads, width, batch});
+    Tensor record_output(record_out.p, dtype, {kStateDim, value_heads, width, batch});
+    Tensor key_record_tensor(key_record.p, dtype, {kStateDim, kQkHeads, width, batch});
+    Tensor value_record_tensor(value_record.p, dtype, {kStateDim, value_heads, width, batch});
     Tensor gate_record_tensor(gate_record.p, DType::FP32, {2, value_heads, width, batch});
 
     constexpr float kScale = 1.0F / std::sqrt(128.0F);
@@ -441,6 +446,93 @@ int oracle_shard_case(std::int32_t width, std::uint32_t seed) {
     return failures;
 }
 
+// FP16 numerical oracle for the record transition. The recurrence is the same complete FP64
+// recurrence the direct and snapshot routes are qualified against; only the stored q/k/v/output
+// dtype changes. The published final FP32 state is checked directly, so a wrong record write
+// cannot hide behind an output-only comparison.
+int oracle_f16_case(std::int32_t width, std::uint32_t seed) {
+    constexpr std::int32_t kQkHeads    = 16;
+    constexpr std::int32_t kValueHeads = 48;
+    const std::int32_t slots           = 2;
+    const std::size_t qk_elements      = static_cast<std::size_t>(kStateDim) * kQkHeads * width;
+    const std::size_t value_elements =
+        static_cast<std::size_t>(kStateDim) * kValueHeads * width;
+    const std::size_t gate_elements = static_cast<std::size_t>(kValueHeads) * width;
+    const std::size_t state_elements =
+        static_cast<std::size_t>(kStateDim) * kStateDim * kValueHeads * slots;
+
+    gdn_ref::Inputs input;
+    input.head_dim    = kStateDim;
+    input.qk_heads    = kQkHeads;
+    input.value_heads = kValueHeads;
+    input.tokens      = width;
+    input.q.resize(qk_elements);
+    input.k.resize(qk_elements);
+    input.v.resize(value_elements);
+    input.g.resize(gate_elements);
+    input.beta.resize(gate_elements);
+    input.state.resize(state_elements / slots);
+    fill_uniform(input.q, seed, -0.08F, 0.08F);
+    fill_uniform(input.k, seed + 1, -0.08F, 0.08F);
+    fill_uniform(input.v, seed + 2, -0.08F, 0.08F);
+    round_to_f16(input.q);
+    round_to_f16(input.k);
+    round_to_f16(input.v);
+    fill_uniform(input.g, seed + 3, -1.2F, -0.02F);
+    fill_uniform(input.beta, seed + 4, 0.02F, 0.98F);
+    fill_uniform(input.state, seed + 5, -0.03F, 0.03F);
+
+    std::vector<float> initial_states(state_elements, 0.0F);
+    std::copy(input.state.begin(), input.state.end(),
+              initial_states.begin() + static_cast<std::ptrdiff_t>(state_elements / slots));
+    const std::vector<std::int32_t> initial_slots{1};
+
+    DeviceBuffer device_q     = to_device_f16(input.q);
+    DeviceBuffer device_k     = to_device_f16(input.k);
+    DeviceBuffer device_v     = to_device_f16(input.v);
+    DeviceBuffer device_g     = to_device_f32(input.g);
+    DeviceBuffer device_beta  = to_device_f32(input.beta);
+    DeviceBuffer device_state = to_device(initial_states);
+    DeviceBuffer device_slots = to_device(initial_slots);
+    DeviceBuffer out(value_elements * sizeof(std::uint16_t));
+    DeviceBuffer key_record(qk_elements * sizeof(std::uint16_t));
+    DeviceBuffer value_record(value_elements * sizeof(std::uint16_t));
+    DeviceBuffer gate_record(gate_elements * 2 * sizeof(std::uint32_t));
+
+    Tensor q_tensor(device_q.p, DType::FP16, {kStateDim, kQkHeads, width, 1});
+    Tensor k_tensor(device_k.p, DType::FP16, {kStateDim, kQkHeads, width, 1});
+    Tensor v_tensor(device_v.p, DType::FP16, {kStateDim, kValueHeads, width, 1});
+    Tensor g_tensor(device_g.p, DType::FP32, {kValueHeads, width, 1});
+    Tensor beta_tensor(device_beta.p, DType::FP32, {kValueHeads, width, 1});
+    Tensor states(device_state.p, DType::FP32, {kStateDim, kStateDim, kValueHeads, slots});
+    Tensor slots_tensor(device_slots.p, DType::I32, {1});
+    Tensor output(out.p, DType::FP16, {kStateDim, kValueHeads, width, 1});
+    Tensor key_tensor(key_record.p, DType::FP16, {kStateDim, kQkHeads, width, 1});
+    Tensor value_tensor(value_record.p, DType::FP16, {kStateDim, kValueHeads, width, 1});
+    Tensor gate_tensor(gate_record.p, DType::FP32, {2, kValueHeads, width, 1});
+
+    constexpr float kScale = 1.0F / std::sqrt(128.0F);
+    ops::gated_delta_net_replay_record(q_tensor, k_tensor, v_tensor, g_tensor, beta_tensor, kScale,
+                                       states, Tensor{}, slots_tensor, key_tensor, value_tensor,
+                                       gate_tensor, output, nullptr);
+    cuda_synchronize();
+
+    const gdn_ref::Result reference =
+        gdn_ref::evaluate(input, 1.0 / std::sqrt(static_cast<double>(kStateDim)), true);
+    const std::string tag = "replay record f16 oracle T=" + std::to_string(width);
+    int failures          = 0;
+    failures += verify_reduction(tag.c_str(), from_device_f16(out, value_elements),
+                                 reference.out, gated_delta_net_output_f16_criterion());
+    // The record form reads the caller's state and publishes the transition through the records;
+    // the state itself is updated only by the fold. Require it untouched here.
+    const std::vector<float> state_after = from_device<float>(device_state, state_elements);
+    if (state_after != initial_states) {
+        std::cerr << tag << ": record modified the source state\n";
+        ++failures;
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -461,6 +553,15 @@ int main() {
     failures += run_case(8, 24, 2, 1, {}, 1751U);
     failures += run_case(8, 24, 4, 1, {3}, 1761U);
     failures += run_case(8, 24, 6, 8, {6, 4, 3, 2, 1, 5, 6, 2}, 1771U);
+    // FP16 activation: the record form must still reproduce the snapshot snapshot transition and
+    // copy its input records exactly, now at two-byte FP16 storage.
+    failures += run_case(16, 32, 2, 1, {}, 2701U, DType::FP16);
+    failures += run_case(16, 32, 16, 1, {7}, 2711U, DType::FP16);
+    failures += run_case(16, 32, 6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 2721U, DType::FP16);
+    failures += run_case(16, 48, 6, 8, {6, 4, 3, 2, 1, 5, 6, 2}, 2741U, DType::FP16);
+    failures += run_case(8, 24, 6, 8, {6, 4, 3, 2, 1, 5, 6, 2}, 2771U, DType::FP16);
+    failures += oracle_f16_case(6, 2751U);
+    failures += oracle_f16_case(2, 2752U);
     failures += oracle_shard_case(6, 1801U);
     failures += oracle_shard_case(4, 1811U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";

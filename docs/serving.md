@@ -10,7 +10,7 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 ## Start the server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 16384 \
@@ -44,13 +44,15 @@ supports up to fifteen drafts and Qwen3.8-27B artifacts with the optional DFlash
 up to seven. DFlash cannot be combined with `--vision`. A later request cannot enable a capability
 omitted at startup.
 
-`--tp 2` or `--tp 4` splits one model across that many GPUs and requires an explicit
-`--devices A,B` (or `A,B,C,D`) naming one distinct device per rank. The 27B package supports
-`--spec mtp` at any tensor-parallel width and optional Qwen3.8 DFlash2 at TP2 only, but rejects
-`--vision`. On the two 16 GB V100s, the qualified NVFP4 v3 DFlash2 profile uses
+`--tp 2` is the current 2×32GB path; `--tp 4` remains a legacy 4×16GB regression. Either width
+splits one model across that many GPUs and requires an explicit `--devices A,B` (or `A,B,C,D`)
+naming one distinct device per rank. The 27B package supports `--spec mtp` at any tensor-parallel
+width and optional Qwen3.8 DFlash2 at TP2 only. The current self-converted NVFP4 27B artifact
+supports `--vision`; the GGUF Q4_K_M identity rejects it. On the legacy two 16 GB V100 DFlash
+profile, the qualified NVFP4 v3 DFlash2 configuration uses
 `--max-context 98304 --prefill-chunk 1024 --kv-dtype int8 --spec dflash --draft-tokens 7`, without
-`--lm-head-draft`: its selector uses the full vocabulary. It does not fit the 180000-capacity MTP
-profile. The 35B-A3B package has no tensor-parallel path.
+`--lm-head-draft`: its selector uses the full vocabulary. It does not fit the current 2×32GB
+262144-capacity MTP profile. The 35B-A3B package has no tensor-parallel path.
 
 ## Multi-instance pools
 
@@ -77,8 +79,9 @@ draft; `--groups > 1` with `--spec dflash` is rejected at startup. A full queue 
 after the permit is returned.
 
 See [`docs/maintainer/multi-instance.md`](maintainer/multi-instance.md) for grouping, routing,
-manifest lifecycle, and the current verification status. The 2-card and 8-card multi-instance
-profiles have not been validated on this checkout.
+manifest lifecycle, and the current verification status. The 2×TP1 profile has passed real
+integration; 4- and 8-card profiles are unverified, and the 8-card profiles are
+community/out-of-contract.
 
 Compatible-prefix reuse is enabled by default at every tensor-parallel width, including
 `--tp 2 --spec mtp` and `--tp 4 --spec mtp`.
@@ -490,6 +493,11 @@ Malformed tool markup is flushed back as ordinary text without losing bytes, exc
 `content` instead: its dangling syntax is discarded, the finish reason stays `length`, and the
 text preceding the call is returned normally.
 
+Tool-call arguments are decoded against the declared tool schema: a parameter whose schema admits
+a string keeps the tag payload verbatim (a numeric-looking zip code stays a string), while other
+parameters are JSON-decoded. Python-style literals `True`, `False`, and `None` emitted by the
+checkpoint are accepted and normalized to JSON `true`, `false`, and `null`.
+
 ### Local response state and resources
 
 `store` defaults to `true`. Stored Responses live only in this server process and are bounded by an
@@ -524,8 +532,9 @@ stored.
 
 ### Responses input token count
 
-`POST /v1/responses/input_tokens` accepts exactly `model` and `input`, performs the same typed Item,
-template, and media expansion, and does not run generation:
+`POST /v1/responses/input_tokens` accepts `model`, `input`, and the optional
+`chat_template_kwargs`/`preserve_thinking` controls, performs the same typed Item, template, and
+media expansion, and does not run generation:
 
 ```bash
 curl http://127.0.0.1:8080/v1/responses/input_tokens \
@@ -630,7 +639,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|iq4nl` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
+| `--draft-tokens N` | MTP `1..5` (V100X2 qualifies at most `3`); DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `65536` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
@@ -668,7 +677,7 @@ file. The parent directory must already exist. Failure to open the file aborts s
 is also rejected if it resolves to the model artifact.
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 

@@ -24,6 +24,7 @@ inline constexpr std::int32_t kKvQuantGroupI4NL = 32;
 [[nodiscard]] inline DType kv_storage_dtype(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::BFloat16: return DType::BF16;
+    case KvCacheStorage::Float16: return DType::FP16;
     case KvCacheStorage::Int8Group64: return DType::I8;
     case KvCacheStorage::Int4NLGroup32: return DType::I4NL;
     }
@@ -32,7 +33,7 @@ inline constexpr std::int32_t kKvQuantGroupI4NL = 32;
 
 [[nodiscard]] inline std::int32_t kv_storage_quant_group(KvCacheStorage storage) {
     const DType dtype = kv_storage_dtype(storage);
-    if (dtype == DType::BF16) { return 0; }
+    if (dtype == DType::BF16 || dtype == DType::FP16) { return 0; }
     return dtype == DType::I4NL ? kKvQuantGroupI4NL : kKvQuantGroup;
 }
 

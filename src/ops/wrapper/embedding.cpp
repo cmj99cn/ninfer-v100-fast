@@ -197,7 +197,9 @@ void require_non_empty_tensors(const Tensor& ids, const Tensor& out) {
 
 void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
     if (ids.dtype != DType::I32) { throw std::invalid_argument("embedding: ids must be I32"); }
-    if (out.dtype != DType::BF16) { throw std::invalid_argument("embedding: out must be BF16"); }
+    if (out.dtype != DType::BF16 && out.dtype != DType::FP16) {
+        throw std::invalid_argument("embedding: out must be BF16 or FP16");
+    }
 
     (void)numel_allow_zero(ids, "ids");
     (void)numel_allow_zero(out, "out");
@@ -214,7 +216,8 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         require_non_empty_tensors(ids, out);
         detail::ggml_k_embedding(ids, table, out, stream);
         break;
-    case QType::BF16_CTRL: {
+    case QType::BF16_CTRL:
+    case QType::FP16_CTRL: {
         require_dense_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
@@ -222,7 +225,15 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
             throw std::invalid_argument("embedding: dense table data must be non-null");
         }
         const Tensor dense = as_dense(table);
-        detail::embed_gather_dense_launch(ids, dense, out, stream);
+        if (out.dtype == DType::FP16) {
+            detail::embed_gather_dense_f16_launch(ids, dense, out, stream);
+        } else {
+            if (table.qtype != QType::BF16_CTRL) {
+                throw std::invalid_argument(
+                    "embedding: FP16 table supports FP16 output only");
+            }
+            detail::embed_gather_dense_launch(ids, dense, out, stream);
+        }
     } break;
     case QType::Q6G64_F16S:
         require_q6_metadata(table, out);
@@ -240,7 +251,11 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         require_fp8_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
-        detail::embed_gather_fp8_launch(ids, table, out, stream);
+        if (out.dtype == DType::FP16) {
+            detail::embed_gather_fp8_f16_launch(ids, table, out, stream);
+        } else {
+            detail::embed_gather_fp8_launch(ids, table, out, stream);
+        }
         break;
     default:
         throw std::invalid_argument("embedding: unsupported table qtype");

@@ -30,6 +30,9 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 // data-only: TextContext is constructed on the stack for one schedule recording/execution and owns
 // neither weights nor device state.
 struct ModelConfig {
+    // Compile-time activation/residual dtype of the text stream. Logits, sampling state, KV
+    // storage, and every weight/norm/conv tensor keep their own fixed dtypes.
+    static constexpr DType act               = TextConfig::activation_dtype;
     static constexpr int hidden              = TextConfig::hidden;
     static constexpr int n_layers            = TextConfig::layers;
     static constexpr int intermediate        = TextConfig::intermediate;

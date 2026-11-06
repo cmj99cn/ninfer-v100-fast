@@ -129,7 +129,8 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--raw-output] [--print-token-ids] [--no-thinking] [--ignore-eos]\n"
+           "       [--raw-output] [--print-token-ids] [--print-prompt-token-ids]\n"
+           "       [--top-logits N] [--no-thinking] [--preserve-thinking] [--ignore-eos]\n"
             "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
             "       [--cuda-graph|--no-cuda-graph]\n"
             "       [--prefix-cache] [--host-cache-mib N]\n"
@@ -229,8 +230,14 @@ Options parse_options(int argc, char** argv) {
             options.raw_output = true;
         } else if (arg == "--print-token-ids") {
             options.print_token_ids = true;
+        } else if (arg == "--print-prompt-token-ids") {
+            options.print_prompt_token_ids = true;
+        } else if (arg == "--top-logits") {
+            options.top_logits = parse_u32(value(arg), "top-logits", true);
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--preserve-thinking") {
+            options.preserve_thinking = true;
         } else if (arg == "--ignore-eos") {
             options.ignore_eos = true;
         } else if (arg == "--reasoning-effort") {

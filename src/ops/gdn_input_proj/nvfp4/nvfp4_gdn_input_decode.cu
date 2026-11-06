@@ -7,6 +7,9 @@
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cuh"
 
+#include <algorithm>
+#include <stdexcept>
+
 namespace ninfer::ops::detail {
 namespace {
 
@@ -37,7 +40,55 @@ void launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z, cudaS
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <class Geometry, class Output>
+void launch_f16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                cudaStream_t stream) {
+    constexpr std::int32_t kRows = Geometry::kOutputRows;
+    constexpr std::int32_t kCols = Geometry::kInputRows;
+    constexpr std::int32_t kChunk = kNvfp4VoltaQpnMaxTokens;
+    const float inverse = 1.0F / weight.weight_scale_divisor;
+    const std::int32_t total_t = x.ne[1];
+    for (std::int32_t begin = 0; begin < total_t; begin += kChunk) {
+        const std::int32_t active = std::min(kChunk, total_t - begin);
+        Tensor x_chunk(static_cast<std::uint8_t*>(x.data) +
+                           static_cast<std::int64_t>(begin) * kCols * sizeof(half),
+                       DType::FP16, {kCols, active});
+        Output output{
+            reinterpret_cast<half*>(static_cast<std::uint8_t*>(qkv.data) +
+                                    static_cast<std::int64_t>(begin) * Output::kQkvRows *
+                                        sizeof(half)),
+            reinterpret_cast<half*>(static_cast<std::uint8_t*>(z.data) +
+                                    static_cast<std::int64_t>(begin) * Output::kZRows *
+                                        sizeof(half))};
+        launch_nvfp4_volta_qpn_with_fp16_activation(
+            x_chunk, weight, static_cast<const half*>(x_chunk.data), output, kRows, inverse,
+            stream);
+    }
+}
+
 } // namespace
+
+void nvfp4_gdn_input_f16_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    launch_f16<Nvfp4GdnInputGeometry, Nvfp4GdnInputF16Output>(x, weight, qkv, z, stream);
+#else
+    (void)x; (void)weight; (void)qkv; (void)z; (void)stream;
+    throw std::invalid_argument("nvfp4 gdn f16 requires the sm_70 build");
+#endif
+}
+
+void nvfp4_gdn_input_f16_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                      cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    launch_f16<Nvfp4GdnInputTp2ColumnGeometry,
+               Nvfp4GdnInputF16ShardOutput<Nvfp4GdnInputTp2ColumnGeometry>>(x, weight, qkv, z,
+                                                                            stream);
+#else
+    (void)x; (void)weight; (void)qkv; (void)z; (void)stream;
+    throw std::invalid_argument("nvfp4 gdn f16 requires the sm_70 build");
+#endif
+}
 
 void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                    cudaStream_t stream) {

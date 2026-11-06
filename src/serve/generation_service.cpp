@@ -368,6 +368,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     prepared.include_usage                 = request.include_usage;
     prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
     prepared.tool_name_max_length          = request.tool_name_max_length;
+    prepared.tool_argument_types           = build_tool_argument_type_contracts(request);
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     prepared.enable_thinking                   = semantics.enable_thinking;
@@ -513,7 +514,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         const bool truncated = outcome.finish_reason == ninfer::FinishReason::OutputLimit ||
                                outcome.finish_reason == ninfer::FinishReason::ContextCapacity;
         ParsedToolCallOutput parsed =
-            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length, truncated);
+            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length,
+                                        prepared.tool_argument_types, truncated);
         outcome.text          = std::move(parsed.content);
         is_tool_call_response = parsed.is_tool_call_response;
         truncated_tool_call   = parsed.unterminated_tool_call;

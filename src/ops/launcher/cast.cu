@@ -43,4 +43,20 @@ void cast_fp32_to_bf16_launch(const Tensor& source, Tensor& destination, cudaStr
     CUDA_CHECK(cudaGetLastError());
 }
 
+void cast_bf16_to_fp16_launch(const Tensor& source, Tensor& destination, cudaStream_t stream) {
+    const std::int64_t count = source.numel();
+    cast_bf16_to_fp16_scalar_kernel<<<cast_grid(count), kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(source.data), static_cast<__half*>(destination.data),
+        count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void cast_fp16_to_bf16_launch(const Tensor& source, Tensor& destination, cudaStream_t stream) {
+    const std::int64_t count = source.numel();
+    cast_fp16_to_bf16_scalar_kernel<<<cast_grid(count), kBlock, 0, stream>>>(
+        static_cast<const __half*>(source.data), static_cast<__nv_bfloat16*>(destination.data),
+        count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

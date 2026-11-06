@@ -29,6 +29,12 @@ constexpr ReductionCriterion gated_delta_net_output_bf16_criterion() {
             /*gross_relative_to_max_reference=*/5.5e-3};
 }
 
+// FP16-stored output of the same recurrence. FP16 carries a finer mantissa than BF16, so a route
+// that stores FP16 must satisfy at least the BF16 contract.
+constexpr ReductionCriterion gated_delta_net_output_f16_criterion() {
+    return gated_delta_net_output_bf16_criterion();
+}
+
 // FP32 published state after the last token.
 constexpr ReductionCriterion gated_delta_net_state_fp32_criterion() {
     return {/*relative_l2=*/2.7e-3, /*gross_absolute=*/1.0e-5,

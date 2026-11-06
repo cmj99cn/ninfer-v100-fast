@@ -36,7 +36,8 @@ Gate: `ninfer_qwen3_8_27b_v100x2_mtp_mixed_real_test` (TP2, NVFP4) — a single-
 owner and a multi-chunk owner each match their isolated MTP run.
 Scope: the Qwen3.6-family hybrid text path (GQA full-attention + GDN linear-attention) at
 `src/targets/qwen3_6`, targeting the V100X2 acceptance workload. 27B/35B-A3B peer variants share
-the design; only the 27B Q4_K_M artifact is required to land the acceptance claim.
+the design; the current acceptance claim uses the 27B NVFP4 artifact, with Q4_K_M retained as a
+legacy regression.
 
 Decisions:
 
@@ -101,9 +102,10 @@ per-request ones; the flat linears are unaffected by either). L2 loses over L0 i
 strictly more general than L1: L1 is L2 with `query_start_loc = {0,c,2c,…,B_total·c}` and
 `valid_columns`.
 
-**Acceptance** (per AGENTS.md "Performance work"): above the LM Studio baseline — ~45 committed
-decode tok/s at ~85 000 occupied context — with **no further quality loss**, i.e. per-request
-continuation identity vs the L0 control.
+**Acceptance** (per AGENTS.md "Performance work"): the current 2×32GB NVFP4 profile in README —
+84.4 committed decode tok/s at roughly 59K occupied context — with **no further quality loss**,
+i.e. per-request continuation identity vs the L0 control. The former Q4_K_M 85K/45 tok/s target is
+legacy and is not the current release gate.
 
 ---
 

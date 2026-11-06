@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -22,6 +23,14 @@ void launch_fp8(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_
     embed_gather_fp8_kernel<BlocksPerToken, Threads><<<grid, Threads, 0, stream>>>(
         static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata),
         static_cast<const __nv_bfloat16*>(table.scales), static_cast<__nv_bfloat16*>(out.data));
+}
+
+template <int BlocksPerToken, int Threads>
+void launch_fp8_f16(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+    const int grid = ids.ne[0] * BlocksPerToken;
+    embed_gather_fp8_f16_kernel<BlocksPerToken, Threads><<<grid, Threads, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata),
+        static_cast<const __nv_bfloat16*>(table.scales), static_cast<__half*>(out.data));
 }
 
 int grid_for(std::int64_t n) {
@@ -80,6 +89,26 @@ void embed_gather_dense_launch(const Tensor& ids, const Tensor& table, Tensor& o
     CUDA_CHECK(cudaGetLastError());
 }
 
+void embed_gather_dense_f16_launch(const Tensor& ids, const Tensor& table, Tensor& out,
+                                   cudaStream_t stream) {
+    const std::int32_t d = out.ne[0];
+    const std::int32_t T = ids.ne[0];
+    const std::int64_t n = static_cast<std::int64_t>(d) * T;
+    const int grid       = grid_for(n);
+    if (table.dtype == DType::BF16) {
+        embed_gather_dense_f16_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(ids.data),
+            static_cast<const __nv_bfloat16*>(table.data), static_cast<__half*>(out.data), d, T);
+    } else if (table.dtype == DType::FP16) {
+        embed_gather_dense_f16_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(ids.data), static_cast<const __half*>(table.data),
+            static_cast<__half*>(out.data), d, T);
+    } else {
+        throw std::invalid_argument("embedding: FP16 output requires a BF16 or FP16 table");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void embed_gather_q6_launch(const Tensor& ids, const Weight& table, Tensor& out,
                             cudaStream_t stream) {
     const std::int32_t d = out.ne[0];
@@ -127,6 +156,17 @@ void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, Tensor& out
         launch_fp8<10, 32>(ids, table, out, stream);
     } else {
         launch_fp8<1, 256>(ids, table, out, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void embed_gather_fp8_f16_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                                 cudaStream_t stream) {
+    const std::int32_t T = ids.ne[0];
+    if (T <= 48) {
+        launch_fp8_f16<10, 32>(ids, table, out, stream);
+    } else {
+        launch_fp8_f16<1, 256>(ids, table, out, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

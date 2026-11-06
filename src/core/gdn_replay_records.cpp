@@ -27,6 +27,9 @@ std::int32_t checked_outer_extent(const GdnReplayRecordSpec& spec) {
 }
 
 void validate_spec(const GdnReplayRecordSpec& spec) {
+    if (spec.activation_dtype != DType::BF16 && spec.activation_dtype != DType::FP16) {
+        throw std::invalid_argument("GDN replay activation dtype must be BF16 or FP16");
+    }
     require_positive(spec.layers, "layer count");
     require_positive(spec.record_capacity, "record capacity");
     require_positive(spec.width, "width");
@@ -75,11 +78,11 @@ void require_disjoint(const TensorRegion& a, const TensorRegion& b) {
 void validate_layout(const GdnReplayRecordLayout& layout) {
     validate_spec(layout.spec);
     const std::int32_t outer = checked_outer_extent(layout.spec);
-    require_region(layout.conv, DType::BF16,
+    require_region(layout.conv, layout.spec.activation_dtype,
                    {layout.spec.conv_channels, layout.spec.width, outer, 1}, "conv");
-    require_region(layout.key, DType::BF16,
+    require_region(layout.key, layout.spec.activation_dtype,
                    {layout.spec.key_dim, layout.spec.qk_heads, layout.spec.width, outer}, "key");
-    require_region(layout.value, DType::BF16,
+    require_region(layout.value, layout.spec.activation_dtype,
                    {layout.spec.value_dim, layout.spec.value_heads, layout.spec.width, outer},
                    "value");
     require_region(layout.gate, DType::FP32, {2, layout.spec.value_heads, layout.spec.width, outer},
@@ -100,12 +103,12 @@ GdnReplayRecordLayout plan_gdn_replay_records(LayoutBuilder& builder,
 
     GdnReplayRecordLayout layout;
     layout.spec = spec;
-    layout.conv = builder.add_tensor(DType::BF16, {spec.conv_channels, spec.width, outer},
+    layout.conv = builder.add_tensor(spec.activation_dtype, {spec.conv_channels, spec.width, outer},
                                      kRecordAlignment, "GDN replay conv records");
-    layout.key  = builder.add_tensor(DType::BF16, {spec.key_dim, spec.qk_heads, spec.width, outer},
+    layout.key  = builder.add_tensor(spec.activation_dtype, {spec.key_dim, spec.qk_heads, spec.width, outer},
                                      kRecordAlignment, "GDN replay key records");
     layout.value =
-        builder.add_tensor(DType::BF16, {spec.value_dim, spec.value_heads, spec.width, outer},
+        builder.add_tensor(spec.activation_dtype, {spec.value_dim, spec.value_heads, spec.width, outer},
                            kRecordAlignment, "GDN replay value records");
     layout.gate = builder.add_tensor(DType::FP32, {2, spec.value_heads, spec.width, outer},
                                      kRecordAlignment, "GDN replay gate records");

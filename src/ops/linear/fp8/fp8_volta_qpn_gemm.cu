@@ -37,6 +37,20 @@ void launch_fp8_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStr
                                      n, stream);
 }
 
+void launch_fp8_volta_qpn_f16(const Tensor& x, const Weight& w, Tensor& out,
+                              cudaStream_t stream) {
+    const std::int32_t n = out.ne[0];
+    launch_fp8_volta_qpn_with_output<Fp8Fp16ContiguousOutput, half>(
+        x, w, Fp8Fp16ContiguousOutput{static_cast<half*>(out.data), n}, n, stream);
+}
+
+void launch_fp8_volta_qpn_f16_bf16out(const Tensor& x, const Weight& w, Tensor& out,
+                                      cudaStream_t stream) {
+    const std::int32_t n = out.ne[0];
+    launch_fp8_volta_qpn_with_output<Fp8ContiguousOutput, half>(
+        x, w, Fp8ContiguousOutput{static_cast<__nv_bfloat16*>(out.data), n}, n, stream);
+}
+
 #endif // NINFER_VOLTA_BUILD
 
 } // namespace ninfer::ops::detail

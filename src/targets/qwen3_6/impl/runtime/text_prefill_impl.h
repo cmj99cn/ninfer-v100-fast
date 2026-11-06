@@ -180,9 +180,10 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
 }
 
 std::array<Tensor, kMaximumDevices> resume_hidden(ExecutionCore& execution, const Tensor& hidden) {
-    if (hidden.dtype != DType::BF16 || hidden.ne[0] != TextConfig::hidden || hidden.ne[1] != 1 ||
+    if (hidden.dtype != TextConfig::activation_dtype || hidden.ne[0] != TextConfig::hidden ||
+        hidden.ne[1] != 1 ||
         hidden.ne[2] != 1 || hidden.ne[3] != 1 || hidden.data == nullptr) {
-        throw std::invalid_argument("prefix resume requires BF16 [hidden,1]");
+        throw std::invalid_argument("prefix resume requires an activation-dtype [hidden,1]");
     }
     std::array<Tensor, kMaximumDevices> result{};
     result[0] = hidden;

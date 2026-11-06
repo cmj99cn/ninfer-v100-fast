@@ -207,11 +207,17 @@ void validate_envelope(GqaExecutionEnvelope envelope, const PagedKVLayerView& ca
     }
 }
 
+bool gqa_activation_dtype_ok(DType dtype, DType cache_dtype) {
+    if (dtype == DType::BF16) { return true; }
+    return dtype == DType::FP16 && (cache_dtype == DType::I8 || cache_dtype == DType::I4NL);
+}
+
 void validate_attention_tensors(const Tensor& q, const Tensor& positions, const Tensor& out,
                                 const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
                                 float scale, const char* op) {
-    if (q.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument(std::string(op) + ": q/out must be BF16");
+    if (q.dtype != out.dtype || !gqa_activation_dtype_ok(q.dtype, cache.dtype)) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": q/out must be BF16, or FP16 over a quantized KV cache");
     }
     if (positions.dtype != DType::I32) {
         throw std::invalid_argument(std::string(op) + ": positions must be I32");
@@ -240,8 +246,9 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
                                         const Tensor& out, const PagedKVBatchLayerView& cache,
                                         GqaExecutionEnvelope envelope, float scale,
                                         const char* op) {
-    if (q.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument(std::string(op) + ": q/out must be BF16");
+    if (q.dtype != out.dtype || !gqa_activation_dtype_ok(q.dtype, cache.dtype)) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": q/out must be BF16, or FP16 over a quantized KV cache");
     }
     const bool masked = valid_columns.data != nullptr;
     if (positions.dtype != DType::I32 || kv_table_rows.dtype != DType::I32 ||
@@ -289,11 +296,11 @@ struct SmallTWorkspace {
 };
 
 template <class Allocator>
-SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_heads,
-                                           std::int32_t tokens, std::int32_t splits,
-                                           std::int32_t batch_size = 1) {
+SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, DType acc_dtype,
+                                           std::int32_t q_heads, std::int32_t tokens,
+                                           std::int32_t splits, std::int32_t batch_size = 1) {
     return {
-        workspace.alloc(DType::BF16, {kHeadDim, q_heads, tokens, splits * batch_size}),
+        workspace.alloc(acc_dtype, {kHeadDim, q_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
     };
@@ -373,7 +380,7 @@ void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceA
         auto chunk_scope         = workspace.scope();
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], count, cache_dtype, envelope);
-        SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], count, splits);
+        SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.dtype, q.ne[1], count, splits);
         Tensor q_chunk          = q.slice(2, begin, count);
         Tensor position_chunk   = positions.slice(0, begin, count);
         Tensor out_chunk        = out.slice(2, begin, count);
@@ -392,7 +399,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], count, cache.dtype, envelope);
         SmallTWorkspace partial =
-            allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
+            allocate_small_t_workspace(workspace, q.dtype, q.ne[1], count, splits, q.ne[3]);
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                              cache, envelope, begin, count, partial.acc, partial.m,
                                              partial.l, out, stream);
@@ -502,7 +509,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q_heads, width, cache_dtype, envelope);
         WorkspaceLayoutBuilder layout;
-        (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size);
+        (void)allocate_small_t_workspace(layout, DType::BF16, q_heads, width, splits, batch_size);
         return layout.peak_bytes(1);
     };
     const auto exact_capacity = [&](std::int32_t width) {
@@ -573,8 +580,8 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     constexpr const char* op = "gqa_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
-    if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
-        throw std::invalid_argument("gqa_attention: k/v must be BF16");
+    if (k.dtype != q.dtype || v.dtype != q.dtype) {
+        throw std::invalid_argument("gqa_attention: k/v must share the q activation dtype");
     }
     const std::int32_t width    = q.ne[2];
     const std::int32_t batch    = q.ne[3];
@@ -587,6 +594,11 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     auto scope = workspace.scope();
     detail::GqaAttentionRoute route =
         detail::gqa_attention_resolve_route(q.ne[1], width, batch, cache.dtype, envelope);
+    // The Volta flash staging kernel is BF16-activation-only for now; an FP16 prefill uses the
+    // chunked small-T path, which carries the activation dtype natively.
+    if (q.dtype == DType::FP16 && route == detail::GqaAttentionRoute::VoltaFlash) {
+        route = detail::GqaAttentionRoute::ChunkedSmallT;
+    }
 #ifdef NINFER_VOLTA_BUILD
     if (route == detail::GqaAttentionRoute::VoltaFlash && valid_columns.data == nullptr) {
         VoltaFlashWorkspace staging =
@@ -614,7 +626,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], width, cache.dtype, envelope);
         SmallTWorkspace partial =
-            allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
+            allocate_small_t_workspace(workspace, q.dtype, q.ne[1], width, splits, batch);
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                              scale, cache, envelope, 0, width, partial.acc,
                                              partial.m, partial.l, out, stream);
@@ -627,8 +639,9 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                    PagedKVLayerView cache, cudaStream_t stream) {
     constexpr const char* op = "gqa_kv_append";
-    if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
-        throw std::invalid_argument("gqa_kv_append: k/v must be BF16");
+    if (k.dtype != v.dtype || !gqa_activation_dtype_ok(k.dtype, cache.dtype)) {
+        throw std::invalid_argument(
+            "gqa_kv_append: k/v must be BF16, or FP16 into a quantized KV cache");
     }
     if (positions.dtype != DType::I32) {
         throw std::invalid_argument("gqa_kv_append: positions must be I32");
@@ -657,8 +670,11 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
 
     auto scope = workspace.scope();
-    const detail::GqaAttentionRoute route =
+    detail::GqaAttentionRoute route =
         detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, cache.dtype, envelope);
+    if (q.dtype == DType::FP16 && route == detail::GqaAttentionRoute::VoltaFlash) {
+        route = detail::GqaAttentionRoute::ChunkedSmallT;
+    }
     // A3 accepts no new K/V, so the VoltaFlash launcher's append step has nothing to
     // do and its staging is not allocated here. The chunked route is the cached-path
     // equivalent. Without this, a wide A3 call would fall through to
@@ -671,7 +687,7 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     if (detail::gqa_attention_uses_small_t(q.ne[2])) {
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
-        SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);
+        SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.dtype, q.ne[1], q.ne[2], splits);
         detail::gqa_attention_cached_small_t_launch(q, positions, scale, cache, envelope,
                                                     partial.acc, partial.m, partial.l, out, stream);
         return;

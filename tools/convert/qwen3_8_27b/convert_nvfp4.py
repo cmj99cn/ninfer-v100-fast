@@ -404,7 +404,16 @@ def _build_report(
             "source_nvfp4_matrices": len(recipe.NVFP4_SOURCES),
         },
     }
-    report["embedding_encoder"] = fp8_embedding.ENCODER_PROFILE
+    embedding_format = next(
+        spec.format
+        for spec in inventory.TENSOR_SPECS
+        if spec.name == "text/token_embedding"
+    )
+    report["embedding_encoder"] = (
+        "FP16_DIRECT_CAST"
+        if embedding_format == inventory.FP16
+        else fp8_embedding.ENCODER_PROFILE
+    )
     return report
 
 
@@ -455,11 +464,18 @@ def convert(
                 if isinstance(spec, inventory.ResourceSpec):
                     payload = resources[spec.name]
                 elif spec.name == "text/token_embedding":
-                    payload = fp8_embedding.iter_reader_payload(
-                        official_reader,
-                        recipe.OFFICIAL_EMBEDDING_SOURCE.name,
-                        spec.shape,
-                    )
+                    if spec.format == inventory.FP16:
+                        payload = fp8_embedding.iter_fp16_payload(
+                            official_reader,
+                            recipe.OFFICIAL_EMBEDDING_SOURCE.name,
+                            spec.shape,
+                        )
+                    else:
+                        payload = fp8_embedding.iter_reader_payload(
+                            official_reader,
+                            recipe.OFFICIAL_EMBEDDING_SOURCE.name,
+                            spec.shape,
+                        )
                 elif spec.name == "text/output_head":
                     # Community NVFP4 packages keep lm_head as BF16 (in the
                     # ignore list); re-encode it to the row-scaled FP8 layout

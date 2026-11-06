@@ -3,6 +3,7 @@
 #include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 
@@ -27,6 +28,18 @@ struct Nvfp4ContiguousOutput {
                                                  uint4 values) const {
         auto* destination = data + static_cast<std::int64_t>(token) * rows + parent_row;
         store_vec(destination, values);
+    }
+};
+
+// FP16 activation stream sibling of Nvfp4ContiguousOutput. The rounding boundary moves from
+// BF16 to FP16; the accumulator and the per-value epilogue stay FP32.
+struct Nvfp4Fp16ContiguousOutput {
+    half* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        data[static_cast<std::int64_t>(token) * rows + parent_row] = __float2half_rn(value);
     }
 };
 

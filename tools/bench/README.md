@@ -1,5 +1,9 @@
 # tools/bench
 
+> **Current target note (2026-10):** the release target is `qwen3.8-27b/nvfp4` on
+> 2×V100-SXM2-32GB. The built-in default artifact and Qwen3.6 references below are legacy;
+> pass `--weights`/`--artifact` for the current artifact.
+
 Offline helper for the `ninfer_bench` throughput tool. Correctness/parity tooling lives separately
 under [`tools/parity`](../parity).
 
@@ -123,7 +127,7 @@ artifacts are supplied. Pass one `--artifact` to select a single target and `--m
 decode corpus with DFlash block=8 (`k=7`) and the optimized proposal head. Add
 `--sampling greedy` to force exact argmax while retaining the same fixtures and repetition count.
 Its schema-v5 result and flattened summaries retain the canonical `weights_id` received from the
-schema-v9 serving startup record. The stochastic route pins its complete
+schema-v10 serving startup record. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do
 not alter the measurement method.
 

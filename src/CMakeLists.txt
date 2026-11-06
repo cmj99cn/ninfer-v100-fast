@@ -70,6 +70,12 @@ endif()
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_ops STATIC
+  ${CMAKE_SOURCE_DIR}/third_party/1cat_flash_attention/fp16_attention_kernel.cu
+  ${CMAKE_SOURCE_DIR}/third_party/1cat_flash_attention/fp16_attention_paged_kernel.cu
+  ${CMAKE_SOURCE_DIR}/third_party/1cat_flash_attention/gdn_f16_kernel.cu
+  ops/attention/fp16/gqa_attention_f16.cu
+  ops/gdn_gating_proj/fp16/gdn_gating_proj_f16.cu
+  ops/launcher/fp16/causal_conv1d_f16.cu
   ops/linear/ggml_k/ggml_k.cu
   ops/common/allreduce.cu
   ops/common/tp_mailbox.cu

@@ -4,7 +4,10 @@
 
 #include "ninfer/engine.h"
 
+#include <algorithm>
+#include <bit>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <iomanip>
@@ -12,6 +15,8 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -103,6 +108,33 @@ std::string format_kv_cache(ninfer::KvCacheStorage storage) {
 
 std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
     return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
+}
+
+void print_prompt_token_ids(const std::vector<ninfer::TokenId>& ids) {
+    std::cerr << std::left << std::setw(12) << "tokens" << std::setw(26) << "prompt ids";
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        if (i != 0) { std::cerr << ' '; }
+        std::cerr << ids[i];
+    }
+    std::cerr << '\n';
+}
+
+void print_top_logits(const std::vector<std::uint16_t>& bits, std::uint32_t count) {
+    std::vector<std::pair<float, std::uint32_t>> values;
+    values.reserve(bits.size());
+    for (std::size_t i = 0; i < bits.size(); ++i) {
+        const float value = std::bit_cast<float>(static_cast<std::uint32_t>(bits[i]) << 16);
+        values.emplace_back(value, static_cast<std::uint32_t>(i));
+    }
+    const std::size_t keep = std::min<std::size_t>(count, values.size());
+    std::partial_sort(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(keep),
+                      values.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::cerr << std::left << std::setw(12) << "logits" << std::setw(26) << "top ids";
+    for (std::size_t i = 0; i < keep; ++i) {
+        if (i != 0) { std::cerr << ' '; }
+        std::cerr << values[i].second << ':' << values[i].first;
+    }
+    std::cerr << '\n';
 }
 
 void print_stage(std::string_view group, std::string_view detail, double seconds) {
@@ -283,6 +315,7 @@ int main(int argc, char** argv) {
                 : ninfer::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
                                                         cli.enable_vision);
         input.options.reasoning_effort = cli.reasoning_effort;
+        input.options.preserve_thinking = cli.preserve_thinking;
 
         ninfer::RequestOptions request;
         request.execution.sampling                = cli.sampling;
@@ -326,6 +359,10 @@ int main(int argc, char** argv) {
         engine.reset_memory_peaks();
 
         ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
+        if (cli.print_prompt_token_ids) {
+            print_prompt_token_ids(prompt.debug_token_ids());
+        }
+        if (cli.top_logits != 0) { engine.debug_enable_logit_capture(true); }
 
         StreamingSink sink;
         ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request));
@@ -340,6 +377,9 @@ int main(int argc, char** argv) {
                 std::cerr << result.generated_token_ids[i];
             }
             std::cerr << '\n';
+        }
+        if (cli.top_logits != 0) {
+            print_top_logits(engine.debug_last_round_logits_bf16(), cli.top_logits);
         }
         print_generation_summary(result, sampling, engine.memory_summary());
         return 0;

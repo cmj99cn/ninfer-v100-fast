@@ -26,6 +26,7 @@ inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
+    Float16,
     Int8Group64,
     // IQ4_NL-G32: 4-bit codes indexing a 16-entry asymmetric LUT (kvalues_iq4nl), one FP16 scale
     // per contiguous 32-value group along the head dim. Same fused-codec model as Int8Group64;

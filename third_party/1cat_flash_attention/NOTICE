@@ -1,0 +1,12 @@
+This directory contains adapted FP16 kernels from:
+
+  1CatAI/1Cat-vLLM v1.5.1
+  flash-attention-v100/kernel/fused_mha_forward.cu
+  flash-attention-v100/kernel/fused_mha_forward_paged.cu
+  flash_qla/ops/gated_delta_rule/chunk/sm70/csrc/gdn_forward.cu
+  https://github.com/1CatAI/1Cat-vLLM
+
+The upstream source is licensed under the Apache License, Version 2.0.
+Only raw-pointer CUDA device kernels and typed launchers were retained;
+the NInfer host wrappers and tests are separate. See the upstream
+repository for the complete license text and copyright notices.

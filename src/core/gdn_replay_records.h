@@ -9,6 +9,7 @@
 namespace ninfer {
 
 struct GdnReplayRecordSpec {
+    DType activation_dtype       = DType::BF16;
     std::int32_t layers          = 0;
     std::int32_t record_capacity = 0;
     std::int32_t width           = 0;
@@ -33,9 +34,9 @@ struct GdnReplayRecordLayout {
                                                             const GdnReplayRecordSpec& spec);
 
 struct GdnReplayRecordLayer {
-    Tensor conv;  // BF16 [conv_channels, width, rows]
-    Tensor key;   // BF16 [key_dim, qk_heads, width, rows]
-    Tensor value; // BF16 [value_dim, value_heads, width, rows]
+    Tensor conv;  // activation dtype [conv_channels, width, rows]
+    Tensor key;   // activation dtype [key_dim, qk_heads, width, rows]
+    Tensor value; // activation dtype [value_dim, value_heads, width, rows]
     Tensor gate;  // FP32 [2, value_heads, width, rows], ordered {g, beta}
 };
 

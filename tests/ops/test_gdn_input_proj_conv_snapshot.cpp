@@ -310,7 +310,7 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
 
     Tensor x(device_activation.p, DType::BF16, {hidden, width, batch});
     Tensor conv(device_conv_weight.p, DType::BF16, {channels, 4});
-    Tensor conv_state(state.data(), DType::BF16, {channels, 3, slots});
+    Tensor conv_state(state.data(), DType::BF16, {3, channels, slots});
     Tensor valid;
     if (!valid_columns.empty()) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
     Tensor initial(device_initial.p, DType::I32, {batch});
@@ -450,7 +450,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     GuardedBf16Tensor z(kZRows, tokens);
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
-    Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
+    Tensor conv_state(state.data(), DType::BF16, {3, kChannels, slots});
     Tensor initial(device_initial.p, DType::I32, {1});
     Tensor snapshot_base(device_snapshot_base.p, DType::I32, {1});
     Tensor q                          = query.tensor();
@@ -586,7 +586,7 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
     GuardedBf16Tensor z(kZRows, tokens);
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
-    Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
+    Tensor conv_state(state.data(), DType::BF16, {3, kChannels, slots});
     Tensor initial(device_initial.p, DType::I32, {1});
     Tensor snapshot_base(device_snapshot_base.p, DType::I32, {1});
     Tensor q                          = query.tensor();
@@ -714,7 +714,7 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     GuardedBf16Tensor z(kZRows, tokens);
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
-    Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
+    Tensor conv_state(state.data(), DType::BF16, {3, kChannels, slots});
     Tensor initial(device_initial.p, DType::I32, {1});
     Tensor snapshot_base(device_snapshot_base.p, DType::I32, {1});
     Tensor q                          = query.tensor();
@@ -861,7 +861,7 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     GuardedBf16Tensor z(kZRows, tokens);
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
-    Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
+    Tensor conv_state(state.data(), DType::BF16, {3, kChannels, slots});
     Tensor initial(device_initial.p, DType::I32, {1});
     Tensor snapshot_base =
         shared_state_selectors ? initial : Tensor(device_snapshot_base.p, DType::I32, {1});

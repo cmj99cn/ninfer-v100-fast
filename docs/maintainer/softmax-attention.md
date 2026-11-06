@@ -637,6 +637,6 @@ runtime registry、通用 mask IR 或 backend interface 不属于扩展性，而
 - standalone cache append 不再属于 Attention；
 - 旧 header、旧 source、旧 symbol、旧测试 target、旧 benchmark target 和兼容 alias 已删除；
 - dense、sliding-window 和 KV append 的独立 qualification 通过；
-- 两个注册目标的 Text、Vision、MTP、DFlash、prefix reuse 和 CUDA Graph 路径保持支持；
+- 当前 27B NVFP4 路径的 Text、Vision、MTP、DFlash、prefix reuse 和 CUDA Graph 保持支持；GGUF Q4_K_M legacy 路径拒绝 Vision；
 - 受影响文档和命令使用新名称，除本文的迁移映射外没有陈旧引用；
 - 相关公共 benchmark 证明迁移未造成目标路径的性能回退，或对有意的性能变化给出直接证据。

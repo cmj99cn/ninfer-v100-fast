@@ -9,6 +9,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/kernel/gqa_activation.cuh"
 #include "ops/kernel/gqa_attention_geometry.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ninfer/ops/gqa_attention.h"
@@ -76,11 +77,7 @@ inline constexpr int kGqaSmallTSplitPageIds =
         static_cast<int>(kPagedKVPageSize) +
     1;
 
-struct GqaAppendInput {
-    static constexpr bool writes_cache = true;
-    const __nv_bfloat16* k;
-    const __nv_bfloat16* v;
-};
+
 
 struct GqaCachedInput {
     static constexpr bool writes_cache = false;
@@ -197,12 +194,13 @@ __device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, in
     q_head            = kv_head * Geometry::GroupSize + local_q;
 }
 
-template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
+template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset,
+          class Out = __nv_bfloat16>
 __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kernel(
-    const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
+    const Out* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t split_count, Out* out) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -262,7 +260,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     if (head_m == -CUDART_INF_F) {
         const int d = d_start + tid;
         if (tid < DChunk && d < kGqaHeadDim) {
-            out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(0.0f);
+            GqaActivation<Out>::store(out + gqa_q_index<Geometry>(q_head, d, output_column), 0.0f);
         }
         return;
     }
@@ -309,8 +307,9 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
             float values[8];
 #pragma unroll
             for (int item = 0; item < 8; ++item) {
-                values[item] = __bfloat162float(partial_acc[gqa_partial_acc_index<Geometry>(
-                    q_head, d, token, split + item * kSplitGroups, tokens)]);
+                values[item] = GqaActivation<Out>::load(
+                    &partial_acc[gqa_partial_acc_index<Geometry>(
+                        q_head, d, token, split + item * kSplitGroups, tokens)]);
             }
 #pragma unroll
             for (int item = 0; item < 8; ++item) {
@@ -318,9 +317,9 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
             }
         }
         for (; split < active_split_count; split += kSplitGroups) {
-            numerator += __bfloat162float(
-                             partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split,
-                                                                         tokens)]) *
+            numerator += GqaActivation<Out>::load(
+                             &partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split,
+                                                                          tokens)]) *
                          weights[split];
         }
     }
@@ -341,7 +340,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         valid = absolute_column < valid_columns[batch];
     }
     const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
-    out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+    GqaActivation<Out>::store(out + gqa_q_index<Geometry>(q_head, d, output_column), value);
 }
 
 } // namespace ninfer::ops

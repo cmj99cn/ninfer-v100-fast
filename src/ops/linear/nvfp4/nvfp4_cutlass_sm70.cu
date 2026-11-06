@@ -162,6 +162,10 @@ struct CublasOutType<cutlass::bfloat16_t> {
     static constexpr cudaDataType_t value = CUDA_R_16BF;
 };
 template <>
+struct CublasOutType<cutlass::half_t> {
+    static constexpr cudaDataType_t value = CUDA_R_16F;
+};
+template <>
 struct CublasOutType<float> {
     static constexpr cudaDataType_t value = CUDA_R_32F;
 };
@@ -305,10 +309,15 @@ void dequant_inputs(const Tensor& x, const Weight& w, cutlass::half_t* w_fp16,
     CUDA_CHECK(cudaGetLastError());
 
     const std::int64_t x_count = static_cast<std::int64_t>(cols) * k;
-    const int x_blocks         = static_cast<int>((x_count + 255) / 256);
-    bf16_to_fp16_kernel<<<x_blocks, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                                      x_fp16, x_count);
-    CUDA_CHECK(cudaGetLastError());
+    if (x.dtype == DType::FP16) {
+        CUDA_CHECK(cudaMemcpyAsync(x_fp16, x.data, static_cast<std::size_t>(x_count) * sizeof(__half),
+                                   cudaMemcpyDeviceToDevice, stream));
+    } else {
+        const int x_blocks = static_cast<int>((x_count + 255) / 256);
+        bf16_to_fp16_kernel<<<x_blocks, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), x_fp16, x_count);
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     if (std::getenv("NINFER_DUMP_INPUT") != nullptr) {
         const int layout = static_cast<int>(w.layout);
@@ -505,6 +514,16 @@ std::size_t nvfp4_cutlass_sm70_fp32_workspace_bytes(std::int32_t n, std::int32_t
 void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
                                cudaStream_t stream) {
     launch<cutlass::bfloat16_t>(x, w, out, ws, stream);
+}
+
+std::size_t nvfp4_cutlass_sm70_f16_workspace_bytes(std::int32_t n, std::int32_t k,
+                                                   std::int32_t cols) {
+    return workspace_bytes_impl(n, k, cols, false);
+}
+
+void nvfp4_cutlass_sm70_f16_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                   WorkspaceArena& ws, cudaStream_t stream) {
+    launch<cutlass::half_t>(x, w, out, ws, stream);
 }
 
 void nvfp4_cutlass_sm70_fp32_launch(const Tensor& x, const Weight& w, Tensor& out,

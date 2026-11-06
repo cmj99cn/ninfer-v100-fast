@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -1230,17 +1231,23 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
 
         // Hybrid prefix cache: initialize the capture state from the plan. A tap snapshot is
         // published with tail_len == 0 and an anchor on the last committed block, so the state
-        // image captured at `cursor` is the state after the block boundary `floor(cursor/64)*64`.
-        // Snap every flexible tap down to a block boundary and require its frontier to sit above
-        // the reuse base, so the capture that advance_prefill performs at that boundary publishes
-        // a state image that is exactly the snapshot's frontier.
+        // image captured at `cursor` is the state after that cursor.
+        //
+        // Snap every flexible tap down to a prefill-chunk boundary, not merely the 64-token KV
+        // block boundary. The prefill route itself depends on the call's token count (the NVFP4
+        // linear dispatch switches at the small-T threshold), so a tap frontier that splits a
+        // chunk makes the resumed suffix process the same tokens in a different chunk grid than a
+        // cold prefill. That yields an equally valid but different numeric path, which then
+        // diverges under sampling and makes prefix reuse observable. A chunk-aligned frontier
+        // keeps the suffix on the global prefill grid.
         if (prefix_index != nullptr && !request_plan.prefix_taps.empty()) {
             constexpr std::uint32_t kBlock = static_cast<std::uint32_t>(
                 ninfer::prefix_cache::kBlockTokens);
+            const std::uint32_t kAlign = std::lcm(prefill_chunk, kBlock);
             std::vector<std::uint32_t> tap_positions;
             tap_positions.reserve(request_plan.prefix_taps.size());
             for (std::uint32_t position : request_plan.prefix_taps) {
-                const std::uint32_t aligned = (position / kBlock) * kBlock;
+                const std::uint32_t aligned = (position / kAlign) * kAlign;
                 if (aligned <= base) { continue; }
                 if (!tap_positions.empty() && tap_positions.back() >= aligned) { continue; }
                 tap_positions.push_back(aligned);
@@ -2932,7 +2939,8 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
 }
 
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
-    if (source.dtype != DType::BF16 || source.ne[0] != TextConfig::hidden || source.ne[1] != 1) {
+    if (source.dtype != TextConfig::activation_dtype || source.ne[0] != TextConfig::hidden ||
+        source.ne[1] != 1) {
         throw std::logic_error("target tail hidden has an invalid shape");
     }
     CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, source.data, sequence.tail_hidden.bytes(),
@@ -4716,6 +4724,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.kv_capacity           = kv_capacity;
     switch (kv_dtype) {
     case DType::BF16: out.kv_cache = KvCacheStorage::BFloat16; break;
+    case DType::FP16: out.kv_cache = KvCacheStorage::Float16; break;
     case DType::I8:   out.kv_cache = KvCacheStorage::Int8Group64; break;
     default:          out.kv_cache = KvCacheStorage::Int4NLGroup32; break;
 }

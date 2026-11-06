@@ -39,21 +39,7 @@ bool is_bf16_attention_output(std::size_t layer) { return layer == 3 || layer ==
 
 bool is_bf16_gdn_output(std::size_t layer) { return layer == 4; }
 
-NumericFormat endpoint_format(WeightsProfile weights_profile) {
-    switch (weights_profile) {
-    case WeightsProfile::Qwen36GroupwiseInt:
-        return NumericFormat::Q6G64_F16S;
-    case WeightsProfile::Qwen38GroupwiseInt:
-    case WeightsProfile::Qwen36Nvfp4:
-        return NumericFormat::W8G32_F16S;
-    case WeightsProfile::Qwen38Nvfp4:
-    case WeightsProfile::Qwen38Nvfp4QVis:
-        return NumericFormat::FP8_E4M3FN_ROW_BF16S;
-    case WeightsProfile::Qwen38GgmlK:
-        return NumericFormat::GGML_K;
-    }
-    throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
-}
+
 
 std::uint32_t read_u32_le(std::span<const std::byte> bytes, std::uint64_t offset,
                           std::string_view label) {
@@ -1063,9 +1049,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         out.mtp_format = NumericFormat::GGML_K;
     }
 
-    const NumericFormat vocabulary_format = endpoint_format(weights_profile);
-    out.token_embedding =
-        bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
+    out.token_embedding = bind_weight(binder, "text/token_embedding",
+                                      binder.tensor_format("text/token_embedding"),
+                                      {248320, 5120});
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -1086,7 +1072,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
-    out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120});
+    out.output_head = bind_weight(binder, "text/output_head",
+                                  binder.tensor_format("text/output_head"), {248320, 5120});
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;

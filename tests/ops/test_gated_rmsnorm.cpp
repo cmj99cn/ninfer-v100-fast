@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cuda_fp16.h>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -77,6 +78,39 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
     return failures;
 }
 
+int run_f16_case(const char* label, const Shape& shape, std::uint32_t seed) {
+    const std::size_t count = shape.elements();
+    std::vector<float> input(count), weight(shape.d), gate(count);
+    fill_uniform(input, seed, -4.0F, 4.0F);
+    fill_uniform(weight, seed + 1U, 0.25F, 1.75F);
+    fill_uniform(gate, seed + 2U, -5.0F, 5.0F);
+    std::vector<std::uint16_t> ib(count), wb(shape.d), zb(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        ib[i] = __half_as_ushort(__float2half_rn(input[i]));
+        zb[i] = __half_as_ushort(__float2half_rn(gate[i]));
+        input[i] = __half2float(__ushort_as_half(ib[i]));
+        gate[i] = __half2float(__ushort_as_half(zb[i]));
+    }
+    for (int i = 0; i < shape.d; ++i) {
+        wb[static_cast<std::size_t>(i)] = __half_as_ushort(__float2half_rn(weight[static_cast<std::size_t>(i)]));
+        weight[static_cast<std::size_t>(i)] = __half2float(__ushort_as_half(wb[static_cast<std::size_t>(i)]));
+    }
+    const auto ref = gated_rmsnorm_oracle(input, weight, gate, shape);
+    GuardedDeviceBuffer di(count*2), dw(shape.d*2), dz(count*2), dout(count*2);
+    di.copy_from_host(ib.data(), di.bytes()); dw.copy_from_host(wb.data(), dw.bytes());
+    dz.copy_from_host(zb.data(), dz.bytes());
+    Tensor xt(di.data(), DType::FP16, {shape.d, shape.rows, shape.tokens});
+    Tensor wt(dw.data(), DType::FP16, {shape.d});
+    Tensor zt(dz.data(), DType::FP16, {shape.d, shape.rows, shape.tokens});
+    Tensor ot(dout.data(), DType::FP16, {shape.d, shape.rows, shape.tokens});
+    ops::gated_rmsnorm(xt, wt, zt, kEps, ot, nullptr);
+    cuda_synchronize();
+    const auto bits = from_device<std::uint16_t>(dout.data(), count);
+    std::vector<double> got(count);
+    for (std::size_t i = 0; i < count; ++i) got[i] = __half2float(__ushort_as_half(bits[i]));
+    return verify_reduction(label, got, ref, {2e-3, 0.02, 3e-3});
+}
+
 } // namespace
 
 int main() {
@@ -92,6 +126,8 @@ int main() {
     failures += run_case("gated_rmsnorm [128,32,128]", {128, 32, 128}, 1403U);
     failures += run_case("gated_rmsnorm near-zero [128,32]", {128, 32}, 1404U, 1.0e-5F);
     failures += run_case("gated_rmsnorm unaligned [128,48]", {128, 48}, 1405U, 4.0F, true);
+    failures += run_f16_case("gated_rmsnorm f16 [128,48]", {128, 48}, 1501U);
+    failures += run_f16_case("gated_rmsnorm f16 [128,32,7]", {128, 32, 7}, 1502U);
     std::cout << (failures ? "FAIL" : "OK") << " gated_rmsnorm\n";
     return failures ? 1 : 0;
 }

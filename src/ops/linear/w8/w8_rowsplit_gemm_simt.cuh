@@ -33,6 +33,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
+#include "ops/common/activation.cuh"
 #include "ops/linear/w8/w8_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
@@ -111,9 +112,9 @@ w8_simt_issue_slab(uint4* __restrict__ s_nib, uint4* __restrict__ s_hi,
 
 // x0 points at the column tile base (x + col0*k); xslab is the slab's first
 // K-value. Requires k % 8 == 0 and 16-byte aligned x.
-template <class Schedule, int ColsPerTile>
+template <class Schedule, int ColsPerTile, class Act = __nv_bfloat16>
 __device__ __forceinline__ void
-w8_simt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, std::int32_t k,
+w8_simt_consume_slab(const Act* __restrict__ x0, std::int64_t xslab, std::int32_t k,
                      int ncols, const uint4* __restrict__ s_nib, const uint4* __restrict__ s_hi,
                      const std::uint32_t* __restrict__ s_sc, int lane, float (&acc)[ColsPerTile]) {
 #pragma unroll
@@ -124,19 +125,12 @@ w8_simt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, s
 #pragma unroll
         for (int tt = 0; tt < ColsPerTile; ++tt) {
             if (tt < ncols) {
-                const uint4 xv  = load_vec<uint4>(x0 + static_cast<std::int64_t>(tt) * k + xoff);
-                const float2 f0 = bf16x2_bits_to_float2(xv.x);
-                const float2 f1 = bf16x2_bits_to_float2(xv.y);
-                const float2 f2 = bf16x2_bits_to_float2(xv.z);
-                const float2 f3 = bf16x2_bits_to_float2(xv.w);
-                acc[tt]         = fmaf(w[0], f0.x, acc[tt]);
-                acc[tt]         = fmaf(w[1], f0.y, acc[tt]);
-                acc[tt]         = fmaf(w[2], f1.x, acc[tt]);
-                acc[tt]         = fmaf(w[3], f1.y, acc[tt]);
-                acc[tt]         = fmaf(w[4], f2.x, acc[tt]);
-                acc[tt]         = fmaf(w[5], f2.y, acc[tt]);
-                acc[tt]         = fmaf(w[6], f3.x, acc[tt]);
-                acc[tt]         = fmaf(w[7], f3.y, acc[tt]);
+                const uint4 xv = load_vec<uint4>(x0 + static_cast<std::int64_t>(tt) * k + xoff);
+                const auto* xe = reinterpret_cast<const Act*>(&xv);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    acc[tt] = fmaf(w[e], ActivationTraits<Act>::load(xe + e), acc[tt]);
+                }
             }
         }
     }
@@ -146,7 +140,7 @@ w8_simt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, s
 // aligned, else 0 (everything runs through the scalar tail).
 template <class Schedule, int ColsPerWarp, int WarpsPerCta, int PipelineStages, bool Full,
           W8Epilogue Epilogue = W8Epilogue::Store, class Output = W8ContiguousOutput,
-          int ColWarpsPerRow = 1>
+          int ColWarpsPerRow = 1, class Act = __nv_bfloat16>
 __global__
 #ifdef NINFER_VOLTA_BUILD
 // ncu measured this kernel (the w8 vocab/lm-head projection, N=248320) at 81 registers/thread,
@@ -160,7 +154,7 @@ __global__
 // MTP 33.33 -> ~36.2 tok/s (+8.6%), non-MTP 31.35 -> ~32.35 tok/s (+3.2%).
 __launch_bounds__(WarpsPerCta * 32, 5)
 #endif
-void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
+void w8_rowsplit_gemm_simt_kernel(const Act* __restrict__ x,
                                              const std::uint8_t* __restrict__ codes,
                                              const std::uint8_t* __restrict__ scales, Output output,
                                              std::int32_t rows, std::int32_t k, std::int32_t cols,
@@ -185,7 +179,7 @@ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
     if constexpr (!Full) {
         if (row >= rows) { return; }
     }
-    const W8OutputTile output_tile = output.tile(cta_row0);
+    const auto output_tile = output.tile(cta_row0);
     const int col0  = static_cast<int>(blockIdx.y) * kColsPerCta + column_warp * ColsPerWarp;
     const int ncols = Full ? ColsPerWarp : max(0, min(ColsPerWarp, cols - col0));
 
@@ -193,7 +187,7 @@ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
     const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * kg_padded * 32;
     const std::uint8_t* high_row  = nullptr;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kg_padded * 2;
-    const __nv_bfloat16* x0       = x + static_cast<std::int64_t>(col0) * k;
+    const Act* x0                 = x + static_cast<std::int64_t>(col0) * k;
 
     float acc[ColsPerWarp];
 #pragma unroll
@@ -223,9 +217,9 @@ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
         __syncwarp();
 
         const int buf = s % PipelineStages;
-        w8_simt_consume_slab<Schedule, ColsPerWarp>(x0, static_cast<std::int64_t>(s) * 1024, k,
-                                                    ncols, s_nib[warp][buf], s_hi[warp][buf],
-                                                    s_sc[warp][buf], lane, acc);
+        w8_simt_consume_slab<Schedule, ColsPerWarp, Act>(
+            x0, static_cast<std::int64_t>(s) * 1024, k, ncols, s_nib[warp][buf],
+            s_hi[warp][buf], s_sc[warp][buf], lane, acc);
         __syncwarp();
     }
 
@@ -243,8 +237,10 @@ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
         for (int tt = 0; tt < ColsPerWarp; ++tt) {
             if (tt < ncols) {
                 const std::int64_t xb = static_cast<std::int64_t>(tt) * k + kk;
-                acc[tt]               = fmaf(w0, __bfloat162float(x0[xb]), acc[tt]);
-                if (kk + 1 < k) { acc[tt] = fmaf(w1, __bfloat162float(x0[xb + 1]), acc[tt]); }
+                acc[tt] = fmaf(w0, ActivationTraits<Act>::load(x0 + xb), acc[tt]);
+                if (kk + 1 < k) {
+                    acc[tt] = fmaf(w1, ActivationTraits<Act>::load(x0 + xb + 1), acc[tt]);
+                }
             }
         }
     }
@@ -255,11 +251,11 @@ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
         float a = acc[tt];
         a       = warp_reduce_sum(a);
         if (lane == 0) {
-            __nv_bfloat16* destination = output_tile.at(row, col0 + tt);
+            auto* destination = output_tile.at(row, col0 + tt);
             if constexpr (Epilogue == W8Epilogue::Residual) {
-                a = __bfloat162float(*destination) + a;
+                a = ActivationTraits<Act>::load(destination) + a;
             }
-            *destination = __float2bfloat16_rn(a);
+            ActivationTraits<Act>::store(destination, a);
         }
     }
 }

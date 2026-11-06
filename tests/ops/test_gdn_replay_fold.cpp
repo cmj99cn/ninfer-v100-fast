@@ -43,8 +43,13 @@ float signed_pattern(std::uint32_t key, float magnitude = 0.06F) {
     return static_cast<float>(centered) * (magnitude / 1000.0F);
 }
 
-std::uint16_t bf16_pattern(std::uint32_t key, float magnitude = 0.06F) {
-    return f32_to_bf16(signed_pattern(key, magnitude));
+std::uint16_t activation_pattern(std::uint32_t key, float magnitude, DType dtype) {
+    return dtype == DType::FP16 ? f32_to_f16(signed_pattern(key, magnitude))
+                                : f32_to_bf16(signed_pattern(key, magnitude));
+}
+
+float activation_to_f32(std::uint16_t bits, DType dtype) {
+    return dtype == DType::FP16 ? f16_to_f32(bits) : bf16_to_f32(bits);
 }
 
 void* offset_pointer(void* pointer, std::size_t bytes) {
@@ -67,7 +72,8 @@ constexpr ReductionCriterion recurrent_state_criterion() {
 }
 
 int verify_fold_oracle(const FoldProfile profile, std::int32_t width, std::int32_t commit,
-                       std::uint32_t seed, const std::vector<std::uint16_t>& key_records,
+                       std::uint32_t seed, DType dtype,
+                       const std::vector<std::uint16_t>& key_records,
                        const std::vector<std::uint16_t>& value_records,
                        const std::vector<std::uint32_t>& gate_records,
                        const std::vector<float>& actual) {
@@ -89,14 +95,14 @@ int verify_fold_oracle(const FoldProfile profile, std::int32_t width, std::int32
             const std::size_t base =
                 static_cast<std::size_t>((column * kQkHeads + head) * kStateDim);
             for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
-                input.k[base + dim] = bf16_to_f32(key_records[base + dim]);
+                input.k[base + dim] = activation_to_f32(key_records[base + dim], dtype);
             }
         }
         for (std::int32_t head = 0; head < profile.value_heads; ++head) {
             const std::size_t value_base =
                 static_cast<std::size_t>((column * profile.value_heads + head) * kStateDim);
             for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
-                input.v[value_base + dim] = bf16_to_f32(value_records[value_base + dim]);
+                input.v[value_base + dim] = activation_to_f32(value_records[value_base + dim], dtype);
             }
             const std::size_t gate_base =
                 static_cast<std::size_t>((column * profile.value_heads + head) * 2);
@@ -122,7 +128,8 @@ std::vector<std::int32_t> selected_slots(std::int32_t rows) {
 }
 
 int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
-             const std::vector<std::int32_t>& commits, std::uint32_t seed) {
+             const std::vector<std::int32_t>& commits, std::uint32_t seed,
+             DType dtype = DType::BF16) {
     const std::vector<std::int32_t> slots = selected_slots(rows);
     const std::int32_t slot_count         = rows == 1 ? 3 : 11;
     const std::int32_t outer              = profile.layers * kRecordCapacity;
@@ -133,6 +140,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     const std::size_t conv_slot_bytes      = conv_slot_elements * sizeof(std::uint16_t);
 
     const GdnReplayRecordSpec record_spec{
+        .activation_dtype = dtype,
         .layers          = profile.layers,
         .record_capacity = kRecordCapacity,
         .width           = width,
@@ -166,16 +174,17 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
                     conv_records[static_cast<std::size_t>(column) * profile.conv_channels +
                                  channel] =
-                        bf16_pattern(seed + layer * 131U + row * 17U + token * 7U + channel);
+                        activation_pattern(seed + layer * 131U + row * 17U + token * 7U + channel, 0.06F,
+                                           dtype);
                 }
                 for (std::int32_t head = 0; head < kQkHeads; ++head) {
                     const std::size_t base =
                         static_cast<std::size_t>((column * kQkHeads + head) * kStateDim);
                     for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
                         key_records[base + dim] =
-                            bf16_pattern(seed + 100003U + layer * 197U + row * 23U + token * 11U +
+                            activation_pattern(seed + 100003U + layer * 197U + row * 23U + token * 11U +
                                              head * 5U + dim,
-                                         0.08F);
+                                         0.08F, dtype);
                     }
                 }
                 for (std::int32_t head = 0; head < profile.value_heads; ++head) {
@@ -183,9 +192,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                         static_cast<std::size_t>((column * profile.value_heads + head) * kStateDim);
                     for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
                         value_records[vector_base + dim] =
-                            bf16_pattern(seed + 200003U + layer * 211U + row * 29U + token * 13U +
+                            activation_pattern(seed + 200003U + layer * 211U + row * 29U + token * 13U +
                                              head * 7U + dim,
-                                         0.08F);
+                                         0.08F, dtype);
                     }
                     const std::size_t gate_base =
                         static_cast<std::size_t>((column * profile.value_heads + head) * 2);
@@ -227,7 +236,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                         .value_head_dim = kStateDim,
                         .key_head_dim   = kStateDim,
                         .slot_count     = slot_count,
-                        .conv_dtype     = DType::BF16});
+                        .conv_dtype     = dtype});
     const std::size_t state_bytes = state_builder.finish(256);
     DeviceBuffer state_storage(state_bytes + 2 * kGuardBytes);
     state_storage.fill(0xa5);
@@ -243,9 +252,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             for (std::int32_t history = 0; history < 3; ++history) {
                 for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
                     initial[static_cast<std::size_t>(history) * profile.conv_channels + channel] =
-                        bf16_pattern(seed + 400009U + layer * 223U + row * 41U + history * 13U +
+                        activation_pattern(seed + 400009U + layer * 223U + row * 41U + history * 13U +
                                          channel,
-                                     0.05F);
+                                     0.05F, dtype);
                 }
             }
             const Tensor destination = state_pool.conv_slot(static_cast<std::uint32_t>(layer),
@@ -312,10 +321,10 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     initial_device.copy_from_host(&local_initial_slot, sizeof(local_initial_slot));
     base_device.copy_from_host(&local_base_slot, sizeof(local_base_slot));
 
-    const Tensor q_tensor(q.p, DType::BF16, {kStateDim, kQkHeads, width, 1});
+    const Tensor q_tensor(q.p, dtype, {kStateDim, kQkHeads, width, 1});
     Tensor local_states(local_snapshot_state.p, DType::FP32,
                         {kStateDim, kStateDim, profile.value_heads, width + 1});
-    Tensor output(out.p, DType::BF16, {kStateDim, profile.value_heads, width, 1});
+    Tensor output(out.p, dtype, {kStateDim, profile.value_heads, width, 1});
     Tensor initial_selector(initial_device.p, DType::I32, {1});
     Tensor base_selector(base_device.p, DType::I32, {1});
     constexpr float kScale = 1.0F / std::sqrt(128.0F);
@@ -420,8 +429,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             }
             if (layer == 0 && row == 0 && profile.layers == 30 && width == 2 && rows == 1 &&
                 commits[0] == 2) {
-                failures += verify_fold_oracle(profile, width, commits[0], seed, key_records,
-                                               value_records, gate_records, actual_recurrent);
+                failures += verify_fold_oracle(profile, width, commits[0], seed, dtype,
+                                               key_records, value_records, gate_records,
+                                               actual_recurrent);
             }
 
             const Tensor actual_history = state_pool.conv_slot(
@@ -512,7 +522,7 @@ int run_record_fold_rounds() {
     std::vector<std::uint16_t> conv_weight_bits(static_cast<std::size_t>(kProfile.conv_channels) *
                                                 4);
     for (std::size_t index = 0; index < conv_weight_bits.size(); ++index) {
-        conv_weight_bits[index] = bf16_pattern(1907U + static_cast<std::uint32_t>(index), 0.02F);
+        conv_weight_bits[index] = activation_pattern(1907U + static_cast<std::uint32_t>(index), 0.02F, DType::BF16);
     }
     DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
     DeviceBuffer device_initial     = to_device(std::vector<std::int32_t>{kInitialSlot});
@@ -562,7 +572,7 @@ int run_record_fold_rounds() {
         for (std::int32_t history = 0; history < 3; ++history) {
             for (std::int32_t channel = 0; channel < kProfile.conv_channels; ++channel) {
                 conv[static_cast<std::size_t>(history) * kProfile.conv_channels + channel] =
-                    bf16_pattern(1913U + layer * 53U + history * 11U + channel, 0.04F);
+                    activation_pattern(1913U + layer * 53U + history * 11U + channel, 0.04F, DType::BF16);
             }
         }
         const Tensor conv_slot =
@@ -726,6 +736,12 @@ int main() {
     failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
     failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
     failures += run_case({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1861U);
+    // FP16 records and FP16 convolution history through the same fold transition. The snapshot
+    // comparator is rerun at FP16 so both routes load identical stored bits.
+    failures += run_case({30, 32, 8192}, 2, 1, {2}, 2801U, DType::FP16);
+    failures += run_case({30, 32, 8192}, 6, 1, {6}, 2841U, DType::FP16);
+    failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 2851U, DType::FP16);
+    failures += run_case({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 2861U, DType::FP16);
     failures += run_record_fold_rounds();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;

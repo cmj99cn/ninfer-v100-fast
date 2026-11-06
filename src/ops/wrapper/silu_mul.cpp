@@ -10,8 +10,12 @@
 namespace ninfer::ops {
 
 void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
-    if (gate.dtype != DType::BF16 || up.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument("silu_mul: gate/up/out must be BF16");
+    const bool bf16 = gate.dtype == DType::BF16 && up.dtype == DType::BF16 &&
+                      out.dtype == DType::BF16;
+    const bool f16 = gate.dtype == DType::FP16 && up.dtype == DType::FP16 &&
+                     out.dtype == DType::FP16;
+    if (!bf16 && !f16) {
+        throw std::invalid_argument("silu_mul: gate/up/out must share BF16 or FP16 dtype");
     }
     for (int d = 0; d < 4; ++d) {
         if (gate.ne[d] != up.ne[d] || gate.ne[d] != out.ne[d]) {
@@ -24,7 +28,11 @@ void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t st
         throw std::invalid_argument("silu_mul: gate/up/out data must be non-null");
     }
 
-    detail::silu_and_mul_launch(gate, up, out, stream); // single variant -> direct dispatch
+    if (out.dtype == DType::FP16) {
+        detail::silu_and_mul_f16_launch(gate, up, out, stream);
+    } else {
+        detail::silu_and_mul_launch(gate, up, out, stream);
+    }
 }
 
 } // namespace ninfer::ops

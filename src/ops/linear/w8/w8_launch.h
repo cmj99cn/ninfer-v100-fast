@@ -35,6 +35,9 @@ void launch_w8_medium_splitk_c144(const Tensor&, const Weight&, Tensor&, cudaStr
 void launch_w8_simt_r8_c4(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_simt_r8_c8(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_simt_r4_c16(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+// FP16 activation/output twins of the general SIMT route (Volta W8 decode uses this route).
+void launch_w8_simt_r8_c4_f16(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_simt_r8_c8_f16(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 void launch_w8_mma_r32_c64(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_mma_r32_c96(const Tensor&, const Weight&, Tensor&, cudaStream_t);

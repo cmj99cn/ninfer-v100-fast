@@ -182,7 +182,10 @@ void allreduce_sum(const std::array<Tensor, kMaximumDevices>& buffer,
     const int tp = ec.tp;
     for (int rank = 0; rank < tp; ++rank) {
         require_contiguous(buffer[rank], kOp, "buffer");
-        require(buffer[rank].dtype == DType::BF16, std::string(kOp) + ": buffer must be BF16");
+        require(buffer[rank].dtype == DType::BF16 || buffer[rank].dtype == DType::FP16,
+                std::string(kOp) + ": buffer must be BF16 or FP16");
+        require(buffer[rank].dtype == buffer[0].dtype,
+                std::string(kOp) + ": buffer dtypes must match");
         require(same_shape<2>(buffer[rank], buffer[0]),
                 std::string(kOp) + ": buffer shapes must match");
         require_contiguous(staging[rank], kOp, "staging");
@@ -194,15 +197,17 @@ void allreduce_sum(const std::array<Tensor, kMaximumDevices>& buffer,
     const std::size_t elems = element_count(buffer[0]);
     if (elems == 0) return;
 
-    // Small BF16 messages take the probed mailbox transport; everything else stays on NCCL.
-    if (comms.mailbox_allreduce_bf16(buffer, ec)) { return; }
+    // Small BF16 messages take the probed mailbox transport; FP16 and larger messages stay on
+    // NCCL.
+    if (buffer[0].dtype == DType::BF16 && comms.mailbox_allreduce_bf16(buffer, ec)) { return; }
 
     const CurrentDeviceGuard guard;
     nccl_check(ncclGroupStart(), kOp);
     for (int rank = 0; rank < tp; ++rank) {
         CurrentDeviceGuard::set(ec.dev[rank]->device);
-        nccl_check(ncclAllReduce(buffer[rank].data, buffer[rank].data, elems, ncclBfloat16,
-                                 ncclSum, comms.comm(rank), ec.dev[rank]->stream),
+        nccl_check(ncclAllReduce(buffer[rank].data, buffer[rank].data, elems,
+                                 nccl_element_type(buffer[0].dtype, kOp), ncclSum,
+                                 comms.comm(rank), ec.dev[rank]->stream),
                    kOp);
     }
     nccl_check(ncclGroupEnd(), kOp);

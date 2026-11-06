@@ -106,21 +106,26 @@ intermediate artifacts are excluded unless requested or themselves the deliverab
 
 NInfer is a from-scratch C++/CUDA inference engine for a small set of explicitly registered
 checkpoint artifacts. This checkout's active target is maximum single-request performance on
-up to four Tesla V100-SXM2 16 GB cards (tensor-parallel width 1, 2, or 4) using CUDA 12.8 and
-`sm_70`. It combines the RTX 3060 TP2 path
+two Tesla V100-SXM2 32 GB cards (tensor-parallel width 1 or 2) using CUDA 12.8 and
+`sm_70`. The four-card Tesla V100-SXM2 16 GB / TP4 path and the GGUF Q4_K_M identity are
+retained legacy regression paths, not the current product target. It combines the RTX 3060 TP2 path
 with the Volta implementation from `geoffwatts/ninfer-v100`. Ampere `sm_86` and early Ada `sm_89`
 builds remain available; the RTX 5090 `sm_120a` results are inherited upstream evidence, not
 measurements of this target. The supported identities are
 `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
 `qwen3.8-27b/nvfp4`, `qwen3.8-27b-coder390/nvfp4-qvis`, `qwen3.8-27b/gguf-q4-k-m`, and
-`qwen3.6-35b-a3b/groupwise-int`.
-The V100X2 workload uses the GGUF-derived Qwen3.8-27B Q4_K_M artifact from the local LM Studio
-directory, 180000-token context capacity, INT8 group-64 KV, eager decode at tensor-parallel
-width > 1 (CUDA Graph capture is optional there and measurably slower on this target), and MTP
-with at most three drafts; accepting zero drafts is valid. Capacity must not be confused with prompt occupancy.
-Its Q4_K/Q6_K codes and scales must remain unchanged. Numerical transformations and inference
-optimizations require evidence against their applicable exact, mathematical, or behavioral oracle;
-preserving packed bytes alone does not prove absence of end-to-end quality loss.
+`qwen3.6-35b-a3b/groupwise-int`. The current release identity is `qwen3.8-27b/nvfp4`;
+`qwen3.8-27b/gguf-q4-k-m` and the four-16-GB/TP4 path are legacy regression. The other
+registered identities remain available but are not the current release target.
+The V100X2 workload uses the self-converted Qwen3.8-27B NVFP4 artifact from
+`/home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer`, 262144-token context
+capacity, INT8 group-64 KV, eager decode at tensor-parallel width > 1 (CUDA Graph capture is
+optional there and measurably slower on this target), and MTP with at most three qualified drafts;
+accepting zero drafts is valid. Capacity must not be confused with prompt occupancy.
+The legacy GGUF Q4_K_M artifact keeps its Q4_K/Q6_K codes and scales unchanged. Numerical
+transformations and inference optimizations require evidence against their applicable exact,
+mathematical, or behavioral oracle; preserving packed bytes alone does not prove absence of
+end-to-end quality loss.
 
 The published identities retain Text, image/video Vision, MTP, prefix reuse, CLI,
 OpenAI/Anthropic serving, and measurement through the same public `.ninfer` Engine route.
@@ -141,12 +146,13 @@ The GGUF-derived identity uses this same route for Text/MTP and rejects Vision; 
 Vision objects are validation-only. The 35B-A3B target additionally supports text-only DFlash.
 Qwen3.8-27B artifacts containing the optional DFlash2 package also support text-only DFlash,
 including TP2; the official NVFP4 v3 package preserves W8 projections and BF16 auxiliary tensors.
-The 27B draft window is at most seven. On this V100X2, the verified DFlash profile is 98304-token
-capacity with a 1024-token prefill chunk, not the 180000-capacity MTP acceptance profile.
+The 27B draft window is at most seven. The current 2×32GB NVFP4 MTP acceptance profile uses
+262144-token capacity. The verified DFlash profile is the legacy 16GB path at 98304-token
+capacity with a 1024-token prefill chunk; it is not the 262144 MTP acceptance profile.
 
-One Engine owns one resident model, with one device, TP2, or TP4 on the 27B package and a
-startup-fixed one to eight active requests. The V100X2 acceptance workload is one active request
-on two or four cards.
+One Engine owns one resident model, with one device or TP2 on the current 2×32GB 27B package and
+a startup-fixed one to eight active requests. The V100X2 acceptance workload is one active request
+on two 32GB cards. TP4 on four 16GB cards remains a legacy regression path.
 The Engine forms one compact decode batch at every round boundary and uses bounded
 FIFO ingress with no request preemption. Large-scale or preemptive continuous batching, priority/QoS
 scheduling, additional checkpoint targets, and additional execution platforms beyond those named
@@ -289,12 +295,13 @@ This is a risk map, not a checklist for every numerical task.
 
 ## Performance work
 
-The requested V100X2 acceptance is above the user's LM Studio baseline without further quality
-loss: about 45 committed decode tok/s at roughly 85000 occupied context tokens, with a reported
-57 tok/s peak whose occupied context was not specified. The estimate of about 40 tok/s at longer context is not a
-measurement. Both sides use 180000 capacity, Q4_K_M weights, Q8/INT8 KV, and a maximum draft
-window of three. Record actual token counts, sampling, acceptance, and committed throughput.
-Short prompts, draft throughput, or inherited RTX 5090 tables cannot establish this acceptance.
+The current V100X2 acceptance is the measured 2×32GB NVFP4 profile in `README.md`: TP2, 262144
+capacity, INT8 group-64 KV, MTP-3, eager decode. The release decode table reports 84.4 committed
+tok/s at roughly 59K occupied context, 99.2 at 3.7K, 99.7 at 15K, and 106.8 at 502 tokens.
+No 85K NVFP4 measurement exists yet. The former 4×16GB/Q4_K_M 180000-capacity 85K/45 tok/s target
+is legacy and is not the release gate. Record actual token counts, sampling, acceptance, and
+committed throughput. Short prompts, draft throughput, or inherited RTX 5090 tables cannot
+establish this acceptance.
 
 Define a performance claim at the level where it matters: operator, schedule, request phase, or
 end-to-end inference. Measure that level directly when practical. An isolated microbenchmark can
@@ -347,14 +354,15 @@ These are conventional project resources, not a checklist of resources every tas
 |---|---|
 | repository | current checkout |
 | Python 3.11 | `python3` in the selected maintainer environment |
-| Q4_K_M source | `/Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf` |
-| companion Vision source | same directory, `mmproj-Qwen3.8-27B-BF16.gguf` |
-| product artifact | `/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer` |
+| NVFP4 quantized source | `/home/cmj/models/Qwen3.8-27B-QUASAR-NVFP4` |
+| product artifact | `/home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer` |
 | conversion report | product artifact path plus `.conversion.json` |
-| normal build | `build-v100/` |
+| legacy Q4_K_M source | `/Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf` |
+| legacy Q4_K_M artifact | `/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer` |
+| normal build | `build/` |
 | private dependency prefix | `build/_deps/install/` |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
-| hardware/toolchain | 4 x Tesla V100-SXM2 16 GB, `sm_70`, CUDA 12.8 |
+| hardware/toolchain | 2 x Tesla V100-SXM2 32 GB, `sm_70`, CUDA 12.8; 4 x 16 GB is legacy regression |
 
 Use the selected Python 3.11 interpreter explicitly. Do not install or upgrade dependencies unless
 the task requires it. Never select an artifact by glob, modification time, or an unqualified
@@ -363,8 +371,10 @@ do not download or regenerate them unless that work is in scope.
 
 ```bash
 PYTHON=python3
-MODEL=/Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
-NINFER_WEIGHTS=/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer
+MODEL=/home/cmj/models/Qwen3.8-27B-QUASAR-NVFP4
+NINFER_WEIGHTS=/home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer
+LEGACY_Q4_K_M=/Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
+LEGACY_NINFER_WEIGHTS=/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer
 ```
 
 ## Commits

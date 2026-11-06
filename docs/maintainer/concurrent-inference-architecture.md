@@ -247,7 +247,7 @@ admission；二者是 server-side phases，不需要扩展成更多 model-execut
 Intermediate prefill chunks 只推进 prompt state。Finalization unit 执行 target output selection并建立 decode
 anchor；如果立即命中 terminal condition，请求不进入 decode batch。Retained current frontier 正好覆盖完整
 prompt 时可以跳过 suffix prefill，但仍通过同一 finalization unit 从 retained tail state 产生下一 anchor，并在
-MTP 下完成 exact-hit bridge/proposal。命中已保存 rewrite checkpoint 时则从该 checkpoint prefill 新 suffix。
+MTP 下完成 exact-hit bridge/proposal。命中已保存 rewrite checkpoint 时则从该 checkpoint prefill 新 suffix（MTP 与 non-speculative 已禁用该恢复；仅 DFlash 保留）。
 单独的 KV match 不足以进入 `DECODE_READY`。
 
 ### 4.2 Slot
@@ -749,6 +749,13 @@ block 边界上且该边界存在 state snapshot 就能复用。它不是 token 
 `kBlockTokens`=64 为单位，且要求对应 frontier 上确有快照。该路径是 additive 的——block-snapshot admission
 未命中时仍回退到上面的 retained/rewrite-checkpoint 逻辑。参见
 `docs/maintainer/hybrid-prefix-cache-plan.md`。
+
+block snapshot 捕获的是 **prefill 路径**产生的 state image；tap frontier 按
+`lcm(prefill_chunk, kBlockTokens)` 对齐，保证恢复后的 suffix 仍落在全局 prefill chunk 网格上。
+non-speculative（`SpeculativeBackend::None`）与 MTP 请求计划**不再恢复** rewrite
+checkpoint（turn/response closure）：实测该复用会改变随机采样输出（同一 server 重跑可复现）。
+这两条路径因此不经过该 checkpoint 恢复，走 block snapshot、retained frontier 或 cold prefill。MTP 保留 checkpoint 时 BFCL 69/200
+（34.5%），禁用后 72/200（36.0%）。DFlash 的 bridge 路径仍保留该 checkpoint（未测）。
 
 27B TP2 的 suffix、exact-hit 和 MTP bridge 采用同一套 reuse plan。Rank 0 独占 retained target hidden
 和 rewrite-checkpoint hidden 的权威副本；恢复时通过有序跨卡传输把选中的 hidden 暂存到 rank 1 已有的

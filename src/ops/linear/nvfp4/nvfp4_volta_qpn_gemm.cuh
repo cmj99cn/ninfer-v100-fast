@@ -168,8 +168,12 @@ __global__ __launch_bounds__(
 
     const std::uint8_t* crow = codes + static_cast<std::int64_t>(use_col) * (k / 2);
 
-    const half2 rebias  = __float2half2_rn(16384.0f);
-    const half2 divisor2 = __float2half2_rn(inverse_weight_divisor * 256.0f);
+    const half2 rebias   = __float2half2_rn(16384.0f);
+    // The weight divisor stays in FP32 and is applied in the epilogue: folding it into the
+    // FP16 block scale rounds 256/d_w to binary16 and biases every output by that relative
+    // amount (~1.7e-4 for the registered divisors). The E2M1 code times the 2^-8-shifted
+    // E4M3 scale is exact in binary16, so the MMA operands stay exact.
+    const float output_scale = inverse_weight_divisor * 256.0f;
 
     float c[kTiles][NACC][8];
 #pragma unroll
@@ -196,7 +200,7 @@ __global__ __launch_bounds__(
                                           : g == 2 ? code23.y         : code23.w;
             const std::uint8_t scale_byte =
                 static_cast<std::uint8_t>(scale_word >> (8 * g));
-            const half2 sc2 = __hmul2(nvfp4_decode_e4m3_scale(scale_byte), divisor2);
+            const half2 sc2 = nvfp4_decode_e4m3_scale(scale_byte);
             half2 b[8];
             nvfp4_decode_e2m1_quad(word_lo, rebias, *reinterpret_cast<half2(*)[4]>(&b[0]));
             nvfp4_decode_e2m1_quad(word_hi, rebias, *reinterpret_cast<half2(*)[4]>(&b[4]));
@@ -278,10 +282,9 @@ __global__ __launch_bounds__(
             float v = 0.0f;
 #pragma unroll
             for (int w = 0; w < SPLITK; ++w) { v += cs[w][e]; }
-            // The group scale (and the 2^-14 rebias correction) was already applied per value
-            // during decode, so unlike the FP8 sibling the epilogue needs no further multiply --
-            // matching Q4, whose per-group scale is likewise folded in before the mma.
-            output.store(ocol, row, v);
+            // The group scale and the 2^-14 rebias correction were applied per value during
+            // decode; the FP32 weight divisor (and the E4M3 2^-8 shift) is applied here.
+            output.store(ocol, row, v * output_scale);
         }
     }
 }
@@ -312,7 +315,7 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
     const std::int64_t tile_base =
         static_cast<std::int64_t>(blockIdx.x) * groups * 32 + lane;
     const half2 rebias   = __float2half2_rn(16384.0f);
-    const half2 divisor2 = __float2half2_rn(inverse_weight_divisor * 256.0f);
+    const float output_scale = inverse_weight_divisor * 256.0f;
 
     float c[kTiles][NACC][8];
 #pragma unroll
@@ -327,7 +330,7 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
     for (int group = g0; group < gend; ++group) {
         const std::int64_t packed_index = tile_base + static_cast<std::int64_t>(group) * 32;
         const uint2 q2 = __ldg(reinterpret_cast<const uint2*>(codes + packed_index * 8));
-        const half2 sc2 = __hmul2(nvfp4_decode_e4m3_scale(scales[packed_index]), divisor2);
+        const half2 sc2 = nvfp4_decode_e4m3_scale(scales[packed_index]);
         half2 b[8];
         nvfp4_decode_e2m1_quad(q2.x, rebias, *reinterpret_cast<half2(*)[4]>(&b[0]));
         nvfp4_decode_e2m1_quad(q2.y, rebias, *reinterpret_cast<half2(*)[4]>(&b[4]));
@@ -402,7 +405,7 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
             float value = 0.0f;
 #pragma unroll
             for (int w = 0; w < SPLITK; ++w) { value += cs[w][e]; }
-            output.store(ocol, row, value);
+            output.store(ocol, row, value * output_scale);
         }
     }
 }

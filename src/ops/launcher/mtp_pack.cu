@@ -19,10 +19,17 @@ void mtp_pack_fc_input_launch(const Tensor& embedding_norm, const Tensor& hidden
         Tensor out_slice             = out.slice(1, token_offset, token_count);
         const dim3 grid(static_cast<unsigned int>(div_up(embedding_norm.ne[0], kBlock)),
                         static_cast<unsigned int>(token_count));
-        mtp_pack_fc_input_kernel<<<grid, kBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(embedding_slice.data),
-            static_cast<const __nv_bfloat16*>(hidden_slice.data),
-            static_cast<__nv_bfloat16*>(out_slice.data), embedding_norm.ne[0]);
+        if (embedding_norm.dtype == DType::FP16) {
+            mtp_pack_fc_input_kernel<half><<<grid, kBlock, 0, stream>>>(
+                static_cast<const half*>(embedding_slice.data),
+                static_cast<const half*>(hidden_slice.data),
+                static_cast<half*>(out_slice.data), embedding_norm.ne[0]);
+        } else {
+            mtp_pack_fc_input_kernel<__nv_bfloat16><<<grid, kBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(embedding_slice.data),
+                static_cast<const __nv_bfloat16*>(hidden_slice.data),
+                static_cast<__nv_bfloat16*>(out_slice.data), embedding_norm.ne[0]);
+        }
         CUDA_CHECK(cudaGetLastError());
     });
 }
@@ -36,10 +43,19 @@ void launch_split_attn_in(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& g
     const std::int64_t n = static_cast<std::int64_t>(AttnRows) * attn_in.ne[1];
     const int grid =
         static_cast<int>(std::max<std::int64_t>(1, div_up(n, static_cast<std::int64_t>(kBlock))));
-    mtp_split_attn_in_kernel<AttnRows, QRows, KvRows><<<grid, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(attn_in.data), static_cast<__nv_bfloat16*>(q.data),
-        static_cast<__nv_bfloat16*>(k.data), static_cast<__nv_bfloat16*>(gate.data),
-        static_cast<__nv_bfloat16*>(v.data), attn_in.ne[1]);
+    if (attn_in.dtype == DType::FP16) {
+        mtp_split_attn_in_kernel<AttnRows, QRows, KvRows, half><<<grid, kBlock, 0, stream>>>(
+            static_cast<const half*>(attn_in.data), static_cast<half*>(q.data),
+            static_cast<half*>(k.data), static_cast<half*>(gate.data), static_cast<half*>(v.data),
+            attn_in.ne[1]);
+    } else {
+        mtp_split_attn_in_kernel<AttnRows, QRows, KvRows, __nv_bfloat16>
+            <<<grid, kBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(attn_in.data),
+                static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+                static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data),
+                attn_in.ne[1]);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

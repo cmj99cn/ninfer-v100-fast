@@ -148,6 +148,12 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
+    if (x.dtype == DType::FP16) {
+        (void)policy;
+        (void)workspace;
+        nvfp4_gdn_input_f16_launch(x, weight, qkv, z, stream);
+        return;
+    }
     if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
         launch_a16(x, weight, qkv, z, workspace, stream);
         return;
@@ -167,6 +173,12 @@ void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv
 void nvfp4_gdn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     LinearPolicy policy, WorkspaceArena* workspace,
                                     cudaStream_t stream) {
+    if (x.dtype == DType::FP16) {
+        (void)policy;
+        (void)workspace;
+        nvfp4_gdn_input_f16_launch_shard(x, weight, qkv, z, stream);
+        return;
+    }
     if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
         launch_a16_shard(x, weight, qkv, z, workspace, stream);
         return;

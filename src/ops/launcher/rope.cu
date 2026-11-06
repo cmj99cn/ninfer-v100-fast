@@ -252,4 +252,34 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Te
     CUDA_CHECK(cudaGetLastError());
 }
 
+void rope_f16_single_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
+                            cudaStream_t stream) {
+    if (rotary_dim != 64 || x.ne[0] != 256) {
+        throw std::invalid_argument("rope_f16: only Text D256/R64 is implemented");
+    }
+    const int tokens   = positions.ne[0];
+    const int block    = x.ne[1] * 32;
+    const int x_stride = static_cast<int>(x.nb[2] / static_cast<std::int64_t>(sizeof(__half)));
+    rope_f16_text_kernel<<<tokens, block, 0, stream>>>(
+        static_cast<const std::int32_t*>(positions.data), static_cast<__half*>(x.data), nullptr,
+        x.ne[1], 0, tokens, x_stride, 0, positions.ne[1], theta);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void rope_f16_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
+                     cudaStream_t stream) {
+    if (rotary_dim != 64 || q.ne[0] != 256 || k.ne[0] != 256) {
+        throw std::invalid_argument("rope_f16: only Text D256/R64 is implemented");
+    }
+    const int tokens = positions.ne[0];
+    const int block  = (q.ne[1] + k.ne[1]) * 32;
+    const int q_stride = static_cast<int>(q.nb[2] / static_cast<std::int64_t>(sizeof(__half)));
+    const int k_stride = static_cast<int>(k.nb[2] / static_cast<std::int64_t>(sizeof(__half)));
+    rope_f16_text_kernel<<<tokens, block, 0, stream>>>(
+        static_cast<const std::int32_t*>(positions.data), static_cast<__half*>(q.data),
+        static_cast<__half*>(k.data), q.ne[1], k.ne[1], tokens, q_stride, k_stride,
+        positions.ne[1], theta);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

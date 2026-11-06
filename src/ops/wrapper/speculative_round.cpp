@@ -176,12 +176,18 @@ void speculative_accept_greedy_tokens(const Tensor& target_tokens, const Tensor&
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,
                                         cudaStream_t stream) {
     constexpr const char* op = "speculative_select_accepted_hidden";
-    require_dtype(hidden, DType::BF16, op, "hidden");
+    const bool shared_activation =
+        hidden.dtype == DType::BF16 || hidden.dtype == DType::FP16;
+    if (!shared_activation) {
+        throw std::invalid_argument(std::string(op) + ": hidden must be BF16 or FP16");
+    }
     if (hidden.ne[0] <= 0 || hidden.ne[1] <= 0 || hidden.ne[2] <= 0 || hidden.ne[3] != 1) {
         throw std::invalid_argument("speculative_select_accepted_hidden: invalid hidden shape");
     }
     require_vector(selectors, DType::I32, hidden.ne[2], op, "selectors");
-    require_dtype(out, DType::BF16, op, "out");
+    if (out.dtype != hidden.dtype) {
+        throw std::invalid_argument(std::string(op) + ": out must share the hidden dtype");
+    }
     if (out.ne[0] != hidden.ne[0] || out.ne[1] != hidden.ne[2] || out.ne[2] != 1 ||
         out.ne[3] != 1) {
         throw std::invalid_argument("speculative_select_accepted_hidden: invalid output shape");

@@ -4,12 +4,17 @@
 #include <ninfer/targets/qwen3_6/hybrid_topology.h>
 #include <ninfer/targets/qwen3_6/vision.h>
 
+#include "targets/qwen3_6/impl/runtime/text_dtype.h"
+
 #include <array>
 #include <cstdint>
 
 namespace ninfer::targets::qwen3_6_35b_a3b::detail {
 
 struct TextConfig {
+    // Text-stream activation element; see targets/qwen3_6/impl/runtime/text_dtype.h.
+    static constexpr DType activation_dtype = qwen3_6::detail::kTextActivationDtype;
+
     static constexpr int hidden       = 2048;
     static constexpr int layers       = 40;
     static constexpr int intermediate = 512;
@@ -69,6 +74,8 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
 };
 
 struct DFlashConfig {
+    static constexpr DType activation_dtype = qwen3_6::detail::kTextActivationDtype;
+
     static constexpr bool supported        = true;
     static constexpr int layers            = 6;
     static constexpr int local_layers      = 5;

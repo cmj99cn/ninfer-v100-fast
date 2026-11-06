@@ -94,7 +94,8 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width,
+    DType activation_dtype = DType::BF16);
 
 /**
  * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8 snapshot
@@ -105,7 +106,8 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width,
+    DType activation_dtype = DType::BF16);
 
 /**
  * Op: gdn_input_proj_conv_snapshot
@@ -189,7 +191,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width,
+    DType activation_dtype = DType::BF16);
 
 /**
  * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8
@@ -200,7 +203,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width,
+    DType activation_dtype = DType::BF16);
 
 /**
  * Op: gdn_input_proj_conv_record

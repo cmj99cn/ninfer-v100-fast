@@ -186,8 +186,8 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
 
     Tensor tx(x.data(), DType::BF16, {C, T});
     Tensor tw(weight.data(), DType::BF16, {C, 4});
-    Tensor ts_in(state_in.data(), DType::BF16, {C, 3});
-    Tensor ts_out(state_out == nullptr ? state_in.data() : state_out->data(), DType::BF16, {C, 3});
+    Tensor ts_in(state_in.data(), DType::BF16, {3, C});
+    Tensor ts_out(state_out == nullptr ? state_in.data() : state_out->data(), DType::BF16, {3, C});
     Tensor tout(output.data(), DType::BF16, {C, T});
 
     if (call == StateCall::InPlaceEntry) {
@@ -262,8 +262,8 @@ int continuation_slot_case(std::int32_t C, std::int32_t T, std::int32_t slots,
         static_cast<std::size_t>(read_slot) * slot_elements * sizeof(std::uint16_t);
     Tensor tx(x.data(), DType::BF16, {C, T});
     Tensor tw(weight.data(), DType::BF16, {C, 4});
-    Tensor ts_in(selected_device, DType::BF16, {C, 3});
-    Tensor ts_out(state.data(), DType::BF16, {C, 3});
+    Tensor ts_in(selected_device, DType::BF16, {3, C});
+    Tensor ts_out(state.data(), DType::BF16, {3, C});
     Tensor tout(output.data(), DType::BF16, {C, T});
     ops::causal_conv1d_silu(tx, tw, ts_in, ts_out, tout, nullptr);
     cuda_synchronize();
@@ -327,7 +327,7 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
 
     Tensor tx(x.data(), DType::BF16, {C, T});
     Tensor tw(weight.data(), DType::BF16, {C, 4});
-    Tensor tstate(state.data(), DType::BF16, {C, 3, slots});
+    Tensor tstate(state.data(), DType::BF16, {3, C, slots});
     Tensor tslot(slot.data(), DType::I32, {1});
     Tensor tsnapshot_base(snapshot_base.data(), DType::I32, {1});
     Tensor tout(output.data(), DType::BF16, {C, T});
@@ -425,7 +425,7 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
 
     Tensor tx(x.data(), DType::BF16, {C, width, batch});
     Tensor tw(weight.data(), DType::BF16, {C, 4});
-    Tensor tstate(state.data(), DType::BF16, {C, 3, slots});
+    Tensor tstate(state.data(), DType::BF16, {3, C, slots});
     Tensor tvalid;
     if (masked) { tvalid = Tensor(valid->data(), DType::I32, {batch}); }
     Tensor tinitial(initial.data(), DType::I32, {batch});

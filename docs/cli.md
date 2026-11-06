@@ -4,13 +4,13 @@
 > 2×V100-SXM2-32GB / TP2 上的部署。下文中的 `qwen3.6-27b`/`qwen3.6-35b-a3b` 示例、上游路径
 > 及性能/兼容性结论**均未在本分支重新验证**，仅作引擎接口参考。
 
-`build-v100/apps/ninfer` runs one request against one registered `.ninfer` artifact. Build NInfer and
+`build/apps/ninfer` runs one request against one registered `.ninfer` artifact. Build NInfer and
 download an artifact using the [project README](../README.md) before following this guide.
 
 ## Text input
 
 ```bash
-build-v100/apps/ninfer models/qwen3_6_27b.ninfer \
+build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Summarize the difference between prefill and decode." \
   --max-context 16384 \
   --max-new 256
@@ -23,7 +23,7 @@ canonical `weights_id`), timings, throughput, GPU memory, and speculative-decodi
 written to stderr, so stdout can be redirected independently:
 
 ```bash
-build-v100/apps/ninfer models/qwen3_6_27b.ninfer \
+build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Return one sentence." --max-new 64 \
   > answer.txt 2> run.log
 ```
@@ -44,7 +44,8 @@ GPU residency is frozen when the Engine starts:
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
   request-transient allocation;
-- `--vision` loads those allocations and enables image/video input.
+- `--vision` loads those allocations and enables image/video input. The current self-converted
+  NVFP4 27B artifact includes Vision; the GGUF Q4_K_M identity rejects `--vision`.
 
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
 text-only Engine rejects media and cannot enable Vision later. DFlash and Vision are mutually
@@ -80,7 +81,7 @@ and an optional `tools` array.
 Run message files from the repository root when they contain repository-relative media paths:
 
 ```bash
-build-v100/apps/ninfer models/qwen3_6_27b.ninfer \
+build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --messages examples/cli/messages/image_chart.json \
   --max-context 8192 \
   --max-new 128 \
@@ -108,13 +109,13 @@ long-decode, and long-context inputs.
 
 ## Speculative decoding
 
-Speculative decoding is disabled by default. Select MTP with one to five draft positions.
-Text-only DFlash supports one to fifteen on 35B-A3B, or one to seven on Qwen3.8-27B artifacts
-containing the optional DFlash2 package. The official NVFP4 v3 container includes that package.
+Speculative decoding is disabled by default. Select MTP with one to five draft positions; the
+V100X2 profile qualifies at most three. Text-only DFlash supports one to fifteen on 35B-A3B, or
+one to seven on Qwen3.8-27B artifacts containing the optional DFlash2 package. The official NVFP4 v3 container includes that package.
 `--lm-head-draft` selects the optimized proposal head and requires a selected backend:
 
 ```bash
-build-v100/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
+build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
   --prompt "Write a short explanation of speculative decoding." \
   --max-context 16384 \
   --max-new 512 \
@@ -125,16 +126,16 @@ build-v100/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
 For DFlash:
 
 ```bash
-build-v100/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
+build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
   --prompt "Write a short explanation of speculative decoding." \
   --max-context 16384 --max-new 512 \
   --spec dflash --draft-tokens 7 --lm-head-draft
 ```
 
-For the two-V100 NVFP4 v3 DFlash2 profile:
+For the legacy two-16GB-V100 NVFP4 v3 DFlash2 profile:
 
 ```bash
-build-v100/apps/ninfer /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
+build/apps/ninfer /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
   --tp 2 --devices 0,1 --max-context 98304 --prefill-chunk 1024 --kv-dtype int8 \
   --prompt "Write a complete C++20 program." --max-new 2048 --greedy --no-thinking \
   --spec dflash --draft-tokens 7
@@ -143,11 +144,16 @@ build-v100/apps/ninfer /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
 MTP and DFlash cannot be enabled together, and DFlash cannot enable Vision. Qwen3.8 DFlash2's
 lattice selector always consumes the full target vocabulary; the optimized MTP shortlist is not
 its proposal path. The NVFP4 v3 drafter adds about 2.074 GiB of resident weights per TP rank.
-The demonstrated V100X2 configuration fits at 98304 capacity/chunk1024; 180000 capacity does not.
+The demonstrated legacy DFlash V100X2 configuration fits at 98304 capacity/chunk1024; DFlash at
+180000 capacity does not. The current 2×32GB NVFP4 MTP profile uses 262144.
 See [`docs/vs-1cat-2026-10-16.md`](vs-1cat-2026-10-16.md) for measured workloads and limitations. Seven drafts
 are a measured choice, not the 35B-A3B semantic limit.
 
 ## Common options
+
+The defaults below are the CLI defaults; `ninfer-serve` uses `8192` for `--max-context` and
+`--kv-capacity` (see [`docs/serving.md`](serving.md)). Pool options marked `(serve only)` are
+rejected by `ninfer`.
 
 | Option | Meaning | Default |
 |---|---|---:|
@@ -159,18 +165,18 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--tp 1\|2\|4` | tensor-parallel width; `2` or `4` splits the model across that many GPUs | `1` |
+| `--tp 1\|2\|4` | tensor-parallel width; `2` is the current path, `4` is the legacy 4×16GB regression | `1` |
 | `--devices A,B[,...]` | one CUDA device index per `--tp` rank; required for `--tp 2` or `--tp 4` | `--device` |
-| `--groups N` | number of independent Engine instances in one process; `1` keeps the single-Engine path | `1` |
-| `--group-devices "0,1;2,3"` | explicit per-group device lists, semicolon-separated; `--tp` is inferred from the group width when omitted | unset |
-| `--max-concurrency N` | lanes per instance; defaults to `1` at TP1, `4` at TP2, `8` at TP4 when `--groups > 1` | `1` |
-| `--global-pending-requests N` | shared pool admission queue bound across all groups | `16` |
-| `--http-threads N` | HTTP worker count; `0` derives `groups * max_concurrency + global_pending_requests + 1` in the pool path | `0` |
-| `--affinity-slack-tokens N` | soft-affinity bonus for an idle home instance during pool routing | `2048` |
-| `--fairness-aging-ms N` | queue-head aging threshold before it bypasses deeper prefixes | `1000` |
+| `--groups N` (serve only) | number of independent Engine instances in one process; `1` keeps the single-Engine path | `1` |
+| `--group-devices "0,1;2,3"` (serve only) | explicit per-group device lists, semicolon-separated; `--tp` is inferred from the group width when omitted | unset |
+| `--max-concurrency N` (serve only) | lanes per instance; defaults to `1` at TP1, `4` at TP2, `8` at TP4 when `--groups > 1` | `1` |
+| `--global-pending-requests N` (serve only) | shared pool admission queue bound across all groups | `16` |
+| `--http-threads N` (serve only) | HTTP worker count; `0` derives `groups * max_concurrency + global_pending_requests + 1` in the pool path | `0` |
+| `--affinity-slack-tokens N` (serve only) | soft-affinity bonus for an idle home instance during pool routing | `2048` |
+| `--fairness-aging-ms N` (serve only) | queue-head aging threshold before it bypasses deeper prefixes | `1000` |
 | `--kv-dtype bf16\|int8\|iq4nl` | KV-cache storage; `iq4nl` selects IQ4_NL group-32 and is accepted only by the Volta sm_70 build | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
+| `--draft-tokens N` | MTP `1..5` (V100X2 qualifies at most `3`); DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--prefix-cache` | enable the hybrid content-addressed prefix cache (block-granular KV reuse plus GDN state snapshots; device tier, optionally host-backed) | off |
@@ -215,25 +221,26 @@ unaffected. This exists for fixed-length decode work such as sustained long-cont
 throughput measurement; normal use should leave it off, because generation past the end-of-turn
 token is off-distribution and its text is not a product output.
 
-Run `build-v100/apps/ninfer --help` for the exact option contract.
+Run `build/apps/ninfer --help` for the exact option contract.
 
 ## Tensor-parallel execution
 
-`--tp 2` or `--tp 4` splits one resident model across that many CUDA devices and requires an explicit
-`--devices A,B` (or `A,B,C,D`) naming that many distinct devices of the same compute capability.
+`--tp 2` is the current 2×32GB path; `--tp 4` remains a legacy 4×16GB regression. Either width
+splits one resident model across that many CUDA devices and requires an explicit `--devices A,B`
+(or `A,B,C,D`) naming that many distinct devices of the same compute capability.
 `--device` alone selects the single device used at the default `--tp 1`; when both are given they
 must agree on the primary device.
 
 ```bash
-build-v100/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --tp 4 --devices 0,1,2,3 \
   --max-context 262144 --kv-dtype int8 --kv-capacity auto \
   --messages long_prompt.json --max-new 256 --no-thinking
 ```
 
 Tensor-parallel execution is implemented for the 27B execution package (`qwen3.6-27b` and
-`qwen3.8-27b`, either weight profile) at width 1, 2, or 4. `qwen3.6-35b-a3b` has no tensor-parallel
-path and rejects `--tp 2`/`--tp 4` at startup. At width greater than 1 on the 27B package the
+`qwen3.8-27b`, either weight profile) at width 1, 2, or 4; width 4 is the legacy 4×16GB
+regression. `qwen3.6-35b-a3b` has no tensor-parallel path and rejects `--tp 2`/`--tp 4` at startup. At width greater than 1 on the 27B package the
 `--vision` tower runs sharded across the rank group rather than replicated. `--spec mtp` is supported at all
 tensor-parallel widths, including compatible-prefix reuse in a resident Engine. Optional Qwen3.8
 DFlash2 remains limited to `--tp 2`. Both suffix prefill and exact-frontier sampling restore the
@@ -257,10 +264,11 @@ selected.
 
 `--groups N` starts N independent Engines in one process. Every group must use the same artifact
 and the same `--tp` width, and no device may appear in two groups. `--group-devices` assigns ranks
-explicitly and infers `--tp` from the group width when it is omitted:
+explicitly and infers `--tp` from the group width when it is omitted. The 8-card example below is
+community/out-of-contract:
 
 ```bash
-build-v100/apps/ninfer-serve models/qwen3_8_27b.ninfer \
+build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --groups 4 --group-devices "0,1;2,3;4,5;6,7" \
   --max-context 262144 --kv-capacity 1048576 --kv-dtype int8 \
   --max-concurrency 4 --spec mtp --draft-tokens 3 \

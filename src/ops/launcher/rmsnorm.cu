@@ -97,4 +97,45 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
     CUDA_CHECK(cudaGetLastError());
 }
 
+void rmsnorm_f16_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
+                        Tensor& out, cudaStream_t stream) {
+    const std::int32_t d = x.ne[0];
+    const std::int64_t rows = out.numel() / d;
+    if (rows > std::numeric_limits<int>::max()) {
+        throw std::overflow_error("rmsnorm_f16: row count exceeds CUDA grid limit");
+    }
+    constexpr int kBlock = 256;
+    if (weight.dtype == DType::BF16) {
+        rmsnorm_f16_generic_kernel<__nv_bfloat16>
+            <<<static_cast<unsigned int>(rows), kBlock, 0, stream>>>(
+                static_cast<const __half*>(x.data),
+                static_cast<const __nv_bfloat16*>(weight.data), static_cast<__half*>(out.data), d,
+                eps, unit_offset);
+    } else {
+        rmsnorm_f16_generic_kernel<__half><<<static_cast<unsigned int>(rows), kBlock, 0, stream>>>(
+            static_cast<const __half*>(x.data), static_cast<const __half*>(weight.data),
+            static_cast<__half*>(out.data), d, eps, unit_offset);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void rmsnorm_f16_gated_launch(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                              Tensor& out, cudaStream_t stream) {
+    const std::int32_t d = x.ne[0];
+    const std::int64_t rows = out.numel() / d;
+    constexpr int kBlock = 256;
+    if (weight.dtype == DType::BF16) {
+        rmsnorm_f16_gated_kernel<__nv_bfloat16>
+            <<<static_cast<unsigned int>(rows), kBlock, 0, stream>>>(
+                static_cast<const __half*>(x.data),
+                static_cast<const __nv_bfloat16*>(weight.data), static_cast<const __half*>(z.data),
+                static_cast<__half*>(out.data), d, eps);
+    } else {
+        rmsnorm_f16_gated_kernel<__half><<<static_cast<unsigned int>(rows), kBlock, 0, stream>>>(
+            static_cast<const __half*>(x.data), static_cast<const __half*>(weight.data),
+            static_cast<const __half*>(z.data), static_cast<__half*>(out.data), d, eps);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

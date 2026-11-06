@@ -776,7 +776,7 @@ void conv_case(int tokens, std::uint64_t salt) {
         ds.copy_from_host(sb.data(), sb.size() * 2);
         Tensor xt(dx.p, DType::BF16, {channels, tokens});
         Tensor wt(dw.p, DType::BF16, {channels, kConvWidth});
-        Tensor st(ds.p, DType::BF16, {channels, kConvState});
+        Tensor st(ds.p, DType::BF16, {kConvState, channels});
         Tensor ot(dout.p, DType::BF16, {channels, tokens});
         ops::causal_conv1d_silu(xt, wt, st, ot, nullptr);
         cuda_synchronize();

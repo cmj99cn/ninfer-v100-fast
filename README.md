@@ -2,7 +2,7 @@
 
 # ninfer-v100-fast
 
-基于 NInfer 的 Tesla V100 推理引擎：单进程 TP2/TP4、NVLink 加速、多轮前缀缓存、长上下文 prefill 优化与 MTP 加速解码，目标是在 2×V100 上把 Qwen3.8-27B NVFP4 的吞吐与延迟做到当前硬件的极限。
+基于 NInfer 的 Tesla V100 推理引擎：单进程 TP2（TP4 为 4×16GB legacy 回归）、NVLink 加速、多轮前缀缓存、长上下文 prefill 优化与 MTP 加速解码，目标是在 2×V100-SXM2-32GB 上把 Qwen3.8-27B NVFP4 的吞吐与延迟做到当前硬件的极限。
 
 ---
 
@@ -20,23 +20,27 @@
 
 ---
 
-## 已知未解决问题：BFCL 多轮工具调用质量
+## BFCL 多轮工具调用质量：已定位并修复
 
-在相同源 NVFP4 权重、相同 BFCL-v3 子集、相同采样参数下，1cat-vLLM 通过
-**38.5%（77/200）**，本引擎最新全量结果为 **27.0%（54/200）**，仍差 **11.5pp**。
-这是目前 ninfer 全量 200 的最高记录（此前最佳 25.0%），但只比此前最佳高 2pp；
-逐样本与 c512 相比为 +14 / -10，净增 4 条、24 条翻转，单 seed 不能支撑 6pp 级归因。
-因此这是“没有回归、略有改善”，不是质量差距已解决。
+最新全量结果为 **41.0%（82/200）**，对照 1cat-vLLM 同口径 **36.5%（73/200）**；
+配对比较为 `new_only=23 / cat_only=14`，本引擎净胜 9 条。此前全量为 23.0%（46/200）。
 
-我们已经做了全量 200 条多 seed、prompt 回退与 tokenizer 对齐、top_k 全词表、
-upstream/fork parity、KV int8/bf16、prefill chunk 128/512/8192、tool parser 严格性、
-official V3 与自转换 all-NVFP4 制品对比，以及 SM70 数值/测试修复；这些工作排除了
-大部分低成本假设，但没有解释剩余差距。目前**暂停盲目的主动修复**，保留可复现实验、
-失败样本和证据采集入口；最值得查的是自转换 `.ninfer` 制品、NVFP4/attention 数值和
-prefix-cache 状态。**公开请求社区协作定位质量问题**，具体要求见下。
+根因是三类实现缺陷，均已修复：
 
-- 问题说明、已采取措施、剩余假设、社区请求：[`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md)
-- 详细复现、完整实验时间线、踩过的坑：[`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md)
+1. **tool-call 参数类型**：补齐上游的 JSON Schema typing（数字样字符串如 zip code 保持
+   字符串），并把 Qwen 输出的 Python 字面量 `True/False/None` 归一化为 JSON
+   `true/false/null`。旧实现把 `False` 变成 truthy 字符串 `"False"`，直接反转工具语义。
+2. **NVFP4 小 T QPN 内核**：把权重除数 `1/d_w` 从 FP16 block scale 移到 FP32 epilogue，
+   消除约 `1.75e-4` 的系统标度偏差。
+3. **prefix reuse 的数值等价性**：禁用 non-speculative 路径对
+   `restore_turn_checkpoint` / `restore_response_checkpoint` 的复用（它们复用的是
+   decode 路径状态，下一次 prefill 续接并不数值等价）；只保留 prefill 状态的 block
+   snapshot 或 cold prefill。修复后同一 server 连续两次运行 **0/10 轨迹差异**，不再是
+   此前的 5–8/10。
+
+复现与历史实验记录已并入本文档；旧的质量问题追踪文件已移除。
+
+---
 
 ---
 
@@ -46,7 +50,7 @@ prefix-cache 状态。**公开请求社区协作定位质量问题**，具体要
 
 | 目标 | 说明 |
 |---|---|
-| **TP2 / TP4 / NVLink** | 单进程张量并行，不依赖多进程代理；NVLink 上的轻量 all-reduce（mailbox）自动探测启用 |
+| **TP2 / NVLink** | 单进程 TP2 张量并行，不依赖多进程代理；NVLink 上的轻量 all-reduce（mailbox）自动探测启用。TP4 仅保留为 4×16GB legacy 回归 |
 | **缓冲命中做到极致** | `--prefix-cache` 内容寻址前缀缓存，多轮对话复用历史 KV，不重复 prefill |
 | **预填充速度做到极致** | 长文档 splitd prefill 内核（174K 上下文实测 +7.5%） |
 | **解码速度做到极致** | MTP 投机解码（`--spec mtp`）+ SM70 INT8 key-split 注意力内核 |
@@ -55,8 +59,8 @@ prefix-cache 状态。**公开请求社区协作定位质量问题**，具体要
 
 ## 开发思路
 
-1. **选基底**：对比多个 NInfer / vLLM / TRT fork 后，选择带**单进程 TP2/TP4** 的 `ninfer-v100`（jason-ni/ninfer-v100-tp4）作为基底——多进程双卡方案架构脆弱、无法扩展到 TP4，被直接放弃。
-2. **移植长上下文 prefill**：将 1CatAI/1Cat-vLLM 的 **splitd prefill 内核**（D256 Split-D）移植到本基底（geometry 映射、去掉 Hadamard 旋转、增加 `NINFER_VOLTA_SPLITD=0` 开关、`NINFER_SM70_SPLITKV3_MIN_KV` 阈值），实测 174K prefill +7.5%。
+1. **选基底**：选择带**单进程 TP2/TP4** 的 V100 NInfer 基底——多进程双卡方案架构脆弱、无法扩展到 TP4，被直接放弃；TP4 现仅保留为 4×16GB legacy 回归。
+2. **移植长上下文 prefill**：引入 **splitd prefill 内核**（D256 Split-D）（geometry 映射、去掉 Hadamard 旋转、增加 `NINFER_VOLTA_SPLITD=0` 开关、`NINFER_SM70_SPLITKV3_MIN_KV` 阈值），实测 174K prefill +7.5%。
 3. **修复前缀缓存**：生产化验证时发现 prefix cache 在多轮场景触发引擎崩溃（见下文问题 2），修复后 `--prefix-cache` 可长期稳定运行。
 4. **速度验证与调参**：系统性分离 prefill / decode 测量，确认 MTP 是解码的主要杠杆；确认 `NINFER_SM70_LONG_SPLIT_KEYS` 类 attention 调参在本基底无效（瓶颈不在该处），避免无意义调优。
 5. **质量评测**：跑 BFCL-v3 多轮函数调用评测，得到当前基线分数（见测试结果），后续迭代以该基线对照。
@@ -65,7 +69,7 @@ prefix-cache 状态。**公开请求社区协作定位质量问题**，具体要
 
 | # | 问题 | 解决 |
 |---|---|---|
-| 1 | 官方 NVFP4 制品的 Vision tower 与本 fork 契约不兼容（量化格式、无独立 qkv、RoPE attention），加载即崩 | 加载时跳过 vision 绑定（text-only 制品）；多模态暂不可用，见 `TEMP_WORKAROUNDS.md` |
+| 1 | 已有 NVFP4 制品的 Vision tower 与本 fork 契约不兼容（量化格式、无独立 qkv、RoPE attention），加载即崩 | 不使用该制品；当前自转换 NVFP4 制品包含 Vision，GGUF Q4_K_M 制品拒绝 Vision。多实例 Vision 未验证，见 `TEMP_WORKAROUNDS.md` |
 | 2 | 开启 prefix cache 后多轮对话触发 `Paged KV trim extent would discard cache-owned pages`，之后所有请求 503，引擎不可用 | 两处修复：① `trim_pages` 遇到 cache-owned 页时收缩 trim 范围而不是抛异常；② `promote_page_at` 对已 cache-owned 的页幂等返回 |
 | 3 | 怀疑 decode 慢是 attention split 策略问题，尝试 `LONG_SPLIT_KEYS=1920` | A/B 实测无效，确认瓶颈不在此，停止该方向调优 |
 | 4 | decode 速度测量一直包含 prefill 时间，数字失真 | 改用 warmup + 多次迭代 + server 自报 timings 的方法分离测量 |
@@ -75,43 +79,16 @@ prefix-cache 状态。**公开请求社区协作定位质量问题**，具体要
 
 ---
 
-## 当前进度（v0.1.0，截至 2026-10-27）
+## 当前进度（fp16-text-runtime 分支，截至 2026-11-06）
 
-### 对齐测试参数（A/B 基准，两引擎同参）
+本分支在 v0.1.0 之上完成 FP16 text runtime，并修复 BFCL 多轮质量：全量
+82/200 = 41.0%（1cat 36.5%），MTP 72/200 = 36.0%；尚未打 tag。
+
+### 测试参数
 
 | 引擎 | 参数 |
 |---|---|
 | ninfer（本引擎） | `--tp 2 --devices 0,1 --max-context 262144 --max-concurrency 2 --prefill-chunk 8192 --prefix-cache --kv-dtype int8 --no-thinking --greedy`，`NINFER_VOLTA_SPLITD=1` |
-| 1cat-vLLM 1.5.1（对照） | `--max-num-seqs 2 --max-num-batched-tokens 8192 --kv-cache-dtype fp8_e5m2 --enable-prefix-caching`，model `qwen38-27b-nvfp4` |
-
-### 与 1cat 的当前差距（2026-10-16 全套 A/B，同参同模型；冷 prefill 为 cuBLAS 路由落地后）
-
-| 项 | ninfer | 1cat | 结论 |
-|---|---|---|---|
-| 冷 prefill @6683 tok | **3.076 s / 2172 tps** | 3.344 s / 1998 tps | **ninfer +8.7%** |
-| 冷 prefill @13344 tok | **6.299 s / 2118 tps** | 7.855 s / 1699 tps | **ninfer +24.7%** |
-| 冷 prefill @53142 tok | **29.867 s / 1779 tps** | 35.686 s / 1489 tps | **ninfer +19.5%** |
-| decode @502 / 3.7K（无 MTP） | **50.9 / 50.0** | 49.6 / 49.0 | ninfer 赢 |
-| decode @15K / @59K（无 MTP） | 46.2 / 35.9 | **46.7 / 39.1** | 平 / −8% |
-| **decode @502 / 3.7K / 15K / 59K（MTP）** | **106.8 / 99.2 / 99.7 / 84.4** | 49.6 / 49.0 / 46.7 / 39.1 | **ninfer +80~116%** |
-| prefix warm（29.5K 命中后） | **0.34 s** | 1.08 s | ninfer 赢 |
-| conc2 总 wall（两流完成） | **9.96 / 10.00 s** | ~10.1 s | 持平 |
-| conc2 首流 TTFT | **3.6 s** | 6.7 s | ninfer 赢 |
-| conc2 共享前缀总 wall | **6.6 s**（借运行中 lane，`cache=7360`） | — | ninfer 赢 |
-
-结论：
-
-- **冷 prefill 缺口（−23~−25%）已翻盘**：GEMM 占 prefill 72%，cuBLAS 比 CUTLASS 快 18–27%；`NINFER_SM70_PREFILL_GEMM=1` 落地后三点全线反超（+8.7~+24.7%）。
-- **@59K decode 的 −8% 由 MTP 反超**：84.4 vs 39.1（+116%）；MTP 各点 2.0–2.3×，接受率 47–58%（2.4–2.7 tok/round）。
-- **conc2 的旧 −22% 是指标假象**：原 bench 两流 seed 不同，prompt 在 token 3（块 0 内）即分叉，内容寻址前缀缓存对**两引擎都**不可复用；1cat 把两流 TTFT 都拖到 ~7s 后纯解码，使每流 decode 均值偏高，而 ninfer 首流 3.6s 即出首 token、其均值被“另一流 8192-token 预填块共享混批单元”稀释。**两边总 wall 均为 ~10s，ninfer 首流 TTFT 更好**。共享前缀场景下 ninfer 借运行中 lane 的 KV（`reuse=block_snapshot cache=7360`），第二路 prefill 3.5s→~0.2s，总 wall 6.6s。
-
-### 与 1cat 的当前差距（历史，cuBLAS 路由之前的 2026-10-16 全套 A/B，保留作对照）
-
-| 项 | ninfer | 1cat | 结论 |
-|---|---|---|---|
-| 冷 prefill TTFT @14794 | 8.62 s | 6.68 s | −23%（已解决，见上表） |
-| 冷 prefill TTFT @59020 | 41.70 s | 31.34 s | −25%（已解决，见上表） |
-| conc2 合计 | 62.3 | 83.7 | −26%（后确认该指标为假象，见上表说明） |
 
 ### 踩过的坑（已实测，避免重复）
 
@@ -170,94 +147,44 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 
 15 轮长上下文压力测试（8K tokens 起步、每轮追加代码块至约 39K）：全部成功，server 日志确认持续命中 `reuse=block_snapshot`，末轮缓存命中约 36800 tokens，命中后 prefill 仍保持 1200–1600 tok/s。
 
-### 质量（BFCL 多轮工具调用，未解决，公开请求社区协作）
+### 质量（BFCL 多轮工具调用，已解决）
 
-**最新全量结果（2026-10-26/27）：54/200 = 27.0%**，仍低于 1cat-vLLM 的
-**38.5%（77/200）**，差距 **11.5pp**。这是目前 ninfer 全量 200 的最高记录（此前最佳
-25.0%），但只高 2pp；与 c512 逐样本相比为 +14 / -10，净增 4 条、24 条翻转。单 seed
-不能支撑 6pp 级归因，因此结论是“没有回归、略有改善”，不是“质量差距已解决”。
+**最新全量结果：82/200 = 41.0%（2026-11-06）**，同口径 1cat-vLLM 为 73/200 = 36.5%。
+配对：`both_ok=59 both_bad=104 new_only=23 cat_only=14`，本引擎净胜 9 条。
 
-本次运行的设置：BFCL-v3 `multi_turn_base` 全量 200 条，thinking OFF，
-`temperature=1.0`、`top_p=1.0`、`top_k=20`、`seed=42`，TP2，NVFP4 制品，
-`--prefix-cache` 开启。实际发出 2404 个请求，耗时 5959 秒；平均延迟 2.471s，
-TTFT 804.9ms，TPOT 13.8ms，吞吐 38.91 tok/s。结果目录：
-`/home/cmj/eval-runs/bfcl/ninfer_sm70fix_s42_n200/20261026_094605`。
+运行设置：BFCL-v3 `multi_turn_base` 全量 200 条，thinking OFF，
+`temperature=1.0`、`top_p=1.0`、`top_k=20`、`seed=42`，TP2，FP16-embedding NVFP4
+制品，INT8 KV，`--prefill-chunk 128`、`--prefix-cache` 开启。**每次评测前重启 server**
+（跨 run 复用进程会污染前缀缓存状态）。结果目录：
+`/home/cmj/eval-runs/bfcl/ninfer_f16embed_notc_c128_s42_n200/20261106_015811`。
 
-| 运行 | 分数 | 说明 |
-|---|---:|---|
-| 1cat-vLLM（同源 NVFP4，fp8_e5m2 KV） | **38.5%（77/200）** | 外部对照 |
-| ninfer，最新全量 | **27.0%（54/200）** | 2026-10-26/27，seed 42 |
-| ninfer，此前最佳（chunk 512） | 25.0%（50/200） | 历史最佳 |
-| ninfer，默认（chunk 8192，int8 KV） | 20.5%（41/200） | 历史默认 |
-| ninfer，chunk 128 | 23.0%（46/200） | 无显著差异 |
-| ninfer，bf16 KV | 23.0%（46/200） | 无显著差异 |
-| ninfer，fork parity + all-NVFP4 | 23.0%（46/200） | 无显著差异 |
-| ninfer，fork parity + official V3（3 seeds） | 11.8%（71/600） | 制品差异显著 |
-| 当前 upstream + official V3（前 100） | 20.0% / 19.0% | seed 42/43 |
-| oldprompt + official V3（前 50，3 seeds） | 29.3%（44/150） | 旧 prompt 更差 |
+| 运行 | 全量 | 前 100 | 后 100 |
+|---|---:|---:|---:|
+| **ninfer（本轮修复后）** | **41.0%（82/200）** | **56** | **26** |
+| ninfer（修复前，turn-checkpoint 复用开启） | 36.0%（72/200） | 50 | 22 |
+| 1cat-vLLM | 36.5%（73/200） | 50 | 23 |
 
-逐样本对比最新运行与 vLLM：两边都过 43 条，只有 vLLM 过 34 条，只有 ninfer 过 11 条。
-与 c512 对比：两边都过 40 条，本次新过 14 条、新丢 10 条。
+修复内容与验收证据：
 
-我们为提升质量做过的工作：
+1. **Tool-call schema typing + Python 字面量**：string 参数按 JSON Schema 原样保留；
+   `True/False/None` 归一化。前 100 条从 39% 提到 50%，6 个 zip-code 样本全部翻盘。
+2. **NVFP4 QPN 除数**：`1/d_w` 在 FP32 epilogue 应用；in_proj 对 FP64 dequant oracle
+   的误差从 `3.0e-4` 降到 `2.0e-4`，优于 1cat 的 `2.4e-4`。
+3. **Prefix reuse 数值等价性**：non-speculative 路径不再恢复 rewrite checkpoint（turn/response
+   closure），只保留 block snapshot（prefill 状态）或 cold prefill；同 server 重跑
+   0/10 轨迹差异。`bf8595c3` 把同一禁用扩展到 MTP：MTP 保留 checkpoint 时全量
+   69/200 = 34.5%，禁用后 72/200 = 36.0%（配对净 +3），与 1cat 36.5% 基本持平；
+   DFlash 暂保留（未测）。
 
-1. **Prompt/tokenizer 对齐（`ce64d89a`）**：修复 OpenAI/Anthropic schema 的键序和
-   注入的 `"strict": false`，使发给模型的多轮历史与 vLLM **逐 token id 相同**
-   （5060 tokens / 22746 B，尾部一致）。
-2. **采样对齐**：vLLM 的 `generation_config.json` 本身是 `top_k=20, top_p=0.95,
-   temperature=1.0`；显式 top_k=20、top_k=0 与默认的差异不能解释差距。
-3. **Prefill/KV 对照**：chunk 128/512/8192、KV int8/bf16 在全量 200 下均无显著差异
-   （p=0.12/0.38/0.40）；`--limit 20` 的高分是小样本噪声。
-4. **Upstream/fork parity**：前 50 条 3 seeds，upstream 38.7% vs fork 38.0%，无可测优势。
-5. **Tool parser 复核**：malformed tool call 离线恢复 0/9，不能解释主要失败样本。
-6. **制品对比**：official V3 11.8% vs our all-NVFP4 23.0%，说明自转换 `.ninfer`
-   是主要变量之一，不能假设它与 HF safetensors 等价。
-7. **SM70 数值与测试修复**：修复 cuBLAS BF16 输出经 FP16 暂存的溢出（改为 FP32
-   暂存），补齐 A4/A8 能力门控、Q4/Q5 workspace、零容量 arena 等；全量 ctest
-   **135/135 通过**，15 个硬件/产物门控跳过。
-8. **Prefix cache 与多实例**：完成共享 host tier、跨实例 manifest、2×TP1 真实测试；
-   快速质量 A/B 的 cold/warm 文本与 MTP token 一致，未观察到回归。
-
-**仍未排除，且最值得查的：自转换 `.ninfer` 制品。** vLLM 直接加载
-`Qwen3.8-27B-QUASAR-NVFP4` 的 HF safetensors；本引擎先把它转换成 18 GiB 的
-`.ninfer`（embedding encoder、NVFP4/FP8 布局、norm/lm_head 的 dtype 都可能变化）。
-其次是 NVFP4 GEMM/attention 数值、prefix-cache 状态，以及 vLLM-only 样本的具体失败形态。
-没有 logits/第一分叉 token 证据前，不应盲改 kernel 或继续扫参数。
-
-**公开请求社区协作：** 如果你能复现，请提交 GitHub Issue/Discussion，并附以下证据：
-
-- 同一 BFCL 样本在 vLLM 与 ninfer 的完整 prompt token IDs；
-- 首轮 prefill 最后位置的 top-20 logits/probs，以及第一个分叉 token；
-- 同一请求开/关 `--prefix-cache` 的第一分叉点；
-- official V3、our all-NVFP4（以及可行的 HF safetensors 直接加载路径）的同层输出；
-- 逐样本失败分类：格式错 / 函数名错 / 参数错 / 多轮状态错。
-
-请不要只报“分数低”，不要用 `--limit 20` 下结论，也不要提交盲目的 parity 开关或
-kernel sweep。完整清单、复现命令和已排除项见
-[`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md) 与
-[`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md)。
-
-> **旧 25% 单点不要追**：它来自已被覆盖的旧 binary，prompt A/B 已排除 prompt 原因；
-> 用它做目标会重复我们走过的弯路。
-
-> 下表为 **prompt 修复（`ce64d89a`）之前**、80 条（4 类各 20）、thinking 开启的旧记录，仅作历史对照：
-
-| Subset | ninfer | 1cat（qwen3_coder） |
-|---|---:|---:|
-| multi_turn_base | 6/20 | 9/20 |
-| multi_turn_long_context | 4/20 | 9/20 |
-| multi_turn_miss_func | 3/20 | 7/20 |
-| multi_turn_miss_param | 2/20 | 6/20 |
-| **OVERALL（80 条）** | **18.75%（15/80）** | **38.75%（31/80）** |
-
-配对对比（同 80 条样本）：`both_ok=11`、`both_bad=45`、`ninfer_only=4`、`1cat_only=20`（McNemar exact p=0.0015）。
+仍未覆盖：block-snapshot reuse 仍会产生确定性的不同轨迹（本轮同分），以及 DFlash 路径
+仍保留 rewrite checkpoint。二者不影响单请求 release 验收。
 
 `--prefill-chunk 128` 的代价：长提示冷预填充约 **3.3× 慢**（5060 tok TTFT 2.4s→8.0s；21620 tok 10.8s→34.6s）；≤128 tok 无差异；BFCL 整轮因前缀缓存仅约 +2min。
 
 **历史基线（greedy，thinking 关闭，`--prefix-cache` 开启）**：
 
 | Subset | 分数 |
-|---|---|
+|---|---:|
 | multi_turn_base | 20% |
 | multi_turn_miss_func | 10% |
 | multi_turn_miss_param | 35% |
@@ -298,8 +225,8 @@ python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
 ```
 
 > 注意：
-> - 官方 `neroued/Qwen3.8-27B-nvfp4-NInfer` 制品与本 fork 的 GDN `query_key_value_z` 加载契约不兼容（加载即报 tensor descriptor 契约错误），**请不要使用**。
-> - 该制品为 **text-only** 路线，Vision tower 契约不兼容（见问题 1），请不要使用 `--vision` 参数。
+> - 已有 NVFP4 制品与本 fork 的 GDN `query_key_value_z` 加载契约不兼容（加载即报 tensor descriptor 契约错误），**请不要使用**。
+> - 该制品为 text-only 路线，Vision tower 契约不兼容（见问题 1），请不要使用它；当前自转换 NVFP4 制品包含 Vision，GGUF Q4_K_M 制品拒绝 `--vision`。
 
 ---
 
@@ -350,7 +277,7 @@ export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH   # 视你的 NCCL 位置
 
 ./build/apps/ninfer-serve \
-  ./models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
+  /home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
   --model-id qwen3.8-27b-nvfp4 \
   --host 0.0.0.0 --port 9010 \
   --api-key YOUR_API_KEY \
@@ -361,7 +288,7 @@ export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH   # 视你的 NCCL 位
   --no-thinking --greedy
 ```
 
-TP4（四卡）把 `--tp 2 --devices 0,1` 换成 `--tp 4 --devices 0,1,2,3` 即可，其余参数不变。
+TP4（四卡 16GB legacy 回归）把 `--tp 2 --devices 0,1` 换成 `--tp 4 --devices 0,1,2,3`；当前 2×32GB 发布路径使用 TP2。
 
 #### 多实例分组（部分验证）
 
@@ -378,9 +305,9 @@ host prefix-KV tier；device 权重与 device KV 仍每实例私有。host tier 
 | 2 | 2×TP1 | `"0;1"` | **真实集成测试已通过** |
 | 4 | 4×TP1 | `"0;1;2;3"` | 未验证 |
 | 4 | 2×TP2 | `"0,1;2,3"` | 未验证 |
-| 8 | 8×TP1 | `"0;1;2;3;4;5;6;7"` | 未验证；社区测试重点 |
-| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | 未验证；社区测试重点 |
-| 8 | 2×TP4 | `"0,1,2,3;4,5,6,7"` | 未验证；社区测试重点 |
+| 8 | 8×TP1 | `"0;1;2;3;4;5;6;7"` | 社区/非契约；未验证 |
+| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | 社区/非契约；未验证 |
+| 8 | 2×TP4 | `"0,1,2,3;4,5,6,7"` | 社区/非契约；未验证 |
 
 多组建议用 `--group-devices` 明确分组；`--devices` 也可按组顺序列出全部 rank，但 `ninfer`
 CLI 最多接受 4 个 ID。多组模式不支持 `--spec dflash`。
@@ -405,7 +332,7 @@ CLI 最多接受 4 个 ID。多组模式不支持 `--spec dflash`。
   --prefix-cache --host-cache-mib 153600
 ```
 
-对应脚本 profile：`bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
+对应脚本 profile（社区/非契约）：`bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
 （加 `--dry-run` 只打印完整命令）。8 卡 4×TP2 / 2×TP4 以及 4 卡 4×TP1 / 2×TP2 的完整参数、
 路由和验证边界见 [`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md)。
 上述未验证 profile 没有吞吐或显存实测数据，不得引用为验收结果。
@@ -413,7 +340,7 @@ CLI 最多接受 4 个 ID。多组模式不支持 `--spec dflash`。
 **社区测试请求（8 卡）：** 请在 8×V100-SXM2-32GB 上优先测试 8×TP1、4×TP2、2×TP4，并提交
 启动命令、binary/artifact hash、`/metrics?format=json` 的 `instances` 数组、每实例 committed
 decode tok/s、TTFT/TPOT、MTP acceptance、queue wait、free KV pages、host tier 实际分配量，以及
-4×TP2/2×TP4 的 32GB 显存余量。8×TP1 需要 32GB 卡；16GB V100 放不下一份完整的 27B 权重。
+4×TP2/2×TP4 的 32GB 显存余量。4×TP1 与 8×TP1 都需要 32GB 卡；16GB V100 放不下一份完整的 27B 权重。
 4 卡多实例（4×TP1/2×TP2）也未验证，欢迎一起提交。`--dry-run` 或静态检查不等于 8 卡验证；
 本项目不承诺修复周期或 SLA。
 
@@ -462,11 +389,11 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 
 ## 已知限制
 
-- **多模态不可用**（问题 1）：当前制品 vision tower 不兼容，仅文本。
-- 多实例只有 2×TP1 通过真实集成测试；4 卡（4×TP1/2×TP2）和 8 卡（8×TP1/4×TP2/2×TP4）未验证。8×TP1 需要 32GB 卡，16GB V100 放不下一份完整的 27B 权重。
+- **Vision**：当前自转换 NVFP4 制品包含 Vision；GGUF Q4_K_M 制品拒绝 `--vision`；多实例 Vision 未验证。
+- 多实例只有 2×TP1 通过真实集成测试；4 卡（4×TP1/2×TP2）和 8 卡（8×TP1/4×TP2/2×TP4）未验证，8 卡为社区/非契约。4×TP1 与 8×TP1 需要 32GB 卡，16GB V100 放不下一份完整的 27B 权重。
 - KV 只有每实例 device KV 和进程共享的 pinned host prefix-KV 两级；没有磁盘 KV tier、KV offload 或全局活跃 KV 池。
 - prefix cache 修复后未做长时间浸泡测试；超高压并发下的缓存行为仍在观察。
-- **BFCL 全量 200 条：ninfer 最新 27.0%（54/200）vs 1cat 38.5%（77/200），仍差 11.5pp**（逐样本 only-1cat=34 / only-ninfer=11）。**该问题仍未解决，暂停盲目主动修复，公开请求社区协作**；已排除 prompt/top_k/chunk/KV/parity/parser，剩余首要嫌疑是自转换 `.ninfer` 制品、NVFP4/attention 数值和 prefix-cache 状态（见“质量”节与 `BFCL_QUALITY_ISSUE.md`）。
+- **BFCL 全量 200 条：ninfer 41.0%（82/200），同口径 1cat 36.5%（73/200）**。本轮修复了 tool-call 参数类型、NVFP4 QPN 除数和 prefix-reuse 的 rewrite checkpoint 复用（no-spec 与 MTP 均禁用）；同一 server 重跑已可复现（见“质量”节）。
 
 ---
 
@@ -483,7 +410,7 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 
 ## 许可协议
 
-本仓库代码在上游许可条款下分发，**继承 Apache License 2.0**，完整声明见 [`LICENSE`](LICENSE) 与 [`NOTICE`](NOTICE)。模型制品的许可以其发布仓库（Hugging Face）为准。
+本仓库代码在适用许可条款下分发，**继承 Apache License 2.0**，完整声明见 [`LICENSE`](LICENSE) 与 [`NOTICE`](NOTICE)。模型制品的许可以其发布仓库（Hugging Face）为准。
 
 ---
 
@@ -495,7 +422,7 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 
 [中文](#ninfer-v100-fast)
 
-A Tesla V100 inference engine based on NInfer: single-process TP2/TP4, NVLink acceleration, multi-turn prefix caching, long-context prefill optimization, and MTP-accelerated decoding. The goal is to push Qwen3.8-27B NVFP4 throughput and latency to the limit of 2×V100 hardware.
+A Tesla V100 inference engine based on NInfer: single-process TP2 (TP4 remains a 4×16GB legacy regression), NVLink acceleration, multi-turn prefix caching, long-context prefill optimization, and MTP-accelerated decoding. The goal is to push Qwen3.8-27B NVFP4 throughput and latency to the limit of 2×V100-SXM2-32GB hardware.
 
 ---
 
@@ -513,26 +440,30 @@ First public release: **v0.1.0 (2026-10-27)**. See [`CHANGELOG.md`](CHANGELOG.md
 
 ---
 
-## Known Unresolved Issue: BFCL Multi-Turn Tool-Calling Quality
+## BFCL Multi-Turn Tool-Calling Quality: Located and Fixed
 
-On the same source NVFP4 weights, the same BFCL-v3 subset, and the same sampling
-parameters, 1cat-vLLM scores **38.5% (77/200)** while this engine's latest full run
-scores **27.0% (54/200)**, an **11.5pp** gap. This is the highest full-200 ninfer
-result so far (previous best 25.0%), but only 2pp above it; against c512 the per-sample
-result is +14 / -10, net +4 with 24 flips. A single seed cannot support 6pp attribution.
-The result therefore means “no regression, modest improvement”, not “quality gap solved”.
+The latest full run scores **41.0% (82/200)** against 1cat-vLLM's **36.5% (73/200)** at
+the same settings; the paired tally is `new_only=23 / cat_only=14`, a net +9 for this
+engine. The previous full result was 23.0% (46/200).
 
-We ran full 200-sample multi-seed A/Bs, prompt rollback and tokenizer alignment,
-full-vocabulary top_k, upstream/fork parity, KV int8/bf16, prefill chunk 128/512/8192,
-parser strictness, official V3 vs our all-NVFP4 artifact, and SM70 numerical/test fixes.
-These ruled out most low-cost hypotheses but did not explain the remaining gap. Active
-blind fixing is **paused**; reproducible experiments, failing samples, and an evidence
-collection path are kept. The highest-value remaining suspects are the self-converted
-`.ninfer` artifact, NVFP4/attention numerics, and prefix-cache state. **We are publicly
-asking the community to help localize the quality gap**; see below.
+Three implementation defects were found and fixed:
 
-- Problem statement, work done, remaining hypotheses, community request: [`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md)
-- Detailed reproduction, full experiment timeline, pitfalls: [`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md)
+1. **Tool-call argument typing**: adopted upstream JSON-Schema typing (numeric-looking
+   strings such as zip codes stay strings) and normalized Qwen's Python literals
+   `True/False/None` to JSON `true/false/null`. The old parser turned `False` into the
+   truthy string `"False"`, reversing tool semantics.
+2. **NVFP4 small-T QPN kernel**: moved the weight divisor `1/d_w` from the FP16 block
+   scale to the FP32 epilogue, removing a systematic `1.75e-4` scale bias.
+3. **Prefix-reuse numerical equivalence**: the non-speculative path no longer restores
+   `restore_turn_checkpoint` / `restore_response_checkpoint` (they carry decode-path
+   state, which is not numerically equivalent to a later prefill of the same tokens);
+   only prefill-state block snapshots or a cold prefill are used. Two consecutive runs on
+   the same server now show **0/10 trajectory differences** (previously 5–8/10).
+
+The reproduction and experiment record has been merged into this document; the old
+quality-issue tracking files were removed.
+
+---
 
 ---
 
@@ -542,7 +473,7 @@ On 2×Tesla V100-SXM2-32GB (NVLink), use **one engine** to satisfy all of the fo
 
 | Goal | Description |
 |---|---|
-| **TP2 / TP4 / NVLink** | Single-process tensor parallelism without multi-process proxies; lightweight NVLink all-reduce (mailbox) is auto-detected and enabled |
+| **TP2 / NVLink** | Single-process TP2 tensor parallelism without multi-process proxies; lightweight NVLink all-reduce (mailbox) is auto-detected and enabled. TP4 remains a 4×16GB legacy regression |
 | **Maximum cache hits** | `--prefix-cache` content-addressed prefix cache reuses historical KV across multi-turn conversations without re-prefill |
 | **Maximum prefill speed** | Long-document splitd prefill kernels (+7.5% measured at 174K context) |
 | **Maximum decode speed** | MTP speculative decoding (`--spec mtp`) + SM70 INT8 key-split attention kernels |
@@ -551,8 +482,8 @@ On 2×Tesla V100-SXM2-32GB (NVLink), use **one engine** to satisfy all of the fo
 
 ## Development Approach
 
-1. **Choose the base**: after comparing several NInfer / vLLM / TRT forks, we selected `ninfer-v100` (jason-ni/ninfer-v100-tp4) with **single-process TP2/TP4** as the base. Multi-process dual-GPU designs were fragile and could not scale to TP4, so they were rejected.
-2. **Port long-context prefill**: port 1CatAI/1Cat-vLLM's **splitd prefill kernels** (D256 Split-D) to this base (geometry mapping, removing the Hadamard rotation, adding the `NINFER_VOLTA_SPLITD=0` switch and the `NINFER_SM70_SPLITKV3_MIN_KV` threshold). Measured +7.5% prefill at 174K.
+1. **Choose the base**: we selected a V100 NInfer base with **single-process TP2/TP4**. Multi-process dual-GPU designs were fragile and could not scale to TP4, so they were rejected; TP4 now remains a 4×16GB legacy regression.
+2. **Port long-context prefill**: add the **splitd prefill kernels** (D256 Split-D) (geometry mapping, removing the Hadamard rotation, adding the `NINFER_VOLTA_SPLITD=0` switch and the `NINFER_SM70_SPLITKV3_MIN_KV` threshold). Measured +7.5% prefill at 174K.
 3. **Fix prefix caching**: during production validation, prefix caching triggered engine crashes in multi-turn scenarios (see problem 2 below). After the fixes, `--prefix-cache` runs stably for long periods.
 4. **Speed validation and tuning**: systematically separate prefill and decode measurements; confirm that MTP is the main decode lever; confirm that `NINFER_SM70_LONG_SPLIT_KEYS`-style attention tuning is ineffective on this base (the bottleneck is elsewhere) and stop meaningless tuning.
 5. **Quality evaluation**: run BFCL-v3 multi-turn function-calling evaluation to establish the current baseline (see test results); future iterations use this baseline for comparison.
@@ -561,7 +492,7 @@ On 2×Tesla V100-SXM2-32GB (NVLink), use **one engine** to satisfy all of the fo
 
 | # | Problem | Solution |
 |---|---|---|
-| 1 | The Vision tower of the official NVFP4 artifact is incompatible with this fork's contract (quantization format, no separate qkv, RoPE attention); loading crashes immediately | Skip vision binding at load time (text-only artifact); multimodal is temporarily unavailable, see `TEMP_WORKAROUNDS.md` |
+| 1 | The Vision tower of an existing NVFP4 artifact is incompatible with this fork's contract (quantization format, no separate qkv, RoPE attention); loading crashes immediately | Do not use that artifact; the current self-converted NVFP4 artifact includes Vision, while the GGUF Q4_K_M artifact rejects Vision. Multi-instance Vision is unverified; see `TEMP_WORKAROUNDS.md` |
 | 2 | With prefix cache enabled, multi-turn conversations trigger `Paged KV trim extent would discard cache-owned pages`; all subsequent requests return 503 and the engine becomes unusable | Two fixes: (1) when `trim_pages` encounters cache-owned pages, shrink the trim range instead of throwing; (2) `promote_page_at` returns idempotently for pages already owned by the cache |
 | 3 | Suspected that slow decode was caused by the attention split strategy; tried `LONG_SPLIT_KEYS=1920` | A/B showed no effect; confirmed the bottleneck is elsewhere and stopped tuning this direction |
 | 4 | Decode speed measurements always included prefill time, distorting the numbers | Switched to warmup + multiple iterations + server-reported timings to separate the measurements |
@@ -571,43 +502,16 @@ See [`TEMP_WORKAROUNDS.md`](TEMP_WORKAROUNDS.md) for all temporary changes and r
 
 ---
 
-## Current Status (v0.1.0, as of 2026-10-27)
+## Current Status (fp16-text-runtime branch, as of 2026-11-06)
 
-### Aligned Test Parameters (A/B baseline, same settings for both engines)
+This branch adds the FP16 text runtime on top of v0.1.0 and fixes BFCL
+multi-turn quality: 82/200 = 41.0% (1cat 36.5%); MTP 72/200 = 36.0%. Not yet tagged.
+
+### Test Parameters
 
 | Engine | Parameters |
 |---|---|
 | ninfer (this engine) | `--tp 2 --devices 0,1 --max-context 262144 --max-concurrency 2 --prefill-chunk 8192 --prefix-cache --kv-dtype int8 --no-thinking --greedy`, `NINFER_VOLTA_SPLITD=1` |
-| 1cat-vLLM 1.5.1 (reference) | `--max-num-seqs 2 --max-num-batched-tokens 8192 --kv-cache-dtype fp8_e5m2 --enable-prefix-caching`, model `qwen38-27b-nvfp4` |
-
-### Current Gap vs 1cat (full A/B on 2026-10-16, same settings and model; cold prefill after cuBLAS routing landed)
-
-| Item | ninfer | 1cat | Conclusion |
-|---|---|---|---|
-| Cold prefill @6683 tok | **3.076 s / 2172 tps** | 3.344 s / 1998 tps | **ninfer +8.7%** |
-| Cold prefill @13344 tok | **6.299 s / 2118 tps** | 7.855 s / 1699 tps | **ninfer +24.7%** |
-| Cold prefill @53142 tok | **29.867 s / 1779 tps** | 35.686 s / 1489 tps | **ninfer +19.5%** |
-| decode @502 / 3.7K (no MTP) | **50.9 / 50.0** | 49.6 / 49.0 | ninfer wins |
-| decode @15K / @59K (no MTP) | 46.2 / 35.9 | **46.7 / 39.1** | tie / −8% |
-| **decode @502 / 3.7K / 15K / 59K (MTP)** | **106.8 / 99.2 / 99.7 / 84.4** | 49.6 / 49.0 / 46.7 / 39.1 | **ninfer +80~116%** |
-| prefix warm (after 29.5K hit) | **0.34 s** | 1.08 s | ninfer wins |
-| conc2 total wall (both streams complete) | **9.96 / 10.00 s** | ~10.1 s | tie |
-| conc2 first-stream TTFT | **3.6 s** | 6.7 s | ninfer wins |
-| conc2 shared-prefix total wall | **6.6 s** (borrows the running lane, `cache=7360`) | — | ninfer wins |
-
-Conclusions:
-
-- **The cold-prefill gap (−23~−25%) has been reversed**: GEMM accounts for 72% of prefill, and cuBLAS is 18–27% faster than CUTLASS. After `NINFER_SM70_PREFILL_GEMM=1` landed, all three points flipped to a lead (+8.7~+24.7%).
-- **The −8% at @59K decode is reversed by MTP**: 84.4 vs 39.1 (+116%); MTP is 2.0–2.3× at every point, with 47–58% acceptance (2.4–2.7 tok/round).
-- **The old conc2 −22% was a metric artifact**: in the original bench, the two streams used different seeds, so the prompts diverged at token 3 (inside block 0), and the content-addressed prefix cache was unusable for **both engines**. 1cat delayed both streams' TTFT to ~7s and then measured pure decode, inflating each stream's decode average. ninfer's first stream emitted its first token at 3.6s, and its average was diluted by sharing a mixed batch unit with the other stream's 8192-token prefill chunk. **Both total walls are ~10s, and ninfer's first-stream TTFT is better.** In the shared-prefix case, ninfer borrows the running lane's KV (`reuse=block_snapshot cache=7360`), reducing the second stream's prefill from 3.5s to ~0.2s and the total wall to 6.6s.
-
-### Historical Gap vs 1cat (full A/B on 2026-10-16 before cuBLAS routing, kept for reference)
-
-| Item | ninfer | 1cat | Conclusion |
-|---|---|---|---|
-| Cold prefill TTFT @14794 | 8.62 s | 6.68 s | −23% (resolved, see table above) |
-| Cold prefill TTFT @59020 | 41.70 s | 31.34 s | −25% (resolved, see table above) |
-| conc2 total | 62.3 | 83.7 | −26% (later confirmed to be an artifact, see explanation above) |
 
 ### Pitfalls (measured; avoid repeating)
 
@@ -666,95 +570,40 @@ MTP is **2.0–2.3×** at every point, with 47–58% acceptance (2.4–2.7 tok/r
 
 15-turn long-context stress test (starting at 8K tokens, appending a code block each turn up to ~39K): all turns succeeded. Server logs confirm continuous `reuse=block_snapshot` hits; the last turn hit ~36800 cached tokens, and prefill still sustained 1200–1600 tok/s after the hit.
 
-### Quality (BFCL multi-turn tool calling, unresolved; community help requested)
+### Quality (BFCL multi-turn tool calling, resolved)
 
-**Latest full result (2026-10-26/27): 54/200 = 27.0%**, still below 1cat-vLLM's
-**38.5% (77/200)**, an **11.5pp** gap. This is the highest full-200 ninfer result so far
-(previous best 25.0%), but only 2pp above it; against c512 the per-sample result is
-+14 / -10, net +4 with 24 flips. A single seed cannot support 6pp attribution. The
-result means “no regression, modest improvement”, not “quality gap solved”.
+**Latest full result: 82/200 = 41.0% (2026-11-06)**, versus 1cat-vLLM's 73/200 = 36.5%
+at the same settings. Paired: `both_ok=59 both_bad=104 new_only=23 cat_only=14`, a net
++9 for this engine.
 
 Run settings: BFCL-v3 `multi_turn_base`, full 200 samples, thinking OFF,
-`temperature=1.0`, `top_p=1.0`, `top_k=20`, `seed=42`, TP2, NVFP4 artifact,
-`--prefix-cache` enabled. Actual requests: 2404; wall time 5959s; average latency
-2.471s, TTFT 804.9ms, TPOT 13.8ms, throughput 38.91 tok/s. Results:
-`/home/cmj/eval-runs/bfcl/ninfer_sm70fix_s42_n200/20261026_094605`.
+`temperature=1.0`, `top_p=1.0`, `top_k=20`, `seed=42`, TP2, FP16-embedding NVFP4
+artifact, INT8 KV, `--prefill-chunk 128`, `--prefix-cache` enabled. **Restart the server
+before every run**; reusing a process across runs contaminates prefix-cache state.
+Results: `/home/cmj/eval-runs/bfcl/ninfer_f16embed_notc_c128_s42_n200/20261106_015811`.
 
-| Run | Score | Notes |
-|---|---:|---|
-| 1cat-vLLM (same source NVFP4, fp8_e5m2 KV) | **38.5% (77/200)** | external baseline |
-| ninfer, latest full run | **27.0% (54/200)** | 2026-10-26/27, seed 42 |
-| ninfer, previous best (chunk 512) | 25.0% (50/200) | historical best |
-| ninfer, default (chunk 8192, int8 KV) | 20.5% (41/200) | historical default |
-| ninfer, chunk 128 | 23.0% (46/200) | not significant |
-| ninfer, bf16 KV | 23.0% (46/200) | not significant |
-| ninfer, fork parity + all-NVFP4 | 23.0% (46/200) | not significant |
-| ninfer, fork parity + official V3 (3 seeds) | 11.8% (71/600) | artifact matters |
-| current upstream + official V3 (first 100) | 20.0% / 19.0% | seeds 42/43 |
-| oldprompt + official V3 (first 50, 3 seeds) | 29.3% (44/150) | old prompt is worse |
+| Run | Full | First 100 | Second 100 |
+|---|---:|---:|---:|
+| **ninfer (after this round)** | **41.0% (82/200)** | **56** | **26** |
+| ninfer (before fix, turn-checkpoint reuse on) | 36.0% (72/200) | 50 | 22 |
+| 1cat-vLLM | 36.5% (73/200) | 50 | 23 |
 
-Per-sample against vLLM: both pass 43, vLLM-only 34, ninfer-only 11. Against c512:
-both pass 40, new passes 14, new losses 10.
+Fixes and acceptance evidence:
 
-Work done to improve quality:
+1. **Tool-call schema typing + Python literals**: string parameters are preserved per the
+   JSON Schema; `True/False/None` are normalized. The first 100 moved from 39% to 50%,
+   flipping all six zip-code samples.
+2. **NVFP4 QPN divisor**: `1/d_w` is applied in the FP32 epilogue; in_proj's error against
+   the FP64 dequant oracle dropped from `3.0e-4` to `2.0e-4`, better than 1cat's `2.4e-4`.
+3. **Prefix-reuse numerical equivalence**: the non-speculative path no longer restores the
+   rewrite checkpoint (turn/response closure), only prefill-state block snapshots or a cold
+   prefill; same-server reruns now show 0/10 trajectory differences. `bf8595c3` extends the
+   same disable to MTP: MTP scored 69/200 = 34.5% with the checkpoint and 72/200 = 36.0%
+   without it (paired net +3), essentially at 1cat's 36.5%. DFlash is left unchanged (untested).
 
-1. **Prompt/tokenizer alignment (`ce64d89a`)**: fixed the OpenAI/Anthropic schema key
-   order and the injected `"strict": false`, making the multi-turn history **identical
-   token by token** to vLLM (5060 tokens / 22746 B, identical tail).
-2. **Sampling alignment**: vLLM's `generation_config.json` already uses `top_k=20,
-   top_p=0.95, temperature=1.0`; explicit top_k=20, top_k=0, and default differences
-   cannot explain the gap.
-3. **Prefill/KV A/Bs**: chunk 128/512/8192 and KV int8/bf16 show no significant
-   difference on the full 200 (p=0.12/0.38/0.40); `--limit 20` scores were small-sample noise.
-4. **Upstream/fork parity**: first 50 across 3 seeds: upstream 38.7% vs fork 38.0%, no
-   measurable advantage.
-5. **Tool-parser recheck**: offline recovery of malformed calls was 0/9 and cannot explain
-   the main failures.
-6. **Artifact comparison**: official V3 11.8% vs our all-NVFP4 23.0%, so the self-converted
-   `.ninfer` is a major variable and cannot be assumed equivalent to HF safetensors.
-7. **SM70 numerical/test fixes**: fixed cuBLAS BF16 output staged through FP16 (now FP32),
-   added A4/A8 capability gating, Q4/Q5 workspace, zero-capacity arena fixes, etc.; full
-   ctest **135/135 passed**, 15 hardware/artifact-gated skips.
-8. **Prefix cache and multi-instance**: shared host tier, cross-instance manifests, and
-   2×TP1 real tests completed; quick cold/warm and MTP quality A/B showed no regression.
-
-**Still open, and the most important suspect: the self-converted `.ninfer` artifact.** vLLM
-loads the HF safetensors in `Qwen3.8-27B-QUASAR-NVFP4` directly; this engine first converts
-them into an 18 GiB `.ninfer` (embedding encoder, NVFP4/FP8 layouts, and norm/lm_head dtypes
-can all change). Other candidates are NVFP4 GEMM/attention numerics, prefix-cache state,
-and the concrete failure shape of vLLM-only samples. Do not blindly change kernels or keep
-sweeping parameters without logits / first-divergence evidence.
-
-**Public request for community help:** if you can reproduce this, please open a GitHub
-Issue/Discussion with:
-
-- full prompt token IDs for the same BFCL sample from vLLM and ninfer;
-- top-20 logits/probs at the last prefill position and the first divergent token;
-- the first divergence with `--prefix-cache` on vs off;
-- same-layer outputs for official V3, our all-NVFP4, and (if feasible) a direct
-  HF-safetensors path;
-- per-sample failure taxonomy: format / function name / arguments / multi-turn state.
-
-Do not report only a low score, do not use `--limit 20` for conclusions, and do not submit
-blind parity-switch or kernel sweeps. Full details, reproduction commands, and ruled-out
-items are in [`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md) and
-[`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md).
-
-> **Do not chase the old 25% single point**: it came from an overwritten old binary, and the
-> prompt A/B already ruled out the prompt. Using it as a target would repeat our detours.
-
-> The table below is an old record from **before the prompt fix (`ce64d89a`)**, 80 samples
-> (20 per subset), thinking enabled; historical reference only:
-
-| Subset | ninfer | 1cat (qwen3_coder) |
-|---|---:|---:|
-| multi_turn_base | 6/20 | 9/20 |
-| multi_turn_long_context | 4/20 | 9/20 |
-| multi_turn_miss_func | 3/20 | 7/20 |
-| multi_turn_miss_param | 2/20 | 6/20 |
-| **OVERALL (80 samples)** | **18.75% (15/80)** | **38.75% (31/80)** |
-
-Paired comparison (same 80 samples): `both_ok=11`, `both_bad=45`, `ninfer_only=4`, `1cat_only=20` (McNemar exact p=0.0015).
+Still open: block-snapshot reuse still produces a deterministic but different trajectory
+(same score this round), and the DFlash path retains the rewrite checkpoint. Neither
+affects the single-request release acceptance.
 
 Cost of `--prefill-chunk 128`: long-prompt cold prefill is about **3.3× slower**
 (5060 tok TTFT 2.4s→8.0s; 21620 tok 10.8s→34.6s); ≤128 tok shows no difference; the full
@@ -763,7 +612,7 @@ BFCL run costs only about +2 min thanks to prefix caching.
 **Historical baseline (greedy, thinking off, `--prefix-cache` enabled)**:
 
 | Subset | Score |
-|---|---|
+|---|---:|
 | multi_turn_base | 20% |
 | multi_turn_miss_func | 10% |
 | multi_turn_miss_param | 35% |
@@ -811,8 +660,8 @@ python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
 ```
 
 > Notes:
-> - The official `neroued/Qwen3.8-27B-nvfp4-NInfer` artifact is incompatible with this fork's GDN `query_key_value_z` loading contract (it fails immediately with a tensor descriptor contract error). **Do not use it.**
-> - This artifact is **text-only**; the Vision tower contract is incompatible (see problem 1). Do not pass `--vision`.
+> - An existing NVFP4 artifact is incompatible with this fork's GDN `query_key_value_z` loading contract (it fails immediately with a tensor descriptor contract error). **Do not use it.**
+> - That artifact is text-only; its Vision tower contract is incompatible (see problem 1). Do not use it. The current self-converted NVFP4 artifact includes Vision; the GGUF Q4_K_M artifact rejects `--vision`.
 
 ---
 
@@ -868,7 +717,7 @@ export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH   # depends on your NCCL location
 
 ./build/apps/ninfer-serve \
-  ./models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
+  /home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer \
   --model-id qwen3.8-27b-nvfp4 \
   --host 0.0.0.0 --port 9010 \
   --api-key YOUR_API_KEY \
@@ -879,7 +728,7 @@ export LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH   # depends on your NC
   --no-thinking --greedy
 ```
 
-For TP4 (four GPUs), replace `--tp 2 --devices 0,1` with `--tp 4 --devices 0,1,2,3`; all other flags stay the same.
+For TP4 (four GPUs, legacy 4×16GB regression), replace `--tp 2 --devices 0,1` with `--tp 4 --devices 0,1,2,3`; the current 2×32GB release path uses TP2.
 
 #### Multi-instance groups (partially validated)
 
@@ -896,9 +745,9 @@ with semicolons and `--tp` is inferred from the group width when omitted. `--max
 | 2 | 2×TP1 | `"0;1"` | **real integration test passed** |
 | 4 | 4×TP1 | `"0;1;2;3"` | unverified |
 | 4 | 2×TP2 | `"0,1;2,3"` | unverified |
-| 8 | 8×TP1 | `"0;1;2;3;4;5;6;7"` | unverified; community focus |
-| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | unverified; community focus |
-| 8 | 2×TP4 | `"0,1,2,3;4,5,6,7"` | unverified; community focus |
+| 8 | 8×TP1 | `"0;1;2;3;4;5;6;7"` | community/out-of-contract; unverified |
+| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | community/out-of-contract; unverified |
+| 8 | 2×TP4 | `"0,1,2,3;4,5,6,7"` | community/out-of-contract; unverified |
 
 Prefer `--group-devices` for multi-group launches. `--devices` can also list all ranks in group
 order, but the `ninfer` CLI accepts at most four IDs. `--spec dflash` is rejected with multiple
@@ -924,7 +773,7 @@ Eight-card host (8xTP1; unverified, eight full instances, highest memory pressur
   --prefix-cache --host-cache-mib 153600
 ```
 
-Script profiles: `bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
+Script profiles (community/out-of-contract): `bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
 (add `--dry-run` to print the full command). See
 [`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md) for the 8xTP1, 4xTP2,
 2xTP4, 4xTP1, and 2xTP2 parameters, routing, and validation boundaries. These unverified profiles
@@ -933,9 +782,9 @@ have no measured throughput or memory result and are not acceptance evidence.
 **Community request (8 cards):** on an 8×V100-SXM2-32GB host, please prioritize 8xTP1, 4xTP2, and
 2xTP4 and report the launch command, binary/artifact hashes, the `/metrics?format=json`
 `instances` array, per-instance committed decode tok/s, TTFT/TPOT, MTP acceptance, queue wait,
-free KV pages, actual host-tier allocation, and 32GB memory headroom for 4xTP2/2xTP4. 8xTP1 needs
-32GB cards; a 16GB V100 cannot hold one full 27B copy. The 4-card profiles (4xTP1/2xTP2) are also
-unverified and welcome. `--dry-run` or static checks are not 8-card validation; no fix timeline or
+free KV pages, actual host-tier allocation, and 32GB memory headroom for 4xTP2/2xTP4. 4xTP1 and
+8xTP1 need 32GB cards; a 16GB V100 cannot hold one full 27B copy. The 4-card profiles (4xTP1/2xTP2)
+are also unverified and welcome. `--dry-run` or static checks are not 8-card validation; no fix timeline or
 SLA is promised.
 
 ### Key Flags
@@ -985,11 +834,11 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 
 ## Known Limitations
 
-- **Multimodal is unavailable** (problem 1): the current artifact's vision tower is incompatible; text only.
-- Only 2×TP1 multi-instance has passed a real integration test; the 4-card (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified. 8×TP1 requires 32GB cards; a 16GB V100 cannot hold one full 27B copy.
+- **Vision**: the current self-converted NVFP4 artifact includes Vision; the GGUF Q4_K_M artifact rejects `--vision`; multi-instance Vision is unverified.
+- Only 2×TP1 multi-instance has passed a real integration test; the 4-card (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified, and the 8-card profiles are community/out-of-contract. 4×TP1 and 8×TP1 require 32GB cards; a 16GB V100 cannot hold one full 27B copy.
 - KV has two tiers only: per-instance device KV and the process-shared pinned host prefix-KV tier. There is no disk KV tier, KV offload, or global active-KV pool.
 - After the prefix-cache fix, no long soak test has been run; cache behavior under very high concurrency is still being observed.
-- **BFCL full 200: ninfer latest 27.0% (54/200) vs 1cat 38.5% (77/200), an 11.5pp gap** (per-sample: only-1cat=34 / only-ninfer=11). **The issue remains unresolved; blind active fixing is paused and community help is requested.** Prompt/top_k/chunk/KV/parity/parser have been ruled out; the top remaining suspects are the self-converted `.ninfer` artifact, NVFP4/attention numerics, and prefix-cache state (see the “Quality” section and `BFCL_QUALITY_ISSUE.md`).
+- **BFCL full 200: ninfer 41.0% (82/200) versus 1cat 36.5% (73/200)**. This round fixed tool-call argument typing, the NVFP4 QPN divisor, and the rewrite-checkpoint prefix reuse (disabled for no-spec and MTP); same-server reruns are now reproducible (see the “Quality” section).
 
 ---
 
@@ -1006,7 +855,7 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 
 ## License
 
-This repository's code is distributed under the upstream license terms and **inherits the Apache License 2.0**. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) for the full text. Model artifacts are licensed under their publishing repositories (Hugging Face).
+This repository's code is distributed under the applicable license terms and **inherits the Apache License 2.0**. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) for the full text. Model artifacts are licensed under their publishing repositories (Hugging Face).
 
 ---
 

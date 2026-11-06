@@ -1,4 +1,5 @@
 #include "ninfer/ops/gdn_gating_proj.h"
+#include "ninfer/ops/gdn_gating_proj_f16.h"
 #include "ninfer/ops/rmsnorm.h"
 
 #include "ops/common/split_launch.h"
@@ -122,6 +123,28 @@ std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
                                                                  max_tokens);
 }
 
+
+namespace {
+
+Tensor control_tensor_view(const Weight& w, std::int32_t rows, std::int32_t input_rows) {
+    return Tensor(const_cast<void*>(w.qdata), DType::BF16, {rows, input_rows});
+}
+
+void gdn_norm_gating_proj_f16(const Tensor& x, const Tensor& norm_weight, float eps, const Weight& a_weight,
+                              const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias,
+                              Tensor& h, Tensor& g, Tensor& beta, cudaStream_t stream) {
+    constexpr const char* op = "gdn_norm_gating_proj";
+    if (a_weight.qtype != QType::BF16_CTRL || b_weight.qtype != QType::BF16_CTRL) {
+        throw std::invalid_argument(std::string(op) + ": FP16 admits only BF16 control weights");
+    }
+    rmsnorm(x, norm_weight, eps, true, h, stream);
+    Tensor a_t = control_tensor_view(a_weight, a_weight.n, a_weight.k);
+    Tensor b_t = control_tensor_view(b_weight, b_weight.n, b_weight.k);
+    gdn_gating_proj_f16(h, a_t, b_t, A_log, dt_bias, g, beta, stream);
+}
+
+} // namespace
+
 void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                      const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g,
                      Tensor& beta, cudaStream_t stream) {
@@ -178,6 +201,20 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     if (!(eps > 0.0F) || !std::isfinite(eps)) {
         throw std::invalid_argument("gdn_norm_gating_proj: eps must be positive and finite");
     }
+    if (x.dtype == DType::FP16) {
+        require_sequence_tensor(x, DType::FP16, 5120, tokens, op, "x");
+        require_sequence_tensor(h, DType::FP16, 5120, tokens, op, "h");
+        require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");
+        require_vector_tensor(A_log, DType::FP32, 48, op, "A_log");
+        require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
+        require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
+        require_sequence_tensor(beta, DType::FP32, 48, tokens, op, "beta");
+        require_control_weight(a_weight, 48, 5120, "a_weight");
+        require_control_weight(b_weight, 48, 5120, "b_weight");
+        gdn_norm_gating_proj_f16(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, h, g,
+                                 beta, stream);
+        return;
+    }
     require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
     require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");
     require_sequence_tensor(h, DType::BF16, 5120, tokens, op, "h");
@@ -211,6 +248,20 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
         throw std::invalid_argument("gdn_norm_gating_proj: eps must be positive and finite");
     }
     const GdnControlParentGeometry geometry = require_control_parent(ab_weight);
+    if (x.dtype == DType::FP16) {
+        require_sequence_tensor(x, DType::FP16, geometry.input_rows, tokens, op, "x");
+        require_sequence_tensor(h, DType::FP16, geometry.input_rows, tokens, op, "h");
+        require_vector_tensor(norm_weight, DType::BF16, geometry.input_rows, op, "norm_weight");
+        require_vector_tensor(A_log, DType::FP32, geometry.heads, op, "A_log");
+        require_vector_tensor(dt_bias, DType::FP32, geometry.heads, op, "dt_bias");
+        require_sequence_tensor(g, DType::FP32, geometry.heads, tokens, op, "g");
+        require_sequence_tensor(beta, DType::FP32, geometry.heads, tokens, op, "beta");
+        const Weight a_weight = control_row_view(ab_weight, 0, geometry.heads);
+        const Weight b_weight = control_row_view(ab_weight, geometry.heads, geometry.heads);
+        gdn_norm_gating_proj_f16(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, h, g,
+                                 beta, stream);
+        return;
+    }
     require_sequence_tensor(x, DType::BF16, geometry.input_rows, tokens, op, "x");
     require_vector_tensor(norm_weight, DType::BF16, geometry.input_rows, op, "norm_weight");
     require_sequence_tensor(h, DType::BF16, geometry.input_rows, tokens, op, "h");
@@ -246,7 +297,7 @@ void validate_column_rank_semantics(const Tensor& x, const Weight& a_weight,
     const std::int32_t tokens  = x.ne[1];
     if (tokens <= 0) { throw std::invalid_argument(std::string(op) + ": T must be positive"); }
     const std::int32_t heads = a_weight.n;
-    require_sequence_tensor(x, DType::BF16, kShardHidden, tokens, op, "x");
+    require_sequence_tensor(x, x.dtype, kShardHidden, tokens, op, "x");
     require_control_weight(a_weight, heads, kShardHidden, "a_weight shard");
     require_control_weight(b_weight, heads, kShardHidden, "b_weight shard");
     require_vector_tensor(A_log, DType::FP32, heads, op, "A_log");
@@ -348,6 +399,24 @@ void gdn_gating_proj_column_parallel(const std::array<Tensor, kMaximumDevices>& 
     }
     detail::for_each_rank(ec, [&](int rank) {
         const auto slot = static_cast<std::size_t>(rank);
+        if (x[slot].dtype == DType::FP16) {
+            Tensor a_t = control_tensor_view(a_weight[slot], a_weight[slot].n, a_weight[slot].k);
+            Tensor b_t = control_tensor_view(b_weight[slot], b_weight[slot].n, b_weight[slot].k);
+            Tensor g_mut(g[slot]);
+            Tensor beta_mut(beta[slot]);
+            gdn_gating_proj_f16(x[slot], a_t, b_t, A_log[slot], dt_bias[slot], g_mut, beta_mut,
+                                ec.dev[slot]->stream);
+            return;
+        }
+        if (x[slot].dtype == DType::FP16) {
+            Tensor a_t = control_tensor_view(a_weight[slot], a_weight[slot].n, a_weight[slot].k);
+            Tensor b_t = control_tensor_view(b_weight[slot], b_weight[slot].n, b_weight[slot].k);
+            Tensor g_mut(g[slot]);
+            Tensor beta_mut(beta[slot]);
+            gdn_gating_proj_f16(x[slot], a_t, b_t, A_log[slot], dt_bias[slot], g_mut, beta_mut,
+                                ec.dev[slot]->stream);
+            return;
+        }
         dispatch_shard(x[slot], a_weight[slot], b_weight[slot], A_log[slot], dt_bias[slot],
                        ws[slot], g[slot], beta[slot], ec.dev[slot]->stream);
     });
@@ -393,6 +462,15 @@ void gdn_gating_proj_column_parallel(const std::array<Tensor, kMaximumDevices>& 
                                          ec.dev[slot]->stream, false, ws[slot]);
             detail::gdn_gating_launch(g_mut, beta_mut, A_log[slot], dt_bias[slot], g_mut, beta_mut,
                                      ec.dev[slot]->stream);
+            return;
+        }
+        if (x[slot].dtype == DType::FP16) {
+            Tensor a_t = control_tensor_view(a_weight[slot], a_weight[slot].n, a_weight[slot].k);
+            Tensor b_t = control_tensor_view(b_weight[slot], b_weight[slot].n, b_weight[slot].k);
+            Tensor g_mut(g[slot]);
+            Tensor beta_mut(beta[slot]);
+            gdn_gating_proj_f16(x[slot], a_t, b_t, A_log[slot], dt_bias[slot], g_mut, beta_mut,
+                                ec.dev[slot]->stream);
             return;
         }
         dispatch_shard(x[slot], a_weight[slot], b_weight[slot], A_log[slot], dt_bias[slot],

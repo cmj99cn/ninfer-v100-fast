@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <iostream>
 #include <vector>
 
@@ -50,6 +52,45 @@ int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::ui
     return failures;
 }
 
+std::uint16_t f32_to_f16_bits(float value) {
+    return __half_as_ushort(__float2half_rn(value));
+}
+
+int run_f16_roundtrip(const char* label, std::int32_t rows, std::int32_t columns,
+                      std::uint32_t seed) {
+    const std::size_t count = static_cast<std::size_t>(rows) * columns;
+    std::vector<float> source(count);
+    fill_uniform(source, seed, -256.0f, 256.0f);
+    round_to_bf16(source);
+    std::vector<std::uint16_t> bf16(count), expected_f16(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        bf16[i]        = f32_to_bf16(source[i]);
+        const float v  = __bfloat162float(__ushort_as_bfloat16(bf16[i]));
+        expected_f16[i] = f32_to_f16_bits(v);
+    }
+
+    GuardedDeviceBuffer device_bf16(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_f16(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_back(count * sizeof(std::uint16_t));
+    device_bf16.copy_from_host(bf16.data(), device_bf16.bytes());
+
+    Tensor bf16_tensor(device_bf16.data(), DType::BF16, {rows, columns});
+    Tensor f16_tensor(device_f16.data(), DType::FP16, {rows, columns});
+    Tensor back_tensor(device_back.data(), DType::BF16, {rows, columns});
+    ops::cast_bf16_to_fp16(bf16_tensor, f16_tensor, nullptr);
+    ops::cast_fp16_to_bf16(f16_tensor, back_tensor, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_exact(label, from_device<std::uint16_t>(device_f16.data(), count),
+                                expected_f16);
+    failures += verify_exact("cast_f16_to_bf16 roundtrip",
+                             from_device<std::uint16_t>(device_back.data(), count), bf16);
+    failures += device_bf16.verify_guards("cast roundtrip bf16");
+    failures += device_f16.verify_guards("cast roundtrip f16");
+    failures += device_back.verify_guards("cast roundtrip back");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -62,6 +103,8 @@ int main() {
     failures += run_case("cast [1536,1]", 1536, 1, 101u);
     failures += run_case("cast [1536,257]", 1536, 257, 201u);
     failures += run_case("cast edge-length tensor", 13, 1, 301u);
+    failures += run_f16_roundtrip("cast bf16<->fp16 [1536,1]", 1536, 1, 401u);
+    failures += run_f16_roundtrip("cast bf16<->fp16 [1536,257]", 1536, 257, 402u);
     std::cout << (failures ? "FAIL" : "OK") << " cast_fp32_to_bf16\n";
     return failures ? 1 : 0;
 }

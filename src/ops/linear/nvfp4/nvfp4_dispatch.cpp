@@ -9,6 +9,7 @@
 #endif
 
 #include <algorithm>
+#include <cuda_fp16.h>
 #include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
@@ -140,6 +141,58 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     auto scope                       = workspace->scope();
     const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(*workspace, x.ne[1], weight.k);
     launch_nvfp4_w4a4(x, weight, out, scratch, stream);
+}
+
+void nvfp4_f16_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
+                        WorkspaceArena* workspace, cudaStream_t stream) {
+    validate_nvfp4_weight(weight, "nvfp4 f16 linear");
+    if (x.dtype != DType::FP16 || out.dtype != DType::FP16) {
+        throw std::invalid_argument("nvfp4 f16 linear: x/out must be FP16");
+    }
+    // LinearPolicy is a permission, not a requirement: a permissive policy admits the A16 route.
+    // Neither W4A4 nor the FP8 A8 path has an FP16 activation form yet, so FP16 always computes
+    // A16 and only an invalid enum reaches the error below.
+    switch (policy) {
+    case LinearPolicy::A16Only:
+    case LinearPolicy::AllowA8:
+    case LinearPolicy::AllowA4:
+        break;
+    }
+#ifdef NINFER_VOLTA_BUILD
+    const std::int32_t total_t = x.ne[1];
+    // Wide-T fills a dequantized weight/activation staging buffer once per call, so it amortizes
+    // the transient memory traffic over enough tokens to beat the small-T chunked route.
+    if (workspace != nullptr && total_t >= 128) {
+        nvfp4_cutlass_sm70_f16_launch(x, weight, out, *workspace, stream);
+        return;
+    }
+    const std::int32_t n = weight.n;
+    const std::int32_t k = weight.k;
+    if (total_t <= kNvfp4VoltaQpnMaxTokens && nvfp4_volta_qpn_supported(n, k, total_t)) {
+        launch_nvfp4_volta_qpn_f16(x, weight, out, stream);
+        return;
+    }
+    // QPN covers at most kNvfp4VoltaQpnMaxTokens rows per launch; chunk the remaining widths.
+    for (std::int32_t token_begin = 0; token_begin < total_t;
+         token_begin += kNvfp4VoltaQpnMaxTokens) {
+        const std::int32_t active =
+            std::min(kNvfp4VoltaQpnMaxTokens, total_t - token_begin);
+        if (!nvfp4_volta_qpn_supported(n, k, active)) {
+            throw std::invalid_argument("nvfp4 f16 linear: unsupported shape for the small-T route");
+        }
+        Tensor x_chunk(static_cast<std::uint8_t*>(x.data) +
+                           static_cast<std::int64_t>(token_begin) * k * sizeof(half),
+                       DType::FP16, {k, active});
+        Tensor out_chunk(static_cast<std::uint8_t*>(out.data) +
+                             static_cast<std::int64_t>(token_begin) * n * sizeof(half),
+                         DType::FP16, {n, active});
+        launch_nvfp4_volta_qpn_f16(x_chunk, weight, out_chunk, stream);
+    }
+#else
+    (void)workspace;
+    (void)stream;
+    throw std::invalid_argument("nvfp4 f16 linear requires the sm_70 build");
+#endif
 }
 
 } // namespace ninfer::ops::detail

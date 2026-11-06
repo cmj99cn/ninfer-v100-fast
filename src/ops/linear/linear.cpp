@@ -67,8 +67,18 @@ void validate_linear_policy(LinearPolicy policy) {
 // member exactly as it found an anonymous-namespace one.
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
                                LinearPolicy policy) {
-    if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument("linear: x/out must be BF16");
+    const bool bf16 = x.dtype == DType::BF16 && out.dtype == DType::BF16;
+    const bool f16 = x.dtype == DType::FP16 && out.dtype == DType::FP16 &&
+                     (w.qtype == QType::NVFP4 || w.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
+                      w.qtype == QType::W8G32_F16S || w.qtype == QType::Q4G64_F16S);
+    // The vocabulary head terminates the activation stream: its logits stay BF16 because the
+    // sampler contract requires BF16, so an FP16 activation is admitted with a BF16 output.
+    const bool f16_logits =
+        x.dtype == DType::FP16 && out.dtype == DType::BF16 &&
+        (w.qtype == QType::FP8_E4M3FN_ROW_BF16S || w.qtype == QType::Q4G64_F16S);
+    if (!bf16 && !f16 && !f16_logits) {
+        throw std::invalid_argument(
+            "linear: x/out must be BF16, or FP16 with an NVFP4/FP8/W8/Q4 weight");
     }
     (void)checked_numel(x, "x");
     (void)checked_numel(out, "out");
@@ -110,7 +120,11 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::ggml_k_linear(x, w, out, stream);
         return;
     case QType::Q4G64_F16S:
-        detail::q4_dispatch(x, w, out, policy, workspace, stream);
+        if (x.dtype == DType::FP16) {
+            detail::q4_f16_dispatch(x, w, out, policy, stream);
+        } else {
+            detail::q4_dispatch(x, w, out, policy, workspace, stream);
+        }
         return;
     case QType::Q5G64_F16S:
         detail::q5_dispatch(x, w, out, policy, stream);
@@ -119,7 +133,11 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q6_dispatch(x, w, out, policy, stream);
         return;
     case QType::W8G32_F16S:
-        detail::w8_dispatch(x, w, out, policy, stream);
+        if (x.dtype == DType::FP16) {
+            detail::w8_f16_dispatch(x, w, out, policy, stream);
+        } else {
+            detail::w8_dispatch(x, w, out, policy, stream);
+        }
         return;
     case QType::BF16_CTRL:
         detail::bf16_dispatch(x, w, out, policy, stream);
@@ -128,10 +146,18 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::fp16_dispatch(x, w, out, policy, stream);
         return;
     case QType::NVFP4:
-        detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
+        if (x.dtype == DType::FP16) {
+            detail::nvfp4_f16_dispatch(x, w, out, policy, workspace, stream);
+        } else {
+            detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
+        }
         return;
     case QType::FP8_E4M3FN_ROW_BF16S:
-        detail::fp8_dispatch(x, w, out, policy, workspace, stream);
+        if (x.dtype == DType::FP16) {
+            detail::fp8_f16_dispatch(x, w, out, policy, stream);
+        } else {
+            detail::fp8_dispatch(x, w, out, policy, workspace, stream);
+        }
         return;
     case QType::FP32_CTRL:
     case QType::I32_CTRL:

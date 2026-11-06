@@ -71,10 +71,12 @@ void require_scale(float scale) {
 Geometry validate_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                             const Tensor& beta, float scale, const Tensor& ssm_state,
                             const Tensor& out) {
-    require_dtype(q, DType::BF16, "q must be BF16");
-    require_dtype(k, DType::BF16, "k must be BF16");
-    require_dtype(v, DType::BF16, "v must be BF16");
-    require_dtype(out, DType::BF16, "out must be BF16");
+    if (!((q.dtype == DType::BF16 && k.dtype == DType::BF16 && v.dtype == DType::BF16 &&
+           out.dtype == DType::BF16) ||
+          (q.dtype == DType::FP16 && k.dtype == DType::FP16 && v.dtype == DType::FP16 &&
+           out.dtype == DType::FP16))) {
+        throw std::invalid_argument("gated_delta_net: q/k/v/out must share BF16 or FP16");
+    }
     require_dtype(g, DType::FP32, "g must be FP32");
     require_dtype(beta, DType::FP32, "beta must be FP32");
     require_dtype(ssm_state, DType::FP32, "ssm_state must be FP32");
@@ -113,10 +115,12 @@ Geometry validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Ten
     constexpr std::int32_t kMaximumBatch = 8;
     constexpr std::int32_t kMaximumWidth = 16;
     const bool masked                    = valid_columns.data != nullptr;
-    require_dtype(q, DType::BF16, "q must be BF16");
-    require_dtype(k, DType::BF16, "k must be BF16");
-    require_dtype(v, DType::BF16, "v must be BF16");
-    require_dtype(out, DType::BF16, "out must be BF16");
+    if (!((q.dtype == DType::BF16 && k.dtype == DType::BF16 && v.dtype == DType::BF16 &&
+           out.dtype == DType::BF16) ||
+          (q.dtype == DType::FP16 && k.dtype == DType::FP16 && v.dtype == DType::FP16 &&
+           out.dtype == DType::FP16))) {
+        throw std::invalid_argument("gated_delta_net: q/k/v/out must share BF16 or FP16");
+    }
     require_dtype(g, DType::FP32, "g must be FP32");
     require_dtype(beta, DType::FP32, "beta must be FP32");
     require_dtype(ssm_states, DType::FP32, "ssm_states must be FP32");

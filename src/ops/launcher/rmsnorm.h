@@ -10,5 +10,9 @@ namespace ninfer::ops::detail {
 
 void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                     const Tensor* z, Tensor& out, cudaStream_t stream);
+void rmsnorm_f16_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
+                        Tensor& out, cudaStream_t stream);
+void rmsnorm_f16_gated_launch(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                              Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

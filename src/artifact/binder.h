@@ -101,6 +101,11 @@ public:
     // targets use this read-only probe to bind them only when the startup feature selects them.
     [[nodiscard]] bool has_tensor(std::string_view name) const noexcept;
 
+    // The artifact's own stored numeric format for a tensor object. Binding the vocabulary
+    // endpoints from this value keeps the artifact (FP8/FP16/BF16) authoritative instead of a
+    // compile-time per-profile guess.
+    [[nodiscard]] NumericFormat tensor_format(std::string_view name) const;
+
     void set_shard_resolver(ShardResolver resolver);
 
     ObjectHandle require_tensor(std::string_view name, NumericFormat format, StorageLayout layout,

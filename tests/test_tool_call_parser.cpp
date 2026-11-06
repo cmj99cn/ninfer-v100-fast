@@ -66,6 +66,78 @@ int test_multiple_calls_and_json_values() {
     return failures;
 }
 
+int test_python_literal_parameters() {
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output("<tool_call>\n"
+                                                   "<function=lockDoors>\n"
+                                                   "<parameter=door>\ndriver\n</parameter>\n"
+                                                   "<parameter=unlock>\nFalse\n</parameter>\n"
+                                                   "<parameter=enabled>\nTrue\n</parameter>\n"
+                                                   "<parameter=note>\nNone\n</parameter>\n"
+                                                   "</function>\n"
+                                                   "</tool_call>",
+                                                   64);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "python literals parsed as tool response");
+    failures += check(parsed.tool_calls.size() == 1, "python literal call count");
+    const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+    failures += check(args.at("door") == "driver", "string parameter still parses");
+    failures += check(args.at("unlock").is_boolean() && args.at("unlock") == false,
+                      "False is a boolean, not the string \"False\"");
+    failures += check(args.at("enabled").is_boolean() && args.at("enabled") == true,
+                      "True is a boolean");
+    failures += check(args.at("note").is_null(), "None is null");
+    return failures;
+}
+
+int test_schema_typed_string_parameters() {
+    ninfer::serve::GenerationRequest request;
+    request.tools.push_back({"estimate_distance", "", R"({
+        "type": "object",
+        "properties": {
+            "cityA": {"type": "string"},
+            "cityB": {"type": "string"},
+            "active": {"type": "boolean"}
+        }
+    })", "", false});
+    request.tool_choice.mode = ninfer::serve::ToolChoiceMode::Auto;
+    const ninfer::serve::ToolArgumentTypeContracts contracts =
+        ninfer::serve::build_tool_argument_type_contracts(request);
+    int failures = 0;
+    failures += check(contracts.tools.size() == 1, "one compiled tool contract");
+    failures += check(contracts.tools[0].parameters.size() == 3, "three compiled parameters");
+
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output("<tool_call>\n"
+                                                   "<function=estimate_distance>\n"
+                                                   "<parameter=cityA>\n94016\n</parameter>\n"
+                                                   "<parameter=cityB>\n83214\n</parameter>\n"
+                                                   "<parameter=active>\nFalse\n</parameter>\n"
+                                                   "</function>\n"
+                                                   "</tool_call>",
+                                                   64, contracts);
+    failures += check(parsed.is_tool_call_response, "typed call parsed");
+    const Json args = Json::parse(parsed.tool_calls.at(0).arguments_json);
+    failures += check(args.at("cityA").is_string() && args.at("cityA") == "94016",
+                      "string-typed numeric value stays a string");
+    failures += check(args.at("cityB").is_string() && args.at("cityB") == "83214",
+                      "second string-typed numeric value stays a string");
+    failures += check(args.at("active").is_boolean() && args.at("active") == false,
+                      "boolean-typed False is boolean");
+
+    // Without a contract the legacy decode still promotes an unquoted number.
+    const ninfer::serve::ParsedToolCallOutput legacy =
+        ninfer::serve::parse_qwen_tool_call_output("<tool_call>\n"
+                                                   "<function=estimate_distance>\n"
+                                                   "<parameter=cityA>\n94016\n</parameter>\n"
+                                                   "</function>\n"
+                                                   "</tool_call>",
+                                                   64);
+    const Json legacy_args = Json::parse(legacy.tool_calls.at(0).arguments_json);
+    failures += check(legacy_args.at("cityA").is_number(), "legacy decode keeps JSON number");
+    return failures;
+}
+
 int test_malformed_falls_back_to_text() {
     const std::string text = "<tool_call>\n<function=get_weather>\n";
     const ninfer::serve::ParsedToolCallOutput parsed =
@@ -84,7 +156,7 @@ int test_truncated_tool_call_is_dropped() {
                              "<parameter=filePath>\n/tmp/x.html\n</parameter>\n"
                              "<parameter=content>\n<!doctype html>\n<html";
     const ninfer::serve::ParsedToolCallOutput parsed =
-        ninfer::serve::parse_qwen_tool_call_output(text, 64, /*drop_unterminated=*/true);
+        ninfer::serve::parse_qwen_tool_call_output(text, 64, {}, /*drop_unterminated=*/true);
     int failures = 0;
     failures += check(!parsed.is_tool_call_response, "truncated call is not a tool response");
     failures += check(parsed.unterminated_tool_call, "truncated call is flagged unterminated");
@@ -98,7 +170,7 @@ int test_truncated_tail_after_complete_call_is_dropped() {
     const std::string text = "<tool_call>\n<function=first>\n</function>\n</tool_call>\n"
                              "<tool_call>\n<function=second>\n<parameter=a>\nv\n</parameter>\n";
     const ninfer::serve::ParsedToolCallOutput parsed =
-        ninfer::serve::parse_qwen_tool_call_output(text, 64, /*drop_unterminated=*/true);
+        ninfer::serve::parse_qwen_tool_call_output(text, 64, {}, /*drop_unterminated=*/true);
     int failures = 0;
     failures += check(parsed.is_tool_call_response, "complete leading call survives");
     failures += check(parsed.tool_calls.size() == 1, "exactly the complete call is kept");
@@ -202,6 +274,8 @@ int main() {
     int failures = 0;
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();
+    failures += test_python_literal_parameters();
+    failures += test_schema_typed_string_parameters();
     failures += test_malformed_falls_back_to_text();
     failures += test_truncated_tool_call_is_dropped();
     failures += test_truncated_tail_after_complete_call_is_dropped();

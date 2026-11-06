@@ -19,6 +19,8 @@ void launch_fp8_vocabulary_a16_mma(const Tensor& x, const Weight& weight, Tensor
 inline constexpr std::int32_t kFp8VoltaQpnRowsPerTile = 8;
 inline constexpr std::int32_t kFp8VoltaQpnMaxTokens   = 32;
 void launch_fp8_volta_qpn(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_fp8_volta_qpn_f16(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_fp8_volta_qpn_f16_bf16out(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 [[nodiscard]] bool fp8_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                            std::int32_t t) noexcept;
 #endif // NINFER_VOLTA_BUILD

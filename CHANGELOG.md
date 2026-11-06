@@ -12,14 +12,16 @@ V100 profiles, but the BFCL quality gap and the limitations below are still open
 ### Added
 
 - First public release of the V100-focused NInfer inference engine.
-- Single-process TP2/TP4 execution on 2×Tesla V100-SXM2 with NVLink.
+- Single-process TP2 execution on 2×Tesla V100-SXM2-32GB with NVLink; TP4 remains a
+  4×16GB legacy regression path.
 - Split-D long-context prefill kernel and cuBLAS prefill GEMM route.
-- MTP speculative decoding with up to three drafts.
+- MTP speculative decoding with up to three qualified drafts on V100X2.
 - Content-addressed multi-turn prefix cache, including shared host tier and
   cross-instance manifest reuse for 2×TP1.
-- Multi-instance serving documentation and 8-GPU profiles for 8×TP1, 4×TP2,
-  and 2×TP4, plus 4-card 4×TP1/2×TP2. Only 2×TP1 has passed a real integration
-  test; community validation is requested for the rest.
+- Multi-instance serving documentation, including community/out-of-contract
+  8-GPU profiles for 8×TP1, 4×TP2, and 2×TP4, plus 4-card 4×TP1/2×TP2. Only
+  2×TP1 has passed a real integration test; community validation is requested
+  for the rest.
 - OpenAI-compatible and Anthropic-compatible serving surfaces, CLI, and metrics.
 - INT8 group-64 KV cache, NVFP4 text execution, and the self-converted
   Qwen3.8-27B NVFP4 `.ninfer` artifact route.
@@ -28,7 +30,8 @@ V100 profiles, but the BFCL quality gap and the limitations below are still open
 ### Changed
 
 - The default model path in the documentation is the self-converted NVFP4
-  artifact; the old Q4_K_M/V100X2 assumptions are not used by this release.
+  artifact on 2×V100-SXM2-32GB; the 4×16GB/Q4_K_M path is retained as a legacy
+  regression target, not the current release profile.
 - SM70 test coverage now gates NVFP4 A4 and FP8 A8 routes by compute capability
   instead of executing unsupported kernels.
 - Q4/Q5 split-storage `gdn_input_proj_column_parallel` requires an explicit
@@ -49,19 +52,19 @@ V100 profiles, but the BFCL quality gap and the limitations below are still open
 
 ### Known Issues
 
-- **BFCL-v3 multi-turn tool calling remains below the vLLM baseline.**
-  Latest full 200: **54/200 = 27.0%** vs 1cat-vLLM **77/200 = 38.5%**.
-  This is the highest ninfer full-200 result so far (previous best 25.0%),
-  but the **11.5pp** gap is unresolved. A single seed cannot support 6pp
-  attribution. Active blind fixing is paused; community help is requested.
-  See [`BFCL_QUALITY_ISSUE.md`](BFCL_QUALITY_ISSUE.md) and
-  [`BFCL_REPRODUCTION.md`](BFCL_REPRODUCTION.md).
-- Multimodal is unavailable on the current artifact; text-only is supported.
+- **BFCL-v3 multi-turn tool calling is resolved for the current release profile.**
+  Latest full 200: **82/200 = 41.0%** vs 1cat-vLLM **73/200 = 36.5%** (paired
+  net +9). The fixes are tool-call schema typing / Python-literal normalization,
+  the NVFP4 QPN divisor, and disabling decode-state turn-checkpoint reuse on the
+  non-speculative prefix path. See the README quality section.
+- The current self-converted NVFP4 artifact includes Vision; the GGUF Q4_K_M
+  artifact rejects Vision. Multi-instance Vision is unverified.
 - Long-duration prefix-cache soak testing under very high concurrency has not
   been completed.
 - Only 2×TP1 multi-instance has passed a real integration test. The 4-card
-  (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified; no
-  throughput or memory claims are made for them. 8×TP1 requires 32GB cards.
+  (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified; the
+  8-card profiles are community/out-of-contract. No throughput or memory claims
+  are made for them. 4×TP1 and 8×TP1 require 32GB cards.
 - KV caching has two tiers only: per-instance device KV and the process-shared
   pinned host prefix-KV tier. There is no disk KV tier, KV offload, or global
   active-KV pool.

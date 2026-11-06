@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/common/activation.cuh"
 #include "ops/common/math.cuh"
 
 #include <cuda_bf16.h>
@@ -8,8 +9,9 @@
 
 namespace ninfer::ops::detail {
 
-struct SnapshotHistoryPublish {
-    __nv_bfloat16* state_write;
+template <class Act = __nv_bfloat16>
+struct SnapshotHistoryPublishOf {
+    Act* state_write;
     const std::int32_t* snapshot_base_slots;
     std::int32_t channels;
 
@@ -18,23 +20,28 @@ struct SnapshotHistoryPublish {
         const std::int64_t slot_stride = static_cast<std::int64_t>(channels) * 3;
         const std::int64_t base =
             static_cast<std::int64_t>(snapshot_base_slots[batch] + token) * slot_stride;
-        state_write[base + row]                  = __float2bfloat16_rn(s1);
-        state_write[base + channels + row]       = __float2bfloat16_rn(s2);
-        state_write[base + 2LL * channels + row] = __float2bfloat16_rn(p);
+        ActivationTraits<Act>::store(state_write + base + row, s1);
+        ActivationTraits<Act>::store(state_write + base + channels + row, s2);
+        ActivationTraits<Act>::store(state_write + base + 2LL * channels + row, p);
     }
 };
 
-struct RecordColumnPublish {
-    __nv_bfloat16* record;
+using SnapshotHistoryPublish = SnapshotHistoryPublishOf<__nv_bfloat16>;
+
+template <class Act = __nv_bfloat16>
+struct RecordColumnPublishOf {
+    Act* record;
     std::int32_t channels;
     std::int32_t width;
 
     __device__ __forceinline__ void publish(std::int32_t token, std::int32_t batch,
                                             std::int32_t row, float, float, float p) const {
-        const std::int64_t column       = static_cast<std::int64_t>(batch) * width + token;
-        record[column * channels + row] = __float2bfloat16_rn(p);
+        const std::int64_t column = static_cast<std::int64_t>(batch) * width + token;
+        ActivationTraits<Act>::store(record + column * channels + row, p);
     }
 };
+
+using RecordColumnPublish = RecordColumnPublishOf<__nv_bfloat16>;
 
 struct NoHistoryPublish {
     __device__ __forceinline__ void publish(std::int32_t, std::int32_t, std::int32_t, float, float,
@@ -44,15 +51,15 @@ struct NoHistoryPublish {
 // Device-side implementation detail shared by exact packed projection kernels. Projection
 // accumulators stay in the route's existing private precision; Publish changes only the side
 // effect after the convolution has consumed that accumulator.
-template <class Publish>
+template <class Publish, class Act = __nv_bfloat16>
 struct GdnConvEpilogue {
     const __nv_bfloat16* conv_weight;
-    const __nv_bfloat16* state_read;
+    const Act* state_read;
     const std::int32_t* initial_slots;
     const std::int32_t* valid_columns;
-    __nv_bfloat16* query;
-    __nv_bfloat16* key;
-    __nv_bfloat16* value;
+    Act* query;
+    Act* key;
+    Act* value;
     std::int32_t channels;
     std::int32_t query_rows;
     std::int32_t key_rows;
@@ -73,9 +80,9 @@ struct GdnConvEpilogue {
         std::int32_t valid = valid_columns == nullptr ? Tokens : valid_columns[batch_row];
         valid              = valid < 0 ? 0 : (valid > Tokens ? Tokens : valid);
 
-        float s0       = __bfloat162float(state_read[initial_base + row]);
-        float s1       = __bfloat162float(state_read[initial_base + channels + row]);
-        float s2       = __bfloat162float(state_read[initial_base + 2LL * channels + row]);
+        float s0       = ActivationTraits<Act>::load(state_read + initial_base + row);
+        float s1 = ActivationTraits<Act>::load(state_read + initial_base + channels + row);
+        float s2 = ActivationTraits<Act>::load(state_read + initial_base + 2LL * channels + row);
         const float w0 = __bfloat162float(conv_weight[row]);
         const float w1 = __bfloat162float(conv_weight[channels + row]);
         const float w2 = __bfloat162float(conv_weight[2LL * channels + row]);
@@ -86,12 +93,12 @@ struct GdnConvEpilogue {
             const std::int64_t column = static_cast<std::int64_t>(batch_row) * width + token;
             if (token >= valid) {
                 if (row < query_rows) {
-                    query[column * query_rows + row] = __float2bfloat16_rn(0.0F);
+                    ActivationTraits<Act>::store(query + column * query_rows + row, 0.0F);
                 } else if (row < query_rows + key_rows) {
-                    key[column * key_rows + row - query_rows] = __float2bfloat16_rn(0.0F);
+                    ActivationTraits<Act>::store(key + column * key_rows + row - query_rows, 0.0F);
                 } else {
-                    value[column * value_rows + row - query_rows - key_rows] =
-                        __float2bfloat16_rn(0.0F);
+                    ActivationTraits<Act>::store(
+                        value + column * value_rows + row - query_rows - key_rows, 0.0F);
                 }
                 continue;
             }
@@ -101,13 +108,14 @@ struct GdnConvEpilogue {
             conv                       = fmaf(w1, s1, conv);
             conv                       = fmaf(w2, s2, conv);
             conv                       = fmaf(w3, p, conv);
-            const __nv_bfloat16 output = __float2bfloat16_rn(silu(conv));
+            const float output = silu(conv);
             if (row < query_rows) {
-                query[column * query_rows + row] = output;
+                ActivationTraits<Act>::store(query + column * query_rows + row, output);
             } else if (row < query_rows + key_rows) {
-                key[column * key_rows + row - query_rows] = output;
+                ActivationTraits<Act>::store(key + column * key_rows + row - query_rows, output);
             } else {
-                value[column * value_rows + row - query_rows - key_rows] = output;
+                ActivationTraits<Act>::store(
+                    value + column * value_rows + row - query_rows - key_rows, output);
             }
 
             publish.publish(token, batch_row, row, s1, s2, p);

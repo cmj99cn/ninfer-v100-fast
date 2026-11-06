@@ -3,6 +3,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -70,6 +73,90 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
     return failures;
 }
 
+std::uint16_t f32_to_f16_bits(float value) { return __half_as_ushort(__float2half_rn(value)); }
+float f16_bits_to_f32(std::uint16_t bits) { return __half2float(__ushort_as_half(bits)); }
+
+int run_f16_case(const char* label, const Shape& shape, std::uint32_t seed) {
+    const std::size_t count = shape.elements();
+    std::vector<float> input(count), weight(shape.d);
+    fill_uniform(input, seed, -4.0F, 4.0F);
+    fill_uniform(weight, seed + 1U, 0.25F, 1.75F);
+    std::vector<std::uint16_t> input_bits(count), weight_bits(shape.d);
+    for (std::size_t i = 0; i < count; ++i) {
+        input_bits[i] = f32_to_f16_bits(input[i]);
+        input[i]      = f16_bits_to_f32(input_bits[i]);
+    }
+    for (std::size_t i = 0; i < static_cast<std::size_t>(shape.d); ++i) {
+        weight_bits[i] = f32_to_f16_bits(weight[i]);
+        weight[i]      = f16_bits_to_f32(weight_bits[i]);
+    }
+    const auto reference = rmsnorm_oracle(input, weight, shape, false);
+    GuardedDeviceBuffer device_input(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_weight(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_output(count * sizeof(std::uint16_t));
+    device_input.copy_from_host(input_bits.data(), device_input.bytes());
+    device_weight.copy_from_host(weight_bits.data(), device_weight.bytes());
+    Tensor input_tensor(device_input.data(), DType::FP16, {shape.d, shape.rows, shape.tokens});
+    Tensor weight_tensor(device_weight.data(), DType::FP16, {shape.d});
+    Tensor output_tensor(device_output.data(), DType::FP16, {shape.d, shape.rows, shape.tokens});
+    ops::rmsnorm(input_tensor, weight_tensor, kEps, false, output_tensor, nullptr);
+    cuda_synchronize();
+    const auto out_bits = from_device<std::uint16_t>(device_output.data(), count);
+    std::vector<double> actual(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        actual[i] = static_cast<double>(f16_bits_to_f32(out_bits[i]));
+    }
+    return verify_reduction(label, actual, reference,
+                            {2e-3, 0.02, 3e-3});
+}
+
+
+std::uint16_t f32_to_bf16_bits(float value) {
+    const __nv_bfloat16 converted = __float2bfloat16_rn(value);
+    std::uint16_t bits = 0;
+    std::memcpy(&bits, &converted, sizeof(bits));
+    return bits;
+}
+
+float bf16_bits_to_f32(std::uint16_t bits) {
+    __nv_bfloat16 converted;
+    std::memcpy(&converted, &bits, sizeof(bits));
+    return __bfloat162float(converted);
+}
+
+int run_f16_bf16w_case(const char* label, const Shape& shape, std::uint32_t seed) {
+    const std::size_t count = shape.elements();
+    std::vector<float> input(count), weight(shape.d);
+    fill_uniform(input, seed, -4.0F, 4.0F);
+    fill_uniform(weight, seed + 1U, 0.25F, 1.75F);
+    std::vector<std::uint16_t> input_bits(count), weight_bits(shape.d);
+    for (std::size_t i = 0; i < count; ++i) {
+        input_bits[i] = f32_to_f16_bits(input[i]);
+        input[i]      = f16_bits_to_f32(input_bits[i]);
+    }
+    for (std::size_t i = 0; i < static_cast<std::size_t>(shape.d); ++i) {
+        weight_bits[i] = f32_to_bf16_bits(weight[i]);
+        weight[i]      = bf16_bits_to_f32(weight_bits[i]);
+    }
+    const auto reference = rmsnorm_oracle(input, weight, shape, false);
+    GuardedDeviceBuffer device_input(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_weight(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_output(count * sizeof(std::uint16_t));
+    device_input.copy_from_host(input_bits.data(), device_input.bytes());
+    device_weight.copy_from_host(weight_bits.data(), device_weight.bytes());
+    Tensor input_tensor(device_input.data(), DType::FP16, {shape.d, shape.rows, shape.tokens});
+    Tensor weight_tensor(device_weight.data(), DType::BF16, {shape.d});
+    Tensor output_tensor(device_output.data(), DType::FP16, {shape.d, shape.rows, shape.tokens});
+    ops::rmsnorm(input_tensor, weight_tensor, kEps, false, output_tensor, nullptr);
+    cuda_synchronize();
+    const auto out_bits = from_device<std::uint16_t>(device_output.data(), count);
+    std::vector<double> actual(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        actual[i] = static_cast<double>(f16_bits_to_f32(out_bits[i]));
+    }
+    return verify_reduction(label, actual, reference, {2e-3, 0.02, 3e-3});
+}
+
 } // namespace
 
 int main() {
@@ -92,6 +179,10 @@ int main() {
     failures += run_case("rmsnorm offset unaligned [128,32]", {128, 32}, true, 1301U, 4.0F, true);
     failures += run_case("rmsnorm plain unaligned [128,8]", {128, 8}, false, 1302U, 4.0F, true);
     failures += run_case("rmsnorm plain near-zero [128,32]", {128, 32}, false, 1303U, 1.0e-5F);
+    failures += run_f16_case("rmsnorm f16 [5120,128]", {5120, 128}, 1401U);
+    failures += run_f16_case("rmsnorm f16 [2048,7]", {2048, 7}, 1402U);
+    failures += run_f16_bf16w_case("rmsnorm f16/bf16w [5120,128]", {5120, 128}, 1501U);
+    failures += run_f16_bf16w_case("rmsnorm f16/bf16w [2048,7]", {2048, 7}, 1502U);
     std::cout << (failures ? "FAIL" : "OK") << " rmsnorm\n";
     return failures ? 1 : 0;
 }

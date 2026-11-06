@@ -13,4 +13,8 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 void w8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream);
 
+// FP16 activation/output form. The persistent weight stays W8; only the activation boundary moves.
+void w8_f16_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                     cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

@@ -57,18 +57,18 @@ void require_weight_shape(const Tensor& weight, std::int32_t C) {
 }
 
 void require_state_shape(const Tensor& conv_state, std::int32_t C) {
-    if (conv_state.ne[0] != C || conv_state.ne[1] != 3 || conv_state.ne[2] != 1 ||
+    if (conv_state.ne[0] != 3 || conv_state.ne[1] != C || conv_state.ne[2] != 1 ||
         conv_state.ne[3] != 1) {
-        throw std::invalid_argument("causal_conv1d: conv_state must have shape [C,3]");
+        throw std::invalid_argument("causal_conv1d: conv_state must have shape [3,C]");
     }
 }
 
 void require_snapshot_state_shape(const Tensor& conv_states, std::int32_t C, std::int32_t width,
                                   std::int32_t batch) {
-    if (conv_states.ne[0] != C || conv_states.ne[1] != 3 || conv_states.ne[2] < width * batch ||
+    if (conv_states.ne[0] != 3 || conv_states.ne[1] != C || conv_states.ne[2] < width * batch ||
         conv_states.ne[3] != 1) {
         throw std::invalid_argument(
-            "causal_conv1d: conv_states must have shape [C,3,S] with S>=B*W");
+            "causal_conv1d: conv_states must have shape [3,C,S] with S>=B*W");
     }
 }
 
@@ -133,10 +133,16 @@ void require_metadata_accessible(const Tensor& metadata, const char* label) {
 
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                         Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
-    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
-        conv_state_in.dtype != DType::BF16 || conv_state_out.dtype != DType::BF16 ||
-        out.dtype != DType::BF16) {
-        throw std::invalid_argument("causal_conv1d: x/weight/conv_state/out must be BF16");
+    const bool bf16 = x.dtype == DType::BF16 && weight.dtype == DType::BF16 &&
+                      conv_state_in.dtype == DType::BF16 &&
+                      conv_state_out.dtype == DType::BF16 && out.dtype == DType::BF16;
+    const bool f16 = x.dtype == DType::FP16 &&
+                     (weight.dtype == DType::BF16 || weight.dtype == DType::FP16) &&
+                     conv_state_in.dtype == DType::FP16 &&
+                     conv_state_out.dtype == DType::FP16 && out.dtype == DType::FP16;
+    if (!bf16 && !f16) {
+        throw std::invalid_argument(
+            "causal_conv1d: tensors must share BF16, or share FP16 with a BF16/FP16 weight");
     }
 
     const std::int64_t n = numel_allow_zero(x, "x");
@@ -157,7 +163,10 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
         throw std::invalid_argument(
             "causal_conv1d: conv_state_out must be contiguous and non-null");
     }
-    if (x.ne[1] == 1) {
+    if (f16) {
+        detail::causal_conv1d_silu_f16_launch(x, weight, conv_state_in, conv_state_out, out,
+                                              stream);
+    } else if (x.ne[1] == 1) {
         detail::causal_conv1d_decode_launch(x, weight, conv_state_in, conv_state_out, out, stream);
     } else if (x.ne[1] <= detail::kCausalConvParallelMaxTokens) {
         detail::causal_conv1d_smallt_launch(x, weight, conv_state_in, conv_state_out, out, stream);

@@ -3,6 +3,7 @@
 #include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 
@@ -27,6 +28,17 @@ struct Fp8ContiguousOutput {
                                                  uint4 values) const {
         auto* destination = data + static_cast<std::int64_t>(token) * rows + parent_row;
         store_vec(destination, values);
+    }
+};
+
+// FP16 activation stream sibling of Fp8ContiguousOutput.
+struct Fp8Fp16ContiguousOutput {
+    half* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        data[static_cast<std::int64_t>(token) * rows + parent_row] = __float2half_rn(value);
     }
 };
 

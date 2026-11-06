@@ -22,7 +22,7 @@ std::vector<std::uint16_t> bit_pattern(std::size_t count, std::uint32_t seed) {
     return values;
 }
 
-int pack_case(std::int32_t hidden, std::int32_t tokens) {
+int pack_case(std::int32_t hidden, std::int32_t tokens, DType dtype = DType::BF16) {
     const std::int32_t output_rows = 2 * hidden;
     const std::size_t input_count  = static_cast<std::size_t>(hidden) * tokens;
     const auto embedding           = bit_pattern(input_count, 0x1234'5678u);
@@ -45,14 +45,15 @@ int pack_case(std::int32_t hidden, std::int32_t tokens) {
                                  hidden_values.size() * sizeof(std::uint16_t));
     device_output.fill(0xcd);
 
-    Tensor embedding_tensor(device_embedding.data(), DType::BF16, {hidden, tokens});
-    Tensor hidden_tensor(device_hidden.data(), DType::BF16, {hidden, tokens});
-    Tensor output_tensor(device_output.data(), DType::BF16, {output_rows, tokens});
+    Tensor embedding_tensor(device_embedding.data(), dtype, {hidden, tokens});
+    Tensor hidden_tensor(device_hidden.data(), dtype, {hidden, tokens});
+    Tensor output_tensor(device_output.data(), dtype, {output_rows, tokens});
     ops::mtp_pack_fc_input(embedding_tensor, hidden_tensor, output_tensor, nullptr);
     cuda_synchronize();
 
-    const std::string label =
-        "mtp_pack_fc_input D=" + std::to_string(hidden) + " T=" + std::to_string(tokens);
+    const std::string label = "mtp_pack_fc_input D=" + std::to_string(hidden) +
+                              " T=" + std::to_string(tokens) +
+                              (dtype == DType::FP16 ? " f16" : " bf16");
     int failures = 0;
     failures += verify_exact(
         label.c_str(), from_device<std::uint16_t>(device_output.data(), expected.size()), expected);
@@ -68,7 +69,7 @@ int pack_case(std::int32_t hidden, std::int32_t tokens) {
     return failures;
 }
 
-int split_case(std::int32_t tokens) {
+int split_case(std::int32_t tokens, DType dtype = DType::BF16) {
     constexpr std::int32_t kInputRows = 14336;
     constexpr std::int32_t kQueryRows = 6144;
     constexpr std::int32_t kKvRows    = 1024;
@@ -104,16 +105,17 @@ int split_case(std::int32_t tokens) {
     device_gate.fill(0xcd);
     device_value.fill(0xcd);
 
-    Tensor input_tensor(device_input.data(), DType::BF16, {kInputRows, tokens});
-    Tensor query_tensor(device_query.data(), DType::BF16, {256, 24, tokens});
-    Tensor key_tensor(device_key.data(), DType::BF16, {256, 4, tokens});
-    Tensor gate_tensor(device_gate.data(), DType::BF16, {256, 24, tokens});
-    Tensor value_tensor(device_value.data(), DType::BF16, {256, 4, tokens});
+    Tensor input_tensor(device_input.data(), dtype, {kInputRows, tokens});
+    Tensor query_tensor(device_query.data(), dtype, {256, 24, tokens});
+    Tensor key_tensor(device_key.data(), dtype, {256, 4, tokens});
+    Tensor gate_tensor(device_gate.data(), dtype, {256, 24, tokens});
+    Tensor value_tensor(device_value.data(), dtype, {256, 4, tokens});
     ops::mtp_split_attn_in(input_tensor, query_tensor, key_tensor, gate_tensor, value_tensor,
                            nullptr);
     cuda_synchronize();
 
-    const std::string label = "mtp_split_attn_in T=" + std::to_string(tokens);
+    const std::string label = "mtp_split_attn_in T=" + std::to_string(tokens) +
+                              (dtype == DType::FP16 ? " f16" : " bf16");
     int failures            = 0;
     failures += verify_exact((label + " query").c_str(),
                              from_device<std::uint16_t>(device_query.data(), expected_query.size()),
@@ -155,6 +157,11 @@ int main() {
     failures += split_case(1);
     failures += split_case(6);
     failures += split_case(48);
+    failures += pack_case(5120, 6, DType::FP16);
+    failures += pack_case(5120, 48, DType::FP16);
+    failures += split_case(1, DType::FP16);
+    failures += split_case(6, DType::FP16);
+    failures += split_case(48, DType::FP16);
     std::cout << (failures ? "FAIL" : "OK") << " mtp_pack\n";
     return failures ? 1 : 0;
 }
