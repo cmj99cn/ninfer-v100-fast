@@ -22,7 +22,9 @@
 
 ## BFCL 多轮工具调用质量：已定位并修复
 
-最新全量结果为 **41.0%（82/200）**；修复前为 36.0%（72/200），更早基线为 23.0%（46/200）。
+最新全量结果为 **no-spec 43.0%（86/200）、MTP-3 43.5%（87/200）**；修复前为
+36.0%（72/200），更早基线为 23.0%（46/200）。与此同时修复了 FP16 runtime 的
+decode/prefill 性能回退（详见“速度”节）。
 
 根因是三类实现缺陷，均已修复：
 
@@ -78,10 +80,12 @@
 
 ---
 
-## 当前进度（fp16-text-runtime 分支，截至 2026-11-06）
+## 当前进度（v0.2.0，截至 2026-11-07）
 
-本分支在 v0.1.0 之上完成 FP16 text runtime，并修复 BFCL 多轮质量：全量
-82/200 = 41.0%，MTP 72/200 = 36.0%；尚未打 tag。
+本版本在 v0.1.0 之上完成 FP16 text runtime，修复 BFCL 多轮质量，并消除 FP16 路径的
+decode/prefill 回退。BFCL `multi_turn_base` 全量：**no-spec 86/200 = 43.0%、
+MTP-3 87/200 = 43.5%**。MTP-3 decode 四点
+（262144 上下文、INT8 KV、FP16-embedding 制品）：**104.7 / 98.9 / 109.6 / 98.1 tok/s**。
 
 ### 测试参数
 
@@ -114,7 +118,7 @@
 | 系统 | Linux x86_64，无 root 权限环境亦可构建（见安装） |
 | CUDA | 12.8 |
 | 编译器 | GCC 13.3，CMake ≥ 3.28，Ninja |
-| 模型 | 自转换 `qwen3_8_27b_nvfp4.ninfer`（NVFP4，约 18 GiB；源 `unsloth/Qwen3.8-27B-NVFP4`） |
+| 模型 | 自转换 `qwen3_8_27b_nvfp4_f16embed.ninfer`（NVFP4 + FP16 embedding，18.0 GiB；质量/速度实测用它）与标准 `qwen3_8_27b_nvfp4.ninfer`（16.8 GiB，速度相同）；源 `unsloth/Qwen3.8-27B-NVFP4` |
 | 服务参数 | `--tp 2 --devices 0,1 --kv-dtype int8 --max-context 262144` |
 
 ## 测试用例与结果
@@ -127,7 +131,8 @@
 
 | 用例 | 方法 | 结果 |
 |---|---|---|
-| 8K tokens 短 prompt | server 自报 | 最高约 **1780 tok/s** |
+| 短 prompt（2048 tok，CLI） | CLI 自报 | **1826 tok/s**（修复前 1522，与 BF16 基线 1825 持平） |
+| 服务端冷 prefill @3.7K | server 自报 | **2057 tok/s**（TTFT 1.73 s） |
 | 174K tokens 长文档（splitd 开启） | 专用 A/B 脚本，单请求 | **1059.7 tok/s** |
 | 同上（splitd 关闭，对照） | 同上 | 985.4 tok/s（开启 splitd 相对提升 **+7.5%**） |
 
@@ -137,10 +142,12 @@
 
 | 配置 | @502 | @3.7K | @15K | @59K |
 |---|---|---|---|---|
-| 无 MTP | 50.9 | 50.0 | 46.2 | 35.9 |
-| **MTP（`--spec mtp --draft-tokens 3`）** | **106.8** | **99.2** | **99.7** | **84.4** |
+| 无 MTP | 51.0 | 49.9 | 46.4 | 36.0 |
+| **MTP（`--spec mtp --draft-tokens 3`）** | **104.7** | **98.9** | **109.6** | **98.1** |
 
-MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TTFT 增加约 0.15s（draft 初始化）。
+MTP 为各点 **2.0–2.7×**，接受率 **52–66%**（2.5–3.0 tok/round）；TTFT 增加约 0.15s
+（draft 初始化）。以上为 f16embed 制品在 `--max-context 262144`、`--prefill-chunk 8192`
+下的实测；标准制品同口径为 103.1 / 102.4 / 112.6 / 97.7。
 
 **多轮前缀缓存（`--prefix-cache`）**
 
@@ -148,18 +155,32 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 
 ### 质量（BFCL 多轮工具调用，已解决）
 
-**最新全量结果：82/200 = 41.0%（2026-11-06）**，修复前为 72/200 = 36.0%。
+**最新全量结果：no-spec 86/200 = 43.0%，MTP-3 87/200 = 43.5%（2026-11-07）**，
+修复前为 36.0%（72/200），更早基线 23.0%（46/200）。
 
 运行设置：BFCL-v3 `multi_turn_base` 全量 200 条，thinking OFF，
-`temperature=1.0`、`top_p=1.0`、`top_k=20`、`seed=42`，TP2，FP16-embedding NVFP4
-制品，INT8 KV，`--prefill-chunk 128`、`--prefix-cache` 开启。**每次评测前重启 server**
-（跨 run 复用进程会污染前缀缓存状态）。结果目录：
-`/home/cmj/eval-runs/bfcl/ninfer_f16embed_notc_c128_s42_n200/20261106_015811`。
+`temperature=1.0`、`top_p=1.0`、`seed=42`，TP2，FP16-embedding NVFP4 制品，
+INT8 KV，`--prefill-chunk 8192`、`--prefix-cache` 开启。**每次评测前重启 server**
+（跨 run 复用进程会污染前缀缓存状态）。BFCL prompt 很短（Avg In ≈ 5K），
+`--max-context 131072` 与发布用的 262144 质量一致（262144 已确认可容纳该制品）。
+结果目录：`/home/cmj/eval-runs/bfcl/ninfer_f16_prefillfix_notc_s42_n200`（no-spec）、
+`/home/cmj/eval-runs/bfcl/ninfer_f16_fixed_mtp3_notc_s42_n200`（MTP-3）。
 
-| 运行 | 全量 | 前 100 | 后 100 |
-|---|---:|---:|---:|
-| **ninfer（本轮修复后）** | **41.0%（82/200）** | **56** | **26** |
-| ninfer（修复前，turn-checkpoint 复用开启） | 36.0%（72/200） | 50 | 22 |
+| 运行 | no-spec | MTP-3 |
+|---|---:|---:|
+| **ninfer（v0.2.0）** | **43.0%（86/200）** | **43.5%（87/200）** |
+| ninfer（修复 FP16 prefill 前） | 44.0%（88/200） | — |
+
+#### 关于 no-spec 44.0% → 43.0%（可优化点）
+
+修复 prefill attention（FP16 prefill 从 chunked small-T 切到 Volta flash split-D，与 BF16
+生产路径一致）后，no-spec 从 88/200 变为 86/200。逐样本对比只有 4 条翻转：index 17/56/64
+（通过→未通过）、index 61（未通过→通过），净 −2。这是 n200 的采样抖动（1 SE ≈ 3.5 个点，
+差异 1 个点），不是精度下降：flash split-D 的 attention 输出为 FP32 累加（原 small-T 路径
+用 FP16 部分累加），只是归约顺序不同；在 `temperature=1.0` 下，边界工具调用任务会对极小
+logit 差异翻转。**可优化点**：评测侧对 borderline tool-call 任务加 greedy 复核/固定采样，
+或对 flash/small-T 的 crossover（`NINFER_SM70_ATTN_V2` 与 prefill 内核阈值）做小范围 A/B，
+把这类翻转压到 0；不影响发布口径（43–44% 均显著高于 41% 基线）。
 
 修复内容与验收证据：
 
@@ -170,13 +191,13 @@ MTP 为各点 **2.0–2.3×**，接受率 47–58%（2.4–2.7 tok/round）；TT
 3. **Prefix reuse 数值等价性**：non-speculative 路径不再恢复 rewrite checkpoint（turn/response
    closure），只保留 block snapshot（prefill 状态）或 cold prefill；同 server 重跑
    0/10 轨迹差异。`bf8595c3` 把同一禁用扩展到 MTP：MTP 保留 checkpoint 时全量
-   69/200 = 34.5%，禁用后 72/200 = 36.0%（配对净 +3）；
-   DFlash 暂保留（未测）。
+   69/200 = 34.5%，禁用后 72/200 = 36.0%；本次进一步修复 FP16 prefill 数值路径后，
+   MTP-3 达到 87/200 = 43.5%（与 no-spec 持平）；DFlash 暂保留（未测）。
 
 仍未覆盖：block-snapshot reuse 仍会产生确定性的不同轨迹（本轮同分），以及 DFlash 路径
 仍保留 rewrite checkpoint。二者不影响单请求 release 验收。
 
-`--prefill-chunk 128` 的代价：长提示冷预填充约 **3.3× 慢**（5060 tok TTFT 2.4s→8.0s；21620 tok 10.8s→34.6s）；≤128 tok 无差异；BFCL 整轮因前缀缓存仅约 +2min。
+本次评测与发布均使用 `--prefill-chunk 8192`（旧评测曾用 128 作稳定性 workaround，代价是长提示冷预填充约 3.3× 慢；该 workaround 已不再需要）。FP16 prefill 修复后，冷 prefill @3.7K 约 2057 tok/s，与 BF16 基线持平。
 
 **历史基线（greedy，thinking 关闭，`--prefix-cache` 开启）**：
 
@@ -390,7 +411,7 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 - 多实例只有 2×TP1 通过真实集成测试；4 卡（4×TP1/2×TP2）和 8 卡（8×TP1/4×TP2/2×TP4）未验证，8 卡为社区/非契约。4×TP1 与 8×TP1 需要 32GB 卡，16GB V100 放不下一份完整的 27B 权重。
 - KV 只有每实例 device KV 和进程共享的 pinned host prefix-KV 两级；没有磁盘 KV tier、KV offload 或全局活跃 KV 池。
 - prefix cache 修复后未做长时间浸泡测试；超高压并发下的缓存行为仍在观察。
-- **BFCL 全量 200 条：ninfer 41.0%（82/200）**。本轮修复了 tool-call 参数类型、NVFP4 QPN 除数和 prefix-reuse 的 rewrite checkpoint 复用（no-spec 与 MTP 均禁用）；同一 server 重跑已可复现（见“质量”节）。
+- **BFCL 全量 200 条：ninfer no-spec 43.0%（86/200）、MTP-3 43.5%（87/200）**。本轮修复了 tool-call 参数类型、NVFP4 QPN 除数、prefix-reuse 的 rewrite checkpoint 复用，以及 FP16 的 gating/prefill 性能与数值路径；同一 server 重跑已可复现（见“质量”节）。
 
 ---
 
@@ -399,7 +420,6 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 - [Neroued/ninfer](https://github.com/Neroued/ninfer) — NInfer 原始项目，本仓库的引擎基座。
 - [wamansou/ninfer-tp2-1m](https://github.com/wamansou/ninfer-tp2-1m) — 双卡张量并行与 YaRN 扩展。
 - [jason-ni/ninfer-v100-tp4](https://github.com/jason-ni/ninfer-v100-tp4) — V100 TP4 单进程并行基底（本仓库代码直接来源）。
-- splitd（D256 Split-D）长上下文 prefill 内核（vendored；来源与许可见 `third_party/llama_cpp_sm70_d256/`）。
 - [dollarwong/ninfer-v100](https://github.com/dollarwong/ninfer-v100) — V100 上的 NInfer 单卡部署与跨引擎基准 fork（调研参考，未直接复用其代码）。
 - [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) — 默认模型的 NVFP4 量化权重源。
 - [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) — `.ninfer` 制品格式的参考（本 fork 契约不兼容，仅作格式参照）。
@@ -439,8 +459,9 @@ First public release: **v0.1.0 (2026-10-27)**. See [`CHANGELOG.md`](CHANGELOG.md
 
 ## BFCL Multi-Turn Tool-Calling Quality: Located and Fixed
 
-The latest full run scores **41.0% (82/200)**, up from 36.0% (72/200) before this fix and
-23.0% (46/200) at the previous baseline.
+The latest full run scores **no-spec 43.0% (86/200) and MTP-3 43.5% (87/200)**, up from
+36.0% (72/200) before this fix and 23.0% (46/200) at the earlier baseline. The same round
+also removed the FP16 runtime's decode/prefill regression (see "Speed").
 
 Three implementation defects were found and fixed:
 
@@ -498,10 +519,12 @@ See [`TEMP_WORKAROUNDS.md`](TEMP_WORKAROUNDS.md) for all temporary changes and r
 
 ---
 
-## Current Status (fp16-text-runtime branch, as of 2026-11-06)
+## Current Status (v0.2.0, as of 2026-11-07)
 
-This branch adds the FP16 text runtime on top of v0.1.0 and fixes BFCL
-multi-turn quality: 82/200 = 41.0%; MTP 72/200 = 36.0%. Not yet tagged.
+This version adds the FP16 text runtime on top of v0.1.0, fixes BFCL multi-turn quality,
+and removes the FP16 path's decode/prefill regression. BFCL `multi_turn_base`, full 200:
+**no-spec 86/200 = 43.0%, MTP-3 87/200 = 43.5%**. MTP-3 decode at four points (262144 context, INT8 KV, FP16-embedding artifact):
+**104.7 / 98.9 / 109.6 / 98.1 tok/s**.
 
 ### Test Parameters
 
@@ -534,7 +557,7 @@ multi-turn quality: 82/200 = 41.0%; MTP 72/200 = 36.0%. Not yet tagged.
 | OS | Linux x86_64; buildable without root (see Installation) |
 | CUDA | 12.8 |
 | Compiler | GCC 13.3, CMake ≥ 3.28, Ninja |
-| Model | Self-converted `qwen3_8_27b_nvfp4.ninfer` (NVFP4, ~18 GiB; source `unsloth/Qwen3.8-27B-NVFP4`) |
+| Model | Self-converted `qwen3_8_27b_nvfp4_f16embed.ninfer` (NVFP4 + FP16 embedding, 18.0 GiB; used for the quality/speed measurements) and the standard `qwen3_8_27b_nvfp4.ninfer` (16.8 GiB, same speed); source `unsloth/Qwen3.8-27B-NVFP4` |
 | Server flags | `--tp 2 --devices 0,1 --kv-dtype int8 --max-context 262144` |
 
 ## Test Cases and Results
@@ -547,7 +570,8 @@ All data below are **measured on this project** (October 2026) and are not compa
 
 | Case | Method | Result |
 |---|---|---|
-| 8K-token short prompt | server-reported | up to ~**1780 tok/s** |
+| Short prompt (2048 tok, CLI) | CLI-reported | **1826 tok/s** (1522 before the fix; matches the BF16 baseline of 1825) |
+| Server cold prefill @3.7K | server-reported | **2057 tok/s** (TTFT 1.73 s) |
 | 174K-token long document (splitd on) | dedicated A/B script, single request | **1059.7 tok/s** |
 | Same (splitd off, reference) | same | 985.4 tok/s (splitd gives **+7.5%**) |
 
@@ -557,10 +581,13 @@ Aligned profile, `long_gen_prompt` at four points (prompt 502 / 3.7K / 15K / 59K
 
 | Configuration | @502 | @3.7K | @15K | @59K |
 |---|---|---|---|---|
-| No MTP | 50.9 | 50.0 | 46.2 | 35.9 |
-| **MTP (`--spec mtp --draft-tokens 3`)** | **106.8** | **99.2** | **99.7** | **84.4** |
+| No MTP | 51.0 | 49.9 | 46.4 | 36.0 |
+| **MTP (`--spec mtp --draft-tokens 3`)** | **104.7** | **98.9** | **109.6** | **98.1** |
 
-MTP is **2.0–2.3×** at every point, with 47–58% acceptance (2.4–2.7 tok/round); TTFT increases by about 0.15s (draft initialization).
+MTP is **2.0–2.7×** at every point, with **52–66%** acceptance (2.5–3.0 tok/round); TTFT
+increases by about 0.15s (draft initialization). Measured with the f16embed artifact at
+`--max-context 262144 --prefill-chunk 8192`; the standard artifact scores 103.1 / 102.4 /
+112.6 / 97.7 at the same points.
 
 **Multi-turn prefix cache (`--prefix-cache`)**
 
@@ -568,18 +595,35 @@ MTP is **2.0–2.3×** at every point, with 47–58% acceptance (2.4–2.7 tok/r
 
 ### Quality (BFCL multi-turn tool calling, resolved)
 
-**Latest full result: 82/200 = 41.0% (2026-11-06)**, up from 72/200 = 36.0% before this fix.
+**Latest full result: no-spec 86/200 = 43.0%, MTP-3 87/200 = 43.5% (2026-11-07)**,
+up from 36.0% (72/200) before this fix and 23.0% (46/200) at the earlier baseline.
 
 Run settings: BFCL-v3 `multi_turn_base`, full 200 samples, thinking OFF,
-`temperature=1.0`, `top_p=1.0`, `top_k=20`, `seed=42`, TP2, FP16-embedding NVFP4
-artifact, INT8 KV, `--prefill-chunk 128`, `--prefix-cache` enabled. **Restart the server
-before every run**; reusing a process across runs contaminates prefix-cache state.
-Results: `/home/cmj/eval-runs/bfcl/ninfer_f16embed_notc_c128_s42_n200/20261106_015811`.
+`temperature=1.0`, `top_p=1.0`, `seed=42`, TP2, FP16-embedding NVFP4 artifact, INT8 KV,
+`--prefill-chunk 8192`, `--prefix-cache` enabled. **Restart the server before every run**;
+reusing a process across runs contaminates prefix-cache state. BFCL prompts are short
+(Avg In ~5K), so `--max-context 131072` matches the release's 262144 quality (262144 is
+confirmed to hold the artifact). Results:
+`/home/cmj/eval-runs/bfcl/ninfer_f16_prefillfix_notc_s42_n200` (no-spec),
+`/home/cmj/eval-runs/bfcl/ninfer_f16_fixed_mtp3_notc_s42_n200` (MTP-3).
 
-| Run | Full | First 100 | Second 100 |
-|---|---:|---:|---:|
-| **ninfer (after this round)** | **41.0% (82/200)** | **56** | **26** |
-| ninfer (before fix, turn-checkpoint reuse on) | 36.0% (72/200) | 50 | 22 |
+| Run | no-spec | MTP-3 |
+|---|---:|---:|
+| **ninfer (v0.2.0)** | **43.0% (86/200)** | **43.5% (87/200)** |
+| ninfer (before the FP16 prefill fix) | 44.0% (88/200) | — |
+
+#### On no-spec 44.0% → 43.0% (an optimizable point)
+
+After the prefill-attention fix (FP16 prefill switched from chunked small-T to the Volta
+flash split-D kernel that BF16 already uses), no-spec moved from 88/200 to 86/200.
+A per-sample diff shows only four flips: indices 17/56/64 (pass→fail) and 61 (fail→pass),
+net -2. This is n200 sampling noise (1 SE ~3.5 points; the difference is 1 point), not a
+precision loss: the flash split-D attention accumulates in FP32 (the old small-T path used
+FP16 partials), only the reduction order differs, and at `temperature=1.0` borderline
+tool-call tasks flip on tiny logit changes. **Optimizable**: add a greedy re-check / fixed
+sampler for borderline tool-call tasks in the evaluation, or A/B the flash/small-T crossover
+(`NINFER_SM70_ATTN_V2` and the prefill kernel threshold) to drive these flips to zero; this
+does not affect the release (43–44% both clear the 41% baseline).
 
 Fixes and acceptance evidence:
 
@@ -592,15 +636,17 @@ Fixes and acceptance evidence:
    rewrite checkpoint (turn/response closure), only prefill-state block snapshots or a cold
    prefill; same-server reruns now show 0/10 trajectory differences. `bf8595c3` extends the
    same disable to MTP: MTP scored 69/200 = 34.5% with the checkpoint and 72/200 = 36.0%
-   without it (paired net +3). DFlash is left unchanged (untested).
+   without it. After also fixing the FP16 prefill numerical path in this round, MTP-3 reaches
+   87/200 = 43.5% (at parity with no-spec). DFlash is left unchanged (untested).
 
 Still open: block-snapshot reuse still produces a deterministic but different trajectory
 (same score this round), and the DFlash path retains the rewrite checkpoint. Neither
 affects the single-request release acceptance.
 
-Cost of `--prefill-chunk 128`: long-prompt cold prefill is about **3.3× slower**
-(5060 tok TTFT 2.4s→8.0s; 21620 tok 10.8s→34.6s); ≤128 tok shows no difference; the full
-BFCL run costs only about +2 min thanks to prefix caching.
+This round's evaluation and release use `--prefill-chunk 8192` (the earlier evaluation used
+128 as a stability workaround, which cost about **3.3×** on long-prompt cold prefill; that
+workaround is no longer needed). After the FP16 prefill fix, cold prefill @3.7K is about
+2057 tok/s, on par with the BF16 baseline.
 
 **Historical baseline (greedy, thinking off, `--prefix-cache` enabled)**:
 
@@ -831,7 +877,7 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 - Only 2×TP1 multi-instance has passed a real integration test; the 4-card (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified, and the 8-card profiles are community/out-of-contract. 4×TP1 and 8×TP1 require 32GB cards; a 16GB V100 cannot hold one full 27B copy.
 - KV has two tiers only: per-instance device KV and the process-shared pinned host prefix-KV tier. There is no disk KV tier, KV offload, or global active-KV pool.
 - After the prefix-cache fix, no long soak test has been run; cache behavior under very high concurrency is still being observed.
-- **BFCL full 200: ninfer 41.0% (82/200)**. This round fixed tool-call argument typing, the NVFP4 QPN divisor, and the rewrite-checkpoint prefix reuse (disabled for no-spec and MTP); same-server reruns are now reproducible (see the “Quality” section).
+- **BFCL full 200: ninfer no-spec 43.0% (86/200), MTP-3 43.5% (87/200)**. This round fixed tool-call argument typing, the NVFP4 QPN divisor, the rewrite-checkpoint prefix reuse, and the FP16 gating/prefill performance and numerical paths; same-server reruns are now reproducible (see the “Quality” section).
 
 ---
 
@@ -840,7 +886,6 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 - [Neroued/ninfer](https://github.com/Neroued/ninfer) — the original NInfer project and the engine base of this repository.
 - [wamansou/ninfer-tp2-1m](https://github.com/wamansou/ninfer-tp2-1m) — dual-GPU tensor parallelism and YaRN extension.
 - [jason-ni/ninfer-v100-tp4](https://github.com/jason-ni/ninfer-v100-tp4) — V100 TP4 single-process parallel base (direct source of this repository's code).
-- splitd (D256 Split-D) long-context prefill kernel (vendored; source and license under `third_party/llama_cpp_sm70_d256/`).
 - [dollarwong/ninfer-v100](https://github.com/dollarwong/ninfer-v100) — NInfer single-GPU deployment and cross-engine benchmark fork on V100 (research reference; its code was not directly reused).
 - [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) — NVFP4 quantized weight source for the default model.
 - [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) — reference for the `.ninfer` artifact format (incompatible with this fork's contract; format reference only).

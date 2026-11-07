@@ -594,11 +594,6 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     auto scope = workspace.scope();
     detail::GqaAttentionRoute route =
         detail::gqa_attention_resolve_route(q.ne[1], width, batch, cache.dtype, envelope);
-    // The Volta flash staging kernel is BF16-activation-only for now; an FP16 prefill uses the
-    // chunked small-T path, which carries the activation dtype natively.
-    if (q.dtype == DType::FP16 && route == detail::GqaAttentionRoute::VoltaFlash) {
-        route = detail::GqaAttentionRoute::ChunkedSmallT;
-    }
 #ifdef NINFER_VOLTA_BUILD
     if (route == detail::GqaAttentionRoute::VoltaFlash && valid_columns.data == nullptr) {
         VoltaFlashWorkspace staging =

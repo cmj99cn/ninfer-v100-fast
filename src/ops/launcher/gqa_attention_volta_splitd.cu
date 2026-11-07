@@ -82,11 +82,23 @@ int split3_min_kv() {
     return value;
 }
 
-// bf16 Q [D][heads][rows] -> f16 [row][head][D] padded to q_pad, zero-filled past `rows`.
+// Activation-dtype overloads for the Q read and the out write. The split-D kernel itself is
+// f16-Q / f32-out for every activation dtype, so only these casts differ.
+__device__ __forceinline__ float splitd_act_to_float(const __nv_bfloat16* p) {
+    return __bfloat162float(*p);
+}
+__device__ __forceinline__ float splitd_act_to_float(const half* p) { return __half2float(*p); }
+__device__ __forceinline__ void splitd_float_to_act(__nv_bfloat16* p, float v) {
+    *p = __float2bfloat16(v);
+}
+__device__ __forceinline__ void splitd_float_to_act(half* p, float v) { *p = __float2half(v); }
+
+// bf16/f16 Q [D][heads][rows] -> f16 [row][head][D] padded to q_pad, zero-filled past `rows`.
 // No rotation: this tree's int8 KV codec stores raw (unrotated) values, so the dot product
 // is already in the original basis.
+template <class E>
 __launch_bounds__(256) __global__ void splitd_stage_q_kernel(
-        const __nv_bfloat16* __restrict__ q, cutlass::half_t* __restrict__ qs, int rows,
+        const E* __restrict__ q, cutlass::half_t* __restrict__ qs, int rows,
         int q_pad, int heads) {
     constexpr int kWarps = 8;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
@@ -111,21 +123,23 @@ __launch_bounds__(256) __global__ void splitd_stage_q_kernel(
     half* dst       = dst_base + (static_cast<std::size_t>(row) * heads + h) * kHeadDim;
 
     for (int d = lane; d < kHeadDim; d += 32) {
-        dst[d] = __float2half(__bfloat162float(src[d]));
+        dst[d] = __float2half(splitd_act_to_float(src + d));
     }
 }
 
 // f32 [row][head][D] (padded) -> bf16 [D][heads][rows], the layout the rest of the engine
 // expects from this route's output tensor.
+template <class E>
 __global__ void splitd_unstage_out_kernel(const float* __restrict__ o,
-                                          __nv_bfloat16* __restrict__ out, int rows, int heads) {
+                                          E* __restrict__ out, int rows, int heads) {
     const std::int64_t total = static_cast<std::int64_t>(rows) * heads * kHeadDim;
     for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < total; i += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
         const int d   = static_cast<int>(i % kHeadDim);
         const int h   = static_cast<int>((i / kHeadDim) % heads);
         const int row = static_cast<int>(i / (kHeadDim * static_cast<std::int64_t>(heads)));
-        out[i] = __float2bfloat16(o[(static_cast<std::size_t>(row) * heads + h) * kHeadDim + d]);
+        splitd_float_to_act(out + i,
+                            o[(static_cast<std::size_t>(row) * heads + h) * kHeadDim + d]);
     }
 }
 
@@ -278,9 +292,9 @@ bool splitd_positions_are_contiguous(const void* positions, std::int32_t base,
 // row 0 (the kernel derives its causal mask from those two). `positions_contiguous` must
 // already have been validated by splitd_positions_are_contiguous for the whole launch.
 template <typename Geometry>
-bool volta_splitd_block(const void* q_bf16, const void* k_f16, const void* v_f16, int rows,
+bool volta_splitd_block(const void* q_act, const void* k_f16, const void* v_f16, int rows,
                         int kv_len, int kv_offset, bool positions_contiguous, float scale,
-                        void* out_bf16, cudaStream_t stream) {
+                        void* out_act, bool f16, cudaStream_t stream) {
     using Traits = FLASH_NAMESPACE::Sm70D256SplitDTraits;
     constexpr int kHeads = Geometry::QHeads;
     constexpr int kKvHeads = Geometry::KVHeads;
@@ -312,8 +326,13 @@ bool volta_splitd_block(const void* q_bf16, const void* k_f16, const void* v_f16
 
     constexpr int kStageWarps = 8;
     const int stage_blocks    = (rows * kHeads + kStageWarps - 1) / kStageWarps;
-    splitd_stage_q_kernel<<<stage_blocks, kStageWarps * 32, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q_bf16), staging.q, rows, q_pad, kHeads);
+    if (f16) {
+        splitd_stage_q_kernel<half><<<stage_blocks, kStageWarps * 32, 0, stream>>>(
+            static_cast<const half*>(q_act), staging.q, rows, q_pad, kHeads);
+    } else {
+        splitd_stage_q_kernel<__nv_bfloat16><<<stage_blocks, kStageWarps * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q_act), staging.q, rows, q_pad, kHeads);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     // SplitKV3: three-way KV split for long prefixes. The upstream fork measured +3.7% on a
@@ -370,19 +389,26 @@ bool volta_splitd_block(const void* q_bf16, const void* k_f16, const void* v_f16
 
     const int unstage_blocks = static_cast<int>(
         (static_cast<std::int64_t>(rows) * kHeads * kHeadDim + 255) / 256);
-    splitd_unstage_out_kernel<<<unstage_blocks, 256, 0, stream>>>(
-        staging.o, static_cast<__nv_bfloat16*>(out_bf16), rows, kHeads);
+    if (f16) {
+        splitd_unstage_out_kernel<half><<<unstage_blocks, 256, 0, stream>>>(
+            staging.o, static_cast<half*>(out_act), rows, kHeads);
+    } else {
+        splitd_unstage_out_kernel<__nv_bfloat16><<<unstage_blocks, 256, 0, stream>>>(
+            staging.o, static_cast<__nv_bfloat16*>(out_act), rows, kHeads);
+    }
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
 
 template bool volta_splitd_block<Gqa27Geometry>(const void*, const void*, const void*, int, int,
-                                                int, bool, float, void*, cudaStream_t);
+                                                int, bool, float, void*, bool, cudaStream_t);
 template bool volta_splitd_block<Gqa35Geometry>(const void*, const void*, const void*, int, int,
-                                                int, bool, float, void*, cudaStream_t);
+                                                int, bool, float, void*, bool, cudaStream_t);
 template bool volta_splitd_block<Gqa27Tp2Geometry>(const void*, const void*, const void*, int,
-                                                   int, int, bool, float, void*, cudaStream_t);
+                                                   int, int, bool, float, void*, bool,
+                                                   cudaStream_t);
 template bool volta_splitd_block<Gqa27Tp4Geometry>(const void*, const void*, const void*, int,
-                                                   int, int, bool, float, void*, cudaStream_t);
+                                                   int, int, bool, float, void*, bool,
+                                                   cudaStream_t);
 
 } // namespace ninfer::ops::detail

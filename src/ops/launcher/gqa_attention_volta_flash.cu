@@ -50,9 +50,9 @@ bool splitd_positions_are_contiguous(const void* positions, std::int32_t base, s
                                      cudaStream_t stream);
 
 template <typename Geometry>
-bool volta_splitd_block(const void* q_bf16, const void* k_f16, const void* v_f16, int rows,
+bool volta_splitd_block(const void* q_act, const void* k_f16, const void* v_f16, int rows,
                         int kv_len, int kv_offset, bool positions_contiguous, float scale,
-                        void* out_bf16, cudaStream_t stream);
+                        void* out_act, bool f16, cudaStream_t stream);
 
 namespace {
 
@@ -156,9 +156,25 @@ __device__ __forceinline__ const std::int32_t* select_block_table(
 // route does this per 5-token chunk; a flash tiling needs the full range resident
 // before the first Q-block runs, and the causal mask is what keeps a query from
 // seeing a key it must not.
-template <int kKVHeads>
+// Activation-dtype casts for the K/V append and the vendored-path Q/out staging. The cache,
+// the vendored f32 Q/O staging and the split-D kernel keep their own fixed element types; only
+// the incoming activation stream changes.
+__device__ __forceinline__ float flash_act_to_float(const __nv_bfloat16* p) {
+    return __bfloat162float(*p);
+}
+__device__ __forceinline__ float flash_act_to_float(const half* p) { return __half2float(*p); }
+__device__ __forceinline__ __nv_bfloat16 flash_act_to_bf16(const __nv_bfloat16* p) { return *p; }
+__device__ __forceinline__ __nv_bfloat16 flash_act_to_bf16(const half* p) {
+    return __float2bfloat16(__half2float(*p));
+}
+__device__ __forceinline__ void flash_float_to_act(__nv_bfloat16* p, float v) {
+    *p = __float2bfloat16(v);
+}
+__device__ __forceinline__ void flash_float_to_act(half* p, float v) { *p = __float2half(v); }
+
+template <int kKVHeads, class E>
 __global__ void volta_flash_append_kv_kernel(
-        const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+        const E* __restrict__ k, const E* __restrict__ v,
         const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ table_rows,
         __nv_bfloat16* __restrict__ k_pages, __nv_bfloat16* __restrict__ v_pages,
         const std::int32_t* __restrict__ block_tables, int logical_pages, int width) {
@@ -174,8 +190,8 @@ __global__ void volta_flash_append_kv_kernel(
     const std::int64_t src =
         static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * t);
 
-    k_pages[dst] = k[src];
-    v_pages[dst] = v[src];
+    k_pages[dst] = flash_act_to_bf16(k + src);
+    v_pages[dst] = flash_act_to_bf16(v + src);
 }
 
 __device__ __forceinline__ float volta_flash_warp_max(float value) {
@@ -189,9 +205,9 @@ __device__ __forceinline__ float volta_flash_warp_max(float value) {
 // BF16 input -> paged INT8-G64 cache. Eight warps independently own one
 // (token, kv-head, 64-d group), matching the cache's public quantization
 // contract and the existing prefill append kernel.
-template <int kKVHeads>
+template <int kKVHeads, class E>
 __launch_bounds__(256) __global__ void volta_flash_append_kv_i8_kernel(
-        const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+        const E* __restrict__ k, const E* __restrict__ v,
         const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ table_rows,
         std::int8_t* __restrict__ k_pages, std::int8_t* __restrict__ v_pages,
         half* __restrict__ k_scales, half* __restrict__ v_scales,
@@ -212,10 +228,10 @@ __launch_bounds__(256) __global__ void volta_flash_append_kv_i8_kernel(
         static_cast<std::int64_t>(d0) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * token);
     const std::int64_t src1 = src0 + 32;
 
-    const float k0 = __bfloat162float(k[src0]);
-    const float k1 = __bfloat162float(k[src1]);
-    const float v0 = __bfloat162float(v[src0]);
-    const float v1 = __bfloat162float(v[src1]);
+    const float k0 = flash_act_to_float(k + src0);
+    const float k1 = flash_act_to_float(k + src1);
+    const float v0 = flash_act_to_float(v + src0);
+    const float v1 = flash_act_to_float(v + src1);
     const float ka = volta_flash_warp_max(fmaxf(fabsf(k0), fabsf(k1)));
     const float va = volta_flash_warp_max(fmaxf(fabsf(v0), fabsf(v1)));
     const half ks  = __float2half_rn(ka > 0.0f ? ka / 127.0f : 0.0f);
@@ -248,9 +264,9 @@ __launch_bounds__(256) __global__ void volta_flash_append_kv_i8_kernel(
 // BF16 input -> paged IQ4_NL-G32 cache. One warp owns one (token, kv-head, 32-d group) with one
 // value per lane; the encode is the shared gqa_i4nl_encode_warp pipeline, so the codes and scales
 // are bit-identical to gqa_kv_append and the ChunkedSmallT fill. Eight warps per CTA.
-template <int kKVHeads>
+template <int kKVHeads, class E>
 __launch_bounds__(256) __global__ void volta_flash_append_kv_i4nl_kernel(
-        const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+        const E* __restrict__ k, const E* __restrict__ v,
         const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ table_rows,
         std::int8_t* __restrict__ k_pages, std::int8_t* __restrict__ v_pages,
         half* __restrict__ k_scales, half* __restrict__ v_scales,
@@ -276,8 +292,8 @@ __launch_bounds__(256) __global__ void volta_flash_append_kv_i4nl_kernel(
 
     const std::int64_t src =
         static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * token);
-    const float kx = __bfloat162float(k[src]);
-    const float vx = __bfloat162float(v[src]);
+    const float kx = flash_act_to_float(k + src);
+    const float vx = flash_act_to_float(v + src);
 
     std::uint32_t k_byte, v_byte;
     half k_sh, v_sh;
@@ -419,20 +435,22 @@ __global__ void volta_flash_gather_kv_i4nl_kernel(
 
 // BF16 [256, QHeads, T] -> FP32, same element order (the kernel's Q and ninfer's q
 // agree on layout; only the element type differs).
-__global__ void volta_flash_convert_q_kernel(const __nv_bfloat16* __restrict__ q,
+template <class E>
+__global__ void volta_flash_convert_q_kernel(const E* __restrict__ q,
                                              float* __restrict__ out, std::int64_t count) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) { return; }
-    out[i] = __bfloat162float(q[i]);
+    out[i] = flash_act_to_float(q + i);
 }
 
 // FP32 -> BF16 on the way back out, same element order.
+template <class E>
 __global__ void volta_flash_convert_out_kernel(const float* __restrict__ in,
-                                               __nv_bfloat16* __restrict__ out,
+                                               E* __restrict__ out,
                                                std::int64_t count) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) { return; }
-    out[i] = __float2bfloat16(in[i]);
+    flash_float_to_act(out + i, in[i]);
 }
 
 // Causal mask for one Q-block, built from the device-side positions rather than
@@ -643,31 +661,72 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
         cudaEventRecord(t0, stream);
         (void)cudaGetLastError(); // timing must not poison the append CUDA_CHECK below
     }
+    const bool f16_kv = k.dtype == DType::FP16;
     if (cache.dtype == DType::I8) {
         constexpr int kWarpsPerBlock = 8;
         const int units              = width * kKVHeads * kGqaKvQuantGroups;
         const int blocks             = (units + kWarpsPerBlock - 1) / kWarpsPerBlock;
-        volta_flash_append_kv_i8_kernel<kKVHeads><<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
-            position_ptr, rows, static_cast<std::int8_t*>(cache.k_pages.data),
-            static_cast<std::int8_t*>(cache.v_pages.data),
-            static_cast<half*>(cache.k_scale_pages.data),
-            static_cast<half*>(cache.v_scale_pages.data), block_tables, logical_pages, width);
+        if (f16_kv) {
+            volta_flash_append_kv_i8_kernel<kKVHeads, half>
+                <<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
+                    static_cast<const half*>(k.data), static_cast<const half*>(v.data),
+                    position_ptr, rows, static_cast<std::int8_t*>(cache.k_pages.data),
+                    static_cast<std::int8_t*>(cache.v_pages.data),
+                    static_cast<half*>(cache.k_scale_pages.data),
+                    static_cast<half*>(cache.v_scale_pages.data), block_tables, logical_pages,
+                    width);
+        } else {
+            volta_flash_append_kv_i8_kernel<kKVHeads, __nv_bfloat16>
+                <<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(k.data),
+                    static_cast<const __nv_bfloat16*>(v.data), position_ptr, rows,
+                    static_cast<std::int8_t*>(cache.k_pages.data),
+                    static_cast<std::int8_t*>(cache.v_pages.data),
+                    static_cast<half*>(cache.k_scale_pages.data),
+                    static_cast<half*>(cache.v_scale_pages.data), block_tables, logical_pages,
+                    width);
+        }
     } else if (cache.dtype == DType::I4NL) {
         constexpr int kWarpsPerBlock = 8;
         const int units              = width * kKVHeads * kGqaI4NLGroups;
         const int blocks             = (units + kWarpsPerBlock - 1) / kWarpsPerBlock;
-        volta_flash_append_kv_i4nl_kernel<kKVHeads><<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
-            position_ptr, rows, static_cast<std::int8_t*>(cache.k_pages.data),
-            static_cast<std::int8_t*>(cache.v_pages.data),
-            static_cast<half*>(cache.k_scale_pages.data),
-            static_cast<half*>(cache.v_scale_pages.data), block_tables, logical_pages, width);
+        if (f16_kv) {
+            volta_flash_append_kv_i4nl_kernel<kKVHeads, half>
+                <<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
+                    static_cast<const half*>(k.data), static_cast<const half*>(v.data),
+                    position_ptr, rows, static_cast<std::int8_t*>(cache.k_pages.data),
+                    static_cast<std::int8_t*>(cache.v_pages.data),
+                    static_cast<half*>(cache.k_scale_pages.data),
+                    static_cast<half*>(cache.v_scale_pages.data), block_tables, logical_pages,
+                    width);
+        } else {
+            volta_flash_append_kv_i4nl_kernel<kKVHeads, __nv_bfloat16>
+                <<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(k.data),
+                    static_cast<const __nv_bfloat16*>(v.data), position_ptr, rows,
+                    static_cast<std::int8_t*>(cache.k_pages.data),
+                    static_cast<std::int8_t*>(cache.v_pages.data),
+                    static_cast<half*>(cache.k_scale_pages.data),
+                    static_cast<half*>(cache.v_scale_pages.data), block_tables, logical_pages,
+                    width);
+        }
     } else {
-        volta_flash_append_kv_kernel<kKVHeads><<<dim3(width, kKVHeads), kHeadDim, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
-            position_ptr, rows, static_cast<__nv_bfloat16*>(cache.k_pages.data),
-            static_cast<__nv_bfloat16*>(cache.v_pages.data), block_tables, logical_pages, width);
+        if (f16_kv) {
+            volta_flash_append_kv_kernel<kKVHeads, half>
+                <<<dim3(width, kKVHeads), kHeadDim, 0, stream>>>(
+                    static_cast<const half*>(k.data), static_cast<const half*>(v.data),
+                    position_ptr, rows, static_cast<__nv_bfloat16*>(cache.k_pages.data),
+                    static_cast<__nv_bfloat16*>(cache.v_pages.data), block_tables, logical_pages,
+                    width);
+        } else {
+            volta_flash_append_kv_kernel<kKVHeads, __nv_bfloat16>
+                <<<dim3(width, kKVHeads), kHeadDim, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(k.data),
+                    static_cast<const __nv_bfloat16*>(v.data), position_ptr, rows,
+                    static_cast<__nv_bfloat16*>(cache.k_pages.data),
+                    static_cast<__nv_bfloat16*>(cache.v_pages.data), block_tables, logical_pages,
+                    width);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
     if (timing_on) {
@@ -791,7 +850,7 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
             if (!volta_splitd_block<Geometry>(q_row, k_contig, v_contig, rows,
                                               n_kv_total, base + begin,
                                               /*positions_contiguous=*/true, scale, out_row,
-                                              stream)) {
+                                              q.dtype == DType::FP16, stream)) {
                 all_done = false;
                 // Continue with the vendored path for the remaining rows via the loop below.
                 // (In practice splitd either accepts or rejects uniformly.)
@@ -821,7 +880,8 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                             static_cast<std::int64_t>(begin) * kQHeads * kHeadDim;
             if (volta_splitd_block<Geometry>(
                     q_row, k_contig, v_contig, tokens, n_kv, base + begin,
-                    /*positions_contiguous=*/true, scale, out_row, stream)) {
+                    /*positions_contiguous=*/true, scale, out_row, q.dtype == DType::FP16,
+                    stream)) {
                 continue;
             }
         }
@@ -830,10 +890,18 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
         const int convert_blocks =
             static_cast<int>((q_count + kConvertThreads - 1) / kConvertThreads);
 
-        volta_flash_convert_q_kernel<<<convert_blocks, kConvertThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(q.data) +
-                static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
-            static_cast<float*>(q_f32.data), q_count);
+        if (q.dtype == DType::FP16) {
+            volta_flash_convert_q_kernel<half><<<convert_blocks, kConvertThreads, 0, stream>>>(
+                static_cast<const half*>(q.data) +
+                    static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
+                static_cast<float*>(q_f32.data), q_count);
+        } else {
+            volta_flash_convert_q_kernel<__nv_bfloat16>
+                <<<convert_blocks, kConvertThreads, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data) +
+                        static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
+                    static_cast<float*>(q_f32.data), q_count);
+        }
 
         // The mask extent is the padded key count, so every key the kernel can touch
         // has a defined mask entry; keys past a row's causal limit -- padding included
@@ -850,11 +918,20 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                            static_cast<float*>(out_f32.data),
                            static_cast<float2*>(dst_meta.data), tokens, n_kv, n_kv, scale, stream);
 
-        volta_flash_convert_out_kernel<<<convert_blocks, kConvertThreads, 0, stream>>>(
-            static_cast<const float*>(out_f32.data),
-            static_cast<__nv_bfloat16*>(out.data) +
-                static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
-            q_count);
+        if (out.dtype == DType::FP16) {
+            volta_flash_convert_out_kernel<half><<<convert_blocks, kConvertThreads, 0, stream>>>(
+                static_cast<const float*>(out_f32.data),
+                static_cast<half*>(out.data) +
+                    static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
+                q_count);
+        } else {
+            volta_flash_convert_out_kernel<__nv_bfloat16>
+                <<<convert_blocks, kConvertThreads, 0, stream>>>(
+                    static_cast<const float*>(out_f32.data),
+                    static_cast<__nv_bfloat16*>(out.data) +
+                        static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
+                    q_count);
+        }
     }
     if (timing_on)
         flash_timing_report(timing_on, t0, t1, t2, t3, &timing_n, width, n_kv_total,
