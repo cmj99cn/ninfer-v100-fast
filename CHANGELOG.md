@@ -4,8 +4,53 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-The first public release is `v0.1.0`: the engine is usable on the documented
-V100 profiles, but the BFCL quality gap and the limitations below are still open.
+The first public release was `v0.1.0` (2026-10-27). `v0.2.0` (2026-11-07) adds
+the FP16 text runtime, closes the BFCL multi-turn quality gap, and removes the
+FP16 path's decode/prefill regression.
+
+## [0.2.0] - 2026-11-07
+
+### Added
+
+- FP16 text-activation runtime for the NVFP4 text stream, selected at configure
+  time with `NINFER_TEXT_DTYPE=f16`: FP16 hidden/residual/activation
+  workspaces plus FP16 embedding, RMSNorm, RoPE, GDN recurrent/conv/gating,
+  attention staging, and the FP8/Q4/W8 control heads.
+- FP16 wide-T CUTLASS routes for the fused GDN input projection and the GDN
+  conv snapshot/record split projection.
+- FP16 activation support on the Volta flash (split-D) prefill attention route:
+  the Q stage, out unstage, KV append (i8/i4nl/bf16 cache), and the vendored
+  f32 Q/out conversions.
+
+### Changed
+
+- The 2x32GB release profile is MTP-3 (`--spec mtp --draft-tokens 3`) on the
+  FP16-embedding NVFP4 artifact at 262144-token capacity, INT8 group-64 KV,
+  eager decode; no-spec is retained as a fallback.
+- The README now reports v0.2.0 speed/quality and documents the no-spec
+  44.0% -> 43.0% four-sample flip as an optimizable evaluation point.
+
+### Fixed
+
+- Replaced the FP16 GDN gating projection's naive per-(head,token) kernel
+  (serial K, uncoalesced weight reads) with a CTA-per-head, shared-weight,
+  warp-per-token reduction.
+- The FP16 fused GDN input projection no longer chunks QPN at prefill width;
+  it uses the FP16 CUTLASS wide-T route for T >= 33.
+- FP16 prefill attention no longer falls back to the chunked small-T path; it
+  runs the Volta flash split-D kernel used by the BF16 build.
+- BFCL multi-turn quality: no-spec 43.0% (86/200) and MTP-3 43.5% (87/200), up
+  from the 36.0% pre-fix baseline. The NVFP4 QPN divisor, tool-call schema
+  typing, and the prefix-reuse rewrite checkpoint are fixed, and the rewrite
+  checkpoint is disabled for no-spec and MTP.
+
+### Performance
+
+- MTP-3 decode (262144 context, INT8 KV, f16embed artifact): 104.7 / 98.9 /
+  109.6 / 98.1 tok/s at 502 / 3.7K / 15K / 59K occupied context; the standard
+  artifact scores 103.1 / 102.4 / 112.6 / 97.7.
+- Cold prefill (2048-token CLI): 1826 tok/s, matching the BF16 baseline of 1825
+  (1522 before the FP16 fix).
 
 ## [0.1.0] - 2026-10-27
 
