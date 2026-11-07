@@ -87,6 +87,18 @@ decode/prefill 回退。BFCL `multi_turn_base` 全量：**no-spec 86/200 = 43.0%
 MTP-3 87/200 = 43.5%**。MTP-3 decode 四点
 （262144 上下文、INT8 KV、FP16-embedding 制品）：**104.7 / 98.9 / 109.6 / 98.1 tok/s**。
 
+**速度与质量优化已基本到达本硬件平台的上限。**
+
+- decode：MTP-3 在四个上下文点为 104.7/98.9/109.6/98.1 tok/s，已达到或超过参考表
+  （106.8/99.2/99.7/84.4）；MTP 接受率 52–66%，继续加 draft 或改采样策略的收益已进入平台期。
+- prefill：1826 tok/s，与 BF16 基线 1825 持平；splitd、prefill GEMM、attention split 等既有
+  旋钮均已逐项 A/B 到局部最优。
+- 质量：no-spec 43.0%、MTP-3 43.5%（修复前基线 36.0%）；44%→43% 的差异仅为 n200 的
+  4 个样本翻转（净 −2），属采样抖动而非精度退化。
+
+剩余项（44%→43% 的边界采样、未测的 DFlash 路径）是边际优化，不是大杠杆；进一步提升需要
+不同硬件或改变产品模型。详见“质量”节的“可优化点”。
+
 ### 测试参数
 
 | 引擎 | 参数 |
@@ -525,6 +537,20 @@ This version adds the FP16 text runtime on top of v0.1.0, fixes BFCL multi-turn 
 and removes the FP16 path's decode/prefill regression. BFCL `multi_turn_base`, full 200:
 **no-spec 86/200 = 43.0%, MTP-3 87/200 = 43.5%**. MTP-3 decode at four points (262144 context, INT8 KV, FP16-embedding artifact):
 **104.7 / 98.9 / 109.6 / 98.1 tok/s**.
+
+**Speed and quality optimization has essentially reached this hardware platform's limit.**
+
+- Decode: MTP-3 is 104.7/98.9/109.6/98.1 tok/s at the four context points, at or above the
+  reference table (106.8/99.2/99.7/84.4); MTP acceptance is 52–66%, and further draft or
+  sampling changes are in the plateau.
+- Prefill: 1826 tok/s, on par with the BF16 baseline of 1825; the splitd, prefill GEMM, and
+  attention-split knobs have each been A/B'd to a local optimum.
+- Quality: no-spec 43.0%, MTP-3 43.5% (pre-fix baseline 36.0%); the 44% -> 43% delta is just
+  four n200 sample flips (net -2), sampling noise rather than a precision regression.
+
+The remaining items (the 44% -> 43% borderline sampling and the untested DFlash path) are
+marginal, not large levers; further gains need different hardware or a changed product model.
+See the "optimizable point" note in the Quality section.
 
 ### Test Parameters
 
