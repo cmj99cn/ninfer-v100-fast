@@ -16,7 +16,7 @@
 
 ## 发布版本
 
-首个公开版本：**v0.1.0（2026-10-27）**。版本说明与已知限制见 [`CHANGELOG.md`](CHANGELOG.md)。
+当前版本：**v0.2.0（2026-11-07）**（首个公开版本 v0.1.0，2026-10-27）。版本说明与已知限制见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ---
 
@@ -465,7 +465,7 @@ A Tesla V100 inference engine based on NInfer: single-process TP2 (TP4 remains a
 
 ## Release
 
-First public release: **v0.1.0 (2026-10-27)**. See [`CHANGELOG.md`](CHANGELOG.md) for release notes and known limitations.
+Current release: **v0.2.0 (2026-11-07)** (first public release v0.1.0, 2026-10-27). See [`CHANGELOG.md`](CHANGELOG.md) for release notes and known limitations.
 
 ---
 
