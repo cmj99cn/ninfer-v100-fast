@@ -6,7 +6,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The first public release was `v0.1.0` (2026-10-27). `v0.2.0` (2026-11-07) adds
 the FP16 text runtime, closes the BFCL multi-turn quality gap, and removes the
-FP16 path's decode/prefill regression.
+FP16 path's decode/prefill regression. `v0.2.1` (2026-11-09) fixes Vision under
+the FP16 text runtime.
+
+## [0.2.1] - 2026-11-09
+
+### Fixed
+
+- Vision requests under the FP16 text runtime no longer fail with
+  `scatter: src/dst must share BF16 or FP16 dtype`. The Vision tower emits BF16
+  while the text residual is FP16, so both prefill paths now stage the tower
+  output through an activation-dtype buffer with a BF16->FP16 cast before
+  scattering into the residual. Covers TP1, TP2, and multi-instance (2xTP1)
+  serving.
 
 ## [0.2.0] - 2026-11-07
 

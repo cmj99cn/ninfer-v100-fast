@@ -9,6 +9,7 @@
 #include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/cast.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gated_delta_net.h"
@@ -1956,7 +1957,15 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 copy_i32(local_scatter_indices.data(), indices_device, s);
                 Tensor embeddings = vision_chunk.embeddings.slice(
                     1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
-                ops::scatter(embeddings, indices_device, x, s);
+                if constexpr (ModelConfig::act != DType::BF16) {
+                    static_assert(ModelConfig::act == DType::FP16,
+                                  "Vision scatter staging assumes the FP16 text runtime");
+                    Tensor activation_embeddings = roots.scatter_embeddings;
+                    ops::cast_bf16_to_fp16(embeddings, activation_embeddings, s);
+                    ops::scatter(activation_embeddings, indices_device, x, s);
+                } else {
+                    ops::scatter(embeddings, indices_device, x, s);
+                }
             }
             if constexpr (Tap::enabled) { tap.begin(x); }
             run_layers(x, Phase::Prefill, tap);
@@ -3144,6 +3153,7 @@ PrefillChunkResult TextContext::prefill_impl_parallel(std::span<const int> ids,
         // visual span is present, respectively; they stay default-constructed otherwise.
         std::array<Tensor, kMaximumDevices> rope_positions;
         std::array<Tensor, kMaximumDevices> scatter_indices_device;
+        std::array<Tensor, kMaximumDevices> scatter_embeddings_device;
         for (std::size_t r = 0; r < static_cast<std::size_t>(tp_width()); ++r) {
             const auto roots = workspace_recipe::text_prefill_roots<TextConfig>(
                 *ws[r], len, rope_axes, static_cast<std::int32_t>(local_scatter_indices.size()));
@@ -3153,6 +3163,7 @@ PrefillChunkResult TextContext::prefill_impl_parallel(std::span<const int> ids,
             staging[r]       = ws[r]->alloc(kCfg.act, {kCfg.hidden, len});
             rope_positions[r] = roots.rope_positions;
             scatter_indices_device[r] = roots.scatter_indices;
+            scatter_embeddings_device[r] = roots.scatter_embeddings;
         }
         // The 3-axis MRoPE positions are replicated across ranks, so build the host copy once and
         // upload to each rank (identical layout to the tp1 path).
@@ -3218,7 +3229,15 @@ PrefillChunkResult TextContext::prefill_impl_parallel(std::span<const int> ids,
                 const Tensor& emb = multimodal->vision->tp_embeddings()[r];
                 Tensor embeddings = emb.slice(1, visual_begin,
                                               static_cast<std::int32_t>(local_scatter_indices.size()));
-                ops::scatter(embeddings, scatter_indices_device[r], x[r], s);
+                if constexpr (ModelConfig::act != DType::BF16) {
+                    static_assert(ModelConfig::act == DType::FP16,
+                                  "Vision scatter staging assumes the FP16 text runtime");
+                    Tensor activation_embeddings = scatter_embeddings_device[r];
+                    ops::cast_bf16_to_fp16(embeddings, activation_embeddings, s);
+                    ops::scatter(activation_embeddings, scatter_indices_device[r], x[r], s);
+                } else {
+                    ops::scatter(embeddings, scatter_indices_device[r], x[r], s);
+                }
             }
         });
 

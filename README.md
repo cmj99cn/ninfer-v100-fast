@@ -16,7 +16,7 @@
 
 ## 发布版本
 
-当前版本：**v0.2.0（2026-11-07）**（首个公开版本 v0.1.0，2026-10-27）。版本说明与已知限制见 [`CHANGELOG.md`](CHANGELOG.md)。
+当前版本：**v0.2.1（2026-11-09）**（首个公开版本 v0.1.0，2026-10-27）。版本说明与已知限制见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ---
 
@@ -70,20 +70,22 @@ decode/prefill 性能回退（详见“速度”节）。
 
 | # | 问题 | 解决 |
 |---|---|---|
-| 1 | 已有 NVFP4 制品的 Vision tower 与本 fork 契约不兼容（量化格式、无独立 qkv、RoPE attention），加载即崩 | 不使用该制品；当前自转换 NVFP4 制品包含 Vision，GGUF Q4_K_M 制品拒绝 Vision。多实例 Vision 未验证，见 `TEMP_WORKAROUNDS.md` |
+| 1 | 已有 NVFP4 制品的 Vision tower 与本 fork 契约不兼容（量化格式、无独立 qkv、RoPE attention），加载即崩 | 不使用该制品；当前自转换 NVFP4 制品包含 Vision，GGUF Q4_K_M 制品拒绝 Vision。多实例 Vision（2×TP1）与 TP2 Vision 均已通过真实集成测试，见 `TEMP_WORKAROUNDS.md` |
 | 2 | 开启 prefix cache 后多轮对话触发 `Paged KV trim extent would discard cache-owned pages`，之后所有请求 503，引擎不可用 | 两处修复：① `trim_pages` 遇到 cache-owned 页时收缩 trim 范围而不是抛异常；② `promote_page_at` 对已 cache-owned 的页幂等返回 |
 | 3 | 怀疑 decode 慢是 attention split 策略问题，尝试 `LONG_SPLIT_KEYS=1920` | A/B 实测无效，确认瓶颈不在此，停止该方向调优 |
 | 4 | decode 速度测量一直包含 prefill 时间，数字失真 | 改用 warmup + 多次迭代 + server 自报 timings 的方法分离测量 |
 | 5 | 无 root 环境编译需要 ffmpeg/libcurl 头文件 | `apt-get download` + `dpkg-deb -x` 本地解包，`PKG_CONFIG_SYSROOT_DIR` 指向本地前缀；或直接 `-DNINFER_SKIP_FFMPEG=OFF` 见安装章节 |
+| 6 | FP16 text runtime 下 Vision 请求返回 500 `scatter: src/dst must share BF16 or FP16 dtype`（Vision tower 输出 BF16，文本残差为 FP16） | 在 Vision 嵌入散射进文本残差前增加 BF16→激活 dtype 的转换缓冲，覆盖 TP1、TP2 与多实例路径；2×TP1 双 lane 与 TP2 单实例均实测返回正确结果 |
 
 全部临时改动与复核事项见 [`TEMP_WORKAROUNDS.md`](TEMP_WORKAROUNDS.md)。
 
 ---
 
-## 当前进度（v0.2.0，截至 2026-11-07）
+## 当前进度（v0.2.1，截至 2026-11-09）
 
-本版本在 v0.1.0 之上完成 FP16 text runtime，修复 BFCL 多轮质量，并消除 FP16 路径的
-decode/prefill 回退。BFCL `multi_turn_base` 全量：**no-spec 86/200 = 43.0%、
+本版本在 v0.1.0 之上完成 FP16 text runtime，修复 BFCL 多轮质量，消除 FP16 路径的
+decode/prefill 回退，并修复 FP16 text runtime 下 Vision 请求的 scatter dtype 失败
+（TP1、TP2 与多实例均已实测）。BFCL `multi_turn_base` 全量：**no-spec 86/200 = 43.0%、
 MTP-3 87/200 = 43.5%**。MTP-3 decode 四点
 （262144 上下文、INT8 KV、FP16-embedding 制品）：**104.7 / 98.9 / 109.6 / 98.1 tok/s**。
 
@@ -180,7 +182,7 @@ INT8 KV，`--prefill-chunk 8192`、`--prefix-cache` 开启。**每次评测前�
 
 | 运行 | no-spec | MTP-3 |
 |---|---:|---:|
-| **ninfer（v0.2.0）** | **43.0%（86/200）** | **43.5%（87/200）** |
+| **ninfer（v0.2.1）** | **43.0%（86/200）** | **43.5%（87/200）** |
 | ninfer（修复 FP16 prefill 前） | 44.0%（88/200） | — |
 
 #### 关于 no-spec 44.0% → 43.0%（可优化点）
@@ -419,7 +421,7 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 
 ## 已知限制
 
-- **Vision**：当前自转换 NVFP4 制品包含 Vision；GGUF Q4_K_M 制品拒绝 `--vision`；多实例 Vision 未验证。
+- **Vision**：当前自转换 NVFP4 制品包含 Vision；GGUF Q4_K_M 制品拒绝 `--vision`；多实例 Vision（2×TP1）与 TP2 Vision 均已通过真实集成测试。
 - 多实例只有 2×TP1 通过真实集成测试；4 卡（4×TP1/2×TP2）和 8 卡（8×TP1/4×TP2/2×TP4）未验证，8 卡为社区/非契约。4×TP1 与 8×TP1 需要 32GB 卡，16GB V100 放不下一份完整的 27B 权重。
 - KV 只有每实例 device KV 和进程共享的 pinned host prefix-KV 两级；没有磁盘 KV tier、KV offload 或全局活跃 KV 池。
 - prefix cache 修复后未做长时间浸泡测试；超高压并发下的缓存行为仍在观察。
@@ -465,7 +467,7 @@ A Tesla V100 inference engine based on NInfer: single-process TP2 (TP4 remains a
 
 ## Release
 
-Current release: **v0.2.0 (2026-11-07)** (first public release v0.1.0, 2026-10-27). See [`CHANGELOG.md`](CHANGELOG.md) for release notes and known limitations.
+Current release: **v0.2.1 (2026-11-09)** (first public release v0.1.0, 2026-10-27). See [`CHANGELOG.md`](CHANGELOG.md) for release notes and known limitations.
 
 ---
 
@@ -521,20 +523,22 @@ On 2×Tesla V100-SXM2-32GB (NVLink), use **one engine** to satisfy all of the fo
 
 | # | Problem | Solution |
 |---|---|---|
-| 1 | The Vision tower of an existing NVFP4 artifact is incompatible with this fork's contract (quantization format, no separate qkv, RoPE attention); loading crashes immediately | Do not use that artifact; the current self-converted NVFP4 artifact includes Vision, while the GGUF Q4_K_M artifact rejects Vision. Multi-instance Vision is unverified; see `TEMP_WORKAROUNDS.md` |
+| 1 | The Vision tower of an existing NVFP4 artifact is incompatible with this fork's contract (quantization format, no separate qkv, RoPE attention); loading crashes immediately | Do not use that artifact; the current self-converted NVFP4 artifact includes Vision, while the GGUF Q4_K_M artifact rejects Vision. Multi-instance Vision (2×TP1) and TP2 Vision have both passed real integration tests; see `TEMP_WORKAROUNDS.md` |
 | 2 | With prefix cache enabled, multi-turn conversations trigger `Paged KV trim extent would discard cache-owned pages`; all subsequent requests return 503 and the engine becomes unusable | Two fixes: (1) when `trim_pages` encounters cache-owned pages, shrink the trim range instead of throwing; (2) `promote_page_at` returns idempotently for pages already owned by the cache |
 | 3 | Suspected that slow decode was caused by the attention split strategy; tried `LONG_SPLIT_KEYS=1920` | A/B showed no effect; confirmed the bottleneck is elsewhere and stopped tuning this direction |
 | 4 | Decode speed measurements always included prefill time, distorting the numbers | Switched to warmup + multiple iterations + server-reported timings to separate the measurements |
 | 5 | Building without root requires ffmpeg/libcurl headers | Use `apt-get download` + `dpkg-deb -x` to unpack locally, and point `PKG_CONFIG_SYSROOT_DIR` at the local prefix; or use `-DNINFER_SKIP_FFMPEG=OFF` as described in the installation section |
+| 6 | Under the FP16 text runtime, Vision requests return 500 `scatter: src/dst must share BF16 or FP16 dtype` (the Vision tower outputs BF16 while the text residual is FP16) | Add a BF16→activation-dtype staging buffer before scattering Vision embeddings into the text residual, covering TP1, TP2, and multi-instance paths; both 2×TP1 lanes and TP2 single-instance were measured returning correct results |
 
 See [`TEMP_WORKAROUNDS.md`](TEMP_WORKAROUNDS.md) for all temporary changes and review items.
 
 ---
 
-## Current Status (v0.2.0, as of 2026-11-07)
+## Current Status (v0.2.1, as of 2026-11-09)
 
 This version adds the FP16 text runtime on top of v0.1.0, fixes BFCL multi-turn quality,
-and removes the FP16 path's decode/prefill regression. BFCL `multi_turn_base`, full 200:
+removes the FP16 path's decode/prefill regression, and fixes the Vision `scatter` dtype
+failure under the FP16 text runtime (verified at TP1, TP2, and multi-instance). BFCL `multi_turn_base`, full 200:
 **no-spec 86/200 = 43.0%, MTP-3 87/200 = 43.5%**. MTP-3 decode at four points (262144 context, INT8 KV, FP16-embedding artifact):
 **104.7 / 98.9 / 109.6 / 98.1 tok/s**.
 
@@ -635,7 +639,7 @@ confirmed to hold the artifact). Results:
 
 | Run | no-spec | MTP-3 |
 |---|---:|---:|
-| **ninfer (v0.2.0)** | **43.0% (86/200)** | **43.5% (87/200)** |
+| **ninfer (v0.2.1)** | **43.0% (86/200)** | **43.5% (87/200)** |
 | ninfer (before the FP16 prefill fix) | 44.0% (88/200) | — |
 
 #### On no-spec 44.0% → 43.0% (an optimizable point)
@@ -899,7 +903,7 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 
 ## Known Limitations
 
-- **Vision**: the current self-converted NVFP4 artifact includes Vision; the GGUF Q4_K_M artifact rejects `--vision`; multi-instance Vision is unverified.
+- **Vision**: the current self-converted NVFP4 artifact includes Vision; the GGUF Q4_K_M artifact rejects `--vision`; multi-instance Vision (2×TP1) and TP2 Vision have both passed real integration tests.
 - Only 2×TP1 multi-instance has passed a real integration test; the 4-card (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified, and the 8-card profiles are community/out-of-contract. 4×TP1 and 8×TP1 require 32GB cards; a 16GB V100 cannot hold one full 27B copy.
 - KV has two tiers only: per-instance device KV and the process-shared pinned host prefix-KV tier. There is no disk KV tier, KV offload, or global active-KV pool.
 - After the prefix-cache fix, no long soak test has been run; cache behavior under very high concurrency is still being observed.

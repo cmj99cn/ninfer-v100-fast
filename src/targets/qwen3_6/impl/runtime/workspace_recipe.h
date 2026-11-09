@@ -26,6 +26,10 @@ struct TextPrefillRoots {
     Tensor rope_positions;
     Tensor residual;
     Tensor scatter_indices;
+    // Activation-dtype staging for the Vision output when the text stream is FP16: the tower emits
+    // BF16, so a direct column scatter into the residual needs this cast buffer. Empty for BF16
+    // text, where the tower output is scattered in place.
+    Tensor scatter_embeddings;
 };
 
 template <class Config, class Allocator>
@@ -38,6 +42,10 @@ TextPrefillRoots text_prefill_roots(Allocator& allocator, std::int32_t tokens,
     out.residual = matrix(allocator, Config::activation_dtype, Config::hidden, tokens);
     if (scatter_tokens != 0) {
         out.scatter_indices = vector(allocator, DType::I32, scatter_tokens);
+        if (Config::activation_dtype != DType::BF16) {
+            out.scatter_embeddings =
+                matrix(allocator, Config::activation_dtype, Config::hidden, scatter_tokens);
+        }
     }
     return out;
 }
