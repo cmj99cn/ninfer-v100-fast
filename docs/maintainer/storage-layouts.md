@@ -16,17 +16,23 @@ The storage registry contains exactly these identities:
 | `blockscale-k16-m128x4-v1` | tensor layout | `NVFP4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row-scale-v1` | tensor layout | `FP8_E4M3FN_ROW_BF16S` | rank 2 `[N,K]` | 256 bytes |
 | `ggml-k256-v1` | tensor layout | `GGML_K` | rank 2 `[N,K]`, `K % 256 == 0` | 256 bytes |
+| `row_paged_g16_4k_v1` | tensor layout | `NF4_G16_E4M3S` | rank 2 `[N,K]`, `K % 16 == 0` | 256 bytes |
+| `block_scale_m128_k128_v1` | tensor layout | `FP8_E4M3FN_BLOCK128_BF16S` | rank 2 `[N,K]` or rank 3 `[M,N,K]`, `N % 128 == 0`, `K % 128 == 0` | 256 bytes |
+| `batched_block_scale_k16_m128x4_v1` | tensor layout | `NVFP4` | rank 3 `[M,N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `raw-bytes-v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These are closed identities, not templates. A format/layout combination not present in the table is
 unsupported. In particular, a direct format cannot use a quantized layout, grouped
 signed-integer formats cannot use `contiguous-le-v1`, and `NVFP4` cannot use
 `row-split-k128-v1`. `FP8_E4M3FN_ROW_BF16S` can use only `row-scale-v1`; a bare E4M3FN code plane
-is not a compatible direct tensor.
+is not a compatible direct tensor. The three v3 layouts in the last three rows are read and sliced
+here; their logical decode belongs to the qwen3.8-flash-next package (see section 7).
 
 Object alignment applies to the object's payload-relative `offset` in the `.ninfer` JSON. Internal
 plane offsets and padding belong to the selected layout. Inter-object padding belongs to the
-container and is not included in an object's `bytes`.
+container and is not included in an object's `bytes`. A layout's internal frame alignment (the
+4096-byte row page of `row_paged_g16_4k_v1`) is not an object alignment: the object's own offset
+follows the 256-byte rule above.
 
 The helper used below is:
 
@@ -383,6 +389,12 @@ Dequantized values follow the reconstruction rule in `tensor-formats.md`. This d
 not select a quantization encoder, output dtype, accumulation dtype, kernel, runtime device layout,
 or model consumer.
 
+The v3 layouts of sections 9 to 11 are sized, validated and sliced by this repository, which
+preserves their encoded bytes and their layout geometry. Their logical decode is implemented by
+the qwen3.8-flash-next package: the paged NF4 codes and group scale bytes, the block-scaled FP8
+codes and 128x128 block scale words, and the batched NVFP4 codes, swizzled group scales and
+per-matrix FP32 weight divisors are decoded there.
+
 ## 8. `ggml-k256-v1`
 
 This layout accepts `GGML_K` rank-two `[N,K]` matrices with positive dimensions and `K % 256 == 0`.
@@ -403,3 +415,110 @@ GGUF GDN output columns when TP2 selects key-head groups from three tiled repeat
 requantizing any block. The materialization plan owns the generated descriptor
 prefix until its host-to-device transfer completes. `Weight.qhigh` points to the descriptor table
 and `Weight.qdata` to the code plane; scales remain inside the raw blocks.
+
+## 9. `row_paged_g16_4k_v1`
+
+This layout stores only rank-two `NF4_G16_E4M3S` matrices `[N,K]` with `K % 16 == 0`. NF4 codes
+are 4 bits per value and are grouped by 16 elements, and each group carries one E4M3FN scale byte.
+A row is its code bytes followed by its scale bytes:
+
+```text
+code_bytes_per_row  = K / 2
+scale_bytes_per_row = K / 16
+row_bytes           = code_bytes_per_row + scale_bytes_per_row
+```
+
+Rows are packed into 4096-byte pages, and the page frame is the layout's internal alignment:
+
+```text
+rows_per_page       = 4096 / row_bytes          (integer division)
+page_count          = ceil_div(N, rows_per_page)
+code_bytes          = N * code_bytes_per_row
+scale_bytes         = N * scale_bytes_per_row
+matrix_scale_offset = page_count * 4096
+payload_bytes       = matrix_scale_offset + 4
+```
+
+A row's byte offset inside its parent is
+
+```text
+row_offset(row) = row / rows_per_page * 4096 + row % rows_per_page * row_bytes
+```
+
+so the rows of one page are contiguous and the page tail is zero padding. The group scale word of
+logical row `row` and group `g = floor(k/16)` is the byte at
+
+```text
+row_offset(row) + code_bytes_per_row + g
+```
+
+The last four bytes of the payload hold the matrix-level FP32 scale.
+
+This layout has no slice form: a paged expert shard is replicated whole, so a row or column slice
+request is rejected.
+
+## 10. `block_scale_m128_k128_v1`
+
+This layout stores `FP8_E4M3FN_BLOCK128_BF16S` matrices, either rank two `[N,K]` or a rank-three
+stack `[M,N,K]` of matrices, with `N % 128 == 0` and `K % 128 == 0`. Every weight is one E4M3FN
+byte, and every 128x128 block of weights carries one BF16 scale word.
+
+```text
+elements      = M * N * K                     (M = 1 for a rank-two shape)
+code_bytes    = elements
+scale_offset  = align_up(code_bytes, 256)
+scale_bytes   = M * (N / 128) * (K / 128) * 2
+payload_bytes = scale_offset + scale_bytes
+```
+
+The code plane is the row-major `[M][N][K]` element array. The scale plane holds one word per
+128x128 block, addressed by 128-row band first and block column second:
+
+```text
+scale_offset + (row / 128) * ((K / 128) * 2) + block_column * 2
+```
+
+where `row` is the row index across the whole stack and `block_column` is `floor(k / 128)`. A
+matrix's own scale words are therefore the `(N / 128)` bands that follow it. The layout has no
+matrix-level FP32 scale.
+
+Row slicing of one matrix selects whole 128-row bands, and each band contributes one contiguous
+code copy and one contiguous scale copy. Row slicing of a stack selects whole matrices, and each
+selected matrix contributes its code block and its scale block. Column slicing takes one
+128-aligned column range, which narrows every matrix of the stack: each row contributes the
+selected code bytes, and each 128-row band contributes the selected block-column scale words.
+
+## 11. `batched_block_scale_k16_m128x4_v1`
+
+This layout stores a rank-three stack `[M,N,K]` of `NVFP4` matrices, with `N % 128 == 0` and
+`K % 64 == 0`. It is the blockscale-k16-m128x4-v1 geometry of section 4 applied to a stack: group
+16, `K/2` code bytes per row and `K/16` scale bytes per row.
+
+The planes are grouped by kind, not by matrix:
+
+```text
+code_bytes          = M * N * K / 2
+scale_offset        = align_up(code_bytes, 256)
+scale_bytes         = M * N * K / 16
+matrix_scale_offset = scale_offset + scale_bytes
+payload_bytes       = matrix_scale_offset + M * 4
+```
+
+The code plane is the row-major `[M][N][K/2]` code array, so one matrix owns its own `N * K / 2`
+code bytes. The scale plane holds each matrix's swizzled scale plane, and the last `M * 4` bytes
+hold one little-endian FP32 weight divisor per matrix.
+
+Within the scale plane a matrix's plane uses the swizzle of section 4, with the row tile index
+counted across the stack:
+
+```text
+scale_offset + (row / 128 * (K / 64) + group / 4) * 512
++ (row % 32) * 16 + ((row % 128) / 32) * 4 + group % 4
+```
+
+where `row` is the row index across the whole stack and `group = floor(k / 16)`.
+
+Row slicing of the stack selects whole experts, and each selected expert contributes its code
+block, its 128-row scale tiles and its FP32 divisor, exactly as the single-matrix rule does.
+Column slicing takes one 64-aligned column range and narrows every expert with the single-matrix
+blockscale rule; the FP32 divisor of each expert is replicated.
