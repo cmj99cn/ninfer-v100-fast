@@ -6,6 +6,7 @@
 #include <array>
 #include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -279,6 +280,13 @@ public:
 
     std::size_t size() const noexcept { return size_; }
 
+    // The end of the file's last whole 4096-byte block. A direct read may not reach past it: the
+    // kernel's direct-I/O path reads whole blocks and refuses a request that covers the file's
+    // partial last block.
+    std::size_t block_aligned_size() const noexcept {
+        return size_ / Reader::direct_io_alignment * Reader::direct_io_alignment;
+    }
+
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const {
         constexpr std::size_t alignment = Reader::direct_io_alignment;
         if (absolute_offset % alignment != 0 || destination.size() % alignment != 0 ||
@@ -329,11 +337,6 @@ std::string v3_metadata_name(const Json& directory) {
         return {};
     }
     return directory.at("metadata").at("name").get<std::string>();
-}
-
-bool v3_declares_continuations(const Json& directory) {
-    return directory.is_object() && directory.contains("files") && directory.at("files").is_array() &&
-           directory.at("files").size() > 1;
 }
 
 class Qwen38Nvfp4V3Adapter {
@@ -846,7 +849,8 @@ constexpr std::array<V3Identity, 1> kContainerV3Identities = {{
     {"qwen3.8-flash-next", "qwen3.8-flash-next", "nvfp4"},
 }};
 
-using ObjectIndex = std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>>;
+using ObjectIndex =
+    std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>>;
 
 // Upstream v3 is a multi-volume container: an entry file holding the 32-byte header and the
 // directory, plus NINPRT continuation files. The directory's file list gives each volume's
@@ -881,20 +885,38 @@ public:
     PayloadSpan payload(const ObjectDescriptor& object) const {
         const auto offset = object_offset(object);
         const auto bytes  = object_bytes(object);
-        const auto& volume = volume_for(offset);
-        const auto file_offset = volume.file_base + (offset - volume.logical_begin);
+        const auto pieces = segments(offset, bytes);
+        if (pieces.size() != 1) {
+            throw ArtifactError("object " + std::string(object_name(object)) + " spans volumes");
+        }
+        const auto& piece = pieces.front();
+        const auto& volume = volumes_[piece.volume];
+        if (piece.file_offset + piece.bytes > volume.file->size()) {
+            throw ArtifactError("object " + std::string(object_name(object)) +
+                                " extends beyond its volume");
+        }
         return {offset,
-                std::span<const std::byte>(volume.file->data() + file_offset,
-                                           static_cast<std::size_t>(bytes))};
+                std::span<const std::byte>(volume.file->data() + piece.file_offset,
+                                           static_cast<std::size_t>(piece.bytes))};
+    }
+
+    std::vector<PayloadSegment> payload_segments(std::uint64_t offset, std::uint64_t bytes) const {
+        std::vector<PayloadSegment> result;
+        for (const auto& piece : segments(offset, bytes)) {
+            result.push_back(PayloadSegment{piece.logical_offset, piece.bytes});
+        }
+        return result;
     }
 
     std::size_t read_direct(std::uint64_t logical_offset, std::span<std::byte> destination) const {
-        const auto& volume = volume_for(logical_offset);
-        const auto local   = logical_offset - volume.logical_begin;
-        if (destination.size() > volume.payload_bytes - local) {
-            throw ArtifactError("direct read crosses a part boundary");
+        std::size_t copied = 0;
+        for (const auto& piece : segments(logical_offset, destination.size())) {
+            const auto read = read_volume(piece.volume, piece.file_offset,
+                                          destination.subspan(copied, piece.bytes));
+            copied += read;
+            if (read < piece.bytes) { break; }
         }
-        return volume.file->read_direct(volume.file_base + local, destination);
+        return copied;
     }
 
 private:
@@ -904,6 +926,68 @@ private:
         std::uint64_t logical_begin = 0;
         std::uint64_t file_base     = 0;
     };
+
+    // One piece of a logical range: the volume that holds it, the byte offset inside that
+    // volume's file, and the piece's length.
+    struct Piece {
+        std::size_t volume = 0;
+        std::uint64_t file_offset = 0;
+        std::uint64_t logical_offset = 0;
+        std::uint64_t bytes = 0;
+    };
+
+    // The volume-contiguous pieces of a logical range. Upstream cuts the logical payload space
+    // into volumes by byte budget, so an object may straddle a boundary.
+    std::vector<Piece> segments(std::uint64_t logical_offset, std::uint64_t bytes) const {
+        if (bytes == 0) { return {}; }
+        if (logical_offset > total_payload_) {
+            throw ArtifactError("read range exceeds the logical payload");
+        }
+        // A request may reach past the payload: the caller rounds its length up to a block
+        // boundary, and the bytes past the end are slack the caller never reads.
+        const auto available = std::min(bytes, total_payload_ - logical_offset);
+        std::vector<Piece> result;
+        std::uint64_t copied = 0;
+        while (copied < available) {
+            const auto& volume = volume_for(logical_offset + copied);
+            const auto local   = logical_offset + copied - volume.logical_begin;
+            const auto count   = std::min(available - copied, volume.payload_bytes - local);
+            result.push_back(Piece{static_cast<std::size_t>(&volume - volumes_.data()),
+                                   volume.file_base + local, logical_offset + copied, count});
+            copied += count;
+        }
+        return result;
+    }
+
+    // Reads one volume's bytes. A request whose file offset, length and destination are all
+    // 4096-aligned, and that stops at the volume file's last whole block, goes straight to the
+    // direct-I/O path. Anything else is served by the mapping: the kernel's direct-I/O path
+    // refuses an unaligned request and refuses one that reaches into a partial last block.
+    std::size_t read_volume(std::size_t volume_index, std::uint64_t file_offset,
+                            std::span<std::byte> destination) const {
+        const auto& file = *volumes_[volume_index].file;
+        const auto end   = file_offset + destination.size();
+        if (end > file.size()) { throw ArtifactError("read range exceeds the volume file"); }
+        const bool aligned =
+            file_offset % kPayloadAlignment == 0 && destination.size() % kPayloadAlignment == 0 &&
+            reinterpret_cast<std::uintptr_t>(destination.data()) % kPayloadAlignment == 0;
+        const auto block_end = file.block_aligned_size();
+        if (aligned && end <= block_end) {
+            return file.read_direct(file_offset, destination);
+        }
+        if (aligned) {
+            const auto direct_bytes = file_offset < block_end ? block_end - file_offset : 0;
+            std::size_t read        = 0;
+            if (direct_bytes != 0) {
+                read = file.read_direct(file_offset, destination.first(direct_bytes));
+            }
+            const auto tail = destination.subspan(read, end - (file_offset + read));
+            std::memcpy(tail.data(), file.data() + file_offset + read, tail.size());
+            return read + tail.size();
+        }
+        std::memcpy(destination.data(), file.data() + file_offset, destination.size());
+        return destination.size();
+    }
 
     void resolve_identity(const Json& directory) {
         if (!directory.is_object() || !directory.contains("metadata") ||
@@ -1025,10 +1109,6 @@ private:
             if (end > total_payload_) {
                 throw ArtifactError("object " + std::string(name) + " extends beyond the payload");
             }
-            const auto& volume = volume_for(offset);
-            if (end > volume.logical_begin + volume.payload_bytes) {
-                throw ArtifactError("object " + std::string(name) + " crosses a part boundary");
-            }
             const auto object_index = objects_.size();
             auto [_, inserted]      = index_.emplace(std::string(name), object_index);
             if (!inserted) { throw ArtifactError("duplicate object name: " + std::string(name)); }
@@ -1045,9 +1125,11 @@ private:
     }
 
     static ObjectDescriptor parse_v3_object(const Json& value) {
-        if (!value.is_object()) { throw ArtifactError("each v3 object entry must be a JSON object"); }
+        if (!value.is_object()) {
+            throw ArtifactError("each v3 object entry must be a JSON object");
+        }
         const auto id = require_string(require_member(value, "id", "v3 object entry"),
-                                        "v3 object id");
+                                       "v3 object id");
         const auto& kind = require_string(require_member(value, "kind", "v3 object entry"),
                                           "v3 object kind");
         const auto offset = require_v3_unsigned(require_member(value, "offset", "v3 object entry"),
@@ -1055,10 +1137,10 @@ private:
         const auto bytes  = require_v3_unsigned(require_member(value, "bytes", "v3 object entry"),
                                                 "v3 object bytes", true);
         if (kind == "tensor") {
-            const auto format = parse_v3_format(
-                require_string(require_member(value, "format", "v3 tensor entry"), "v3 tensor format"));
-            const auto layout = parse_v3_layout(
-                require_string(require_member(value, "layout", "v3 tensor entry"), "v3 tensor layout"));
+            const auto format = parse_v3_format(require_string(
+                require_member(value, "format", "v3 tensor entry"), "v3 tensor format"));
+            const auto layout = parse_v3_layout(require_string(
+                require_member(value, "layout", "v3 tensor entry"), "v3 tensor layout"));
             const auto& raw_shape = require_member(value, "shape", "v3 tensor entry");
             if (!raw_shape.is_array()) { throw ArtifactError("v3 tensor shape must be an array"); }
             std::vector<std::uint64_t> shape;
@@ -1076,8 +1158,9 @@ private:
         if (kind == "resource") {
             return ResourceDescriptor{
                 id,
-                parse_v3_encoding(require_string(
-                    require_member(value, "encoding", "v3 resource entry"), "v3 resource encoding")),
+                parse_v3_encoding(
+                    require_string(require_member(value, "encoding", "v3 resource entry"),
+                                   "v3 resource encoding")),
                 offset,
                 bytes,
             };
@@ -1149,12 +1232,12 @@ struct Reader::Impl {
 
         std::map<std::string, std::vector<std::byte>, std::less<>> named_overrides;
         if (v3) {
-            // A v3 artifact that declares continuation volumes, or that names an identity this
-            // reader serves directly, is read by the container path. Everything else is the 27B
-            // package's single-file artifact, which the narrow adapter projects.
-            if (v3_declares_continuations(directory) ||
-                V3MultiPartReader::recognizes(v3_metadata_name(directory))) {
-                multipart = std::make_unique<V3MultiPartReader>(path, file, directory, payload_start);
+            // A v3 artifact that names an identity this reader serves directly is read by the
+            // container path. Every other v3 artifact is the 27B package's single-file artifact,
+            // which the narrow adapter projects and rejects when it is not one.
+            if (V3MultiPartReader::recognizes(v3_metadata_name(directory))) {
+                multipart =
+                    std::make_unique<V3MultiPartReader>(path, file, directory, payload_start);
                 identity  = multipart->identity();
                 return;
             }
@@ -1287,6 +1370,15 @@ PayloadSpan Reader::payload(std::string_view name) const {
     const auto* object = find(name);
     if (object == nullptr) { throw ArtifactError("unknown artifact object: " + std::string(name)); }
     return payload(*object);
+}
+
+std::vector<PayloadSegment> Reader::payload_segments(std::uint64_t offset,
+                                                      std::uint64_t bytes) const {
+    if (impl_->multipart) { return impl_->multipart->payload_segments(offset, bytes); }
+    const auto end = checked_add(offset, bytes, "payload range");
+    if (end > impl_->file.size()) { throw ArtifactError("read range exceeds the file"); }
+    if (bytes == 0) { return {}; }
+    return {PayloadSegment{offset, bytes}};
 }
 
 std::size_t Reader::read_direct(std::uint64_t absolute_offset,

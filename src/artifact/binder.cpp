@@ -105,6 +105,17 @@ PayloadSpan Binder::payload(ObjectHandle handle) const {
     return reader_.payload(descriptor(handle));
 }
 
+// The payload bytes a shard slice may consult. A slice is computed from the object's geometry;
+// only the ggml-k256 row descriptors need the bytes themselves. An object of a multi-volume
+// artifact may straddle a volume boundary and then has no single span, so the slice geometry is
+// computed without them.
+std::span<const std::byte> Binder::shard_payload(ObjectHandle handle) const {
+    const auto& object = descriptor(handle);
+    const auto base    = reader_.payload_offset() + object_offset(object);
+    if (reader_.payload_segments(base, object_bytes(object)).size() > 1) { return {}; }
+    return payload(handle).data;
+}
+
 void Binder::place(ObjectHandle handle, int device, std::uint64_t bytes, std::uint64_t alignment,
                    std::vector<PlaneCopy> copies) {
     std::uint64_t& capacity =
@@ -216,9 +227,11 @@ void Binder::materialize_on_device(ObjectHandle handle) {
     const ShardPlacement placement =
         shard_resolver_ ? shard_resolver_(tensor->name) : ShardPlacement{};
 
+    const std::span<const std::byte> payload_data =
+        placement.axis == ShardAxis::Replicated ? std::span<const std::byte>{}
+                                                : shard_payload(handle);
     for (int device = 0; device < materialization_.device_count; ++device) {
-        const ResolvedShard shard =
-            resolve_device_shard(*tensor, placement, device, payload(handle).data);
+        const ResolvedShard shard = resolve_device_shard(*tensor, placement, device, payload_data);
         place(handle, device, shard.encoded_bytes, alignment, std::move(shard.copies));
         materialization_.device_objects.back().prefix = std::move(shard.prefix);
     }
@@ -238,9 +251,11 @@ void Binder::stage_shard_on_host(ObjectHandle handle) {
     const ShardPlacement placement =
         shard_resolver_ ? shard_resolver_(tensor->name) : ShardPlacement{};
 
+    const std::span<const std::byte> payload_data =
+        placement.axis == ShardAxis::Replicated ? std::span<const std::byte>{}
+                                                : shard_payload(handle);
     for (int device = 0; device < materialization_.device_count; ++device) {
-        const ResolvedShard shard =
-            resolve_device_shard(*tensor, placement, device, payload(handle).data);
+        const ResolvedShard shard = resolve_device_shard(*tensor, placement, device, payload_data);
         // No layout currently staged on the host carries a ggml row-descriptor header; revisit
         // this assert rather than silently discarding bytes if that ever changes.
         if (!shard.prefix.empty()) {

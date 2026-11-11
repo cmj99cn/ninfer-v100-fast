@@ -177,6 +177,13 @@ struct PayloadSpan {
     std::span<const std::byte> data;
 };
 
+// One volume-contiguous piece of a logical payload range. A multi-volume artifact splits a
+// range at its volume boundaries; a single-file artifact reports the range itself.
+struct PayloadSegment {
+    std::uint64_t offset = 0;
+    std::uint64_t bytes  = 0;
+};
+
 struct ArtifactIdentity {
     std::string model_id;
     std::string weights_id;
@@ -204,6 +211,9 @@ public:
     std::uint64_t payload_offset() const noexcept;
     PayloadSpan payload(const ObjectDescriptor& object) const;
     PayloadSpan payload(std::string_view name) const;
+    // The volume-contiguous pieces of a logical payload range, in order. A range that spans
+    // volumes is split at the volume boundaries; a range inside one volume is one piece.
+    std::vector<PayloadSegment> payload_segments(std::uint64_t offset, std::uint64_t bytes) const;
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const;
 
 private:

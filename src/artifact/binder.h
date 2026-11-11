@@ -126,6 +126,8 @@ public:
 
 private:
     ObjectHandle find_unconsumed(std::string_view name);
+    // The payload bytes a shard slice may consult; empty for an object that straddles a volume.
+    std::span<const std::byte> shard_payload(ObjectHandle handle) const;
     void place(ObjectHandle handle, int device, std::uint64_t bytes, std::uint64_t alignment,
                std::vector<PlaneCopy> copies);
     void place_host(ObjectHandle handle, int device, std::uint64_t bytes, std::uint64_t alignment,

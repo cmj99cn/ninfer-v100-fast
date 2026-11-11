@@ -1,6 +1,11 @@
+#include "artifact/binder.h"
+#include "artifact/materializer.h"
 #include "artifact/reader.h"
+#include "core/device.h"
 
 #include <nlohmann/json.hpp>
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <array>
@@ -17,6 +22,8 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>
 
 namespace {
 
@@ -69,6 +76,11 @@ struct V3Fixture {
     }
 };
 
+std::filesystem::path fixture_base() {
+    return std::filesystem::temp_directory_path() /
+           ("ninfer-v3-artifact-test-" + std::to_string(static_cast<long long>(::getpid())));
+}
+
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
@@ -119,10 +131,10 @@ std::vector<PlacedObject> canonical_objects() {
 V3Fixture write_v3_multi_part(const std::vector<PlacedObject>& objects,
                                const std::vector<std::vector<std::byte>>& payloads,
                                const FixtureOptions& options = {}) {
-    const auto directory_path = std::filesystem::temp_directory_path();
-    V3Fixture fixture{directory_path / "v3_multi_entry.ninfer",
-                       directory_path / "v3_multi_entry.ninfer.part-0001",
-                       directory_path / "v3_multi_entry.ninfer.part-0002",
+    const auto base = fixture_base();
+    V3Fixture fixture{base.string() + ".ninfer",
+                       base.string() + ".ninfer.part-0001",
+                       base.string() + ".ninfer.part-0002",
                        0};
     const std::array<std::filesystem::path, 2> part_paths = {fixture.part1, fixture.part2};
 
@@ -154,7 +166,7 @@ V3Fixture write_v3_multi_part(const std::vector<PlacedObject>& objects,
     }
 
     std::string text = directory.dump();
-    const auto region   = align_up(kHeaderBytes + text.size(), kPayloadAlignment);
+    const auto region    = align_up(kHeaderBytes + text.size(), kPayloadAlignment);
     const auto json_bytes = region - kHeaderBytes;
     text.append(json_bytes - text.size(), ' ');
 
@@ -310,27 +322,59 @@ void test_foreign_part_id_rejected() {
     expect_artifact_error([&] { Reader reader(fixture.entry); }, "belongs to a different artifact");
 }
 
-void test_crossing_object_rejected() {
+// An object that straddles a volume boundary is read in segments: one piece per volume, each
+// piece's bytes equal to the bytes written into that volume.
+void test_crossing_object_read_in_segments() {
+    constexpr std::uint64_t kFirstVolumeBytes = 4096;
+    constexpr std::uint64_t kCrossingBytes    = 512;
+    constexpr std::uint64_t kCrossingOffset   = kFirstVolumeBytes - 256;
     auto objects = canonical_objects();
-    objects.pop_back();
+    objects.resize(1);
     objects.push_back({Json{{"id", "delta"},
                             {"kind", "tensor"},
                             {"format", "bf16"},
                             {"layout", "contiguous_le_v1"},
                             {"shape", Json::array({256, 1})},
-                            {"bytes", 512}},
-                       1, kPartPayloadBytes - 256});
+                            {"bytes", kCrossingBytes}},
+                       0, kCrossingOffset});
     const auto fixture =
         write_v3_multi_part(objects,
-                            {marker_payload(kPartPayloadBytes, 0x11),
+                            {marker_payload(kFirstVolumeBytes, 0x11),
                              marker_payload(kPartPayloadBytes, 0x22),
                              marker_payload(kPartPayloadBytes, 0x33)});
-    expect_artifact_error([&] { Reader reader(fixture.entry); }, "crosses a part boundary");
+    Reader reader(fixture.entry);
+
+    const auto* delta = std::get_if<TensorDescriptor>(reader.find("delta"));
+    if (delta == nullptr) { throw std::runtime_error("crossing object is missing"); }
+    const auto offset = ninfer::artifact::object_offset(*delta);
+    const auto bytes  = ninfer::artifact::object_bytes(*delta);
+
+    const auto segments = reader.payload_segments(offset, bytes);
+    if (segments.size() != 2 || segments[0].offset != kCrossingOffset ||
+        segments[0].bytes != 256 || segments[1].offset != kFirstVolumeBytes ||
+        segments[1].bytes != kCrossingBytes - 256) {
+        throw std::runtime_error("crossing object was not split at the volume boundary");
+    }
+
+    std::vector<std::byte> buffer(bytes, std::byte{0});
+    const auto read = reader.read_direct(offset, buffer);
+    if (read != bytes) { throw std::runtime_error("crossing object read returned a short count"); }
+    const auto first = std::all_of(
+        buffer.begin(), buffer.begin() + 256,
+        [](std::byte value) { return is_marker(value, std::byte{0x11}); });
+    const auto second = std::all_of(
+        buffer.begin() + 256, buffer.end(),
+        [](std::byte value) { return is_marker(value, std::byte{0x22}); });
+    if (!first || !second) {
+        throw std::runtime_error("crossing object bytes differ from the volumes");
+    }
+
+    expect_artifact_error([&] { reader.payload(*delta); }, "spans volumes");
 }
 
 void test_single_file_container_accepted() {
-    const auto fixture =
-        write_v3_multi_part({canonical_objects().front()}, {marker_payload(kPartPayloadBytes, 0x11)});
+    const auto fixture = write_v3_multi_part(
+        {canonical_objects().front()}, {marker_payload(kPartPayloadBytes, 0x11)});
     Reader reader(fixture.entry);
     const auto payload = reader.payload("alpha");
     if (reader.identity().model_id != "qwen3.8-flash-next" || reader.objects().size() != 1 ||
@@ -352,7 +396,9 @@ void test_direct_reads_resolve_volumes() {
     for (std::size_t volume = 0; volume < markers.size(); ++volume) {
         auto* buffer =
             static_cast<std::byte*>(std::aligned_alloc(kPayloadAlignment, kPayloadAlignment));
-        if (buffer == nullptr) { throw std::runtime_error("failed to allocate a direct read buffer"); }
+        if (buffer == nullptr) {
+            throw std::runtime_error("failed to allocate a direct read buffer");
+        }
         const auto read = reader.read_direct(volume * kPartPayloadBytes,
                                              std::span<std::byte>(buffer, kPayloadAlignment));
         const bool matched =
@@ -367,6 +413,86 @@ void test_direct_reads_resolve_volumes() {
     }
 }
 
+// The materializer must serve a multi-volume artifact: an object that ends near a volume's end
+// (its 4096-byte read request reaches past that end) and an object that straddles the boundary.
+void test_multi_volume_materialization() {
+    constexpr std::uint64_t kFirstVolumeBytes = 3000;
+    constexpr std::uint64_t kTailBytes        = 256;
+    constexpr std::uint64_t kTailOffset       = 2560;
+    constexpr std::uint64_t kCrossingBytes    = 512;
+    constexpr std::uint64_t kCrossingOffset   = kTailOffset + kTailBytes;
+    const auto objects = std::vector<PlacedObject>{
+        {Json{{"id", "tail"},
+              {"kind", "tensor"},
+              {"format", "bf16"},
+              {"layout", "contiguous_le_v1"},
+              {"shape", Json::array({128, 1})},
+              {"bytes", kTailBytes}},
+         0, kTailOffset},
+        {Json{{"id", "crossing"},
+              {"kind", "tensor"},
+              {"format", "bf16"},
+              {"layout", "contiguous_le_v1"},
+              {"shape", Json::array({256, 1})},
+              {"bytes", kCrossingBytes}},
+         0, kCrossingOffset},
+    };
+    const auto fixture =
+        write_v3_multi_part(objects,
+                            {marker_payload(kFirstVolumeBytes, 0x11),
+                             marker_payload(kPartPayloadBytes, 0x22),
+                             marker_payload(kPartPayloadBytes, 0x33)});
+    Reader reader(fixture.entry);
+
+    int device_count              = 0;
+    const cudaError_t count_error = cudaGetDeviceCount(&device_count);
+    if (count_error == cudaErrorNoDevice || count_error == cudaErrorInsufficientDriver) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        std::exit(77);
+    }
+    CUDA_CHECK(count_error);
+    if (device_count == 0) {
+        std::cout << "SKIP: no CUDA devices\n";
+        std::exit(77);
+    }
+
+    ninfer::artifact::Binder binder(reader);
+    constexpr std::array<std::uint64_t, 2> tail_shape = {128, 1};
+    const auto tail = binder.require_tensor("tail", NumericFormat::BF16,
+                                            StorageLayout::ContiguousLeV1, tail_shape);
+    binder.materialize_on_device(tail);
+    constexpr std::array<std::uint64_t, 2> crossing_shape = {256, 1};
+    const auto crossing =
+        binder.require_tensor("crossing", NumericFormat::BF16, StorageLayout::ContiguousLeV1,
+                              crossing_shape);
+    binder.materialize_on_device(crossing);
+    const auto plan = binder.finish();
+
+    ninfer::DeviceContext device(0);
+    auto materialized = ninfer::artifact::materialize(reader, plan, device);
+
+    std::vector<std::byte> tail_bytes(kTailBytes);
+    CUDA_CHECK(cudaMemcpy(tail_bytes.data(), materialized.device_data(tail), tail_bytes.size(),
+                          cudaMemcpyDeviceToHost));
+    std::vector<std::byte> crossing_bytes(kCrossingBytes);
+    CUDA_CHECK(cudaMemcpy(crossing_bytes.data(), materialized.device_data(crossing),
+                          crossing_bytes.size(), cudaMemcpyDeviceToHost));
+
+    const auto tail_ok = std::all_of(
+        tail_bytes.begin(), tail_bytes.end(),
+        [](std::byte value) { return is_marker(value, std::byte{0x11}); });
+    const auto split = kFirstVolumeBytes - kCrossingOffset;
+    const auto crossing_first = std::all_of(
+        crossing_bytes.begin(), crossing_bytes.begin() + split,
+        [](std::byte value) { return is_marker(value, std::byte{0x11}); });
+    const auto crossing_second = std::all_of(
+        crossing_bytes.begin() + split, crossing_bytes.end(),
+        [](std::byte value) { return is_marker(value, std::byte{0x22}); });
+    if (!tail_ok || !crossing_first || !crossing_second) {
+        throw std::runtime_error("multi-volume materialization produced wrong bytes");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -376,9 +502,10 @@ int main() {
         test_wrong_part_index_rejected();
         test_swapped_parts_rejected();
         test_foreign_part_id_rejected();
-        test_crossing_object_rejected();
+        test_crossing_object_read_in_segments();
         test_single_file_container_accepted();
         test_direct_reads_resolve_volumes();
+        test_multi_volume_materialization();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

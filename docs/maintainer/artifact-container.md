@@ -105,8 +105,14 @@ null) and each later member names a sibling continuation file together with its 
 count.
 
 The logical payload space is the entry payload followed by the continuation payloads in file order.
-Object offsets are absolute in that space, whose origin is the first byte of the entry payload. An
-object whose extent crosses a volume boundary is rejected rather than split across volumes.
+Object offsets are absolute in that space, whose origin is the first byte of the entry payload.
+
+A volume boundary falls wherever the byte budget of the previous volume ends, so an object may
+straddle one. A reader therefore resolves a logical range into one or more volume-contiguous
+pieces, each with the volume that holds it and the byte offset inside that volume's file. A read
+request that spans volumes is served piece by piece into the same destination buffer. An object's
+payload span is a single contiguous range, so a reader reports an object that straddles a volume
+as such instead of returning a span that leaves its volume.
 
 A reader validates the entry length and every continuation against the directory: part magic,
 declared part index, artifact identity, and file length (`4096 + payload_bytes`). The v3 directory
@@ -324,7 +330,9 @@ logical model views, schedules, kernels, GPU support, or runtime residency.
 
 For the upstream v3 multi-volume container of §2.4 the same reader opens the continuation volumes,
 resolves a logical offset to the volume that holds it, and exposes the same object descriptors and
-payload spans; only the framing and the address mapping differ from version 2.
+payload spans; only the framing and the address mapping differ from version 2. A read range is cut
+at the volume boundaries before it reaches the device, so the 4096-byte read request never carries
+past the volume that holds the bytes.
 
 The JSON and name index are cold-load data. A model binder resolves them once; inference does not
 reparse JSON or perform per-layer/per-token directory lookups.

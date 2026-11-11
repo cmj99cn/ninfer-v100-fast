@@ -26,7 +26,7 @@
 
 ## 审查重点（Review Focus）
 
-1. **对象跨分卷边界**：逻辑偏移落在两卷交界处的对象必须被明确拒绝（不得静默错读）——真实工件的分卷按对象边界切分，遇到跨界即说明理解有误。→ 任务 1 步骤 1 的 `crossing_object_rejected` 用例 + 任务 5 真实工件全量扫描。
+1. **对象跨分卷边界**：真实工件按字节预算切卷，**确有对象跨卷**（`weight/000028`、`weight/000074`、`weight/000171`）——上游用 `segments()` 把跨界对象拆成多段读。跨卷对象必须被支持：不得静默错读，也不得整体拒绝；`payload()` 的单段语义对跨界对象显式报错，`read_direct`/materializer 必须分段取数。→ 任务 1 的 `crossing_object_rejected` 改为 `crossing_object_read_in_segments`，任务 5 用真实工件验证这 3 个对象的分段读字节正确。
 2. **续卷归属校验**：part index / artifact_id 不匹配的续卷文件（或两卷互换）必须报错，不得拼接。→ 任务 1 的 `wrong_part_index`、`swapped_parts` 用例。
 3. **NF4 不完整末页**：`rows_per_page=45`（2500012%45=7），末页不满时的 page_count 与 matrix_scale_offset 必须按 ceil 计算，错一位会让 PLE 全表错位。→ 任务 3 的精确字节数断言（227,553,284）。
 4. **q8_g32 与 W8G32 的语义差异**：两者同构是本计划假设（复用 `W8G32_F16S`），必须用真实工件采样字节序验证平面序与缩放 dtype，不等则在任务 2 改为新增枚举并回归任务 3。→ 任务 5 的对表步骤。
@@ -49,7 +49,7 @@
 - `wrong_part_index_rejected`：index 写 3 → 打开抛 `ArtifactError`；
 - `swapped_parts_rejected`：两续卷文件互换 → 抛；
 - `foreign_part_id_rejected`：续卷 artifact_id 改一字节 → 抛；
-- `crossing_object_rejected`：一个对象逻辑区间跨两卷 → 打开或 `payload()` 抛。
+- `crossing_object_rejected`：一个对象逻辑区间跨两卷 → 改为 `crossing_object_read_in_segments`：跨卷对象被正确拆段读出（分段内容逐字节等于写入值），`payload()` 对该对象显式报错。
 
 - [ ] **步骤 2：运行测试验证失败**
 
@@ -61,10 +61,10 @@
 `reader.cpp` 中新增（与现有 `Qwen38Nvfp4V3Adapter` 平行的内部类，命名 `V3MultiPartReader`）：
 - 打开入口：校验 `kV3Magic`（现 39-42 行常量复用），读 32B 头（+8 的目录长度 u64、+16 起 16B artifact id），目录 JSON 解析上游 v3 schema；`metadata.name → (model_id, weights_id)` 用 `constexpr` 映射表（本期一项：`"qwen3.8-flash-next" → ("qwen3.8-flash-next","nvfp4")`，未知 name 抛错并提示）；
 - 续卷：按 `files[]` 顺序在入口同目录打开 `files[i].path`，逐个校验 magic、`read_u64_le(header+8)==i`、artifact id 逐字节相等、文件大小 == `4096 + payload_bytes[i]`（沿用上游 `open_file` 的校验集，`src/artifact/reader.cpp` 现有 `MappedFile` 复用为每卷一个映射）；
-- 逻辑地址：`entry_payload_start = align_up(32 + json_bytes, 4096)`；第 i 卷逻辑基址 = `entry_payload_start + Σ_{j<i} payload_bytes[j]`，卷内偏移 = `4096 + (logical - base)`；对象 `offset+bytes` 落在单卷 payload 区间内，否则抛（跨界即拒绝）；
+- 逻辑地址：逻辑原点 = 入口 payload 首字节（`entry_payload_start = align_up(32 + json_bytes, 4096)` 是它所在的文件内偏移）；第 i 卷逻辑基址 = `Σ_{j<i} payload_bytes[j]`，卷内偏移 = `4096 + (logical - base)`；对象 `offset+bytes` **允许跨卷**（上游按字节预算切卷，真实工件有 3 个跨界对象），跨卷对象按段拆解；
+- 跨卷支持（上游 `segments()` 语义）：每个对象可解析为 1..N 段 `(volume, file_offset, length)`；`read_direct` 对跨卷区间分段 `pread` 进同一目标缓冲（每段起点 4096 对齐）；`payload()` 的单段语义对跨界对象显式报错（"object spans volumes"），不得算出越界 span；materializer 按段发起读取（见 `src/artifact/materializer.cpp` 的对齐/合并逻辑：读区间在卷界处切开，不得因对齐尾越过卷尾而失败）；
 - 对象表：`objects[]` 的 `id/format/layout/shape/offset/bytes` 直接构造 `TensorDescriptor`/`ResourceDescriptor`（kind 分派；format/layout 字符串经任务 2 的解析函数——本任务先用桩映射 `bf16→BF16` 等已知项，任务 2 完成全量）；
-- `payload(object)` 返回所在卷映射内的 span；`read_direct(absolute_offset, dst)` 以逻辑偏移解析卷后 `pread`（4096 对齐约束保持）。
-
+- `payload(object)` 返回所在卷映射内的 span（须校验 `bytes` 不越出所在卷）；`read_direct(absolute_offset, dst)` 以逻辑偏移解析卷后 `pread`（4096 对齐约束保持）。
 - [ ] **步骤 4：运行测试验证通过**
 
 运行：`cmake --build build --target ninfer_v3_artifact_reader_test && ./build/tests/ninfer_v3_artifact_reader_test`
@@ -187,7 +187,7 @@ git commit -m "feat(core): dtype slots for NF4 and block-FP8 (decode in qwen4_ex
 - `identity == {qwen3.8-flash-next, nvfp4}`；
 - 全量对象扫描：按 format 计数 `{nvfp4:96, q8_g32_fp16:96, nf4:128, fp8_block128:2, bf16:916, fp32:72, q4_g64_fp16:1}`（以工件旁 `artifact-manifest.json` 为准，若与清单不符，以清单修正断言并记录）；
 - 每个对象 `bytes == tensor_encoded_size(...)` 且 `offset % tensor_alignment(layout) == 0`（审查重点 5）；
-- 无对象跨卷（扫描时逐对象解析所在卷）。
+- 3 个跨界对象（`weight/000028`、`weight/000074`、`weight/000171`）被正确分段读出：分段拼接后的字节与卷内原始字节一致（上游 `segments()` 语义）。
 
 - [ ] **步骤 2：运行验证**
 

@@ -251,8 +251,14 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     std::uint64_t last_published = 0;
     std::uint64_t total          = 0;
     for (const DeviceMaterialization& placement : plan.device_objects) {
-        const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
-        const auto slot           = static_cast<std::size_t>(placement.device);
+        // The source range is the object's logical extent, not its payload span: an object of a
+        // multi-volume artifact may straddle a volume boundary and has no single span.
+        const auto& object    = reader.objects().at(placement.object.index);
+        const auto source_base =
+            checked_add(reader.payload_offset(), object_offset(object),
+                        "artifact source base overflows u64");
+        const auto source_bytes = object_bytes(object);
+        const auto slot         = static_cast<std::size_t>(placement.device);
         if (placement.device < 0 || placement.device >= device_count) {
             throw ArtifactError("materialization placement names a device outside the plan");
         }
@@ -277,15 +283,14 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         }
         const auto add_range = [&](std::uint64_t source_offset, std::uint64_t dest_offset,
                                    std::uint64_t bytes) {
-            if (source_offset > payload.data.size() ||
-                payload.data.size() - source_offset < bytes || dest_offset > placement.bytes ||
-                placement.bytes - dest_offset < bytes) {
+            if (source_offset > source_bytes || source_bytes - source_offset < bytes ||
+                dest_offset > placement.bytes || placement.bytes - dest_offset < bytes) {
                 throw ArtifactError("materialization plan does not match artifact payload");
             }
             ranges.push_back(CopyRange{
-                .source_begin = checked_add(payload.absolute_offset, source_offset,
+                .source_begin = checked_add(source_base, source_offset,
                                             "artifact tensor source range overflows u64"),
-                .source_end   = checked_add(payload.absolute_offset + source_offset, bytes,
+                .source_end   = checked_add(source_base + source_offset, bytes,
                                             "artifact tensor source range overflows u64"),
                 .destination  = base + dest_offset,
                 .device       = placement.device,
@@ -293,7 +298,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             total = checked_add(total, bytes, "artifact tensor byte count overflows u64");
         };
         if (placement.copies.empty()) {
-            if (payload.data.size() != placement.bytes) {
+            if (source_bytes != placement.bytes) {
                 throw ArtifactError("materialization plan does not match artifact payload");
             }
             add_range(0, 0, placement.bytes);
@@ -310,8 +315,12 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         if (placement.device < 0 || placement.device >= device_count) {
             continue;
         }
-        const auto slot           = static_cast<std::size_t>(placement.device);
-        const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+        const auto slot   = static_cast<std::size_t>(placement.device);
+        const auto& object = reader.objects().at(placement.object.index);
+        const auto source_base =
+            checked_add(reader.payload_offset(), object_offset(object),
+                        "artifact source base overflows u64");
+        const auto source_bytes = object_bytes(object);
         if (!out.host_staging_[slot]) {
             throw ArtifactError("host staging placement on a device with no staging region");
         }
@@ -326,15 +335,14 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             static_cast<std::byte*>(out.host_staging_[slot]->data()) + placement.offset;
         const auto add_range = [&](std::uint64_t source_offset, std::uint64_t dest_offset,
                                    std::uint64_t bytes) {
-            if (source_offset > payload.data.size() ||
-                payload.data.size() - source_offset < bytes || dest_offset > placement.bytes ||
-                placement.bytes - dest_offset < bytes) {
+            if (source_offset > source_bytes || source_bytes - source_offset < bytes ||
+                dest_offset > placement.bytes || placement.bytes - dest_offset < bytes) {
                 throw ArtifactError("materialization plan does not match artifact payload");
             }
             ranges.push_back(CopyRange{
-                .source_begin = checked_add(payload.absolute_offset, source_offset,
+                .source_begin = checked_add(source_base, source_offset,
                                             "artifact tensor source range overflows u64"),
-                .source_end   = checked_add(payload.absolute_offset + source_offset, bytes,
+                .source_end   = checked_add(source_base + source_offset, bytes,
                                             "artifact tensor source range overflows u64"),
                 .destination  = base + dest_offset,
                 .device       = placement.device,
@@ -343,7 +351,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             host_total = checked_add(host_total, bytes, "host staging byte count overflows u64");
         };
         if (placement.copies.empty()) {
-            if (payload.data.size() != placement.bytes) {
+            if (source_bytes != placement.bytes) {
                 throw ArtifactError("materialization plan does not match artifact payload");
             }
             add_range(0, 0, placement.bytes);
@@ -421,89 +429,103 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     const auto start             = std::chrono::steady_clock::now();
     if (progress != nullptr && progress->callback) { progress->callback("weights", 0, total); }
     for (const ReadSpan& span : read_spans) {
-        for (std::uint64_t source = span.begin; source < span.end; source += slot_bytes) {
-            Slot& slot = *slots[next_slot++ % slot_count];
-            slot.wait();
+        // A read range is cut at the volume boundaries of a multi-volume artifact: the 4096-byte
+        // read request rounds its length up, and that rounding must not carry a request past the
+        // end of the volume that holds the bytes.
+        for (const auto& segment : reader.payload_segments(span.begin, span.end - span.begin)) {
+            const std::uint64_t segment_end = segment.offset + segment.bytes;
+            for (std::uint64_t source = segment.offset; source < segment_end;
+                 source += slot_bytes) {
+                Slot& slot = *slots[next_slot++ % slot_count];
+                slot.wait();
 
-            const std::uint64_t remaining = span.end - source;
-            const std::size_t request     = static_cast<std::size_t>(std::min<std::uint64_t>(
-                slot_bytes,
-                align_up(remaining, alignment, "artifact direct I/O request overflows u64")));
-            auto destination =
-                std::span<std::byte>(static_cast<std::byte*>(slot.buffer.data()), request);
-            const std::size_t bytes_read = reader.read_direct(source, destination);
-            const std::uint64_t required = std::min<std::uint64_t>(request, remaining);
-            if (bytes_read < required) {
-                throw ArtifactError("direct artifact read ended before the planned tensor range");
-            }
-            out.stats_.file_bytes =
-                checked_add(out.stats_.file_bytes, bytes_read, "artifact read bytes overflow u64");
-            const std::uint64_t chunk_end =
-                checked_add(source, bytes_read, "artifact direct I/O result overflows u64");
+                const std::uint64_t remaining = segment_end - source;
+                const std::size_t request     = static_cast<std::size_t>(std::min<std::uint64_t>(
+                    slot_bytes,
+                    align_up(remaining, alignment, "artifact direct I/O request overflows u64")));
+                auto destination =
+                    std::span<std::byte>(static_cast<std::byte*>(slot.buffer.data()), request);
+                const std::size_t bytes_read = reader.read_direct(source, destination);
+                const std::uint64_t required = std::min<std::uint64_t>(request, remaining);
+                if (bytes_read < required) {
+                    throw ArtifactError(
+                        "direct artifact read ended before the planned tensor range");
+                }
+                out.stats_.file_bytes = checked_add(out.stats_.file_bytes, bytes_read,
+                                                    "artifact read bytes overflow u64");
+                // The read may reach past the segment into the next volume; the copies stop at
+                // the segment so that every source byte is copied exactly once.
+                const std::uint64_t chunk_end = std::min(
+                    checked_add(source, bytes_read, "artifact direct I/O result overflows u64"),
+                    segment_end);
 
-            // Retire the leading run of ranges this chunk has already left behind. Ranges that
-            // still straddle `source` stay in the scan window; they are cheap to re-test.
-            while (first_unfinished < ranges.size() &&
-                   ranges[first_unfinished].source_end <= source) {
-                ++first_unfinished;
-            }
-// One pass per destination device: a stream belongs to its device, so the copies are
-            // grouped rather than interleaved, and only devices this chunk actually fed record an
-            // event on it. Host-staged destinations are synchronous memcpies: no stream, no event.
-            for (int index = 0; index < device_count; ++index) {
-                const auto device_slot          = static_cast<std::size_t>(index);
-                bool fed                        = false;
-                std::uint64_t host_copied_here  = 0;
-                for (std::size_t range_index = first_unfinished;
-                     range_index < ranges.size() &&
-                     ranges[range_index].source_begin < chunk_end;
-                     ++range_index) {
-                    const CopyRange& range = ranges[range_index];
-                    if (range.device != index) { continue; }
-                    const std::uint64_t copy_begin = std::max(source, range.source_begin);
-                    const std::uint64_t copy_end   = std::min(chunk_end, range.source_end);
-                    if (copy_begin >= copy_end) { continue; }
-                    const auto amount = static_cast<std::size_t>(copy_end - copy_begin);
-                    if (range.host_destination) {
-                        std::memcpy(
+                // Retire the leading run of ranges this chunk has already left behind. Ranges that
+                // still straddle `source` stay in the scan window; they are cheap to re-test.
+                while (first_unfinished < ranges.size() &&
+                       ranges[first_unfinished].source_end <= source) {
+                    ++first_unfinished;
+                }
+                // One pass per destination device: a stream belongs to its device, so the copies
+                // are grouped rather than interleaved, and only devices this chunk actually fed
+                // record an event on it. Host-staged destinations are synchronous memcpies: no
+                // stream, no event.
+                for (int index = 0; index < device_count; ++index) {
+                    const auto device_slot          = static_cast<std::size_t>(index);
+                    bool fed                        = false;
+                    std::uint64_t host_copied_here  = 0;
+                    for (std::size_t range_index = first_unfinished;
+                         range_index < ranges.size() &&
+                         ranges[range_index].source_begin < chunk_end;
+                         ++range_index) {
+                        const CopyRange& range = ranges[range_index];
+                        if (range.device != index) { continue; }
+                        const std::uint64_t copy_begin = std::max(source, range.source_begin);
+                        const std::uint64_t copy_end   = std::min(chunk_end, range.source_end);
+                        if (copy_begin >= copy_end) { continue; }
+                        const auto amount = static_cast<std::size_t>(copy_end - copy_begin);
+                        if (range.host_destination) {
+                            std::memcpy(
+                                range.destination +
+                                    static_cast<std::size_t>(copy_begin - range.source_begin),
+                                static_cast<std::byte*>(slot.buffer.data()) +
+                                    static_cast<std::size_t>(copy_begin - source),
+                                amount);
+                            host_copied_here += amount;
+                            continue;
+                        }
+                        if (!fed && device_count > 1) {
+                        CUDA_CHECK(cudaSetDevice(devices[device_slot]->device));
+                    }
+                        CUDA_CHECK(cudaMemcpyAsync(
                             range.destination +
                                 static_cast<std::size_t>(copy_begin - range.source_begin),
                             static_cast<std::byte*>(slot.buffer.data()) +
                                 static_cast<std::size_t>(copy_begin - source),
-                            amount);
-                        host_copied_here += amount;
-                        continue;
+                            amount, cudaMemcpyHostToDevice, devices[device_slot]->load_stream));
+                        copied           = checked_add(copied, amount,
+                                                       "artifact copied byte count overflows u64");
+                        out.stats_.per_device_h2d_bytes[device_slot] += amount;
+                        fed = true;
                     }
-                    if (!fed && device_count > 1) { CUDA_CHECK(cudaSetDevice(devices[device_slot]->device)); }
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        range.destination +
-                            static_cast<std::size_t>(copy_begin - range.source_begin),
-                        static_cast<std::byte*>(slot.buffer.data()) +
-                            static_cast<std::size_t>(copy_begin - source),
-                        amount, cudaMemcpyHostToDevice, devices[device_slot]->load_stream));
-                    copied           = checked_add(copied, amount,
-                                                   "artifact copied byte count overflows u64");
-                    out.stats_.per_device_h2d_bytes[device_slot] += amount;
-                    fed = true;
+                    if (host_copied_here != 0) {
+                        copied = checked_add(copied, host_copied_here,
+                                             "artifact copied byte count overflows u64");
+                        out.stats_.staged_host_bytes =
+                            checked_add(out.stats_.staged_host_bytes, host_copied_here,
+                                        "host staging byte count overflows u64");
+                    }
+                    if (fed) {
+                        CUDA_CHECK(cudaEventRecord(slot.events[device_slot],
+                                                   devices[device_slot]->load_stream));
+                        slot.pending[device_slot] = true;
+                    }
                 }
-                if (host_copied_here != 0) {
-                    copied = checked_add(copied, host_copied_here,
-                                         "artifact copied byte count overflows u64");
-                    out.stats_.staged_host_bytes =
-                        checked_add(out.stats_.staged_host_bytes, host_copied_here,
-                                    "host staging byte count overflows u64");
-                }
-                if (fed) {
-                    CUDA_CHECK(cudaEventRecord(slot.events[device_slot],
-                                               devices[device_slot]->load_stream));
-                    slot.pending[device_slot] = true;
-                }
-            }
 
-            if (progress != nullptr && progress->callback && copied != last_published &&
-                copied < total) {
-                last_published = copied;
-                progress->callback("weights", copied, total);
+                if (progress != nullptr && progress->callback && copied != last_published &&
+                    copied < total) {
+                    last_published = copied;
+                    progress->callback("weights", copied, total);
+                }
             }
         }
     }
