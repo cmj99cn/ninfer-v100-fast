@@ -18,10 +18,11 @@
 - 本仓 v2 契约不变：v2 工件、27B/coder390 窄 v3 适配的行为一字不改。
 - 新格式拼写（上游 `formats.cpp`）：`bf16`/`fp32`/`int32`/`q4_g64_fp16`/`q8_g32_fp16`/`nvfp4`/`nf4_g16_e4m3fn`/`fp8_e4m3fn_block128x128_bf16`；新布局拼写：`row_paged_g16_4k_v1`、`block_scale_m128_k128_v1`、`batched_block_scale_k16_m128x4_v1`。
 - 几何公式（上游 `src/core/weight_view.cpp`）：
-  - NF4 分页行：`row_bytes = k/2 + k/16`，`rows_per_page = 4096/row_bytes`（整除截断），`page_count = ceil(n/rows_per_page)`（**向上取整**；n=2500012、rows_per_page=45 → page_count=55556），`matrix_scale_offset = page_count*4096`，`bytes = matrix_scale_offset + 4`；
+  - NF4 分页行：`row_bytes = k/2 + k/16`（每行 = **80 码字节 + 10 个 E4M3 缩放字节**，先码后缩放，上游 `weight_scale_offset` 权威；实测行尾 10 B 100% 落在 E4M3 数值区间），`rows_per_page = 4096/row_bytes`（整除截断），`page_count = ceil(n/rows_per_page)`（**向上取整**；n=2500012、rows_per_page=45 → page_count=55556），`matrix_scale_offset = page_count*4096`，`bytes = matrix_scale_offset + 4`；页内行寻址 = `row/rows_per_page*4096 + row%rows_per_page*row_bytes`（行在页内是 4096 对齐页帧，页尾补零）；
   - Q8_G32 row-split：group 32，码 1B/值、缩放 2B/组，列对齐 128，平面序 code(256 对齐)→high(0B)→scale(256 对齐)，无矩阵缩放；
   - 块 FP8 128×128：n%128=k%128=0，码 1B/值，缩放 2B/块，scale_offset=align(code,256)，`scale_bytes = (n/128)*(k/128)*2`；
-  - batched NVFP4：n%128=0、k%64=0，group 16，码 k/2/行、缩放 k/16/行，逐矩阵平面拼接，每矩阵尾随 4B FP32 除数。
+  - batched NVFP4（上游 `src/core/weight_view.cpp` 权威，2026-11-11 核实）：`n%128==0、k%64==0`，group 16，码 k/2/行、缩放 k/16/行；**码面与缩放面按矩阵轴整体分组**——`code_bytes = matrices*n*k/2`（全部矩阵的码连续）、`scale_offset = aligned(code_bytes, 256)`、`scale_bytes = matrices*(n/scale_block_rows)*scale_row_bytes`（每个矩阵的缩放面连续，矩阵主序）、NVFP4 末尾再跟 `matrices*4` 字节的 FP32 矩阵尺度（`matrix_scale_offset = bytes`）。→ `[全部码面][全部缩放面][512 个 FP32 矩阵尺度]`；
+  - 块 FP8 128×128（上游同款分组）：`n%128==0、k%128==0`，码 1B/值，`scale_offset = aligned(code_bytes,256)`，`scale_bytes = matrices*(n/128)*(k/128)*2`，**无每矩阵 FP32 尺度**；支持 rank2/rank3（工件里两个对象是 3D `[512,1280,2560]`/`[512,2560,640]`）。
 - 主机 CPU 占用上限 ~85%（构建并发据此配额）。
 
 ## 审查重点（Review Focus）
