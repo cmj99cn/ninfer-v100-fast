@@ -114,6 +114,48 @@ struct RowScaleGeometry {
 
 RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
 
+struct RowPagedNf4Geometry {
+    std::uint64_t rows                = 0;
+    std::uint64_t columns             = 0;
+    std::uint64_t row_bytes           = 0;
+    std::uint64_t rows_per_page       = 0;
+    std::uint64_t page_bytes          = 0;
+    std::uint64_t page_count          = 0;
+    std::uint64_t matrix_scale_offset = 0;
+    std::uint64_t encoded_bytes       = 0;
+};
+
+RowPagedNf4Geometry row_paged_nf4_geometry(NumericFormat format,
+                                           std::span<const std::uint64_t> shape);
+
+struct Block128Geometry {
+    std::uint64_t rows               = 0;
+    std::uint64_t columns            = 0;
+    std::uint64_t matrices           = 1;
+    std::uint64_t code_plane_bytes   = 0;
+    std::uint64_t scale_plane_bytes  = 0;
+    std::uint64_t scale_plane_offset = 0;
+    std::uint64_t encoded_bytes      = 0;
+};
+
+Block128Geometry block_scale_m128_k128_geometry(NumericFormat format,
+                                               std::span<const std::uint64_t> shape);
+
+struct BatchedBlockScaleGeometry {
+    std::uint64_t matrices              = 0;
+    std::uint64_t rows                  = 0;
+    std::uint64_t columns               = 0;
+    std::uint64_t code_plane_bytes      = 0;
+    std::uint64_t scale_plane_bytes     = 0;
+    std::uint64_t matrix_stride         = 0;
+    std::uint64_t scale_plane_offset    = 0;
+    std::uint64_t weight_divisor_offset = 0;
+    std::uint64_t encoded_bytes         = 0;
+};
+
+BatchedBlockScaleGeometry batched_block_scale_geometry(NumericFormat format,
+                                                       std::span<const std::uint64_t> shape);
+
 // --- Tensor slicing (TP2 sharded materialization) ---------------------------------------------
 //
 // A shard of a tensor is a *standalone tensor of the same layout and format* whose logical shape

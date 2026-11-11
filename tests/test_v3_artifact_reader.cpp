@@ -32,6 +32,7 @@ using ninfer::artifact::NumericFormat;
 using ninfer::artifact::Reader;
 using ninfer::artifact::ResourceDescriptor;
 using ninfer::artifact::ResourceEncoding;
+using ninfer::artifact::SliceRange;
 using ninfer::artifact::StorageLayout;
 using ninfer::artifact::TensorDescriptor;
 using Json = nlohmann::json;
@@ -429,6 +430,253 @@ void test_public_table_covers_upstream_v3_artifact() {
               << " resources, every spelling accepted by the shared table\n";
 }
 
+// row_paged_g16_4k_v1: NF4 codes with one E4M3FN scale per 16 elements, packed into 4096-byte
+// pages, with an FP32 matrix scale after the last page.
+void test_nf4_paged_geometry() {
+    const std::array<std::uint64_t, 2> shape = {2500012, 160};
+    const auto geometry =
+        ninfer::artifact::row_paged_nf4_geometry(NumericFormat::NF4_G16_E4M3S, shape);
+    if (geometry.row_bytes != 90 || geometry.rows_per_page != 45 || geometry.page_count != 55556 ||
+        geometry.matrix_scale_offset != 227557376 || geometry.encoded_bytes != 227557380) {
+        throw std::runtime_error("row_paged_g16_4k_v1 geometry is not the upstream geometry");
+    }
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 2> ragged = {16, 24};
+            (void)ninfer::artifact::row_paged_nf4_geometry(NumericFormat::NF4_G16_E4M3S, ragged);
+        },
+        "divisible by 16");
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 2> shape = {16, 32};
+            (void)ninfer::artifact::row_paged_nf4_geometry(NumericFormat::NVFP4, shape);
+        },
+        "NF4_G16_E4M3S");
+}
+
+// block_scale_m128_k128_v1: an E4M3FN code plane plus one BF16 scale per 128x128 block.
+void test_block128_geometry() {
+    const std::array<std::uint64_t, 2> shape = {2560, 640};
+    const auto geometry = ninfer::artifact::block_scale_m128_k128_geometry(
+        NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, shape);
+    if (geometry.code_plane_bytes != 1638400 || geometry.scale_plane_offset != 1638400 ||
+        geometry.scale_plane_bytes != 200 || geometry.encoded_bytes != 1638600) {
+        throw std::runtime_error("block_scale_m128_k128_v1 geometry is not the upstream geometry");
+    }
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 2> ragged = {256, 192};
+            (void)ninfer::artifact::block_scale_m128_k128_geometry(
+                NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, ragged);
+        },
+        "divisible by 128");
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 2> shape = {256, 128};
+            (void)ninfer::artifact::block_scale_m128_k128_geometry(NumericFormat::NVFP4, shape);
+        },
+        "FP8_E4M3FN_BLOCK128_BF16S");
+}
+
+// batched_block_scale_k16_m128x4_v1: expert matrices in the NVFP4 blockscale layout.
+void test_batched_blockscale_geometry() {
+    {
+        const std::array<std::uint64_t, 3> shape = {512, 1280, 2560};
+        const auto geometry =
+            ninfer::artifact::batched_block_scale_geometry(NumericFormat::NVFP4, shape);
+        if (geometry.matrices != 512 || geometry.code_plane_bytes != 1638400 ||
+            geometry.scale_plane_bytes != 204800 || geometry.matrix_stride != 1843200 ||
+            geometry.encoded_bytes != 943720448) {
+            throw std::runtime_error(
+                "batched_block_scale_k16_m128x4_v1 geometry is not the upstream geometry");
+        }
+    }
+    {
+        const std::array<std::uint64_t, 3> shape = {512, 2560, 640};
+        const auto geometry =
+            ninfer::artifact::batched_block_scale_geometry(NumericFormat::NVFP4, shape);
+        if (geometry.matrix_stride != 921600 || geometry.encoded_bytes != 471861248) {
+            throw std::runtime_error(
+                "batched_block_scale_k16_m128x4_v1 geometry is not the upstream geometry");
+        }
+    }
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 3> shape = {512, 1280, 200};
+            (void)ninfer::artifact::batched_block_scale_geometry(NumericFormat::NVFP4, shape);
+        },
+        "divisible by");
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 3> shape = {512, 192, 2560};
+            (void)ninfer::artifact::batched_block_scale_geometry(NumericFormat::NVFP4, shape);
+        },
+        "divisible by");
+}
+
+// The batched layout slices per matrix: a row slice selects whole experts, a column slice
+// narrows the K axis of every expert with the single-matrix blockscale rule.
+void test_batched_slices() {
+    const std::array<std::uint64_t, 3> shape = {512, 1280, 2560};
+    const std::array<SliceRange, 1> experts = {SliceRange{0, 256}};
+    const auto row_slice = ninfer::artifact::tensor_row_slice(
+        StorageLayout::BatchedBlockScaleK16M128x4V1, NumericFormat::NVFP4, shape, experts);
+    // one code block, ten 128-row scale tiles and one FP32 divisor per selected expert
+    if (row_slice.encoded_bytes != 471860224 || row_slice.copies.size() != 256 * 12) {
+        throw std::runtime_error("batched expert row slice is not the single-matrix rule");
+    }
+    const std::array<SliceRange, 1> halves = {SliceRange{0, 1280}};
+    const auto column_slice = ninfer::artifact::tensor_column_slice(
+        StorageLayout::BatchedBlockScaleK16M128x4V1, NumericFormat::NVFP4, shape, halves);
+    // one code copy per row, ten scale tiles and one divisor per expert
+    if (column_slice.encoded_bytes != 471861248 || column_slice.copies.size() != 512 * 1291) {
+        throw std::runtime_error("batched expert column slice is not the single-matrix rule");
+    }
+}
+
+// The batched slice arithmetic must copy the exact bytes of the selected experts and columns.
+// The parent payload and the expected shard are both built from the layout's logical
+// coordinates, so a wrong plane offset or a wrong stride shows up as a byte mismatch.
+using Bytes = std::vector<std::uint8_t>;
+
+std::uint8_t batched_pattern(std::uint64_t a, std::uint64_t b, std::uint64_t c) {
+    return static_cast<std::uint8_t>((a * 131 + b * 17 + c * 7 + 11) & 0xFFU);
+}
+
+Bytes build_batched_nvfp4(std::uint64_t experts, std::uint64_t rows, std::uint64_t columns,
+                          std::uint64_t expert_origin, std::uint64_t column_origin,
+                          std::uint64_t group_origin) {
+    const std::array<std::uint64_t, 3> shape = {experts, rows, columns};
+    const auto geometry =
+        ninfer::artifact::batched_block_scale_geometry(NumericFormat::NVFP4, shape);
+    Bytes out(static_cast<std::size_t>(geometry.encoded_bytes), 0);
+    const std::uint64_t k_tiles = columns / 64;
+    for (std::uint64_t expert = 0; expert < experts; ++expert) {
+        const std::uint64_t code_base  = expert * geometry.code_plane_bytes;
+        const std::uint64_t scale_base = geometry.scale_plane_offset +
+                                        expert * geometry.scale_plane_bytes;
+        for (std::uint64_t row = 0; row < rows; ++row) {
+            for (std::uint64_t byte = 0; byte < columns / 2; ++byte) {
+                out[static_cast<std::size_t>(code_base + row * (columns / 2) + byte)] =
+                    batched_pattern(expert_origin + expert, row, column_origin / 2 + byte);
+            }
+            for (std::uint64_t group = 0; group < columns / 16; ++group) {
+                const std::uint64_t row_inner = row % 128;
+                const std::uint64_t offset = ((row / 128) * k_tiles + group / 4) * 512 +
+                                             (row_inner % 32) * 16 + (row_inner / 32) * 4 +
+                                             (group % 4);
+                out[static_cast<std::size_t>(scale_base + offset)] =
+                    batched_pattern(expert_origin + expert, group_origin + group, 200);
+            }
+        }
+        for (std::uint64_t byte = 0; byte < 4; ++byte) {
+            out[static_cast<std::size_t>(geometry.weight_divisor_offset + 4 * expert + byte)] =
+                batched_pattern(expert_origin + expert, byte, 240);
+        }
+    }
+    return out;
+}
+
+Bytes apply_batched_slice(const Bytes& parent, const ninfer::artifact::TensorSlice& slice) {
+    Bytes out(static_cast<std::size_t>(slice.encoded_bytes), 0);
+    for (const auto& copy : slice.copies) {
+        if (copy.source_offset + copy.bytes > parent.size() ||
+            copy.dest_offset + copy.bytes > out.size()) {
+            throw std::runtime_error("batched slice copy range escapes its buffer");
+        }
+        for (std::uint64_t i = 0; i < copy.bytes; ++i) {
+            out[static_cast<std::size_t>(copy.dest_offset + i)] =
+                parent[static_cast<std::size_t>(copy.source_offset + i)];
+        }
+    }
+    return out;
+}
+
+void test_batched_slice_bytes() {
+    constexpr std::uint64_t kExperts = 4;
+    constexpr std::uint64_t kRows    = 256;
+    constexpr std::uint64_t kColumns = 256;
+    const std::array<std::uint64_t, 3> shape = {kExperts, kRows, kColumns};
+    const Bytes parent = build_batched_nvfp4(kExperts, kRows, kColumns, 0, 0, 0);
+
+    // Expert interval [1, 3): the shard holds experts 1 and 2 with their own coordinates.
+    const std::array<SliceRange, 1> experts = {SliceRange{1, 2}};
+    const auto row_slice = ninfer::artifact::tensor_row_slice(
+        StorageLayout::BatchedBlockScaleK16M128x4V1, NumericFormat::NVFP4, shape, experts);
+    if (apply_batched_slice(parent, row_slice) !=
+        build_batched_nvfp4(2, kRows, kColumns, 1, 0, 0)) {
+        throw std::runtime_error("batched expert row slice did not copy the expert bytes");
+    }
+
+    // K interval [64, 192): the shard holds the parent's columns 64..191 of every expert.
+    const std::array<SliceRange, 1> columns = {SliceRange{64, 128}};
+    const auto column_slice = ninfer::artifact::tensor_column_slice(
+        StorageLayout::BatchedBlockScaleK16M128x4V1, NumericFormat::NVFP4, shape, columns);
+    if (apply_batched_slice(parent, column_slice) !=
+        build_batched_nvfp4(kExperts, kRows, 128, 0, 64, 4)) {
+        throw std::runtime_error("batched expert column slice did not copy the column bytes");
+    }
+}
+
+// The paged expert layout is replicated whole: it has no slice form yet.
+void test_paged_layout_has_no_slice() {
+    const std::array<std::uint64_t, 2> shape = {64, 160};
+    const std::array<SliceRange, 1> rows = {SliceRange{0, 32}};
+    expect_artifact_error(
+        [&] {
+            (void)ninfer::artifact::tensor_row_slice(StorageLayout::RowPagedG16x4KV1,
+                                                      NumericFormat::NF4_G16_E4M3S, shape, rows);
+        },
+        "row_paged_g16_4k_v1");
+    expect_artifact_error(
+        [&] {
+            (void)ninfer::artifact::tensor_column_slice(StorageLayout::RowPagedG16x4KV1,
+                                                         NumericFormat::NF4_G16_E4M3S, shape, rows);
+        },
+        "row_paged_g16_4k_v1");
+}
+
+// The Flash-Next artifact must open through the public Reader, and every tensor's declared byte
+// count must be the geometry of its own layout and format.
+// NINFER_FLASH_NEXT_V3_ARTIFACT=
+//   /home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer
+void test_flash_next_artifact_geometries() {
+    const char* artifact = std::getenv("NINFER_FLASH_NEXT_V3_ARTIFACT");
+    if (artifact == nullptr || *artifact == '\0') {
+        std::cout << "skip: NINFER_FLASH_NEXT_V3_ARTIFACT is not set\n";
+        return;
+    }
+    Reader reader(artifact);
+    std::size_t tensors           = 0;
+    std::size_t paged             = 0;
+    std::size_t block128          = 0;
+    std::size_t batched_blockscale = 0;
+    for (const auto& object : reader.objects()) {
+        const auto* tensor = std::get_if<TensorDescriptor>(&object);
+        if (tensor == nullptr) { continue; }
+        ++tensors;
+        const auto expected =
+            ninfer::artifact::tensor_encoded_size(tensor->layout, tensor->format, tensor->shape);
+        if (tensor->bytes != expected) {
+            throw std::runtime_error("artifact tensor " + tensor->name + " stores " +
+                                     std::to_string(tensor->bytes) + " bytes; its geometry needs " +
+                                     std::to_string(expected));
+        }
+        switch (tensor->layout) {
+        case StorageLayout::RowPagedG16x4KV1: ++paged; break;
+        case StorageLayout::BlockScaleM128K128V1: ++block128; break;
+        case StorageLayout::BatchedBlockScaleK16M128x4V1: ++batched_blockscale; break;
+        default: break;
+        }
+    }
+    if (tensors != 1312 || paged != 128 || block128 != 2 || batched_blockscale != 96) {
+        throw std::runtime_error("the Flash-Next artifact does not carry the expected objects");
+    }
+    std::cout << "flash-next artifact: " << tensors << " tensors, every byte count matches its "
+              << "geometry (" << paged << " paged, " << batched_blockscale << " batched, "
+              << block128 << " block128)\n";
+}
+
 void test_identity_synthesized() {
     const auto fixture =
         write_v3_multi_part(canonical_objects(),
@@ -709,6 +957,13 @@ int main() {
         test_v3_object_spelling_reaches_the_reader();
         test_v3_unknown_spelling_rejected();
         test_public_table_covers_upstream_v3_artifact();
+        test_nf4_paged_geometry();
+        test_block128_geometry();
+        test_batched_blockscale_geometry();
+        test_batched_slices();
+        test_batched_slice_bytes();
+        test_paged_layout_has_no_slice();
+        test_flash_next_artifact_geometries();
         test_identity_synthesized();
         test_objects_and_payloads_across_parts();
         test_wrong_part_index_rejected();
