@@ -614,7 +614,7 @@ std::unique_ptr<TpMailboxPlan::Impl> init_plan(const ExecutionContext& ec,
         DeviceGuard::set(ec.dev[a]->device);
         for (int b = 0; b < impl->tp; ++b) {
             if (a == b) { continue; }
-            const cudaError_t err = cudaDeviceEnablePeerAccess(b, 0);
+            const cudaError_t err = cudaDeviceEnablePeerAccess(ec.dev[b]->device, 0);
             if (err == cudaErrorPeerAccessAlreadyEnabled) {
                 // A previous plan in this process already enabled the pair; the sticky error must
                 // be consumed or the next CUDA_CHECK trips on it.
