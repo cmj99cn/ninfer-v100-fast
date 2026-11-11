@@ -593,13 +593,54 @@ TensorSlice tensor_row_slice(StorageLayout layout, NumericFormat format,
     }
 
     if (layout == StorageLayout::BlockScaleM128K128V1) {
-        // The row axis of a stacked object is its matrix axis: a row slice selects whole
+        const auto parent = block_scale_m128_k128_geometry(format, shape);
+        if (shape.size() == 2) {
+            // One matrix: the row axis is the matrix's row axis, a row range covers whole
+            // 128-row bands, and each band contributes one code copy and one scale copy.
+            const std::uint64_t selected = validate_row_ranges(rows, shape[0], kBlock128Tile);
+            const std::array<std::uint64_t, 2> shard_shape = {selected, shape[1]};
+            const auto shard = block_scale_m128_k128_geometry(format, shard_shape);
+            out.encoded_bytes = shard.encoded_bytes;
+            const std::uint64_t code_band_bytes =
+                checked_mul(kBlock128Tile, shape[1], "FP8 band code bytes");
+            const std::uint64_t scale_band_bytes =
+                checked_mul(shape[1] / kBlock128Tile, kBlock128ScaleBytes, "FP8 band scale bytes");
+            std::uint64_t destination_band = 0;
+            for (const SliceRange& range : rows) {
+                const auto first = range.begin / kBlock128Tile;
+                const auto last  = (range.begin + range.count) / kBlock128Tile;
+                for (std::uint64_t band = first; band < last; ++band) {
+                    out.copies.push_back(PlaneCopy{
+                        .source_offset = checked_mul(band, code_band_bytes,
+                                                     "row slice source offset"),
+                        .dest_offset = checked_mul(destination_band, code_band_bytes,
+                                                   "row slice destination offset"),
+                        .bytes = code_band_bytes,
+                    });
+                    out.copies.push_back(PlaneCopy{
+                        .source_offset = checked_add(
+                            parent.scale_plane_offset,
+                            checked_mul(band, scale_band_bytes, "row slice source offset"),
+                            "row slice source offset"),
+                        .dest_offset = checked_add(
+                            shard.scale_plane_offset,
+                            checked_mul(destination_band, scale_band_bytes,
+                                        "row slice destination offset"),
+                            "row slice destination offset"),
+                        .bytes = scale_band_bytes,
+                    });
+                    ++destination_band;
+                }
+            }
+            return out;
+        }
+        // A stack of matrices: the row axis is its matrix axis, so a row slice selects whole
         // matrices, and each selected matrix contributes its code block and its scale block.
         require_slice(shape.size() == 3,
-                      "block_scale_m128_k128_v1 row slicing requires a rank-three shape");
+                      "block_scale_m128_k128_v1 row slicing requires a rank-two or rank-three "
+                      "shape");
         const std::uint64_t matrices = shape[0];
         const std::uint64_t selected = validate_row_ranges(rows, matrices, 1);
-        const auto parent = block_scale_m128_k128_geometry(format, shape);
         const std::array<std::uint64_t, 3> shard_shape = {selected, shape[1], shape[2]};
         const auto shard = block_scale_m128_k128_geometry(format, shard_shape);
         out.encoded_bytes = shard.encoded_bytes;
@@ -635,8 +676,8 @@ TensorSlice tensor_row_slice(StorageLayout layout, NumericFormat format,
 
     if (layout == StorageLayout::RowPagedG16x4KV1) {
         throw ArtifactError(
-            "tensor slice: row_paged_g16_4k_v1 has no slice form; the paged expert shard is "
-            "replicated whole");
+            "tensor slice: row_paged_g16_4k_v1 has no slice form in this milestone; the paged "
+            "expert shard is replicated whole");
     }
     throw ArtifactError("unknown tensor layout");
 }
@@ -645,7 +686,13 @@ TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
                                 std::span<const std::uint64_t> shape,
                                 std::span<const SliceRange> column_ranges,
                                 std::span<const std::byte> payload) {
-    require_slice(!shape.empty(), "a column slice needs a tensor of rank one or higher");
+    if (layout == StorageLayout::BatchedBlockScaleK16M128x4V1 ||
+        layout == StorageLayout::BlockScaleM128K128V1) {
+        require_slice(shape.size() == 2 || shape.size() == 3,
+                      "this storage layout requires a rank-two or rank-three shape");
+    } else {
+        require_slice(shape.size() == 2, "a column slice requires a rank-two shape");
+    }
     TensorSlice out;
 
     if (layout == StorageLayout::BatchedBlockScaleK16M128x4V1) {
@@ -739,13 +786,84 @@ TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
 
     if (layout == StorageLayout::RowPagedG16x4KV1) {
         throw ArtifactError(
-            "tensor slice: row_paged_g16_4k_v1 has no slice form; the paged expert shard is "
-            "replicated whole");
+            "tensor slice: row_paged_g16_4k_v1 has no slice form in this milestone; the paged "
+            "expert shard is replicated whole");
     }
+
     if (layout == StorageLayout::BlockScaleM128K128V1) {
-        throw ArtifactError(
-            "tensor slice: block_scale_m128_k128_v1 has no column slice form; the 128x128 "
-            "block scale order of one matrix is not established");
+        // The column axis is the K axis: one column range narrows every matrix of the stack,
+        // and the scale plane is addressed by 128-row bands of block-column words.
+        const std::uint64_t matrices = shape.size() == 3 ? shape[0] : 1;
+        const std::uint64_t rows     = shape[shape.size() - 2];
+        const std::uint64_t columns  = shape.back();
+        validate_column_ranges(column_ranges, columns);
+        require_slice(column_ranges.size() == 1,
+                      "this storage layout requires one contiguous column range");
+        const SliceRange selected = column_ranges.front();
+        require_slice(selected.begin % kBlock128Tile == 0 && selected.count % kBlock128Tile == 0,
+                      "block_scale_m128_k128_v1 column ranges must be multiples of 128");
+        const auto parent = block_scale_m128_k128_geometry(format, shape);
+        Block128Geometry shard;
+        if (shape.size() == 2) {
+            shard = block_scale_m128_k128_geometry(
+                format, std::array<std::uint64_t, 2>{rows, selected.count});
+        } else {
+            shard = block_scale_m128_k128_geometry(
+                format, std::array<std::uint64_t, 3>{matrices, rows, selected.count});
+        }
+        out.encoded_bytes = shard.encoded_bytes;
+        const std::uint64_t bands = rows / kBlock128Tile;
+        const std::uint64_t parent_band_bytes =
+            checked_mul(columns / kBlock128Tile, kBlock128ScaleBytes, "FP8 band scale bytes");
+        const std::uint64_t shard_band_bytes = checked_mul(selected.count / kBlock128Tile,
+                                                           kBlock128ScaleBytes,
+                                                           "FP8 band scale bytes");
+        for (std::uint64_t matrix_index = 0; matrix_index < matrices; ++matrix_index) {
+            const auto source_code = checked_mul(matrix_index, parent.code_plane_bytes,
+                                                 "column slice source offset");
+            const auto dest_code = checked_mul(matrix_index, shard.code_plane_bytes,
+                                               "column slice destination offset");
+            const auto source_scale = checked_add(
+                parent.scale_plane_offset,
+                checked_mul(matrix_index, parent.scale_plane_bytes, "column slice source offset"),
+                "column slice source offset");
+            const auto dest_scale = checked_add(
+                shard.scale_plane_offset,
+                checked_mul(matrix_index, shard.scale_plane_bytes,
+                            "column slice destination offset"),
+                "column slice destination offset");
+            for (std::uint64_t row = 0; row < rows; ++row) {
+                out.copies.push_back(PlaneCopy{
+                    .source_offset = checked_add(
+                        source_code,
+                        checked_add(checked_mul(row, columns, "column slice source offset"),
+                                    selected.begin, "column slice source offset"),
+                        "column slice source offset"),
+                    .dest_offset = checked_add(dest_code,
+                                               checked_mul(row, selected.count,
+                                                           "column slice destination offset"),
+                                               "column slice destination offset"),
+                    .bytes = selected.count,
+                });
+            }
+            for (std::uint64_t band = 0; band < bands; ++band) {
+                out.copies.push_back(PlaneCopy{
+                    .source_offset = checked_add(
+                        source_scale,
+                        checked_add(checked_mul(band, parent_band_bytes,
+                                                "column slice source offset"),
+                                    (selected.begin / kBlock128Tile) * kBlock128ScaleBytes,
+                                    "column slice source offset"),
+                        "column slice source offset"),
+                    .dest_offset = checked_add(dest_scale,
+                                               checked_mul(band, shard_band_bytes,
+                                                           "column slice destination offset"),
+                                               "column slice destination offset"),
+                    .bytes = shard_band_bytes,
+                });
+            }
+        }
+        return out;
     }
 
     require_slice(shape.size() == 2, "a column slice requires a rank-two shape");
@@ -919,20 +1037,47 @@ RowPagedNf4Geometry row_paged_nf4_geometry(NumericFormat format,
     }
 
     RowPagedNf4Geometry out;
-    out.rows       = shape[0];
-    out.columns    = shape[1];
-    out.page_bytes = kNf4PageBytes;
-    out.row_bytes  = checked_add(shape[1] / 2, shape[1] / kNf4GroupSize, "NF4 row bytes");
-    out.rows_per_page = kNf4PageBytes / out.row_bytes;
+    out.rows                = shape[0];
+    out.columns             = shape[1];
+    out.group_size          = kNf4GroupSize;
+    out.page_bytes          = kNf4PageBytes;
+    out.code_bytes_per_row  = shape[1] / 2;
+    out.scale_bytes_per_row = shape[1] / kNf4GroupSize;
+    out.row_bytes           = checked_add(out.code_bytes_per_row, out.scale_bytes_per_row,
+                                          "NF4 row bytes");
+    out.rows_per_page       = kNf4PageBytes / out.row_bytes;
     if (out.rows_per_page == 0) {
         throw ArtifactError("row_paged_g16_4k_v1 requires a row that fits in one 4096-byte page");
     }
     const auto rows_ceiling = checked_add(shape[0], out.rows_per_page - 1, "NF4 row count");
     out.page_count          = rows_ceiling / out.rows_per_page;
+    out.code_bytes          = checked_mul(shape[0], out.code_bytes_per_row, "NF4 code bytes");
+    out.scale_bytes         = checked_mul(shape[0], out.scale_bytes_per_row, "NF4 scale bytes");
     out.matrix_scale_offset = checked_mul(out.page_count, kNf4PageBytes, "NF4 matrix scale offset");
     out.encoded_bytes =
         checked_add(out.matrix_scale_offset, kNf4MatrixScaleBytes, "NF4 tensor encoded size");
     return out;
+}
+
+std::uint64_t row_paged_nf4_row_offset(const RowPagedNf4Geometry& geometry, std::uint64_t row) {
+    if (geometry.rows_per_page == 0 || row >= geometry.rows) {
+        throw ArtifactError("row_paged_g16_4k_v1 row is outside its parent");
+    }
+    const auto page = row / geometry.rows_per_page;
+    const auto index = row % geometry.rows_per_page;
+    return checked_add(checked_mul(page, geometry.page_bytes, "NF4 page offset"),
+                       checked_mul(index, geometry.row_bytes, "NF4 row offset"),
+                       "NF4 row offset");
+}
+
+std::uint64_t row_paged_nf4_scale_offset(const RowPagedNf4Geometry& geometry, std::uint64_t row,
+                                         std::uint64_t group) {
+    if (group >= geometry.columns / geometry.group_size) {
+        throw ArtifactError("row_paged_g16_4k_v1 group is outside its row");
+    }
+    return checked_add(row_paged_nf4_row_offset(geometry, row),
+                       checked_add(geometry.code_bytes_per_row, group, "NF4 group scale offset"),
+                       "NF4 group scale offset");
 }
 
 Block128Geometry block_scale_m128_k128_geometry(NumericFormat format,
@@ -980,27 +1125,32 @@ BatchedBlockScaleGeometry batched_block_scale_geometry(NumericFormat format,
     if (shape.size() != 3) {
         throw ArtifactError("batched_block_scale_k16_m128x4_v1 requires a rank-three shape");
     }
-
-    const std::array<std::uint64_t, 2> matrix_shape = {shape[1], shape[2]};
-    const auto matrix = block_scale_geometry(format, matrix_shape);
+    const std::uint64_t matrices = shape[0];
+    const std::uint64_t rows     = shape[1];
+    const std::uint64_t columns  = shape[2];
+    if (matrices == 0 || rows == 0 || columns == 0) {
+        throw ArtifactError("batched_block_scale_k16_m128x4_v1 requires positive dimensions");
+    }
+    if (rows % kNvfp4RowTile != 0 || columns % kNvfp4TileColumns != 0) {
+        throw ArtifactError(
+            "batched_block_scale_k16_m128x4_v1 requires N divisible by 128 and K divisible by 64");
+    }
 
     BatchedBlockScaleGeometry out;
-    out.matrices          = shape[0];
-    out.rows              = shape[1];
-    out.columns           = shape[2];
-    out.code_plane_bytes  = matrix.code_plane_bytes;
-    out.scale_plane_bytes = matrix.scale_plane_bytes;
-    out.matrix_stride     = checked_add(matrix.scale_plane_offset, matrix.scale_plane_bytes,
-                                        "batched NVFP4 matrix stride");
-    const auto codes = checked_mul(out.matrices, out.code_plane_bytes, "batched NVFP4 code bytes");
+    out.matrices          = matrices;
+    out.rows              = rows;
+    out.columns           = columns;
+    out.code_plane_bytes  = checked_mul(rows, columns / 2, "batched NVFP4 code plane bytes");
+    out.scale_plane_bytes = checked_mul(rows, columns / 16, "batched NVFP4 scale plane bytes");
+    const auto codes = checked_mul(matrices, out.code_plane_bytes, "batched NVFP4 code bytes");
     out.scale_plane_offset = align_up(codes, kTensorAlignment, "batched NVFP4 scale plane offset");
     const auto scales =
-        checked_mul(out.matrices, out.scale_plane_bytes, "batched NVFP4 scale plane bytes");
+        checked_mul(matrices, out.scale_plane_bytes, "batched NVFP4 scale plane bytes");
     out.weight_divisor_offset =
         checked_add(out.scale_plane_offset, scales, "batched NVFP4 weight divisor offset");
     out.encoded_bytes = checked_add(
         out.weight_divisor_offset,
-        checked_mul(out.matrices, kNvfp4DivisorBytes, "batched NVFP4 weight divisor bytes"),
+        checked_mul(matrices, kNvfp4DivisorBytes, "batched NVFP4 weight divisor bytes"),
         "batched NVFP4 tensor encoded size");
     return out;
 }

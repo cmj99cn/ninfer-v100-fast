@@ -117,16 +117,28 @@ RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::u
 struct RowPagedNf4Geometry {
     std::uint64_t rows                = 0;
     std::uint64_t columns             = 0;
+    std::uint64_t group_size          = 16;
+    std::uint64_t code_bytes_per_row  = 0;
+    std::uint64_t scale_bytes_per_row = 0;
     std::uint64_t row_bytes           = 0;
     std::uint64_t rows_per_page       = 0;
     std::uint64_t page_bytes          = 0;
     std::uint64_t page_count          = 0;
+    std::uint64_t code_bytes          = 0;
+    std::uint64_t scale_bytes         = 0;
     std::uint64_t matrix_scale_offset = 0;
     std::uint64_t encoded_bytes       = 0;
 };
 
 RowPagedNf4Geometry row_paged_nf4_geometry(NumericFormat format,
                                            std::span<const std::uint64_t> shape);
+
+// Byte offset of one encoded NF4 row inside its paged parent.
+std::uint64_t row_paged_nf4_row_offset(const RowPagedNf4Geometry& geometry, std::uint64_t row);
+
+// Byte offset of one group scale word inside its paged parent.
+std::uint64_t row_paged_nf4_scale_offset(const RowPagedNf4Geometry& geometry, std::uint64_t row,
+                                         std::uint64_t group);
 
 struct Block128Geometry {
     std::uint64_t rows               = 0;
@@ -147,7 +159,6 @@ struct BatchedBlockScaleGeometry {
     std::uint64_t columns               = 0;
     std::uint64_t code_plane_bytes      = 0;
     std::uint64_t scale_plane_bytes     = 0;
-    std::uint64_t matrix_stride         = 0;
     std::uint64_t scale_plane_offset    = 0;
     std::uint64_t weight_divisor_offset = 0;
     std::uint64_t encoded_bytes         = 0;
