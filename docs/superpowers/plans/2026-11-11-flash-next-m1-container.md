@@ -18,7 +18,7 @@
 - 本仓 v2 契约不变：v2 工件、27B/coder390 窄 v3 适配的行为一字不改。
 - 新格式拼写（上游 `formats.cpp`）：`bf16`/`fp32`/`int32`/`q4_g64_fp16`/`q8_g32_fp16`/`nvfp4`/`nf4_g16_e4m3fn`/`fp8_e4m3fn_block128x128_bf16`；新布局拼写：`row_paged_g16_4k_v1`、`block_scale_m128_k128_v1`、`batched_block_scale_k16_m128x4_v1`。
 - 几何公式（上游 `src/core/weight_view.cpp`）：
-  - NF4 分页行：`row_bytes = k/2 + k/16`，`rows_per_page = 4096/row_bytes`，`page_count = ceil(n/rows_per_page)`，`matrix_scale_offset = page_count*4096`，`bytes = matrix_scale_offset + 4`；
+  - NF4 分页行：`row_bytes = k/2 + k/16`，`rows_per_page = 4096/row_bytes`（整除截断），`page_count = ceil(n/rows_per_page)`（**向上取整**；n=2500012、rows_per_page=45 → page_count=55556），`matrix_scale_offset = page_count*4096`，`bytes = matrix_scale_offset + 4`；
   - Q8_G32 row-split：group 32，码 1B/值、缩放 2B/组，列对齐 128，平面序 code(256 对齐)→high(0B)→scale(256 对齐)，无矩阵缩放；
   - 块 FP8 128×128：n%128=k%128=0，码 1B/值，缩放 2B/块，scale_offset=align(code,256)，`scale_bytes = (n/128)*(k/128)*2`；
   - batched NVFP4：n%128=0、k%64=0，group 16，码 k/2/行、缩放 k/16/行，逐矩阵平面拼接，每矩阵尾随 4B FP32 除数。
@@ -28,7 +28,7 @@
 
 1. **对象跨分卷边界**：真实工件按字节预算切卷，**确有对象跨卷**（`weight/000028`、`weight/000074`、`weight/000171`）——上游用 `segments()` 把跨界对象拆成多段读。跨卷对象必须被支持：不得静默错读，也不得整体拒绝；`payload()` 的单段语义对跨界对象显式报错，`read_direct`/materializer 必须分段取数。→ 任务 1 的 `crossing_object_rejected` 改为 `crossing_object_read_in_segments`，任务 5 用真实工件验证这 3 个对象的分段读字节正确。
 2. **续卷归属校验**：part index / artifact_id 不匹配的续卷文件（或两卷互换）必须报错，不得拼接。→ 任务 1 的 `wrong_part_index`、`swapped_parts` 用例。
-3. **NF4 不完整末页**：`rows_per_page=45`（2500012%45=7），末页不满时的 page_count 与 matrix_scale_offset 必须按 ceil 计算，错一位会让 PLE 全表错位。→ 任务 3 的精确字节数断言（227,553,284）。
+3. **NF4 不完整末页**：`rows_per_page=45`（2500012%45=7），末页不满时 `page_count` 必须按 **ceil** 计算（55556 页），错一位会让 PLE 全表错位。→ 任务 3 的精确字节数断言（227,557,380）。
 4. **q8_g32 与 W8G32 的语义差异**：两者同构是本计划假设（复用 `W8G32_F16S`），必须用真实工件采样字节序验证平面序与缩放 dtype，不等则在任务 2 改为新增枚举并回归任务 3。→ 任务 5 的对表步骤。
 5. **offset/bytes 与几何自洽**：每个对象 `bytes == tensor_encoded_size(layout,format,shape)` 且 `offset % alignment == 0`（上游 `describe_tensor` 同款校验），不满足即工件被误读。→ 任务 5 全量扫描。
 
@@ -118,7 +118,7 @@ git commit -m "feat(artifact): accept v3 formats and layouts for Flash-Next"
 - [ ] **步骤 1：编写失败的测试**
 
 用例（全部硬编码期望值，按全局约束公式）：
-- `nf4_paged_geometry`：`row_paged_nf4_geometry(NF4_G16_E4M3S, [2500012,160])` → `row_bytes=90, rows_per_page=45, page_count=55556, matrix_scale_offset=227553280, encoded_bytes=227553284`；`k%16!=0` 或格式不符抛错。
+- `nf4_paged_geometry`：`row_paged_nf4_geometry(NF4_G16_E4M3S, [2500012,160])` → `row_bytes=90, rows_per_page=45, page_count=55556, matrix_scale_offset=227557376, encoded_bytes=227557380`；`k%16!=0` 或格式不符抛错。
 - `block128_geometry`：`block_scale_m128_k128_geometry(FP8_E4M3FN_BLOCK128_BF16S, [2560,640])` → `code_plane_bytes=1638400, scale_plane_offset=1638400, scale_plane_bytes=200, encoded_bytes=1638600`；`n%128||k%128` 抛错。
 - `batched_blockscale_geometry`：`batched_block_scale_geometry(NVFP4, [512,1280,2560])` → 单矩阵 `code_plane_bytes=1638400, scale_plane_bytes=204800, matrix_stride=1843200, matrices=512, encoded_bytes=943720448`（512×1843200 + 512×4）；`[512,2560,640]` → `matrix_stride=921600, encoded_bytes=471859200+2048`；`n%128||k%64` 抛错。
 - `batched_slices`：对 `[512,1280,2560]` 断言 `tensor_row_slice`（专家区间 `[0,256)`）与 `tensor_column_slice`（K 区间 `[0,1280)`，TP2 每专家半宽）产生的 `encoded_bytes` 与拷贝数符合"逐矩阵应用现有 BlockScale 切分"的构造（256 个专家块的拷贝区间数与单矩阵规则一致）。
@@ -185,7 +185,7 @@ git commit -m "feat(core): dtype slots for NF4 and block-FP8 (decode in qwen4_ex
 
 门控为真时断言：
 - `identity == {qwen3.8-flash-next, nvfp4}`；
-- 全量对象扫描：按 format 计数 `{nvfp4:96, q8_g32_fp16:96, nf4:128, fp8_block128:2, bf16:916, fp32:72, q4_g64_fp16:1}`（以工件旁 `artifact-manifest.json` 为准，若与清单不符，以清单修正断言并记录）；
+- 全量对象扫描：按 format 计数 `{nvfp4:96, q8_g32_fp16:96, nf4:128, fp8_block128:2, bf16:916, fp32:73, q4_g64_fp16:1}`（真实工件目录实测值；工件旁 `qwen3_8_flash_next.ninfer.conversion.json` 写 fp32=72，与目录差 1——**以工件目录为准**，并记录该差异）；
 - 每个对象 `bytes == tensor_encoded_size(...)` 且 `offset % tensor_alignment(layout) == 0`（审查重点 5）；
 - 3 个跨界对象（`weight/000028`、`weight/000074`、`weight/000171`）被正确分段读出：分段拼接后的字节与卷内原始字节一致（上游 `segments()` 语义）。
 
