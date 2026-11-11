@@ -16,7 +16,7 @@
 
 ## 发布版本
 
-当前版本：**v0.2.1（2026-11-09）**（首个公开版本 v0.1.0，2026-10-27）。版本说明与已知限制见 [`CHANGELOG.md`](CHANGELOG.md)。
+当前版本：**v0.2.2（2026-11-11）**（首个公开版本 v0.1.0，2026-10-27）。版本说明与已知限制见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ---
 
@@ -76,16 +76,18 @@ decode/prefill 性能回退（详见“速度”节）。
 | 4 | decode 速度测量一直包含 prefill 时间，数字失真 | 改用 warmup + 多次迭代 + server 自报 timings 的方法分离测量 |
 | 5 | 无 root 环境编译需要 ffmpeg/libcurl 头文件 | `apt-get download` + `dpkg-deb -x` 本地解包，`PKG_CONFIG_SYSROOT_DIR` 指向本地前缀；或直接 `-DNINFER_SKIP_FFMPEG=OFF` 见安装章节 |
 | 6 | FP16 text runtime 下 Vision 请求返回 500 `scatter: src/dst must share BF16 or FP16 dtype`（Vision tower 输出 BF16，文本残差为 FP16） | 在 Vision 嵌入散射进文本残差前增加 BF16→激活 dtype 的转换缓冲，覆盖 TP1、TP2 与多实例路径；2×TP1 双 lane 与 TP2 单实例均实测返回正确结果 |
+| 7 | `--devices` 不从 0 开始时（如 `--tp 2 --devices 4,5`）TP mailbox 崩溃：开启 P2P 时把 rank 序号当作 CUDA 设备序号 | `cudaDeviceEnablePeerAccess` 改用各 rank 的真实设备序号；`--devices 4,5` 下自检通过并选中 nvlink mailbox |
 
 全部临时改动与复核事项见 [`TEMP_WORKAROUNDS.md`](TEMP_WORKAROUNDS.md)。
 
 ---
 
-## 当前进度（v0.2.1，截至 2026-11-09）
+## 当前进度（v0.2.2，截至 2026-11-11）
 
 本版本在 v0.1.0 之上完成 FP16 text runtime，修复 BFCL 多轮质量，消除 FP16 路径的
-decode/prefill 回退，并修复 FP16 text runtime 下 Vision 请求的 scatter dtype 失败
-（TP1、TP2 与多实例均已实测）。BFCL `multi_turn_base` 全量：**no-spec 86/200 = 43.0%、
+decode/prefill 回退，修复 FP16 text runtime 下 Vision 请求的 scatter dtype 失败
+（TP1、TP2 与多实例均已实测），并修复 `--devices` 不从 0 开始时 TP mailbox 的
+P2P 使能崩溃。BFCL `multi_turn_base` 全量：**no-spec 86/200 = 43.0%、
 MTP-3 87/200 = 43.5%**。MTP-3 decode 四点
 （262144 上下文、INT8 KV、FP16-embedding 制品）：**104.7 / 98.9 / 109.6 / 98.1 tok/s**。
 
@@ -182,7 +184,7 @@ INT8 KV，`--prefill-chunk 8192`、`--prefix-cache` 开启。**每次评测前�
 
 | 运行 | no-spec | MTP-3 |
 |---|---:|---:|
-| **ninfer（v0.2.1）** | **43.0%（86/200）** | **43.5%（87/200）** |
+| **ninfer（v0.2.2）** | **43.0%（86/200）** | **43.5%（87/200）** |
 | ninfer（修复 FP16 prefill 前） | 44.0%（88/200） | — |
 
 #### 关于 no-spec 44.0% → 43.0%（可优化点）
@@ -467,7 +469,7 @@ A Tesla V100 inference engine based on NInfer: single-process TP2 (TP4 remains a
 
 ## Release
 
-Current release: **v0.2.1 (2026-11-09)** (first public release v0.1.0, 2026-10-27). See [`CHANGELOG.md`](CHANGELOG.md) for release notes and known limitations.
+Current release: **v0.2.2 (2026-11-11)** (first public release v0.1.0, 2026-10-27). See [`CHANGELOG.md`](CHANGELOG.md) for release notes and known limitations.
 
 ---
 
@@ -529,16 +531,18 @@ On 2×Tesla V100-SXM2-32GB (NVLink), use **one engine** to satisfy all of the fo
 | 4 | Decode speed measurements always included prefill time, distorting the numbers | Switched to warmup + multiple iterations + server-reported timings to separate the measurements |
 | 5 | Building without root requires ffmpeg/libcurl headers | Use `apt-get download` + `dpkg-deb -x` to unpack locally, and point `PKG_CONFIG_SYSROOT_DIR` at the local prefix; or use `-DNINFER_SKIP_FFMPEG=OFF` as described in the installation section |
 | 6 | Under the FP16 text runtime, Vision requests return 500 `scatter: src/dst must share BF16 or FP16 dtype` (the Vision tower outputs BF16 while the text residual is FP16) | Add a BF16→activation-dtype staging buffer before scattering Vision embeddings into the text residual, covering TP1, TP2, and multi-instance paths; both 2×TP1 lanes and TP2 single-instance were measured returning correct results |
+| 7 | With a device list that does not start at 0 (for example `--tp 2 --devices 4,5`), TP mailbox crashes because P2P enablement passes the rank index as the CUDA device ordinal | `cudaDeviceEnablePeerAccess` now uses each rank's real device ordinal; the self-check passes on `--devices 4,5` and selects the nvlink mailbox |
 
 See [`TEMP_WORKAROUNDS.md`](TEMP_WORKAROUNDS.md) for all temporary changes and review items.
 
 ---
 
-## Current Status (v0.2.1, as of 2026-11-09)
+## Current Status (v0.2.2, as of 2026-11-11)
 
 This version adds the FP16 text runtime on top of v0.1.0, fixes BFCL multi-turn quality,
-removes the FP16 path's decode/prefill regression, and fixes the Vision `scatter` dtype
-failure under the FP16 text runtime (verified at TP1, TP2, and multi-instance). BFCL `multi_turn_base`, full 200:
+removes the FP16 path's decode/prefill regression, fixes the Vision `scatter` dtype
+failure under the FP16 text runtime (verified at TP1, TP2, and multi-instance), and fixes
+the TP mailbox P2P setup that crashed when `--devices` did not start at 0. BFCL `multi_turn_base`, full 200:
 **no-spec 86/200 = 43.0%, MTP-3 87/200 = 43.5%**. MTP-3 decode at four points (262144 context, INT8 KV, FP16-embedding artifact):
 **104.7 / 98.9 / 109.6 / 98.1 tok/s**.
 
@@ -639,7 +643,7 @@ confirmed to hold the artifact). Results:
 
 | Run | no-spec | MTP-3 |
 |---|---:|---:|
-| **ninfer (v0.2.1)** | **43.0% (86/200)** | **43.5% (87/200)** |
+| **ninfer (v0.2.2)** | **43.0% (86/200)** | **43.5% (87/200)** |
 | ninfer (before the FP16 prefill fix) | 44.0% (88/200) | — |
 
 #### On no-spec 44.0% → 43.0% (an optimizable point)

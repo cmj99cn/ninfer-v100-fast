@@ -7,7 +7,19 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 The first public release was `v0.1.0` (2026-10-27). `v0.2.0` (2026-11-07) adds
 the FP16 text runtime, closes the BFCL multi-turn quality gap, and removes the
 FP16 path's decode/prefill regression. `v0.2.1` (2026-11-09) fixes Vision under
-the FP16 text runtime.
+the FP16 text runtime. `v0.2.2` (2026-11-11) fixes TP peer-access setup for
+device lists that do not start at device 0.
+
+## [0.2.2] - 2026-11-11
+
+### Fixed
+
+- TP mailbox P2P enablement used the rank index as the CUDA device ordinal, so a
+  device list that does not start at 0 (for example `--tp 2 --devices 4,5`)
+  enabled peer access against unrelated GPUs, never enabled the real pair, and
+  then aborted in the mailbox self-check with `cudaErrorIllegalAddress`. Peer
+  access now uses each rank's real device ordinal, restoring NVLink mailbox
+  selection on non-zero device lists.
 
 ## [0.2.1] - 2026-11-09
 
