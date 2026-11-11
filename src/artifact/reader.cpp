@@ -280,13 +280,6 @@ public:
 
     std::size_t size() const noexcept { return size_; }
 
-    // The end of the file's last whole 4096-byte block. A direct read may not reach past it: the
-    // kernel's direct-I/O path reads whole blocks and refuses a request that covers the file's
-    // partial last block.
-    std::size_t block_aligned_size() const noexcept {
-        return size_ / Reader::direct_io_alignment * Reader::direct_io_alignment;
-    }
-
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const {
         constexpr std::size_t alignment = Reader::direct_io_alignment;
         if (absolute_offset % alignment != 0 || destination.size() % alignment != 0 ||
@@ -960,9 +953,8 @@ private:
     }
 
     // Reads one volume's bytes. A request whose file offset, length and destination are all
-    // 4096-aligned, and that stops at the volume file's last whole block, goes straight to the
-    // direct-I/O path. Anything else is served by the mapping: the kernel's direct-I/O path
-    // refuses an unaligned request and refuses one that reaches into a partial last block.
+    // 4096-aligned goes straight to the direct-I/O path, which the kernel serves in whole blocks.
+    // Anything else is served by the mapping: the direct-I/O path refuses an unaligned request.
     std::size_t read_volume(std::size_t volume_index, std::uint64_t file_offset,
                             std::span<std::byte> destination) const {
         const auto& file = *volumes_[volume_index].file;
@@ -971,19 +963,8 @@ private:
         const bool aligned =
             file_offset % kPayloadAlignment == 0 && destination.size() % kPayloadAlignment == 0 &&
             reinterpret_cast<std::uintptr_t>(destination.data()) % kPayloadAlignment == 0;
-        const auto block_end = file.block_aligned_size();
-        if (aligned && end <= block_end) {
-            return file.read_direct(file_offset, destination);
-        }
         if (aligned) {
-            const auto direct_bytes = file_offset < block_end ? block_end - file_offset : 0;
-            std::size_t read        = 0;
-            if (direct_bytes != 0) {
-                read = file.read_direct(file_offset, destination.first(direct_bytes));
-            }
-            const auto tail = destination.subspan(read, end - (file_offset + read));
-            std::memcpy(tail.data(), file.data() + file_offset + read, tail.size());
-            return read + tail.size();
+            return file.read_direct(file_offset, destination);
         }
         std::memcpy(destination.data(), file.data() + file_offset, destination.size());
         return destination.size();

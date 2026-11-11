@@ -331,8 +331,9 @@ logical model views, schedules, kernels, GPU support, or runtime residency.
 For the upstream v3 multi-volume container of §2.4 the same reader opens the continuation volumes,
 resolves a logical offset to the volume that holds it, and exposes the same object descriptors and
 payload spans; only the framing and the address mapping differ from version 2. A read range is cut
-at the volume boundaries before it reaches the device, so the 4096-byte read request never carries
-past the volume that holds the bytes.
+at the volume boundaries before it reaches the device, so no copied byte comes from another volume;
+the read of such a range may still carry up to 4095 bytes of block padding past the volume that
+holds the bytes.
 
 The JSON and name index are cold-load data. A model binder resolves them once; inference does not
 reparse JSON or perform per-layer/per-token directory lookups.

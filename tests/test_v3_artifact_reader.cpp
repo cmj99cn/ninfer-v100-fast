@@ -415,7 +415,9 @@ void test_direct_reads_resolve_volumes() {
 
 // The materializer must serve a multi-volume artifact: an object that ends near a volume's end
 // (its 4096-byte read request reaches past that end) and an object that straddles the boundary.
-void test_multi_volume_materialization() {
+// Returns 0 when the case ran, 77 when it skipped. The skip path returns instead of exiting so
+// that the fixture's destructor removes the files it wrote.
+int test_multi_volume_materialization() {
     constexpr std::uint64_t kFirstVolumeBytes = 3000;
     constexpr std::uint64_t kTailBytes        = 256;
     constexpr std::uint64_t kTailOffset       = 2560;
@@ -448,12 +450,12 @@ void test_multi_volume_materialization() {
     const cudaError_t count_error = cudaGetDeviceCount(&device_count);
     if (count_error == cudaErrorNoDevice || count_error == cudaErrorInsufficientDriver) {
         std::cout << "SKIP: no usable CUDA device\n";
-        std::exit(77);
+        return 77;
     }
     CUDA_CHECK(count_error);
     if (device_count == 0) {
         std::cout << "SKIP: no CUDA devices\n";
-        std::exit(77);
+        return 77;
     }
 
     ninfer::artifact::Binder binder(reader);
@@ -491,6 +493,7 @@ void test_multi_volume_materialization() {
     if (!tail_ok || !crossing_first || !crossing_second) {
         throw std::runtime_error("multi-volume materialization produced wrong bytes");
     }
+    return 0;
 }
 
 } // namespace
@@ -505,7 +508,8 @@ int main() {
         test_crossing_object_read_in_segments();
         test_single_file_container_accepted();
         test_direct_reads_resolve_volumes();
-        test_multi_volume_materialization();
+        const int skipped = test_multi_volume_materialization();
+        if (skipped != 0) { return skipped; }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

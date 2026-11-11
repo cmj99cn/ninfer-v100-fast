@@ -494,8 +494,8 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                             continue;
                         }
                         if (!fed && device_count > 1) {
-                        CUDA_CHECK(cudaSetDevice(devices[device_slot]->device));
-                    }
+                            CUDA_CHECK(cudaSetDevice(devices[device_slot]->device));
+                        }
                         CUDA_CHECK(cudaMemcpyAsync(
                             range.destination +
                                 static_cast<std::size_t>(copy_begin - range.source_begin),
