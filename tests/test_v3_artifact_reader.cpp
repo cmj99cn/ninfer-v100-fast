@@ -224,6 +224,132 @@ void expect_artifact_error(Function&& function, std::string_view needle) {
     throw std::runtime_error("invalid v3 multi-part artifact was accepted");
 }
 
+// The v3 container spells its formats, layouts and encodings in lower case snake case. Its
+// spelling table is upstream's legal set, and every spelling denotes a public enum value. A
+// value's canonical name is the spelling of the container that introduced it, so the values the
+// v3 container introduced round trip through the v3 table.
+void test_v3_spelling_round_trip() {
+    struct FormatCase {
+        std::string_view spelling;
+        NumericFormat value;
+        std::string_view canonical_name;
+        bool v3_native;
+    };
+    struct LayoutCase {
+        std::string_view spelling;
+        StorageLayout value;
+        std::string_view canonical_name;
+        bool v3_native;
+    };
+
+    const std::array<FormatCase, 9> format_cases = {{
+        {"bf16", NumericFormat::BF16, "BF16", false},
+        {"fp32", NumericFormat::FP32, "FP32", false},
+        {"int32", NumericFormat::I32, "I32", false},
+        {"q4_g64_fp16", NumericFormat::Q4G64_F16S, "Q4G64_F16S", false},
+        {"q8_g32_fp16", NumericFormat::W8G32_F16S, "W8G32_F16S", false},
+        {"nvfp4", NumericFormat::NVFP4, "NVFP4", false},
+        {"nf4_g16_e4m3fn", NumericFormat::NF4_G16_E4M3S, "nf4_g16_e4m3fn", true},
+        {"fp8_e4m3fn_block128x128_bf16", NumericFormat::FP8_E4M3FN_BLOCK128_BF16S,
+         "fp8_e4m3fn_block128x128_bf16", true},
+        {"fp8_e4m3fn_row_bf16", NumericFormat::FP8_E4M3FN_ROW_BF16S, "FP8_E4M3FN_ROW_BF16S", false},
+    }};
+    const std::array<LayoutCase, 6> layout_cases = {{
+        {"contiguous_le_v1", StorageLayout::ContiguousLeV1, "contiguous-le-v1", false},
+        {"row_split_k128_v1", StorageLayout::RowSplitK128V1, "row-split-k128-v1", false},
+        {"row_paged_g16_4k_v1", StorageLayout::RowPagedG16x4KV1, "row_paged_g16_4k_v1", true},
+        {"block_scale_k16_m128x4_v1", StorageLayout::BlockScaleK16M128x4V1,
+         "blockscale-k16-m128x4-v1", false},
+        {"batched_block_scale_k16_m128x4_v1", StorageLayout::BatchedBlockScaleK16M128x4V1,
+         "batched_block_scale_k16_m128x4_v1", true},
+        {"block_scale_m128_k128_v1", StorageLayout::BlockScaleM128K128V1,
+         "block_scale_m128_k128_v1", true},
+    }};
+
+    for (const auto& entry : format_cases) {
+        if (ninfer::artifact::parse_v3_format(entry.spelling) != entry.value) {
+            throw std::runtime_error("v3 format spelling " + std::string(entry.spelling) +
+                                     " does not denote its public enum value");
+        }
+        if (ninfer::artifact::format_name(entry.value) != entry.canonical_name) {
+            throw std::runtime_error("v3 format value " + std::string(entry.canonical_name) +
+                                     " carries a different canonical name");
+        }
+        if (entry.v3_native &&
+            ninfer::artifact::parse_v3_format(entry.canonical_name) != entry.value) {
+            throw std::runtime_error("v3 format spelling " + std::string(entry.spelling) +
+                                     " does not round trip through its canonical name");
+        }
+    }
+    for (const auto& entry : layout_cases) {
+        if (ninfer::artifact::parse_v3_layout(entry.spelling) != entry.value) {
+            throw std::runtime_error("v3 layout spelling " + std::string(entry.spelling) +
+                                     " does not denote its public enum value");
+        }
+        if (ninfer::artifact::layout_name(entry.value) != entry.canonical_name) {
+            throw std::runtime_error("v3 layout value " + std::string(entry.canonical_name) +
+                                     " carries a different canonical name");
+        }
+        if (entry.v3_native &&
+            ninfer::artifact::parse_v3_layout(entry.canonical_name) != entry.value) {
+            throw std::runtime_error("v3 layout spelling " + std::string(entry.spelling) +
+                                     " does not round trip through its canonical name");
+        }
+    }
+
+    expect_artifact_error([] { ninfer::artifact::parse_v3_format("q9_g64_fp16"); },
+                          "unknown v3 tensor format");
+    expect_artifact_error([] { ninfer::artifact::parse_v3_layout("row_paged_g16_4k_v2"); },
+                          "unknown v3 tensor layout");
+    expect_artifact_error([] { ninfer::artifact::parse_v3_encoding("raw_bytes_v2"); },
+                          "unknown v3 resource encoding");
+}
+
+// A v3 object reaches the reader as the same public enum value the v2 container's table denotes.
+void test_v3_object_spelling_reaches_the_reader() {
+    const std::array<std::uint64_t, 2> shape = {4, 256};
+    const auto bytes =
+        ninfer::artifact::row_split_geometry(NumericFormat::W8G32_F16S, shape).encoded_bytes;
+    const std::vector<PlacedObject> objects = {
+        {Json{{"id", "alpha"},
+              {"kind", "tensor"},
+              {"format", "bf16"},
+              {"layout", "contiguous_le_v1"},
+              {"shape", Json::array({2, 2})},
+              {"bytes", 8}},
+         0, 0},
+        {Json{{"id", "q8"},
+              {"kind", "tensor"},
+              {"format", "q8_g32_fp16"},
+              {"layout", "row_split_k128_v1"},
+              {"shape", Json::array({4, 256})},
+              {"bytes", bytes}},
+         0, 256},
+    };
+    const auto fixture = write_v3_multi_part(objects, {marker_payload(kPartPayloadBytes, 0x11)});
+    Reader reader(fixture.entry);
+
+    const auto* q8 = std::get_if<TensorDescriptor>(reader.find("q8"));
+    if (q8 == nullptr || q8->format != NumericFormat::W8G32_F16S ||
+        q8->layout != StorageLayout::RowSplitK128V1 || q8->bytes != bytes) {
+        throw std::runtime_error("v3 object spelling did not reach the reader as its enum value");
+    }
+}
+
+void test_v3_unknown_spelling_rejected() {
+    const std::vector<PlacedObject> objects = {
+        {Json{{"id", "alpha"},
+              {"kind", "tensor"},
+              {"format", "q8_g33_fp16"},
+              {"layout", "contiguous_le_v1"},
+              {"shape", Json::array({2, 2})},
+              {"bytes", 8}},
+         0, 0},
+    };
+    const auto fixture = write_v3_multi_part(objects, {marker_payload(kPartPayloadBytes, 0x11)});
+    expect_artifact_error([&] { Reader reader(fixture.entry); }, "unknown v3 tensor format");
+}
+
 void test_identity_synthesized() {
     const auto fixture =
         write_v3_multi_part(canonical_objects(),
@@ -500,6 +626,9 @@ int test_multi_volume_materialization() {
 
 int main() {
     try {
+        test_v3_spelling_round_trip();
+        test_v3_object_spelling_reaches_the_reader();
+        test_v3_unknown_spelling_rejected();
         test_identity_synthesized();
         test_objects_and_payloads_across_parts();
         test_wrong_part_index_rejected();

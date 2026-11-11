@@ -30,6 +30,8 @@ enum class NumericFormat {
     NVFP4,
     FP8_E4M3FN_ROW_BF16S,
     GGML_K,
+    NF4_G16_E4M3S,
+    FP8_E4M3FN_BLOCK128_BF16S,
 };
 
 enum class StorageLayout {
@@ -38,6 +40,9 @@ enum class StorageLayout {
     BlockScaleK16M128x4V1,
     RowScaleV1,
     GgmlK256V1,
+    RowPagedG16x4KV1,
+    BlockScaleM128K128V1,
+    BatchedBlockScaleK16M128x4V1,
 };
 
 enum class ResourceEncoding {
@@ -47,6 +52,14 @@ enum class ResourceEncoding {
 std::string_view format_name(NumericFormat format) noexcept;
 std::string_view layout_name(StorageLayout layout) noexcept;
 std::string_view encoding_name(ResourceEncoding encoding) noexcept;
+
+// The v3 container spells its numeric formats, storage layouts and resource encodings in lower
+// case snake case; the v2 container spells the same concepts differently. The two spellings are
+// separate contracts that denote the same enum values, so the v3 table is the authority for
+// reading an upstream v3 artifact and never widens the v2 one.
+NumericFormat parse_v3_format(std::string_view name);
+StorageLayout parse_v3_layout(std::string_view name);
+ResourceEncoding parse_v3_encoding(std::string_view name);
 
 std::uint64_t tensor_alignment(StorageLayout layout) noexcept;
 std::uint64_t resource_alignment(ResourceEncoding encoding) noexcept;

@@ -137,36 +137,6 @@ ResourceEncoding parse_encoding(std::string_view name) {
     throw ArtifactError("unknown resource encoding: " + std::string(name));
 }
 
-// Upstream v3 spells its numeric formats, storage layouts and resource encodings in lower case
-// snake case; the v2 container spells the same concepts in upper case. The two spellings are
-// separate contracts, so the v3 reader keeps its own table instead of widening the v2 one.
-NumericFormat parse_v3_format(std::string_view name) {
-    if (name == "bf16") { return NumericFormat::BF16; }
-    if (name == "fp16") { return NumericFormat::FP16; }
-    if (name == "fp32") { return NumericFormat::FP32; }
-    if (name == "int32") { return NumericFormat::I32; }
-    if (name == "q4_g64_fp16") { return NumericFormat::Q4G64_F16S; }
-    if (name == "q5_g64_fp16") { return NumericFormat::Q5G64_F16S; }
-    if (name == "q6_g64_fp16") { return NumericFormat::Q6G64_F16S; }
-    if (name == "q8_g32_fp16") { return NumericFormat::W8G32_F16S; }
-    if (name == "nvfp4") { return NumericFormat::NVFP4; }
-    if (name == "fp8_e4m3fn_row_bf16") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
-    throw ArtifactError("unknown v3 tensor format: " + std::string(name));
-}
-
-StorageLayout parse_v3_layout(std::string_view name) {
-    if (name == "contiguous_le_v1") { return StorageLayout::ContiguousLeV1; }
-    if (name == "row_split_k128_v1") { return StorageLayout::RowSplitK128V1; }
-    if (name == "block_scale_k16_m128x4_v1") { return StorageLayout::BlockScaleK16M128x4V1; }
-    if (name == "row_scale_v1") { return StorageLayout::RowScaleV1; }
-    throw ArtifactError("unknown v3 tensor layout: " + std::string(name));
-}
-
-ResourceEncoding parse_v3_encoding(std::string_view name) {
-    if (name == "raw_bytes_v1") { return ResourceEncoding::RawBytesV1; }
-    throw ArtifactError("unknown v3 resource encoding: " + std::string(name));
-}
-
 TensorDescriptor parse_tensor(const Json& value) {
     static constexpr std::array members = {
         "name", "kind", "shape", "format", "layout", "offset", "bytes",
@@ -1167,6 +1137,41 @@ private:
 };
 
 } // namespace
+
+// The upstream v3 container spells its numeric formats, storage layouts and resource encodings in
+// lower case snake case; the v2 container spells the same concepts differently. The two spellings
+// are separate contracts that denote the same enum values, so the v3 reader keeps its own table
+// instead of widening the v2 one. The table is upstream's legal v3 spelling set: a spelling
+// outside it is not an upstream v3 spelling, and the reader says so instead of guessing.
+NumericFormat parse_v3_format(std::string_view name) {
+    if (name == "bf16") { return NumericFormat::BF16; }
+    if (name == "fp32") { return NumericFormat::FP32; }
+    if (name == "int32") { return NumericFormat::I32; }
+    if (name == "q4_g64_fp16") { return NumericFormat::Q4G64_F16S; }
+    if (name == "q8_g32_fp16") { return NumericFormat::W8G32_F16S; }
+    if (name == "nvfp4") { return NumericFormat::NVFP4; }
+    if (name == "nf4_g16_e4m3fn") { return NumericFormat::NF4_G16_E4M3S; }
+    if (name == "fp8_e4m3fn_block128x128_bf16") { return NumericFormat::FP8_E4M3FN_BLOCK128_BF16S; }
+    if (name == "fp8_e4m3fn_row_bf16") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
+    throw ArtifactError("unknown v3 tensor format: " + std::string(name));
+}
+
+StorageLayout parse_v3_layout(std::string_view name) {
+    if (name == "contiguous_le_v1") { return StorageLayout::ContiguousLeV1; }
+    if (name == "row_split_k128_v1") { return StorageLayout::RowSplitK128V1; }
+    if (name == "row_paged_g16_4k_v1") { return StorageLayout::RowPagedG16x4KV1; }
+    if (name == "block_scale_k16_m128x4_v1") { return StorageLayout::BlockScaleK16M128x4V1; }
+    if (name == "batched_block_scale_k16_m128x4_v1") {
+        return StorageLayout::BatchedBlockScaleK16M128x4V1;
+    }
+    if (name == "block_scale_m128_k128_v1") { return StorageLayout::BlockScaleM128K128V1; }
+    throw ArtifactError("unknown v3 tensor layout: " + std::string(name));
+}
+
+ResourceEncoding parse_v3_encoding(std::string_view name) {
+    if (name == "raw_bytes_v1") { return ResourceEncoding::RawBytesV1; }
+    throw ArtifactError("unknown v3 resource encoding: " + std::string(name));
+}
 
 std::string_view object_name(const ObjectDescriptor& object) noexcept {
     return std::visit([](const auto& descriptor) -> std::string_view { return descriptor.name; },

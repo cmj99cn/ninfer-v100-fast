@@ -137,6 +137,10 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "FP8_E4M3FN_ROW_BF16S";
     case NumericFormat::GGML_K:
         return "GGML_K";
+    case NumericFormat::NF4_G16_E4M3S:
+        return "nf4_g16_e4m3fn";
+    case NumericFormat::FP8_E4M3FN_BLOCK128_BF16S:
+        return "fp8_e4m3fn_block128x128_bf16";
     }
     return {};
 }
@@ -153,6 +157,12 @@ std::string_view layout_name(StorageLayout layout) noexcept {
         return "row-scale-v1";
     case StorageLayout::GgmlK256V1:
         return "ggml-k256-v1";
+    case StorageLayout::RowPagedG16x4KV1:
+        return "row_paged_g16_4k_v1";
+    case StorageLayout::BlockScaleM128K128V1:
+        return "block_scale_m128_k128_v1";
+    case StorageLayout::BatchedBlockScaleK16M128x4V1:
+        return "batched_block_scale_k16_m128x4_v1";
     }
     return {};
 }
