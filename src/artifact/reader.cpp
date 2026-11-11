@@ -40,6 +40,10 @@ constexpr std::array<std::byte, 8> kV3Magic = {
     std::byte{'N'}, std::byte{'I'}, std::byte{'N'}, std::byte{'F'},
     std::byte{'E'}, std::byte{'R'}, std::byte{0},   std::byte{3},
 };
+constexpr std::array<std::byte, 8> kV3PartMagic = {
+    std::byte{'N'}, std::byte{'I'}, std::byte{'N'}, std::byte{'P'},
+    std::byte{'R'}, std::byte{'T'}, std::byte{0},   std::byte{3},
+};
 constexpr std::uint64_t kPrefixBytes      = 16;
 constexpr std::uint64_t kV3HeaderBytes    = 32;
 constexpr std::uint64_t kPayloadAlignment = 4096;
@@ -95,6 +99,14 @@ std::uint64_t require_unsigned(const Json& value, std::string_view label, bool p
     return result;
 }
 
+const Json& require_member(const Json& value, const char* member, std::string_view label) {
+    const auto it = value.find(member);
+    if (it == value.end()) {
+        throw ArtifactError(std::string(label) + " is missing its " + member + " member");
+    }
+    return *it;
+}
+
 NumericFormat parse_format(std::string_view name) {
     if (name == "BF16") { return NumericFormat::BF16; }
     if (name == "FP16") { return NumericFormat::FP16; }
@@ -122,6 +134,36 @@ StorageLayout parse_layout(std::string_view name) {
 ResourceEncoding parse_encoding(std::string_view name) {
     if (name == "raw-bytes-v1") { return ResourceEncoding::RawBytesV1; }
     throw ArtifactError("unknown resource encoding: " + std::string(name));
+}
+
+// Upstream v3 spells its numeric formats, storage layouts and resource encodings in lower case
+// snake case; the v2 container spells the same concepts in upper case. The two spellings are
+// separate contracts, so the v3 reader keeps its own table instead of widening the v2 one.
+NumericFormat parse_v3_format(std::string_view name) {
+    if (name == "bf16") { return NumericFormat::BF16; }
+    if (name == "fp16") { return NumericFormat::FP16; }
+    if (name == "fp32") { return NumericFormat::FP32; }
+    if (name == "int32") { return NumericFormat::I32; }
+    if (name == "q4_g64_fp16") { return NumericFormat::Q4G64_F16S; }
+    if (name == "q5_g64_fp16") { return NumericFormat::Q5G64_F16S; }
+    if (name == "q6_g64_fp16") { return NumericFormat::Q6G64_F16S; }
+    if (name == "q8_g32_fp16") { return NumericFormat::W8G32_F16S; }
+    if (name == "nvfp4") { return NumericFormat::NVFP4; }
+    if (name == "fp8_e4m3fn_row_bf16") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
+    throw ArtifactError("unknown v3 tensor format: " + std::string(name));
+}
+
+StorageLayout parse_v3_layout(std::string_view name) {
+    if (name == "contiguous_le_v1") { return StorageLayout::ContiguousLeV1; }
+    if (name == "row_split_k128_v1") { return StorageLayout::RowSplitK128V1; }
+    if (name == "block_scale_k16_m128x4_v1") { return StorageLayout::BlockScaleK16M128x4V1; }
+    if (name == "row_scale_v1") { return StorageLayout::RowScaleV1; }
+    throw ArtifactError("unknown v3 tensor layout: " + std::string(name));
+}
+
+ResourceEncoding parse_v3_encoding(std::string_view name) {
+    if (name == "raw_bytes_v1") { return ResourceEncoding::RawBytesV1; }
+    throw ArtifactError("unknown v3 resource encoding: " + std::string(name));
 }
 
 TensorDescriptor parse_tensor(const Json& value) {
@@ -278,6 +320,20 @@ std::uint64_t require_v3_unsigned(const Json& value, std::string_view label, boo
     const auto result = value.get<std::uint64_t>();
     if (positive && result == 0) { throw ArtifactError(std::string(label) + " must be positive"); }
     return result;
+}
+
+std::string v3_metadata_name(const Json& directory) {
+    if (!directory.is_object() || !directory.contains("metadata") ||
+        !directory.at("metadata").is_object() || !directory.at("metadata").contains("name") ||
+        !directory.at("metadata").at("name").is_string()) {
+        return {};
+    }
+    return directory.at("metadata").at("name").get<std::string>();
+}
+
+bool v3_declares_continuations(const Json& directory) {
+    return directory.is_object() && directory.contains("files") && directory.at("files").is_array() &&
+           directory.at("files").size() > 1;
 }
 
 class Qwen38Nvfp4V3Adapter {
@@ -778,6 +834,274 @@ private:
     std::map<std::string, std::string, std::less<>> physical_names_;
 };
 
+// An upstream v3 artifact carries no product identity: the reader synthesizes one from the
+// directory's architecture name. Each name is bound to exactly one registered identity.
+struct V3Identity {
+    std::string_view metadata_name;
+    std::string_view model_id;
+    std::string_view weights_id;
+};
+
+constexpr std::array<V3Identity, 1> kContainerV3Identities = {{
+    {"qwen3.8-flash-next", "qwen3.8-flash-next", "nvfp4"},
+}};
+
+using ObjectIndex = std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>>;
+
+// Upstream v3 is a multi-volume container: an entry file holding the 32-byte header and the
+// directory, plus NINPRT continuation files. The directory's file list gives each volume's
+// payload extent, and the logical payload space is the entry payload followed by the
+// continuation payloads in file order. Object offsets are absolute in that logical space, whose
+// origin is the first byte of the entry payload.
+class V3MultiPartReader {
+public:
+    V3MultiPartReader(const std::filesystem::path& entry_path, const MappedFile& entry,
+                      const Json& directory, std::uint64_t entry_payload_start)
+        : entry_(entry) {
+        resolve_identity(directory);
+        open_volumes(entry_path, directory, entry_payload_start);
+        parse_objects(directory);
+    }
+
+    static bool recognizes(std::string_view metadata_name) noexcept {
+        return find_identity(metadata_name) != nullptr;
+    }
+
+    const ArtifactIdentity& identity() const noexcept { return identity_; }
+
+    const std::vector<ObjectDescriptor>& objects() const noexcept { return objects_; }
+
+    const ObjectDescriptor* find(std::string_view name) const noexcept {
+        const auto it = index_.find(name);
+        return it == index_.end() ? nullptr : &objects_[it->second];
+    }
+
+    std::uint64_t file_bytes() const noexcept { return file_bytes_; }
+
+    PayloadSpan payload(const ObjectDescriptor& object) const {
+        const auto offset = object_offset(object);
+        const auto bytes  = object_bytes(object);
+        const auto& volume = volume_for(offset);
+        const auto file_offset = volume.file_base + (offset - volume.logical_begin);
+        return {offset,
+                std::span<const std::byte>(volume.file->data() + file_offset,
+                                           static_cast<std::size_t>(bytes))};
+    }
+
+    std::size_t read_direct(std::uint64_t logical_offset, std::span<std::byte> destination) const {
+        const auto& volume = volume_for(logical_offset);
+        const auto local   = logical_offset - volume.logical_begin;
+        if (destination.size() > volume.payload_bytes - local) {
+            throw ArtifactError("direct read crosses a part boundary");
+        }
+        return volume.file->read_direct(volume.file_base + local, destination);
+    }
+
+private:
+    struct Volume {
+        const MappedFile* file      = nullptr;
+        std::uint64_t payload_bytes = 0;
+        std::uint64_t logical_begin = 0;
+        std::uint64_t file_base     = 0;
+    };
+
+    void resolve_identity(const Json& directory) {
+        if (!directory.is_object() || !directory.contains("metadata") ||
+            !directory.at("metadata").is_object() ||
+            !directory.at("metadata").contains("name") ||
+            !directory.at("metadata").at("name").is_string()) {
+            throw ArtifactError("NInfer v3 directory is missing its metadata");
+        }
+        const auto metadata_name = directory.at("metadata").at("name").get<std::string>();
+        const auto* identity      = find_identity(metadata_name);
+        if (identity == nullptr) {
+            throw ArtifactError("unsupported NInfer v3 artifact name: " + metadata_name +
+                                " (supported: qwen3.8-flash-next)");
+        }
+        identity_.model_id   = identity->model_id;
+        identity_.weights_id = identity->weights_id;
+    }
+
+    void open_volumes(const std::filesystem::path& entry_path, const Json& directory,
+                      std::uint64_t entry_payload_start) {
+        if (!directory.contains("files") || !directory.at("files").is_array() ||
+            directory.at("files").empty()) {
+            throw ArtifactError("NInfer v3 directory is missing its file list");
+        }
+        if (!directory.contains("bindings") || !directory.at("bindings").is_object() ||
+            !directory.contains("uses") || !directory.at("uses").is_array() ||
+            !directory.contains("components") || !directory.at("components").is_object()) {
+            throw ArtifactError("NInfer v3 directory is incomplete");
+        }
+        const auto& files = directory.at("files");
+
+        const auto& entry_record = files[0];
+        if (!entry_record.is_object() || !entry_record.contains("path") ||
+            !entry_record.at("path").is_null()) {
+            throw ArtifactError("NInfer v3 files[0].path must be null");
+        }
+        const auto entry_payload_bytes = require_v3_unsigned(
+            require_member(entry_record, "payload_bytes", "v3 file record"),
+            "v3 payload_bytes", true);
+        if (checked_add(entry_payload_start, entry_payload_bytes, "v3 entry length") !=
+            static_cast<std::uint64_t>(entry_.size())) {
+            throw ArtifactError("NInfer v3 entry length differs from its directory");
+        }
+        std::array<std::byte, 16> artifact_id{};
+        std::copy(entry_.data() + 16, entry_.data() + kV3HeaderBytes, artifact_id.begin());
+
+        volumes_.push_back(Volume{&entry_, entry_payload_bytes, 0, entry_payload_start});
+        std::uint64_t logical_begin = entry_payload_bytes;
+        std::uint64_t total_bytes   = entry_.size();
+        for (std::size_t index = 1; index < files.size(); ++index) {
+            const auto& record = files[index];
+            const auto path     = require_string(
+                require_member(record, "path", "v3 file record"), "v3 continuation path");
+            if (path == "." || path == ".." || path.find('/') != std::string::npos ||
+                path.find('\\') != std::string::npos) {
+                throw ArtifactError("NInfer v3 continuation path is not a sibling file: " + path);
+            }
+            const auto payload_bytes = require_v3_unsigned(
+                require_member(record, "payload_bytes", "v3 file record"),
+                "v3 payload_bytes", true);
+            auto file = std::make_unique<MappedFile>(entry_path.parent_path() / path);
+            if (file->size() < kV3HeaderBytes) {
+                throw ArtifactError(path + ": continuation header is truncated");
+            }
+            if (!std::equal(kV3PartMagic.begin(), kV3PartMagic.end(), file->data())) {
+                throw ArtifactError(path + ": continuation magic is not NInfer v3");
+            }
+            const auto part_index = read_u64_le(file->data() + 8);
+            if (part_index != index) {
+                throw ArtifactError(path + ": continuation declares part index " +
+                                    std::to_string(part_index) + " but the directory expects " +
+                                    std::to_string(index));
+            }
+            if (!std::equal(artifact_id.begin(), artifact_id.end(), file->data() + 16)) {
+                throw ArtifactError(path + ": continuation belongs to a different artifact");
+            }
+            if (file->size() !=
+                checked_add(kPayloadAlignment, payload_bytes, "v3 continuation length")) {
+                throw ArtifactError(path + ": continuation length differs from its directory");
+            }
+            volumes_.push_back(Volume{file.get(), payload_bytes, logical_begin, kPayloadAlignment});
+            owned_.push_back(std::move(file));
+            logical_begin += payload_bytes;
+            total_bytes += static_cast<std::uint64_t>(owned_.back()->size());
+        }
+        file_bytes_     = total_bytes;
+        total_payload_  = logical_begin;
+    }
+
+    void parse_objects(const Json& directory) {
+        if (!directory.contains("objects") || !directory.at("objects").is_array() ||
+            directory.at("objects").empty()) {
+            throw ArtifactError("NInfer v3 directory has no objects");
+        }
+        std::uint64_t cursor = 0;
+        for (const auto& raw_object : directory.at("objects")) {
+            auto object = parse_v3_object(raw_object);
+            const auto name   = object_name(object);
+            const auto offset = object_offset(object);
+            const auto bytes  = object_bytes(object);
+            const auto alignment = std::visit(
+                [](const auto& descriptor) {
+                    using Descriptor = std::decay_t<decltype(descriptor)>;
+                    if constexpr (std::is_same_v<Descriptor, TensorDescriptor>) {
+                        return tensor_alignment(descriptor.layout);
+                    } else {
+                        return resource_alignment(descriptor.encoding);
+                    }
+                },
+                object);
+            if (offset < cursor) {
+                throw ArtifactError("object " + std::string(name) + " overlaps or is out of order");
+            }
+            if (offset % alignment != 0) {
+                throw ArtifactError("object " + std::string(name) + " is not " +
+                                    std::to_string(alignment) + "-byte aligned");
+            }
+            const auto end = checked_add(offset, bytes, "object payload range");
+            if (end > total_payload_) {
+                throw ArtifactError("object " + std::string(name) + " extends beyond the payload");
+            }
+            const auto& volume = volume_for(offset);
+            if (end > volume.logical_begin + volume.payload_bytes) {
+                throw ArtifactError("object " + std::string(name) + " crosses a part boundary");
+            }
+            const auto object_index = objects_.size();
+            auto [_, inserted]      = index_.emplace(std::string(name), object_index);
+            if (!inserted) { throw ArtifactError("duplicate object name: " + std::string(name)); }
+            objects_.push_back(std::move(object));
+            cursor = end;
+        }
+    }
+
+    static const V3Identity* find_identity(std::string_view metadata_name) noexcept {
+        for (const auto& identity : kContainerV3Identities) {
+            if (identity.metadata_name == metadata_name) { return &identity; }
+        }
+        return nullptr;
+    }
+
+    static ObjectDescriptor parse_v3_object(const Json& value) {
+        if (!value.is_object()) { throw ArtifactError("each v3 object entry must be a JSON object"); }
+        const auto id = require_string(require_member(value, "id", "v3 object entry"),
+                                        "v3 object id");
+        const auto& kind = require_string(require_member(value, "kind", "v3 object entry"),
+                                          "v3 object kind");
+        const auto offset = require_v3_unsigned(require_member(value, "offset", "v3 object entry"),
+                                                 "v3 object offset", false);
+        const auto bytes  = require_v3_unsigned(require_member(value, "bytes", "v3 object entry"),
+                                                "v3 object bytes", true);
+        if (kind == "tensor") {
+            const auto format = parse_v3_format(
+                require_string(require_member(value, "format", "v3 tensor entry"), "v3 tensor format"));
+            const auto layout = parse_v3_layout(
+                require_string(require_member(value, "layout", "v3 tensor entry"), "v3 tensor layout"));
+            const auto& raw_shape = require_member(value, "shape", "v3 tensor entry");
+            if (!raw_shape.is_array()) { throw ArtifactError("v3 tensor shape must be an array"); }
+            std::vector<std::uint64_t> shape;
+            shape.reserve(raw_shape.size());
+            for (const auto& dimension : raw_shape) {
+                shape.push_back(require_v3_unsigned(dimension, "v3 shape dimension", true));
+            }
+            const auto expected = tensor_encoded_size(layout, format, shape, bytes);
+            if (bytes != expected) {
+                throw ArtifactError("tensor " + id + " stores " + std::to_string(bytes) +
+                                    " bytes; layout requires " + std::to_string(expected));
+            }
+            return TensorDescriptor{id, std::move(shape), format, layout, offset, bytes};
+        }
+        if (kind == "resource") {
+            return ResourceDescriptor{
+                id,
+                parse_v3_encoding(require_string(
+                    require_member(value, "encoding", "v3 resource entry"), "v3 resource encoding")),
+                offset,
+                bytes,
+            };
+        }
+        throw ArtifactError("v3 object kind must be 'tensor' or 'resource'");
+    }
+
+    const Volume& volume_for(std::uint64_t logical_offset) const {
+        for (const auto& volume : volumes_) {
+            if (logical_offset < volume.logical_begin + volume.payload_bytes) { return volume; }
+        }
+        throw ArtifactError("v3 payload offset is beyond the artifact payload");
+    }
+
+    const MappedFile& entry_;
+    std::vector<std::unique_ptr<MappedFile>> owned_;
+    std::vector<Volume> volumes_;
+    ArtifactIdentity identity_;
+    std::vector<ObjectDescriptor> objects_;
+    ObjectIndex index_;
+    std::uint64_t file_bytes_    = 0;
+    std::uint64_t total_payload_ = 0;
+};
+
 } // namespace
 
 std::string_view object_name(const ObjectDescriptor& object) noexcept {
@@ -825,6 +1149,15 @@ struct Reader::Impl {
 
         std::map<std::string, std::vector<std::byte>, std::less<>> named_overrides;
         if (v3) {
+            // A v3 artifact that declares continuation volumes, or that names an identity this
+            // reader serves directly, is read by the container path. Everything else is the 27B
+            // package's single-file artifact, which the narrow adapter projects.
+            if (v3_declares_continuations(directory) ||
+                V3MultiPartReader::recognizes(v3_metadata_name(directory))) {
+                multipart = std::make_unique<V3MultiPartReader>(path, file, directory, payload_start);
+                identity  = multipart->identity();
+                return;
+            }
             auto compatible = Qwen38Nvfp4V3Adapter(directory, file, payload_start).build();
             directory       = std::move(compatible.directory);
             named_overrides = std::move(compatible.payload_overrides);
@@ -895,6 +1228,7 @@ struct Reader::Impl {
     }
 
     MappedFile file;
+    std::unique_ptr<V3MultiPartReader> multipart;
     ArtifactIdentity identity;
     std::vector<ObjectDescriptor> entries;
     std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> index;
@@ -911,18 +1245,29 @@ Reader& Reader::operator=(Reader&&) noexcept = default;
 
 const ArtifactIdentity& Reader::identity() const noexcept { return impl_->identity; }
 
-const std::vector<ObjectDescriptor>& Reader::objects() const noexcept { return impl_->entries; }
+const std::vector<ObjectDescriptor>& Reader::objects() const noexcept {
+    return impl_->multipart ? impl_->multipart->objects() : impl_->entries;
+}
 
 const ObjectDescriptor* Reader::find(std::string_view name) const noexcept {
+    if (impl_->multipart) { return impl_->multipart->find(name); }
     const auto it = impl_->index.find(name);
     return it == impl_->index.end() ? nullptr : &impl_->entries[it->second];
 }
 
-std::uint64_t Reader::file_bytes() const noexcept { return impl_->file.size(); }
+std::uint64_t Reader::file_bytes() const noexcept {
+    return impl_->multipart ? impl_->multipart->file_bytes() : impl_->file.size();
+}
 
-std::uint64_t Reader::payload_offset() const noexcept { return impl_->payload_start; }
+// The payload coordinate space of a multi-volume artifact is the concatenation of its volume
+// payloads, so its origin is zero; a single-file artifact's payload space is the file's byte
+// space, whose origin is the payload start.
+std::uint64_t Reader::payload_offset() const noexcept {
+    return impl_->multipart ? 0 : impl_->payload_start;
+}
 
 PayloadSpan Reader::payload(const ObjectDescriptor& object) const {
+    if (impl_->multipart) { return impl_->multipart->payload(object); }
     if (const auto override = impl_->payload_overrides.find(object_name(object));
         override != impl_->payload_overrides.end()) {
         return {0, override->second};
@@ -946,6 +1291,7 @@ PayloadSpan Reader::payload(std::string_view name) const {
 
 std::size_t Reader::read_direct(std::uint64_t absolute_offset,
                                 std::span<std::byte> destination) const {
+    if (impl_->multipart) { return impl_->multipart->read_direct(absolute_offset, destination); }
     return impl_->file.read_direct(absolute_offset, destination);
 }
 

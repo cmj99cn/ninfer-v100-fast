@@ -63,6 +63,9 @@ ninfer_add_test(ninfer_artifact_reader_test
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES ninfer_artifact)
+ninfer_add_test(ninfer_v3_artifact_reader_test
+  SOURCES test_v3_artifact_reader.cpp
+  LIBRARIES ninfer_artifact)
 # Host-only: no artifact, no device. Byte-level TP2 shard slice geometry per storage layout.
 ninfer_add_test(ninfer_tensor_slice_test
   SOURCES test_tensor_slice.cpp

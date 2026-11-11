@@ -89,6 +89,32 @@ payload offsets and packed bytes. The adapter is not a generic version-3 reader 
 second artifact identity; the projected result resolves to `qwen3.8-27b/nvfp4`. Its v3 DFlash2
 objects are intentionally outside the selected target plan.
 
+### 2.4 Upstream v3 multi-volume container
+
+The reader also accepts an upstream v3 container directly, without projecting it into the
+version-2 directory. Such an artifact is one entry file plus zero or more continuation volumes:
+
+| Volume | Magic | `u64` at header offset 8 | Payload start |
+|---|---|---|---|
+| entry | `4e 49 4e 46 45 52 00 03` | `json_bytes` | `align_up(32 + json_bytes, 4096)` |
+| continuation | `4e 49 4e 50 52 54 00 03` | part index, counting from 1 | 4096 |
+
+The 32-byte header of every volume is the magic, that `u64`, and the 16-byte artifact identity at
+offset 16. The entry's directory lists the volumes: `files[0]` describes the entry itself (`path` is
+null) and each later member names a sibling continuation file together with its payload byte
+count.
+
+The logical payload space is the entry payload followed by the continuation payloads in file order.
+Object offsets are absolute in that space, whose origin is the first byte of the entry payload. An
+object whose extent crosses a volume boundary is rejected rather than split across volumes.
+
+A reader validates the entry length and every continuation against the directory: part magic,
+declared part index, artifact identity, and file length (`4096 + payload_bytes`). The v3 directory
+carries no product identity, so the reader synthesizes one from the directory's `metadata.name`;
+the reader currently binds `qwen3.8-flash-next` to `qwen3.8-flash-next/nvfp4` and rejects any
+other name. Object names are the upstream object ids: the version-2 projection and the renaming of
+the narrow Qwen3.8 adapter do not apply to this form.
+
 ## 3. JSON directory
 
 ### 3.1 Root
@@ -295,6 +321,10 @@ The generic reader performs only common file work:
 
 It does not know Qwen dimensions, source tensors, layer kinds, component flags, fusion records,
 logical model views, schedules, kernels, GPU support, or runtime residency.
+
+For the upstream v3 multi-volume container of §2.4 the same reader opens the continuation volumes,
+resolves a logical offset to the volume that holds it, and exposes the same object descriptors and
+payload spans; only the framing and the address mapping differ from version 2.
 
 The JSON and name index are cold-load data. A model binder resolves them once; inference does not
 reparse JSON or perform per-layer/per-token directory lookups.
