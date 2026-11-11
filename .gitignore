@@ -52,3 +52,4 @@ models/
 
 # Local run outputs / packaged serve binary
 dist/
+.worktrees/
