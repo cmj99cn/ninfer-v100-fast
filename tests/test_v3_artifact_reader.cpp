@@ -242,11 +242,14 @@ void test_v3_spelling_round_trip() {
         bool v3_native;
     };
 
-    const std::array<FormatCase, 9> format_cases = {{
+    const std::array<FormatCase, 12> format_cases = {{
         {"bf16", NumericFormat::BF16, "BF16", false},
+        {"fp16", NumericFormat::FP16, "FP16", false},
         {"fp32", NumericFormat::FP32, "FP32", false},
         {"int32", NumericFormat::I32, "I32", false},
         {"q4_g64_fp16", NumericFormat::Q4G64_F16S, "Q4G64_F16S", false},
+        {"q5_g64_fp16", NumericFormat::Q5G64_F16S, "Q5G64_F16S", false},
+        {"q6_g64_fp16", NumericFormat::Q6G64_F16S, "Q6G64_F16S", false},
         {"q8_g32_fp16", NumericFormat::W8G32_F16S, "W8G32_F16S", false},
         {"nvfp4", NumericFormat::NVFP4, "NVFP4", false},
         {"nf4_g16_e4m3fn", NumericFormat::NF4_G16_E4M3S, "nf4_g16_e4m3fn", true},
@@ -254,9 +257,10 @@ void test_v3_spelling_round_trip() {
          "fp8_e4m3fn_block128x128_bf16", true},
         {"fp8_e4m3fn_row_bf16", NumericFormat::FP8_E4M3FN_ROW_BF16S, "FP8_E4M3FN_ROW_BF16S", false},
     }};
-    const std::array<LayoutCase, 6> layout_cases = {{
+    const std::array<LayoutCase, 7> layout_cases = {{
         {"contiguous_le_v1", StorageLayout::ContiguousLeV1, "contiguous-le-v1", false},
         {"row_split_k128_v1", StorageLayout::RowSplitK128V1, "row-split-k128-v1", false},
+        {"row_scale_v1", StorageLayout::RowScaleV1, "row-scale-v1", false},
         {"row_paged_g16_4k_v1", StorageLayout::RowPagedG16x4KV1, "row_paged_g16_4k_v1", true},
         {"block_scale_k16_m128x4_v1", StorageLayout::BlockScaleK16M128x4V1,
          "blockscale-k16-m128x4-v1", false},
@@ -348,6 +352,81 @@ void test_v3_unknown_spelling_rejected() {
     };
     const auto fixture = write_v3_multi_part(objects, {marker_payload(kPartPayloadBytes, 0x11)});
     expect_artifact_error([&] { Reader reader(fixture.entry); }, "unknown v3 tensor format");
+}
+
+// The v3 directory an upstream artifact carries, read from the container header.
+Json read_v3_directory(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) { throw std::runtime_error("failed to open the v3 artifact"); }
+    std::array<std::byte, 32> header{};
+    input.read(reinterpret_cast<char*>(header.data()),
+               static_cast<std::streamsize>(header.size()));
+    const std::array<std::uint8_t, 8> magic = {'N', 'I', 'N', 'F', 'E', 'R', 0, 3};
+    for (std::size_t i = 0; i < magic.size(); ++i) {
+        if (std::to_integer<unsigned char>(header[i]) != magic[i]) {
+            throw std::runtime_error("the artifact is not a v3 container");
+        }
+    }
+    std::uint64_t json_bytes = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        json_bytes |= static_cast<std::uint64_t>(std::to_integer<unsigned char>(header[8 + i]))
+                      << (i * 8);
+    }
+    std::vector<char> text(json_bytes);
+    input.read(text.data(), static_cast<std::streamsize>(json_bytes));
+    if (!input) { throw std::runtime_error("the v3 directory is truncated"); }
+    return Json::parse(text.begin(), text.end());
+}
+
+// The shared v3 spelling table must accept every spelling an upstream v3 artifact uses. The 27B
+// narrow adapter reads exactly those spellings, so one spelling must not be accepted in one place
+// and rejected in the other.
+// NINFER_27B_V3_ARTIFACT=/home/cmj/models/ninfer-artifacts/qwen3_8_27b_nvfp4.ninfer
+void test_public_table_covers_upstream_v3_artifact() {
+    const char* artifact = std::getenv("NINFER_27B_V3_ARTIFACT");
+    if (artifact == nullptr || *artifact == '\0') {
+        std::cout << "skip: NINFER_27B_V3_ARTIFACT is not set\n";
+        return;
+    }
+    const Json directory = read_v3_directory(artifact);
+    if (directory.at("metadata").at("name").get<std::string>() != "qwen3.8-27b") {
+        throw std::runtime_error("NINFER_27B_V3_ARTIFACT is not the upstream 27B v3 artifact");
+    }
+    std::size_t tensors   = 0;
+    std::size_t resources = 0;
+    for (const auto& object : directory.at("objects")) {
+        if (object.at("kind").get<std::string>() == "tensor") {
+            ++tensors;
+            const auto format = object.at("format").get<std::string>();
+            const auto layout = object.at("layout").get<std::string>();
+            try {
+                ninfer::artifact::parse_v3_format(format);
+                ninfer::artifact::parse_v3_layout(layout);
+            } catch (const ArtifactError& error) {
+                throw std::runtime_error("the shared v3 table rejects " + format + "/" + layout +
+                                         ": " + error.what());
+            }
+        } else {
+            ++resources;
+            const auto encoding = object.at("encoding").get<std::string>();
+            try {
+                ninfer::artifact::parse_v3_encoding(encoding);
+            } catch (const ArtifactError& error) {
+                throw std::runtime_error("the shared v3 table rejects " + encoding + ": " +
+                                         error.what());
+            }
+        }
+    }
+    if (tensors == 0 || resources == 0) {
+        throw std::runtime_error("the upstream v3 artifact has no objects");
+    }
+    Reader reader(artifact);
+    if (reader.identity().model_id != "qwen3.8-27b" || reader.identity().weights_id != "nvfp4" ||
+        reader.objects().empty()) {
+        throw std::runtime_error("the 27B narrow adapter did not open the upstream v3 artifact");
+    }
+    std::cout << "upstream v3 artifact: " << tensors << " tensors, " << resources
+              << " resources, every spelling accepted by the shared table\n";
 }
 
 void test_identity_synthesized() {
@@ -629,6 +708,7 @@ int main() {
         test_v3_spelling_round_trip();
         test_v3_object_spelling_reaches_the_reader();
         test_v3_unknown_spelling_rejected();
+        test_public_table_covers_upstream_v3_artifact();
         test_identity_synthesized();
         test_objects_and_payloads_across_parts();
         test_wrong_part_index_rejected();

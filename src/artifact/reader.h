@@ -56,7 +56,8 @@ std::string_view encoding_name(ResourceEncoding encoding) noexcept;
 // The v3 container spells its numeric formats, storage layouts and resource encodings in lower
 // case snake case; the v2 container spells the same concepts differently. The two spellings are
 // separate contracts that denote the same enum values, so the v3 table is the authority for
-// reading an upstream v3 artifact and never widens the v2 one.
+// reading an upstream v3 artifact and never widens the v2 one. It accepts every spelling an
+// upstream v3 artifact uses.
 NumericFormat parse_v3_format(std::string_view name);
 StorageLayout parse_v3_layout(std::string_view name);
 ResourceEncoding parse_v3_encoding(std::string_view name);
