@@ -195,9 +195,9 @@ git commit -m "feat(artifact): map element intervals to logical layout views"
 |---|---:|---|
 | `text/layers/N/attention_hc/{down,inject,norm,up}` | 各 48 | 每层 attention HC（下投影 320×10240、注入 4×10240、范数 10240、上投影 10240×320） |
 | `text/layers/N/moe_hc/{down,inject,norm,up}` | 各 48 | 每层 MoE HC |
-| `text/layers/N/gdn/{query,key,value,z,a_projection,b_projection,a_log,dt_bias,convolution,norm,output}` | 各 36 | GDN 层（q/k/v/z 同属一个 16384×2560 的父权重；a/b 控制投影同属一个父权重） |
-| `text/layers/N/attention/{query,key,value,index_key,index_query,output,output_gate,query_norm,index_query_norm,key_norm,index_key_norm}` | 各 12 | QSA 层（query/key/value/index_key/index_query/output_gate 同属一个 13952×2560 的 BF16 父权重，按宽度轴连续排列：key\|value\|index_key\|query\|output_gate\|index_query） |
-| `text/layers/N/moe/{router,shared_score,shared/gate,shared/up,shared/down,experts/gate,experts/up,experts/down}` | 各 48 | MoE 层（router 与 shared_score 属一个 513×2560 父权重；experts 三个角色是 512 专家库的矩阵内行区间：gate = 专家矩阵行 [0,640)、up = 行 [640,1280)） |
+| `text/layers/N/gdn/{query,key,value,z,a_projection,b_projection,a_log,dt_bias,convolution,norm,output}` | 各 36 | GDN 层：q/k/v/z 属 `[16384,2560]` 的 q8_g32 行拆父权重（行 [0,2048)、[2048,4096)、[4096,10240)、[10240,16384)）；a/b 控制投影属 `[96,2560]` BF16 对象（行 [0,48)、[48,96)） |
+| `text/layers/N/attention/{query,key,value,index_key,index_query,output,output_gate,query_norm,index_query_norm,key_norm,index_key_norm}` | 各 12 | QSA 层：**两个对象、两种布局**——`query`/`output_gate` 属 `[12288,2560]` 的 q8_g32 行拆父权重（行 [0,6144) 与 [6144,12288)）；`key`/`value`/`index_query`/`index_key` 属 `[1664,2560]` 的 BF16 连续父权重（行 [0,512)、[512,1024)、[1024,1536)、[1536,1664)）。那个 13952×2560 的 BF16 父权重属 **MTP** 层（M3），不是文本 QSA |
+| `text/layers/N/moe/{router,shared_score,shared/gate,shared/up,shared/down,experts/gate,experts/up,experts/down}` | 各 48 | MoE 层（router 与 shared_score 属一个 513×2560 父权重；`experts/gate`/`experts/up` 是 `[512,1280,2560]` 专家库的**矩阵内行区间**（每个专家矩阵行 [0,640) 与 [640,1280)）；`experts/down` 是独立的 `[512,2560,640]` 对象，每个矩阵整段） |
 | `text/layers/N/ple/{table,key,value,norm_key,norm_query,norm_conv,convolution}` | 各 1 | PLE（仅第 1 层；`table` 是 128 个 NF4 分页 shard） |
 | `text/{token_embedding,output_head,final_hc/norm,final_hc/down,final_hc/up}` | 各 1 | 嵌入、主头、末层 HC |
 
@@ -356,7 +356,7 @@ git commit -m "feat(ops): add the four-stream gated residual ops"
 ### 任务 6：QSA 四件套 + `linear_split`（五入口 + oracle）
 
 **文件：**
-- 创建：`include/ninfer/ops/qsa.h`、`include/ninfer/ops/linear_split.h`
+- 创建：`include/ninfer/ops/qsa.h`、`include/ninfer/ops/linear_split.h`（`linear_split` = 一个 packed 父权重按**输出特征行轴**切成 N 段，各段写进独立输出；支持 row-split K128（W8/Q4/Q5/Q6）与 BF16 连续）
 - 创建：`src/ops/qsa/{qsa_prepare.cu,qsa_indexer.cu,qsa_sparse_gqa.cu,qsa_tail_extract.cu}`、`src/ops/linear/split/linear_split.cu`
 - 测试：`tests/ops/qsa_test.cpp`、`tests/ops/linear_split_test.cpp`
 
@@ -421,7 +421,7 @@ git commit -m "feat(ops): add the QSA indexed attention ops and packed linear sp
 - [ ] **步骤 1：编写失败的测试**
 
 - 路由：router 权重 BF16 `[513,2560]`（512 专家 + 1 shared 行），对每个 token 取 top-10，`norm_topk_prob=true` → 概率 = softmax(top-10 logits) 归一化，共享专家行给 sigmoid 分数；断言 top-10 的选择与 tie 规则（并列时专家 id 小者先）、归一化后和为 1；
-- grouped gate_up/down：真实几何 512 专家、hidden 2560、intermediate 640、gate_up `[512,1280,2560]`、down `[512,2560,640]`（batched blockscale 布局），取 4 个专家做 FP32 oracle 比对：oracle 按存储码本解 NVFP4（4-bit code + 16 元素组 E4M3 scale + 每矩阵 FP32 除数）后做 FP32 GEMM；
+- grouped gate_up/down：真实几何 512 专家、hidden 2560、intermediate 640、gate_up `[512,1280,2560]`、down `[512,2560,640]`（batched blockscale 布局），取 4 个专家做 FP32 oracle 比对：oracle 按存储码本解 NVFP4（4-bit code + 16 元素组 E4M3 scale + 每矩阵 FP32 除数）后做 FP32 GEMM；**op 原地消费整块专家库 payload + 每个角色在矩阵内的行区间**（gate 行 [0,640)、up 行 [640,1280)、down 整段），不先做物理拷贝（拷贝会按 128 行带重组 swizzle 缩放 tile，比原地解码更贵）；
 - 共享专家：BF16 SwiGLU 路径贡献一次。
 
 - [ ] **步骤 2：运行测试验证失败**
