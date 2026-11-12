@@ -845,6 +845,10 @@ manifest 目录；device page、device snapshot slot、device LRU 和 `PrefixInd
 - host tier 的 manifest 目录、引用计数和 slab 元数据由 tier mutex 串行化，D2H/H2D 传输在锁外执行。
   manifest 只描述 host 页，不包含 MTP/DFlash provisional backend KV，因此跨实例恢复后 backend
   state 按普通冷启动路径建立。
+- 容量按 80% block / 20% snapshot 切分，slab 大小为 `tp × per-rank`。分配在池满时先淘汰
+  零引用 manifest 再重试；重试成功不计失败，最终仍无 slab 时计入
+  `HostCacheMetrics.block_alloc_failures` / `snapshot_alloc_failures`，写穿被跳过而不是中断
+  请求。该计数持续增长说明 host 预算小于工作集。
 
 ---
 

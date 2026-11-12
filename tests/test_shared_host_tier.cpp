@@ -360,6 +360,44 @@ int test_retire_owner() {
     return failures;
 }
 
+int test_allocation_failure_counter() {
+    int failures = 0;
+    auto cfg       = config(1 << 20);
+    cfg.block_slabs    = 1;
+    cfg.snapshot_slabs = 1;
+    auto tier          = SharedHostTier::create(cfg);
+
+    const pc::HostPageId page = tier->allocate_block().page;
+    failures += check(page != pc::kInvalidHostPage, "initial block allocation failed");
+    tier->pin(page);
+    failures += check(tier->allocate_block().page == pc::kInvalidHostPage,
+                      "a fully pinned tier should reject a block allocation");
+    failures += check(tier->block_alloc_failures() == 1,
+                      "the final failed allocation was not counted");
+    tier->unpin(page);
+    tier->release(page);
+
+    // Eviction-recovered allocation must not be reported as a failure.
+    auto cfg2          = config(1 << 20);
+    cfg2.block_slabs    = 1;
+    cfg2.snapshot_slabs = 1;
+    auto tier2          = SharedHostTier::create(cfg2);
+    const pc::HostPageId block_page = tier2->allocate_block().page;
+    const pc::HostPageId state_page = tier2->allocate_snapshot().page;
+    failures += check(block_page != pc::kInvalidHostPage &&
+                          state_page != pc::kInvalidHostPage,
+                      "recovery-test allocations failed");
+    const std::uint64_t id = tier2->publish(1, manifest(64, {block_page}, state_page));
+    failures += check(id != 0, "recovery-test publish failed");
+    failures += check(!tier2->release_manifest(id), "manifest should drop to zero refs");
+    const pc::SlabAllocation recovered = tier2->allocate_block();
+    failures += check(recovered.page != pc::kInvalidHostPage,
+                      "evicting a zero-ref manifest should recover the allocation");
+    failures += check(tier2->block_alloc_failures() == 0,
+                      "an allocation recovered by manifest eviction was counted as a failure");
+    return failures;
+}
+
 int test_no_cross_owner_eviction() {
     int failures = 0;
     auto cfg     = config(1 << 20);
@@ -439,6 +477,7 @@ int main() {
     failures += test_erase_requires_zero_refs();
     failures += test_release_retain_cycle();
     failures += test_retire_owner();
+    failures += test_allocation_failure_counter();
     failures += test_no_cross_owner_eviction();
     failures += test_pressure_evicts_zero_ref_manifest();
     if (failures == 0) {

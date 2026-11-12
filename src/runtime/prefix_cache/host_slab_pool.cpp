@@ -180,10 +180,12 @@ SlabAllocation HostSlabPool::allocate_block() {
     HostPageId page = find_free(0, block_slabs_.size());
     if (page == kInvalidHostPage) {
         if (!options_.evict_on_exhaustion) {
+            if (options_.count_allocation_failures) { ++block_alloc_failures_; }
             return result; // shared tier: never evict another owner's local page
         }
         page = pick_victim(0, block_slabs_.size());
         if (page == kInvalidHostPage) {
+            if (options_.count_allocation_failures) { ++block_alloc_failures_; }
             return result; // all block slabs pinned
         }
         result.evicted = page; // previous owner existed at this index
@@ -203,10 +205,12 @@ SlabAllocation HostSlabPool::allocate_snapshot() {
     HostPageId page = find_free(offset, snapshot_slabs_.size());
     if (page == kInvalidHostPage) {
         if (!options_.evict_on_exhaustion) {
+            if (options_.count_allocation_failures) { ++snapshot_alloc_failures_; }
             return result; // shared tier: never evict another owner's local page
         }
         page = pick_victim(offset, snapshot_slabs_.size());
         if (page == kInvalidHostPage) {
+            if (options_.count_allocation_failures) { ++snapshot_alloc_failures_; }
             return result; // all snapshot slabs pinned
         }
         result.evicted = page; // previous owner existed at this index

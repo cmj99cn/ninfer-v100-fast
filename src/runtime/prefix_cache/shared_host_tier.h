@@ -99,6 +99,8 @@ public:
     [[nodiscard]] std::size_t pinned_bytes() const noexcept override;
     [[nodiscard]] std::size_t block_slab_count() const noexcept override;
     [[nodiscard]] std::size_t snapshot_slab_count() const noexcept override;
+    [[nodiscard]] std::uint64_t block_alloc_failures() const noexcept override;
+    [[nodiscard]] std::uint64_t snapshot_alloc_failures() const noexcept override;
 
 private:
     struct Entry {
@@ -134,6 +136,8 @@ private:
     std::uint64_t next_manifest_id_ = 1;
     std::uint64_t next_owner_ = 1;
     std::uint64_t access_tick_ = 0;
+    std::uint64_t block_alloc_failures_ = 0;
+    std::uint64_t snapshot_alloc_failures_ = 0;
 };
 
 } // namespace ninfer

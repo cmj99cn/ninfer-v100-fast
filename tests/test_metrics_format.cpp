@@ -45,6 +45,8 @@ ninfer::MetricsSnapshot sample() {
     m.prefix_cache.host.used_bytes                     = 7ULL << 30;
     m.prefix_cache.host.block_slab_count               = 10291;
     m.prefix_cache.host.snapshot_slab_count            = 38;
+    m.prefix_cache.host.block_alloc_failures           = 7;
+    m.prefix_cache.host.snapshot_alloc_failures        = 2;
     m.instances.push_back(ninfer::InstanceMetrics{.free_kv_pages = 4096,
                                                   .active_requests = 2,
                                                   .pending_requests = 1,
@@ -74,6 +76,8 @@ ninfer::MetricsSnapshot instance_snapshot(std::uint64_t committed, std::uint32_t
     snapshot.prefix_cache.host.used_bytes        = 3ULL << 30;
     snapshot.prefix_cache.host.block_slab_count  = 10291;
     snapshot.prefix_cache.host.snapshot_slab_count = 38;
+    snapshot.prefix_cache.host.block_alloc_failures = 7;
+    snapshot.prefix_cache.host.snapshot_alloc_failures = 2;
     return snapshot;
 }
 
@@ -99,6 +103,10 @@ int test_prometheus() {
                       "host pinned bytes missing");
     failures += check(has("ninfer_prefix_cache_host_slabs{kind=\"block\"} 10291"),
                       "host block slab count missing");
+    failures += check(has("ninfer_prefix_cache_host_alloc_failures_total{kind=\"block\"} 7"),
+                      "host block allocation failures missing");
+    failures += check(has("ninfer_prefix_cache_host_alloc_failures_total{kind=\"snapshot\"} 2"),
+                      "host snapshot allocation failures missing");
     failures += check(has("ninfer_requests{state=\"waiting\"} 3"), "waiting requests missing");
     failures += check(has("# TYPE ninfer_decode_rounds_total counter"),
                       "decode rounds counter missing");
@@ -135,6 +143,10 @@ int test_json() {
                       "json host pinned wrong");
     failures += check(parsed["prefix_cache"]["host"]["block_slab_count"] == 10291,
                       "json host slab count wrong");
+    failures += check(parsed["prefix_cache"]["host"]["block_alloc_failures"] == 7,
+                      "json host block allocation failures wrong");
+    failures += check(parsed["prefix_cache"]["host"]["snapshot_alloc_failures"] == 2,
+                      "json host snapshot allocation failures wrong");
     failures += check(parsed["scheduler"]["waiting_requests"] == 3,
                       "json scheduler waiting wrong");
     failures += check(parsed["instances"].size() == 2, "json instance array size wrong");
@@ -209,6 +221,9 @@ int test_pool_metrics_aggregate() {
     failures += check(pool.prefix_cache.host.block_slab_count == 10291 &&
                           pool.prefix_cache.host.snapshot_slab_count == 38,
                       "the aggregate summed shared host slab counts");
+    failures += check(pool.prefix_cache.host.block_alloc_failures == 7 &&
+                          pool.prefix_cache.host.snapshot_alloc_failures == 2,
+                      "the aggregate summed shared host allocation failures");
     return failures;
 }
 

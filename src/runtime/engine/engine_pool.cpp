@@ -439,6 +439,11 @@ MetricsSnapshot aggregate_instance_metrics(std::span<const PoolInstanceMetrics> 
             std::max(out.prefix_cache.host.block_slab_count, instance.prefix_cache.host.block_slab_count);
         out.prefix_cache.host.snapshot_slab_count = std::max(
             out.prefix_cache.host.snapshot_slab_count, instance.prefix_cache.host.snapshot_slab_count);
+        out.prefix_cache.host.block_alloc_failures = std::max(
+            out.prefix_cache.host.block_alloc_failures, instance.prefix_cache.host.block_alloc_failures);
+        out.prefix_cache.host.snapshot_alloc_failures = std::max(
+            out.prefix_cache.host.snapshot_alloc_failures,
+            instance.prefix_cache.host.snapshot_alloc_failures);
     }
     return out;
 }

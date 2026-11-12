@@ -44,6 +44,27 @@
 tier。未启用 prefix cache 或预算为 0 时不分配 host tier，跨实例 manifest 恢复不可用；device
 内 prefix 命中仍然工作。
 
+### 2.1 host tier 容量
+
+预算是进程级 pinned host 字节数，按 80% KV block / 20% snapshot 镜像切分；两类 slab 都按
+`tp × per-rank` 大小分配：
+
+```text
+block_slabs    = floor(0.8 × N MiB × 1 MiB / (tp × per_rank_block_bytes))
+snapshot_slabs = floor(0.2 × N MiB × 1 MiB / (tp × per_rank_snapshot_bytes))
+host prefix tokens ≈ block_slabs × 64
+```
+
+`per_rank_block_bytes` 是该 rank 上 text KV pool 与 speculative backend KV pool 的
+`per_page_bytes()` 之和；启用 MTP/DFlash 时 backend pool 也计入。`per_rank_snapshot_bytes`
+是该 rank 的完整 GDN continuation state 镜像（每层 conv history 加 recurrent state）。两个
+值都随 `--tp`、KV dtype/group 和 speculative 后端变化，因此同一 `N` 在不同 profile 下的
+token 容量不同。以本机 NVFP4 27B、INT8 group-64、TP2 + MTP-3 为例，一个 block slab 约
+2.19 MiB：`--host-cache-mib 1024` 得到 373 个 block slab（约 24K host prefix tokens），
+`12288` 得到 4485 个（约 287K）。预算必须同时放得下一个 block slab 和一个 snapshot slab，
+否则该实例跳过 host tier 并打印 `[host-cache] ... too small` 诊断。实际 slab 数在启动时由
+`[host-cache] ... block + ... snapshot slabs` 行报告。
+
 2 卡本机（正确性已验证、性能未测，见 §7）：
 
 ```bash
@@ -228,11 +249,17 @@ v1 只发布完整 64-token 边界的 Tap snapshot；partial-tail 或没有完�
 | `prefix_hit_tokens` | permit 完成时累计的 `GenerationResult.reused_prompt_tokens` |
 | `manifest_restore_tokens` | 带 manifest hint 且完成路径为 `ReusedBlockSnapshot` 时累计的 hint frontier |
 
+共享 host tier 的 `prefix_cache.host` 还报告 `block_alloc_failures` 和
+`snapshot_alloc_failures`：tier 启用时返回空 slab 的累计次数。被淘汰旧 slab/manifest 后重试
+成功的分配不计入；只有调用方最终拿不到 slab 时才递增。这些计数持续增长说明
+`--host-cache-mib` 小于工作集，host 写穿/镜像写入正在被静默跳过。
+
 `prefix_hit_tokens` 覆盖所有 prefix 复用路径；`manifest_restore_tokens` 是 pool 可观测的
 跨实例 manifest 归属，若目标实例恢复的 live manifest 比 hint 更深，指标只记录 hint frontier。
 两者都是进程生命周期累计计数器。
 
-Prometheus 暴露 `ninfer_instance_free_kv_pages`、`ninfer_instance_active_requests`、
+Prometheus 暴露 `ninfer_prefix_cache_host_alloc_failures_total{kind="block|snapshot"}`、
+`ninfer_instance_free_kv_pages`、`ninfer_instance_active_requests`、
 `ninfer_instance_pending_requests`、`ninfer_instance_prefix_hit_tokens_total`、
 `ninfer_instance_manifest_restore_tokens_total` 和 `ninfer_instance_committed_tokens_total`，
 均带 `instance` 标签。JSON 响应增加 `instances` 数组；单实例时该数组为空。`instances` 为空时

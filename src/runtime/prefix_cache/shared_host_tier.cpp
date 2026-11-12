@@ -23,7 +23,8 @@ SharedHostTier::SharedHostTier(Config config)
              .snapshot_slab_bytes  = config_.snapshot_slab_bytes,
              .block_slab_count     = config_.block_slabs,
              .snapshot_slab_count  = config_.snapshot_slabs,
-             .evict_on_exhaustion  = false}) {}
+             .evict_on_exhaustion  = false,
+             .count_allocation_failures = false}) {}
 
 std::shared_ptr<SharedHostTier> SharedHostTier::create(Config config) {
     if (config.host_bytes == 0) {
@@ -248,6 +249,7 @@ prefix_cache::SlabAllocation SharedHostTier::allocate_block() {
         if (evict_one_locked() != 0) {
             alloc = pool_.allocate_block();
         }
+        if (alloc.page == prefix_cache::kInvalidHostPage) { ++block_alloc_failures_; }
     }
     return alloc;
 }
@@ -259,6 +261,7 @@ prefix_cache::SlabAllocation SharedHostTier::allocate_snapshot() {
         if (evict_one_locked() != 0) {
             alloc = pool_.allocate_snapshot();
         }
+        if (alloc.page == prefix_cache::kInvalidHostPage) { ++snapshot_alloc_failures_; }
     }
     return alloc;
 }
@@ -332,6 +335,16 @@ std::size_t SharedHostTier::block_slab_count() const noexcept {
 
 std::size_t SharedHostTier::snapshot_slab_count() const noexcept {
     return pool_.snapshot_slab_count();
+}
+
+std::uint64_t SharedHostTier::block_alloc_failures() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return block_alloc_failures_;
+}
+
+std::uint64_t SharedHostTier::snapshot_alloc_failures() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return snapshot_alloc_failures_;
 }
 
 } // namespace ninfer

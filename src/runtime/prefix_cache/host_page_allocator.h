@@ -71,6 +71,10 @@ public:
     virtual std::size_t pinned_bytes() const noexcept = 0;
     virtual std::size_t block_slab_count() const noexcept = 0;
     virtual std::size_t snapshot_slab_count() const noexcept = 0;
+    // Caller-visible allocation failures: allocations that returned kInvalidHostPage while the
+    // tier was enabled. Exhaustion that was recovered by evicting a slab is not a failure.
+    virtual std::uint64_t block_alloc_failures() const noexcept = 0;
+    virtual std::uint64_t snapshot_alloc_failures() const noexcept = 0;
 };
 
 } // namespace ninfer::prefix_cache

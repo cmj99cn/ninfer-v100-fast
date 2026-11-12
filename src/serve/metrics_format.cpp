@@ -105,6 +105,12 @@ std::string metrics_to_prometheus(const ninfer::MetricsSnapshot& metrics) {
            metrics.prefix_cache.host.block_slab_count);
     sample(out, "ninfer_prefix_cache_host_slabs", labels({{"kind", "snapshot"}}),
            metrics.prefix_cache.host.snapshot_slab_count);
+    header(out, "ninfer_prefix_cache_host_alloc_failures_total",
+           "Host-tier allocations that returned no slab while the tier was enabled.", "counter");
+    sample(out, "ninfer_prefix_cache_host_alloc_failures_total", labels({{"kind", "block"}}),
+           metrics.prefix_cache.host.block_alloc_failures);
+    sample(out, "ninfer_prefix_cache_host_alloc_failures_total", labels({{"kind", "snapshot"}}),
+           metrics.prefix_cache.host.snapshot_alloc_failures);
 
     header(out, "ninfer_requests", "Requests by scheduler state.", "gauge");
     sample(out, "ninfer_requests", labels({{"state", "running"}}),
@@ -203,7 +209,10 @@ nlohmann::json metrics_to_json(const ninfer::MetricsSnapshot& metrics) {
                                         {"pinned_bytes", host.pinned_bytes},
                                         {"used_bytes", host.used_bytes},
                                         {"block_slab_count", host.block_slab_count},
-                                        {"snapshot_slab_count", host.snapshot_slab_count}}}}},
+                                        {"snapshot_slab_count", host.snapshot_slab_count},
+                                        {"block_alloc_failures", host.block_alloc_failures},
+                                        {"snapshot_alloc_failures",
+                                         host.snapshot_alloc_failures}}}}},
         {"instances", std::move(instances)}};
 }
 

@@ -37,6 +37,9 @@ struct HostSlabPoolOptions {
     // When false, allocation returns kInvalidHostPage on exhaustion instead of evicting.
     // Shared tiers use false so that cross-owner local pages are never evicted.
     bool evict_on_exhaustion = true;
+    // When false, failed allocations are not counted. A shared tier that retries after evicting a
+    // manifest counts only its own final failure, so its pool must not count the first attempt.
+    bool count_allocation_failures = true;
 };
 
 class HostSlabPool : public HostPageAllocator {
@@ -59,6 +62,12 @@ public:
     }
     [[nodiscard]] std::size_t snapshot_slab_count() const noexcept override {
         return snapshot_slabs_.size();
+    }
+    [[nodiscard]] std::uint64_t block_alloc_failures() const noexcept override {
+        return block_alloc_failures_;
+    }
+    [[nodiscard]] std::uint64_t snapshot_alloc_failures() const noexcept override {
+        return snapshot_alloc_failures_;
     }
 
     // Allocate a block slab, evicting another BLOCK slab if the pool is full. Returns
@@ -113,6 +122,8 @@ private:
     std::vector<HostSlab> snapshot_slabs_;
     void* host_memory_ = nullptr;
     std::size_t pinned_bytes_ = 0;
+    std::uint64_t block_alloc_failures_ = 0;
+    std::uint64_t snapshot_alloc_failures_ = 0;
     std::uint64_t tick_ = 0;
 };
 

@@ -4801,6 +4801,8 @@ MetricsSnapshot ProgramImplCore::metrics() const noexcept {
             static_cast<std::uint32_t>(prefix_host_allocator->block_slab_count());
         host.snapshot_slab_count =
             static_cast<std::uint32_t>(prefix_host_allocator->snapshot_slab_count());
+        host.block_alloc_failures    = prefix_host_allocator->block_alloc_failures();
+        host.snapshot_alloc_failures = prefix_host_allocator->snapshot_alloc_failures();
     }
     return out;
 }

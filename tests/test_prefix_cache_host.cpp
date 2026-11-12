@@ -188,6 +188,41 @@ int test_slab_pool_eviction() {
     return failures;
 }
 
+int test_slab_pool_allocation_failures() {
+    int failures = 0;
+    pc::HostSlabPool pool({.total_bytes = 1024 * 1024,
+                           .block_slab_bytes = 256 * 1024,
+                           .snapshot_slab_bytes = 64 * 1024,
+                           .block_slab_count = 1,
+                           .snapshot_slab_count = 1});
+    const pc::SlabAllocation block = pool.allocate_block();
+    const pc::SlabAllocation snapshot = pool.allocate_snapshot();
+    failures += check(block.page != pc::kInvalidHostPage &&
+                          snapshot.page != pc::kInvalidHostPage,
+                      "failure-counter test allocations failed");
+    pool.pin(block.page);
+    pool.pin(snapshot.page);
+    failures += check(pool.allocate_block().page == pc::kInvalidHostPage,
+                      "pinned-only pool should reject a block allocation");
+    failures += check(pool.allocate_snapshot().page == pc::kInvalidHostPage,
+                      "pinned-only pool should reject a snapshot allocation");
+    failures += check(pool.block_alloc_failures() == 1 &&
+                          pool.snapshot_alloc_failures() == 1,
+                      "exhausted allocations were not counted");
+
+    pc::HostSlabPool disabled({.total_bytes = 0,
+                               .block_slab_bytes = 256 * 1024,
+                               .snapshot_slab_bytes = 64 * 1024,
+                               .block_slab_count = 1,
+                               .snapshot_slab_count = 1});
+    failures += check(!disabled.enabled(), "zero-budget pool should be disabled");
+    failures += check(disabled.allocate_block().page == pc::kInvalidHostPage,
+                      "disabled pool should not allocate");
+    failures += check(disabled.block_alloc_failures() == 0,
+                      "a disabled tier must not report allocation failures");
+    return failures;
+}
+
 int test_slab_pool_gdsf() {
     int failures = 0;
     pc::HostSlabPool pool({.total_bytes = 2 * 1024 * 1024,
@@ -924,6 +959,7 @@ int main() {
     failures += test_host_allocator_contract();
     failures += test_slab_pool_basic();
     failures += test_slab_pool_eviction();
+    failures += test_slab_pool_allocation_failures();
     failures += test_slab_pool_gdsf();
     failures += test_prefix_index_host_residency();
     failures += test_device_fill_roundtrip();

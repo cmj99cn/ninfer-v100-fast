@@ -648,6 +648,10 @@ struct HostCacheMetrics {
     std::uint64_t used_bytes          = 0;
     std::uint32_t block_slab_count    = 0;
     std::uint32_t snapshot_slab_count = 0;
+    // Lifetime count of enabled-tier allocations that returned no slab. Exhaustion recovered by
+    // evicting an older slab is not a failure.
+    std::uint64_t block_alloc_failures    = 0;
+    std::uint64_t snapshot_alloc_failures = 0;
 };
 
 // Content-addressed prefix residency for a prompt's block-hash chain, read at a settled boundary.
