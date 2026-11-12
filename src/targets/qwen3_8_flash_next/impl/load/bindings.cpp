@@ -127,6 +127,22 @@ void validate_layer_types(const std::map<std::string, std::string>& config) {
     }
 }
 
+void validate_ple_shard_shape(const std::map<std::string, std::string>& config) {
+    const auto shape = split(config_value(config, "ple_shard_shape"), ',');
+    if (shape.size() != 2) {
+        throw ArtifactError("qwen3.8-flash-next: the artifact declares " +
+                            std::to_string(shape.size()) + " PLE shard dimensions; it declares 2");
+    }
+    const auto rows = parse_integer(shape[0], "ple_shard_shape");
+    const auto columns = parse_integer(shape[1], "ple_shard_shape");
+    if (rows != TextConfig::ple_shard_rows || columns != TextConfig::ple_head_width) {
+        throw ArtifactError("qwen3.8-flash-next: the artifact's PLE shard is " +
+                            std::to_string(rows) + "x" + std::to_string(columns) +
+                            "; this package expects " + std::to_string(TextConfig::ple_shard_rows) +
+                            "x" + std::to_string(TextConfig::ple_head_width));
+    }
+}
+
 void validate_mrope_sections(const std::map<std::string, std::string>& config) {
     const auto sections = split(config_value(config, "rope_parameters.mrope_section"), ',');
     if (sections.size() != TextConfig::rope_sections.size()) {
@@ -192,65 +208,15 @@ void validate_text_config(const artifact::V3Directory& directory) {
     require_text(config, "tie_word_embeddings", "false");
     require_text(config, "attention_bias", "false");
     require_text(config, "mamba_ssm_dtype", "float32");
+    require_text(config, "architectures", "Qwen4ExpForCausalLM");
+    require_text(config, "model_type", "qwen4_exp_text");
+    require_text(config, "rope_parameters.mrope_interleaved", "true");
+    require_text(config, "rope_parameters.rope_type", "default");
+    validate_ple_shard_shape(config);
     validate_mrope_sections(config);
     validate_layer_types(config);
 }
 
-enum class RoleScope {
-    Global,
-    EveryLayer,
-    GdnLayers,
-    QsaLayers,
-    PleLayer,
-};
-
-RoleScope role_scope(roles::Role role) {
-    switch (role) {
-    case roles::Role::TokenEmbedding:
-    case roles::Role::OutputHead:
-    case roles::Role::FinalHcNorm:
-    case roles::Role::FinalHcDown:
-    case roles::Role::FinalHcUp:
-        return RoleScope::Global;
-    case roles::Role::GdnQuery:
-    case roles::Role::GdnKey:
-    case roles::Role::GdnValue:
-    case roles::Role::GdnZ:
-    case roles::Role::GdnAProjection:
-    case roles::Role::GdnBProjection:
-    case roles::Role::GdnALog:
-    case roles::Role::GdnDtBias:
-    case roles::Role::GdnConvolution:
-    case roles::Role::GdnNorm:
-    case roles::Role::GdnOutput:
-        return RoleScope::GdnLayers;
-    case roles::Role::QsaQuery:
-    case roles::Role::QsaKey:
-    case roles::Role::QsaValue:
-    case roles::Role::QsaIndexQuery:
-    case roles::Role::QsaIndexKey:
-    case roles::Role::QsaOutput:
-    case roles::Role::QsaOutputGate:
-    case roles::Role::QsaQueryNorm:
-    case roles::Role::QsaKeyNorm:
-    case roles::Role::QsaIndexQueryNorm:
-    case roles::Role::QsaIndexKeyNorm:
-        return RoleScope::QsaLayers;
-    case roles::Role::PleTable:
-    case roles::Role::PleKey:
-    case roles::Role::PleValue:
-    case roles::Role::PleNormKey:
-    case roles::Role::PleNormQuery:
-    case roles::Role::PleNormConv:
-    case roles::Role::PleConvolution:
-        return RoleScope::PleLayer;
-    default:
-        return RoleScope::EveryLayer;
-    }
-}
-
-// The column of the layer's activation input divisor the routed expert parameters read: the
-// gate and up projections read the first divisor, the down projection the second.
 std::optional<std::uint64_t> activation_divisor_column(roles::Role role) {
     switch (role) {
     case roles::Role::MoeRoutedGate:
@@ -307,7 +273,8 @@ public:
         }
         check_rectangle(parameter, geometry);
         check_matrix_coverage(parameter, geometry);
-        bind_auxiliaries(parameter);
+        bind_use(parameter);
+        bind_library(parameter, geometry);
         claimed_.insert(parameter.parameter);
         return parameter;
     }
@@ -331,6 +298,11 @@ private:
         }
         const auto handle = binder_.require_tensor(name, geometry.format, geometry.layout,
                                                    geometry.object_shape());
+        const auto* tensor = std::get_if<artifact::TensorDescriptor>(&binder_.descriptor(handle));
+        if (tensor == nullptr || tensor->shape.size() != geometry.rank) {
+            throw ArtifactError("qwen3.8-flash-next: the object " + name +
+                                " does not have the rank this package expects");
+        }
         BoundObject object;
         object.name   = name;
         object.handle = handle;
@@ -383,9 +355,10 @@ private:
         }
     }
 
-    void bind_auxiliaries(BoundParameter& parameter) {
+    void bind_use(BoundParameter& parameter) {
         const auto use = uses_.find(parameter.parameter);
         if (use == uses_.end()) { return; }
+        parameter.activation_policy = use->second->activation_policy;
         for (const auto& [name, parts] : use->second->auxiliaries) {
             if (name != kActivationInput) {
                 throw ArtifactError("qwen3.8-flash-next: the use edge of " + parameter.parameter +
@@ -427,6 +400,21 @@ private:
             }
             parameter.auxiliaries.emplace(name, std::move(bound));
         }
+    }
+
+    void bind_library(BoundParameter& parameter, const RoleGeometry& geometry) {
+        if (geometry.matrix_count <= 1) { return; }
+        const auto& part = parameter.parts.front();
+        const BoundObject& object = plan_.objects.at(part.object);
+        ExpertLibrary library;
+        library.object     = object.name;
+        library.handle     = object.handle;
+        library.matrices   = geometry.shape[0];
+        library.rows       = geometry.shape[1];
+        library.columns    = geometry.shape[2];
+        library.row_begin  = geometry.row_begin;
+        library.row_count  = geometry.row_count;
+        parameter.library  = std::move(library);
     }
 
     artifact::Binder& binder_;

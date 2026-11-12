@@ -948,12 +948,12 @@ void test_column_slice_rank_rejection_unchanged() {
 
 // The Flash-Next artifact must open through the public Reader, and every tensor's declared byte
 // count must be the geometry of its own layout and format.
-// NINFER_FLASH_NEXT_V3_ARTIFACT=
+// NINFER_FLASH_NEXT_ARTIFACT=
 //   /home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer
 void test_flash_next_artifact_geometries() {
-    const char* artifact = std::getenv("NINFER_FLASH_NEXT_V3_ARTIFACT");
+    const char* artifact = std::getenv("NINFER_FLASH_NEXT_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "skip: NINFER_FLASH_NEXT_V3_ARTIFACT is not set\n";
+        std::cout << "skip: NINFER_FLASH_NEXT_ARTIFACT is not set\n";
         return;
     }
     Reader reader(artifact);
@@ -989,12 +989,12 @@ void test_flash_next_artifact_geometries() {
 
 // The upstream Flash-Next directory carries the component configuration, the parameter binding
 // table and the operator use edges. The reader reports the census the artifact ships.
-// NINFER_FLASH_NEXT_V3_ARTIFACT=
+// NINFER_FLASH_NEXT_ARTIFACT=
 //   /home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer
 void test_flash_next_directory_metadata() {
-    const char* artifact = std::getenv("NINFER_FLASH_NEXT_V3_ARTIFACT");
+    const char* artifact = std::getenv("NINFER_FLASH_NEXT_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "skip: NINFER_FLASH_NEXT_V3_ARTIFACT is not set\n";
+        std::cout << "skip: NINFER_FLASH_NEXT_ARTIFACT is not set\n";
         return;
     }
     Reader reader(artifact);

@@ -318,9 +318,9 @@ int main(int argc, char** argv) {
         test_parameter_names_of_a_layer();
         test_layer_of_and_role_of();
         if (!artifact_mode) { return 0; }
-        const char* artifact = std::getenv("NINFER_FLASH_NEXT_V3_ARTIFACT");
+        const char* artifact = std::getenv("NINFER_FLASH_NEXT_ARTIFACT");
         if (artifact == nullptr || *artifact == '\0') {
-            std::cout << "skip: NINFER_FLASH_NEXT_V3_ARTIFACT is not set\n";
+            std::cout << "skip: NINFER_FLASH_NEXT_ARTIFACT is not set\n";
             return 77;
         }
         test_real_artifact_binding_coverage(artifact);

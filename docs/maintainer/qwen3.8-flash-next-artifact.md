@@ -134,13 +134,18 @@ rotary_dim          = head_dim * partial_rotary_factor      = 256 * 0.25 = 64
 indexer_block_budget = indexer_budget / indexer_compress_ratio = 2048 / 4 = 512
 ple_heads            = (ngram_size - 1) * heads_per_ngram = 2 * 8     = 16
 ple_head_width      = ple_embed_dim / ple_heads           = 2560 / 16 = 160
-split_ngram_parts    = 128                                   (the number of NF4 table shards)
 ```
 
 Two invariants follow from the configuration and must hold for any consumer: the MRoPE sections
 must sum to half the rotary width (`11 + 11 + 10 = 32 = rotary_dim / 2`), and the PLE head
 geometry must satisfy `(ngram_size - 1) * heads_per_ngram = ple_embed_dim / ple_shard_shape[1]`
 (`2 * 8 = 2560 / 160 = 16`).
+
+**`split_ngram_parts = 128` is not stated by the artifact to be the shard count.** The
+configuration value and the measured shard count of section 4.5 are both 128, and no consumer
+may depend on more than that: the directory does not declare the relation. This package binds
+the table's shards from the artifact's own binding (128 parts), not from the configuration
+value, and the configuration value is checked against the measured shard geometry instead.
 
 ## 3. Parameter names and weight roles
 

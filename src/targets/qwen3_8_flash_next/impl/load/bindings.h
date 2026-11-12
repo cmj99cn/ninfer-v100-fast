@@ -18,7 +18,6 @@
 
 namespace ninfer::targets::qwen3_8_flash_next::detail {
 
-// One artifact object the package bound, with the artifact's own descriptor.
 struct BoundObject {
     std::string name;
     artifact::ObjectHandle handle;
@@ -27,25 +26,31 @@ struct BoundObject {
     std::vector<std::uint64_t> shape;
 };
 
-// The logical rectangle one artifact parameter occupies inside one object.
 struct BoundPart {
     std::uint32_t object = 0;
     artifact::ElementIntervalView view;
 };
 
-// One artifact parameter of the text namespace: the role it denotes, the layer it lives in,
-// the artifact's own name for it, the rectangles it occupies and the auxiliary inputs its
-// operator use edge carries.
+struct ExpertLibrary {
+    std::string object;
+    artifact::ObjectHandle handle;
+    std::uint64_t matrices = 0;
+    std::uint64_t rows = 0;
+    std::uint64_t columns = 0;
+    std::uint64_t row_begin = 0;
+    std::uint64_t row_count = 0;
+};
+
 struct BoundParameter {
     roles::Role role = roles::Role::TokenEmbedding;
     std::uint32_t layer = 0;
     std::string parameter;
     std::vector<BoundPart> parts;
-    // The auxiliary inputs of the parameter's use edge, by the auxiliary's role name.
     std::map<std::string, std::vector<BoundPart>> auxiliaries;
+    std::optional<std::string> activation_policy;
+    std::optional<ExpertLibrary> library;
 };
 
-// The four-stream gated residual block of one layer or of the final mix.
 struct HcPlan {
     BoundParameter norm;
     BoundParameter down;
@@ -53,7 +58,6 @@ struct HcPlan {
     BoundParameter up;
 };
 
-// The linear-attention (GDN) mixer of one layer.
 struct GdnPlan {
     BoundParameter query;
     BoundParameter key;
@@ -68,7 +72,6 @@ struct GdnPlan {
     BoundParameter output;
 };
 
-// The indexed-attention (QSA) mixer of one layer.
 struct QsaPlan {
     BoundParameter query;
     BoundParameter key;
@@ -83,7 +86,6 @@ struct QsaPlan {
     BoundParameter index_key_norm;
 };
 
-// The mixture of experts of one layer.
 struct MoePlan {
     BoundParameter router;
     BoundParameter shared_score;
@@ -95,7 +97,6 @@ struct MoePlan {
     BoundParameter routed_down;
 };
 
-// One text layer: its two four-stream blocks, its mixer and its mixture of experts.
 struct LayerPlan {
     HcPlan attention_hc;
     HcPlan moe_hc;
@@ -103,7 +104,6 @@ struct LayerPlan {
     MoePlan moe;
 };
 
-// The n-gram prediction layer of the trunk.
 struct PlePlan {
     BoundParameter table;
     BoundParameter key;
@@ -114,18 +114,10 @@ struct PlePlan {
     BoundParameter convolution;
 };
 
-// The artifact parameters this milestone does not bind.
-//
-// The text namespace belongs to this milestone, so an unclaimed text parameter is an error
-// rather than a diagnostic. The other namespaces belong to later milestones: their parameters
-// are counted here, so that a milestone that owns one of them finds every parameter of that
-// namespace already listed.
 struct UnclaimedParameters {
     std::map<std::string, std::vector<std::string>> by_namespace;
 };
 
-// The binding plan: which artifact object holds which weight role, which rectangle of that
-// object the role occupies, and in which format the object is stored.
 struct BindingPlan {
     std::vector<BoundObject> objects;
     BoundParameter token_embedding;
@@ -135,20 +127,9 @@ struct BindingPlan {
     PlePlan ple;
     UnclaimedParameters unclaimed;
 
-    // Every parameter the plan binds, in the order the plan holds them: the global
-    // parameters, then every layer, then the n-gram prediction layer.
     [[nodiscard]] std::vector<const BoundParameter*> parameters() const;
 };
 
-// Binds every artifact object the text milestone of this package needs.
-//
-// The binder is consumed: every bound object is claimed exactly once, and the objects of the
-// namespaces this milestone does not own stay unclaimed. The plan therefore describes the
-// binding and the geometry of the text namespace only; the placement of the bound objects and
-// the materialization of the artifact belong to the Engine wiring.
-//
-// `tp` is the tensor-parallel width: only one device is planned at this milestone, so a wider
-// plan is rejected instead of silently binding the whole model on one device.
 [[nodiscard]] BindingPlan bind_artifact(artifact::Binder& binder, WeightsProfile profile, int tp);
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

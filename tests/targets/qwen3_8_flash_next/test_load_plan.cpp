@@ -126,24 +126,25 @@ public:
     }
 
     void bind_whole(const std::string& name, const std::string& object,
-                    const std::string& policy = "A16Only") {
+                    const std::string& policy = "A16Only", bool declares_use = true) {
         FixtureBinding binding;
         binding.name   = name;
         binding.whole  = true;
         binding.object = object;
         artifact.bindings.push_back(std::move(binding));
-        add_use(name, policy);
+        if (declares_use) { add_use(name, policy); }
     }
 
     void bind_rows(const std::string& name, const std::string& object, std::uint64_t row_begin,
-                   std::uint64_t row_count, const std::string& policy = "A16Only") {
+                   std::uint64_t row_count, const std::string& policy = "A16Only",
+                   bool declares_use = true) {
         const Axes axes = axes_of(shape_of(object));
         FixtureBinding binding;
         binding.name        = name;
         binding.parts.push_back(FixturePart{object, row_begin * axes.columns,
                                              (row_begin + row_count) * axes.columns});
         artifact.bindings.push_back(std::move(binding));
-        add_use(name, policy);
+        if (declares_use) { add_use(name, policy); }
     }
 
     void bind_matrix_rows(const std::string& name, const std::string& object,
@@ -160,7 +161,8 @@ public:
         add_use(name, policy);
     }
 
-    void bind_whole_objects(const std::string& name, const std::vector<std::string>& objects) {
+    void bind_whole_objects(const std::string& name, const std::vector<std::string>& objects,
+                            bool declares_use = true) {
         FixtureBinding binding;
         binding.name = name;
         for (const auto& object : objects) {
@@ -168,7 +170,7 @@ public:
             binding.parts.push_back(FixturePart{object, 0, axes.matrices * axes.rows * axes.columns});
         }
         artifact.bindings.push_back(std::move(binding));
-        add_use(name, "A16Only");
+        if (declares_use) { add_use(name, "A16Only"); }
     }
 
     void bind_activation_divisor(const std::string& name, const std::string& auxiliary,
@@ -264,11 +266,13 @@ FixtureArtifact build_fixture() {
     builder.artifact.config = text_config();
 
     builder.bind_whole("text/token_embedding",
-                       builder.add_object("bf16", "contiguous_le_v1", {248320, 2560}));
+                       builder.add_object("bf16", "contiguous_le_v1", {248320, 2560}),
+                       "A16Only", false);
     builder.bind_whole("text/output_head",
                        builder.add_object("bf16", "contiguous_le_v1", {248320, 2560}));
     builder.bind_whole("text/final_hc/norm",
-                       builder.add_object("bf16", "contiguous_le_v1", {10240}));
+                       builder.add_object("bf16", "contiguous_le_v1", {10240}),
+                       "A16Only", false);
     builder.bind_whole("text/final_hc/down",
                        builder.add_object("bf16", "contiguous_le_v1", {320, 10240}));
     builder.bind_whole("text/final_hc/up",
@@ -283,7 +287,7 @@ FixtureArtifact build_fixture() {
 
         const auto attention_hc_norm =
             builder.add_object("bf16", "contiguous_le_v1", {10240});
-        builder.bind_whole(prefix + "attention_hc/norm", attention_hc_norm);
+        builder.bind_whole(prefix + "attention_hc/norm", attention_hc_norm, "A16Only", false);
         const auto attention_hc_down = builder.add_object("bf16", "contiguous_le_v1", {324, 10240});
         builder.bind_rows(prefix + "attention_hc/down", attention_hc_down, 0, 320);
         builder.bind_rows(prefix + "attention_hc/inject", attention_hc_down, 320, 4);
@@ -291,7 +295,7 @@ FixtureArtifact build_fixture() {
         builder.bind_whole(prefix + "attention_hc/up", attention_hc_up);
 
         const auto moe_hc_norm = builder.add_object("bf16", "contiguous_le_v1", {10240});
-        builder.bind_whole(prefix + "moe_hc/norm", moe_hc_norm);
+        builder.bind_whole(prefix + "moe_hc/norm", moe_hc_norm, "A16Only", false);
         const auto moe_hc_down = builder.add_object("bf16", "contiguous_le_v1", {324, 10240});
         builder.bind_rows(prefix + "moe_hc/down", moe_hc_down, 0, 320);
         builder.bind_rows(prefix + "moe_hc/inject", moe_hc_down, 320, 4);
@@ -312,13 +316,17 @@ FixtureArtifact build_fixture() {
                                builder.add_object("q8_g32_fp16", "row_split_k128_v1",
                                                   {2560, 6144}));
             builder.bind_whole(prefix + "attention/query_norm",
-                               builder.add_object("bf16", "contiguous_le_v1", {256}));
+                               builder.add_object("bf16", "contiguous_le_v1", {256}),
+                               "A16Only", false);
             builder.bind_whole(prefix + "attention/key_norm",
-                               builder.add_object("bf16", "contiguous_le_v1", {256}));
+                               builder.add_object("bf16", "contiguous_le_v1", {256}),
+                               "A16Only", false);
             builder.bind_whole(prefix + "attention/index_query_norm",
-                               builder.add_object("bf16", "contiguous_le_v1", {128}));
+                               builder.add_object("bf16", "contiguous_le_v1", {128}),
+                               "A16Only", false);
             builder.bind_whole(prefix + "attention/index_key_norm",
-                               builder.add_object("bf16", "contiguous_le_v1", {128}));
+                               builder.add_object("bf16", "contiguous_le_v1", {128}),
+                               "A16Only", false);
         } else {
             const auto query_value =
                 builder.add_object("q8_g32_fp16", "row_split_k128_v1", {16384, 2560});
@@ -330,13 +338,17 @@ FixtureArtifact build_fixture() {
             builder.bind_rows(prefix + "gdn/a_projection", control, 0, 48);
             builder.bind_rows(prefix + "gdn/b_projection", control, 48, 48);
             builder.bind_whole(prefix + "gdn/a_log",
-                               builder.add_object("fp32", "contiguous_le_v1", {48}));
+                               builder.add_object("fp32", "contiguous_le_v1", {48}),
+                               "A16Only", false);
             builder.bind_whole(prefix + "gdn/dt_bias",
-                               builder.add_object("fp32", "contiguous_le_v1", {48}));
+                               builder.add_object("fp32", "contiguous_le_v1", {48}),
+                               "A16Only", false);
             builder.bind_whole(prefix + "gdn/convolution",
-                               builder.add_object("bf16", "contiguous_le_v1", {4, 10240}));
+                               builder.add_object("bf16", "contiguous_le_v1", {4, 10240}),
+                               "A16Only", false);
             builder.bind_whole(prefix + "gdn/norm",
-                               builder.add_object("bf16", "contiguous_le_v1", {128}));
+                               builder.add_object("bf16", "contiguous_le_v1", {128}),
+                               "A16Only", false);
             builder.bind_whole(prefix + "gdn/output",
                                builder.add_object("q8_g32_fp16", "row_split_k128_v1",
                                                   {2560, 6144}));
@@ -366,18 +378,22 @@ FixtureArtifact build_fixture() {
         shards.push_back(builder.add_object("nf4_g16_e4m3fn", "row_paged_g16_4k_v1",
                                             {2500012, 160}));
     }
-    builder.bind_whole_objects("text/layers/1/ple/table", shards);
+    builder.bind_whole_objects("text/layers/1/ple/table", shards, false);
     const auto ple_key_value = builder.add_object("bf16", "contiguous_le_v1", {12800, 2560});
     builder.bind_rows("text/layers/1/ple/key", ple_key_value, 0, 10240);
     builder.bind_rows("text/layers/1/ple/value", ple_key_value, 10240, 2560);
     builder.bind_whole("text/layers/1/ple/norm_key",
-                       builder.add_object("bf16", "contiguous_le_v1", {10240}));
+                       builder.add_object("bf16", "contiguous_le_v1", {10240}),
+                       "A16Only", false);
     builder.bind_whole("text/layers/1/ple/norm_query",
-                       builder.add_object("bf16", "contiguous_le_v1", {10240}));
+                       builder.add_object("bf16", "contiguous_le_v1", {10240}),
+                       "A16Only", false);
     builder.bind_whole("text/layers/1/ple/norm_conv",
-                       builder.add_object("bf16", "contiguous_le_v1", {10240}));
+                       builder.add_object("bf16", "contiguous_le_v1", {10240}),
+                       "A16Only", false);
     builder.bind_whole("text/layers/1/ple/convolution",
-                       builder.add_object("bf16", "contiguous_le_v1", {4, 10240}));
+                       builder.add_object("bf16", "contiguous_le_v1", {4, 10240}),
+                       "A16Only", false);
 
     const auto mtp = builder.add_object("bf16", "contiguous_le_v1", {248320, 2560});
     builder.bind_whole("mtp/token_embedding", mtp);
@@ -498,6 +514,9 @@ void require_rectangle(const flash::BoundParameter& parameter, std::uint64_t row
         require(part.view.matrix_row_count == row_count,
                 what + " spans " + std::to_string(part.view.matrix_row_count) + " rows; it spans " +
                     std::to_string(row_count));
+        require(part.view.column_begin == 0,
+                what + " starts at column " + std::to_string(part.view.column_begin) +
+                    "; it starts at column 0");
         require(part.view.column_count == column_count,
                 what + " spans " + std::to_string(part.view.column_count) + " columns; it spans " +
                     std::to_string(column_count));
@@ -646,6 +665,62 @@ void check_routed_bank(const flash::BindingPlan& plan, std::uint32_t layer) {
     require(layer_plan.moe.routed_down.parts.front().view.matrix_row_count == 2560,
             "the routed down projection of layer " + std::to_string(layer) +
                 " does not span 2560 rows");
+
+    const auto library_of = [&](const flash::BoundParameter& parameter) {
+        require(parameter.library.has_value(),
+                "the routed bank of layer " + std::to_string(layer) +
+                    " has no expert library descriptor");
+        return *parameter.library;
+    };
+    const auto& gate = library_of(layer_plan.moe.routed_gate);
+    require(gate.object == object_of(plan, layer_plan.moe.routed_gate.parts.front()).name,
+            "the expert library of the routed gate names another object");
+    require(gate.matrices == 512, "the routed gate's expert library does not hold 512 experts");
+    require(gate.rows == 1280, "the routed gate's expert library does not hold 1280 rows");
+    require(gate.columns == 2560,
+            "the routed gate's expert library does not hold 2560 columns");
+    require(gate.row_begin == 0, "the routed gate's expert library does not start at row 0");
+    require(gate.row_count == 640, "the routed gate's expert library does not span 640 rows");
+
+    const auto& up = library_of(layer_plan.moe.routed_up);
+    require(up.object == gate.object,
+            "the routed up projection's expert library is another object");
+    require(up.matrices == 512 && up.rows == 1280 && up.columns == 2560,
+            "the routed up projection's expert library has another geometry");
+    require(up.row_begin == 640, "the routed up projection's expert library does not start at 640");
+    require(up.row_count == 640, "the routed up projection's expert library does not span 640 rows");
+
+    const auto& down = library_of(layer_plan.moe.routed_down);
+    require(down.object != gate.object,
+            "the routed down projection's expert library is the gate's object");
+    require(down.matrices == 512, "the routed down projection's expert library holds 512 experts");
+    require(down.rows == 2560, "the routed down projection's expert library holds 2560 rows");
+    require(down.columns == 640,
+            "the routed down projection's expert library holds 640 columns");
+    require(down.row_begin == 0, "the routed down projection's expert library starts at row 0");
+    require(down.row_count == 2560,
+            "the routed down projection's expert library does not span 2560 rows");
+}
+
+void check_activation_policy(const flash::BindingPlan& plan, std::uint32_t layer) {
+    const auto& layer_plan = plan.layers[layer];
+    const auto check = [&](const flash::BoundParameter& parameter, const std::string& policy) {
+        require(parameter.activation_policy.has_value(),
+                "the parameter " + parameter.parameter + " has no activation policy");
+        require(*parameter.activation_policy == policy,
+                "the parameter " + parameter.parameter + " has the activation policy '" +
+                    *parameter.activation_policy + "'; it has '" + policy + "'");
+    };
+    check(layer_plan.moe.routed_gate, "AllowA4");
+    check(layer_plan.moe.routed_up, "AllowA4");
+    check(layer_plan.moe.routed_down, "AllowA4");
+    check(layer_plan.moe.router, "A16Only");
+    check(layer_plan.attention_hc.down, "A16Only");
+    const auto& gdn = std::get<flash::GdnPlan>(layer_plan.mixer);
+    check(gdn.query, "A16Only");
+    require(!layer_plan.attention_hc.norm.activation_policy.has_value(),
+            "the attention HC norm has an activation policy; the artifact declares no use edge "
+            "for it");
 }
 
 void check_activation_divisor(const flash::BindingPlan& plan, std::uint32_t layer) {
@@ -755,6 +830,7 @@ void test_synthetic_artifact() {
     check_layers(bindings);
     check_geometry(bindings);
     check_routed_bank(bindings, 0);
+    check_activation_policy(bindings, 0);
     check_activation_divisor(bindings, 0);
     check_unclaimed(bindings, {{"mtp", 2}, {"vision", 1}, {"proposal", 1}});
 
@@ -819,6 +895,7 @@ void test_real_artifact(const char* path) {
     check_layers(bindings);
     check_geometry(bindings);
     check_routed_bank(bindings, 0);
+    check_activation_policy(bindings, 0);
     check_activation_divisor(bindings, 0);
     check_unclaimed(bindings, {{"mtp", 36}, {"vision", 441}, {"proposal", 1}});
 
