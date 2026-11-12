@@ -18,7 +18,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1055,6 +1057,241 @@ void test_flash_next_directory_metadata() {
               << directory.component_resources.size() << " component resource maps\n";
 }
 
+// The logical axes of a layout, as the test understands them: a stack of matrices, and inside one
+// matrix the rows and the columns.
+struct ViewAxes {
+    std::uint64_t matrices = 1;
+    std::uint64_t rows     = 1;
+    std::uint64_t columns  = 1;
+};
+
+// The rectangle a view is expected to report.
+struct ViewExpectation {
+    ViewAxes axes;
+    std::uint64_t matrix_begin = 0;
+    std::uint64_t matrix_count = 0;
+    std::uint64_t row_begin    = 0;
+    std::uint64_t row_count    = 0;
+    std::uint64_t column_begin = 0;
+    std::uint64_t column_count = 0;
+};
+
+// The element indices a view covers, recomputed from the element order: matrix-major, row-major
+// inside one matrix. The axes come from the caller, so the recomputation does not borrow the
+// implementation's own idea of them.
+std::vector<std::uint64_t> view_element_indices(const ninfer::artifact::ElementIntervalView& view,
+                                                 const ViewAxes& axes) {
+    const std::uint64_t per_matrix = axes.rows * axes.columns;
+    std::vector<std::uint64_t> indices;
+    indices.reserve(static_cast<std::size_t>(view.element_count));
+    for (std::uint64_t matrix = view.matrix_begin;
+         matrix < view.matrix_begin + view.matrix_count; ++matrix) {
+        for (std::uint64_t row = view.row_begin; row < view.row_begin + view.row_count; ++row) {
+            for (std::uint64_t column = view.column_begin;
+                 column < view.column_begin + view.column_count; ++column) {
+                indices.push_back(matrix * per_matrix + row * axes.columns + column);
+            }
+        }
+    }
+    std::sort(indices.begin(), indices.end());
+    return indices;
+}
+
+// A view must report the requested interval and the expected rectangle, and the elements of that
+// rectangle must be exactly the elements of the interval.
+void expect_element_view(StorageLayout layout, NumericFormat format,
+                         std::span<const std::uint64_t> shape, std::uint64_t begin,
+                         std::uint64_t count, const ViewExpectation& expected) {
+    const auto view = ninfer::artifact::tensor_element_interval_view(layout, format, shape, begin,
+                                                                      count);
+    if (view.layout != layout || view.linear_begin != begin || view.element_count != count) {
+        throw std::runtime_error(
+            "the element interval view does not report the requested interval");
+    }
+    if (view.matrix_begin != expected.matrix_begin || view.matrix_count != expected.matrix_count ||
+        view.row_begin != expected.row_begin || view.row_count != expected.row_count ||
+        view.column_begin != expected.column_begin ||
+        view.column_count != expected.column_count) {
+        throw std::runtime_error(
+            "the element interval view does not report the expected rectangle");
+    }
+    const auto indices = view_element_indices(view, expected.axes);
+    std::vector<std::uint64_t> wanted(count);
+    std::iota(wanted.begin(), wanted.end(), begin);
+    if (indices != wanted) {
+        throw std::runtime_error(
+            "the element interval view does not describe the requested elements");
+    }
+}
+
+// contiguous-le-v1 counts its elements in one linear order: matrix-major, row-major inside one
+// matrix.
+void test_element_view_contiguous() {
+    const std::array<std::uint64_t, 2> shape = {4, 6};
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 0, 24,
+                        ViewExpectation{{1, 4, 6}, 0, 1, 0, 4, 0, 6});
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 6, 12,
+                        ViewExpectation{{1, 4, 6}, 0, 1, 1, 2, 0, 6});
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 7, 5,
+                        ViewExpectation{{1, 4, 6}, 0, 1, 1, 1, 1, 5});
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 23, 1,
+                        ViewExpectation{{1, 4, 6}, 0, 1, 3, 1, 5, 1});
+
+    const std::array<std::uint64_t, 1> vector = {5};
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, vector, 2, 3,
+                        ViewExpectation{{1, 5, 1}, 0, 1, 2, 3, 0, 1});
+
+    // An interval that crosses a row boundary is not a rectangle of the logical axes.
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 2> shape = {4, 6};
+            (void)ninfer::artifact::tensor_element_interval_view(
+                StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 7, 6);
+        },
+        "rectangle");
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 2> shape = {4, 6};
+            (void)ninfer::artifact::tensor_element_interval_view(
+                StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 0, 25);
+        },
+        "last element");
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 2> shape = {4, 6};
+            (void)ninfer::artifact::tensor_element_interval_view(
+                StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 0, 0);
+        },
+        "empty");
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 2> shape = {4, 6};
+            (void)ninfer::artifact::tensor_element_interval_view(
+                StorageLayout::ContiguousLeV1, NumericFormat::NVFP4, shape, 0, 24);
+        },
+        "contiguous-le-v1");
+}
+
+// row-split-k128-v1 counts its elements row-major over the logical columns: the padded K of its
+// physical groups is not part of the logical order.
+void test_element_view_row_split() {
+    const std::array<std::uint64_t, 2> shape = {4, 256};
+    expect_element_view(StorageLayout::RowSplitK128V1, NumericFormat::W8G32_F16S, shape, 0, 512,
+                        ViewExpectation{{1, 4, 256}, 0, 1, 0, 2, 0, 256});
+    expect_element_view(StorageLayout::RowSplitK128V1, NumericFormat::W8G32_F16S, shape, 512, 256,
+                        ViewExpectation{{1, 4, 256}, 0, 1, 2, 1, 0, 256});
+    expect_element_view(StorageLayout::RowSplitK128V1, NumericFormat::W8G32_F16S, shape, 100, 6,
+                        ViewExpectation{{1, 4, 256}, 0, 1, 0, 1, 100, 6});
+
+    // The logical order stops at the logical K: the pad groups of the physical layout are not
+    // elements of the tensor's logical order.
+    const std::array<std::uint64_t, 2> padded = {4, 100};
+    expect_element_view(StorageLayout::RowSplitK128V1, NumericFormat::W8G32_F16S, padded, 0, 400,
+                        ViewExpectation{{1, 4, 100}, 0, 1, 0, 4, 0, 100});
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 2> padded = {4, 100};
+            (void)ninfer::artifact::tensor_element_interval_view(
+                StorageLayout::RowSplitK128V1, NumericFormat::W8G32_F16S, padded, 0, 401);
+        },
+        "last element");
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 2> shape = {4, 256};
+            (void)ninfer::artifact::tensor_element_interval_view(
+                StorageLayout::RowSplitK128V1, NumericFormat::BF16, shape, 0, 1024);
+        },
+        "grouped quantized format");
+}
+
+// row_paged_g16_4k_v1 counts its elements row-major over the rows of the table.
+void test_element_view_row_paged() {
+    const std::array<std::uint64_t, 2> shape = {10, 160};
+    expect_element_view(StorageLayout::RowPagedG16x4KV1, NumericFormat::NF4_G16_E4M3S, shape, 0,
+                        320, ViewExpectation{{1, 10, 160}, 0, 1, 0, 2, 0, 160});
+    expect_element_view(StorageLayout::RowPagedG16x4KV1, NumericFormat::NF4_G16_E4M3S, shape, 160,
+                        480, ViewExpectation{{1, 10, 160}, 0, 1, 1, 3, 0, 160});
+    expect_element_view(StorageLayout::RowPagedG16x4KV1, NumericFormat::NF4_G16_E4M3S, shape, 1590,
+                        10, ViewExpectation{{1, 10, 160}, 0, 1, 9, 1, 150, 10});
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 2> shape = {10, 160};
+            (void)ninfer::artifact::tensor_element_interval_view(
+                StorageLayout::RowPagedG16x4KV1, NumericFormat::NF4_G16_E4M3S, shape, 0, 1601);
+        },
+        "last element");
+}
+
+// batched_block_scale_k16_m128x4_v1 counts its elements matrix-major, row-major inside one
+// matrix: the expert gate is a row range of one expert matrix, not a range of the expert axis.
+void test_element_view_batched_block_scale() {
+    const std::array<std::uint64_t, 3> shape = {4, 128, 256};
+    const std::uint64_t matrix_elements = 128 * 256;
+    expect_element_view(StorageLayout::BatchedBlockScaleK16M128x4V1, NumericFormat::NVFP4, shape,
+                        0, 4 * matrix_elements,
+                        ViewExpectation{{4, 128, 256}, 0, 4, 0, 128, 0, 256});
+    expect_element_view(StorageLayout::BatchedBlockScaleK16M128x4V1, NumericFormat::NVFP4, shape,
+                        matrix_elements, 64 * 256,
+                        ViewExpectation{{4, 128, 256}, 1, 1, 0, 64, 0, 256});
+    expect_element_view(StorageLayout::BatchedBlockScaleK16M128x4V1, NumericFormat::NVFP4, shape,
+                        2 * matrix_elements + 64 * 256, 64 * 256,
+                        ViewExpectation{{4, 128, 256}, 2, 1, 64, 64, 0, 256});
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 3> shape = {4, 128, 256};
+            (void)ninfer::artifact::tensor_element_interval_view(
+                StorageLayout::BatchedBlockScaleK16M128x4V1, NumericFormat::NVFP4, shape,
+                128 * 256 + 100, 200);
+        },
+        "rectangle");
+}
+
+// block_scale_m128_k128_v1 counts its elements matrix-major, row-major inside one matrix, for a
+// single matrix as well as for a stack of matrices.
+void test_element_view_block_scale_m128_k128() {
+    const std::array<std::uint64_t, 2> single = {256, 256};
+    expect_element_view(StorageLayout::BlockScaleM128K128V1,
+                        NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, single, 0, 256 * 256,
+                        ViewExpectation{{1, 256, 256}, 0, 1, 0, 256, 0, 256});
+    expect_element_view(StorageLayout::BlockScaleM128K128V1,
+                        NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, single, 128 * 256, 128 * 256,
+                        ViewExpectation{{1, 256, 256}, 0, 1, 128, 128, 0, 256});
+
+    const std::array<std::uint64_t, 3> stack = {4, 256, 256};
+    expect_element_view(StorageLayout::BlockScaleM128K128V1,
+                        NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, stack, 0, 4 * 256 * 256,
+                        ViewExpectation{{4, 256, 256}, 0, 4, 0, 256, 0, 256});
+    expect_element_view(StorageLayout::BlockScaleM128K128V1,
+                        NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, stack, 256 * 256, 128 * 256,
+                        ViewExpectation{{4, 256, 256}, 1, 1, 0, 128, 0, 256});
+}
+
+// The remaining layouts count their elements the same way: the single-matrix NVFP4 blockscale,
+// the row-scaled FP8, and the GGML blocks.
+void test_element_view_remaining_layouts() {
+    const std::array<std::uint64_t, 2> nvfp4 = {128, 64};
+    expect_element_view(StorageLayout::BlockScaleK16M128x4V1, NumericFormat::NVFP4, nvfp4, 0,
+                        128 * 64, ViewExpectation{{1, 128, 64}, 0, 1, 0, 128, 0, 64});
+    expect_element_view(StorageLayout::BlockScaleK16M128x4V1, NumericFormat::NVFP4, nvfp4,
+                        64 * 64, 64 * 64,
+                        ViewExpectation{{1, 128, 64}, 0, 1, 64, 64, 0, 64});
+
+    const std::array<std::uint64_t, 2> row_scale = {4, 8};
+    expect_element_view(StorageLayout::RowScaleV1, NumericFormat::FP8_E4M3FN_ROW_BF16S, row_scale,
+                        8, 16, ViewExpectation{{1, 4, 8}, 0, 1, 1, 2, 0, 8});
+
+    const std::array<std::uint64_t, 2> ggml = {2, 256};
+    expect_element_view(StorageLayout::GgmlK256V1, NumericFormat::GGML_K, ggml, 256, 256,
+                        ViewExpectation{{1, 2, 256}, 0, 1, 1, 1, 0, 256});
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 2> ggml = {2, 128};
+            (void)ninfer::artifact::tensor_element_interval_view(StorageLayout::GgmlK256V1,
+                                                                NumericFormat::GGML_K, ggml, 0, 256);
+        },
+        "divisible by 256");
+}
+
 std::vector<PlacedObject> new_format_objects(std::uint64_t& fp8_offset,
                                              std::uint64_t& payload_bytes) {
     const std::array<std::uint64_t, 2> nf4_shape = {16, 160};
@@ -1471,6 +1708,12 @@ int main() {
         test_block128_slice_bytes();
         test_paged_layout_has_no_slice();
         test_column_slice_rank_rejection_unchanged();
+        test_element_view_contiguous();
+        test_element_view_row_split();
+        test_element_view_row_paged();
+        test_element_view_batched_block_scale();
+        test_element_view_block_scale_m128_k128();
+        test_element_view_remaining_layouts();
         test_flash_next_artifact_geometries();
         test_flash_next_directory_metadata();
         test_validate_only_accepts_new_quantized_formats();

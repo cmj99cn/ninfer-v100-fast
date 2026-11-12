@@ -422,6 +422,119 @@ void test_nvfp4_column_shard_smoke() {
     }
 }
 
+// The logical axes of an object, as the artifact's own shapes spell them: a stack of matrices, and
+// inside one matrix the rows and the columns.
+struct ViewAxes {
+    std::uint64_t matrices;
+    std::uint64_t rows;
+    std::uint64_t columns;
+};
+
+ViewAxes view_axes(const TensorDescriptor& tensor) {
+    if (tensor.shape.size() >= 3) {
+        return ViewAxes{tensor.shape[0], tensor.shape[1], tensor.shape[2]};
+    }
+    if (tensor.shape.size() == 2) { return ViewAxes{1, tensor.shape[0], tensor.shape[1]}; }
+    if (tensor.shape.size() == 1) { return ViewAxes{1, tensor.shape[0], 1}; }
+    return ViewAxes{1, 1, 1};
+}
+
+// A view must cover exactly the elements of the interval it was asked about. The element order is
+// matrix-major and row-major inside one matrix, so the first and the last element of the reported
+// rectangle fix the interval, and the rectangle must be contiguous in that order.
+void check_view_covers(const TensorDescriptor& tensor,
+                       const ninfer::artifact::ElementIntervalView& view, std::uint64_t begin,
+                       std::uint64_t end, const std::string& parameter) {
+    const auto axes       = view_axes(tensor);
+    const auto per_matrix = axes.rows * axes.columns;
+    if (view.element_count != end - begin) {
+        fail("the view of a part does not count the part's elements: " + parameter);
+    }
+    const auto first = view.matrix_begin * per_matrix + view.row_begin * axes.columns +
+                       view.column_begin;
+    if (first != begin) {
+        fail("the view of a part does not start at the part's first element: " + parameter);
+    }
+    const auto last = (view.matrix_begin + view.matrix_count - 1) * per_matrix +
+                      (view.row_begin + view.row_count - 1) * axes.columns + view.column_begin +
+                      view.column_count - 1;
+    if (last + 1 != end) {
+        fail("the view of a part does not end at the part's last element: " + parameter);
+    }
+    const bool contiguous =
+        view.matrix_count == 1
+            ? (view.row_count == 1 ||
+               (view.column_begin == 0 && view.column_count == axes.columns))
+            : (view.row_begin == 0 && view.row_count == axes.rows && view.column_begin == 0 &&
+               view.column_count == axes.columns);
+    if (!contiguous) {
+        fail("the view of a part is not a rectangle of the logical axes: " + parameter);
+    }
+}
+
+// Every part binding of the artifact is an element interval of one object, and every one of them
+// must map to a rectangle of that object's logical axes. The parts of an object also tile it
+// exactly, which is the artifact's own statement that the element order is the one the views
+// assume.
+void test_part_bindings_map_to_logical_views() {
+    Reader reader(artifact_path());
+    const auto& directory = reader.v3_directory();
+
+    std::map<StorageLayout, std::uint64_t> parts_per_layout;
+    std::map<std::string, std::vector<std::pair<std::uint64_t, std::uint64_t>>> parts_per_object;
+    std::uint64_t parts = 0;
+    for (const auto& [parameter, part_list] : directory.part_bindings) {
+        for (const auto& part : part_list) {
+            const auto* tensor = std::get_if<TensorDescriptor>(reader.find(part.object));
+            if (tensor == nullptr) {
+                fail("a part binding names an object that is not a tensor: " + part.object);
+            }
+            if (part.end <= part.begin) {
+                fail("a part binding names an empty interval: " + parameter);
+            }
+            const auto view = ninfer::artifact::tensor_element_interval_view(
+                tensor->layout, tensor->format, tensor->shape, part.begin, part.end - part.begin);
+            if (view.layout != tensor->layout) {
+                fail("the view of a part does not report the object's layout: " + parameter);
+            }
+            check_view_covers(*tensor, view, part.begin, part.end, parameter);
+            ++parts_per_layout[tensor->layout];
+            parts_per_object[part.object].emplace_back(part.begin, part.end);
+            ++parts;
+        }
+    }
+
+    if (parts != 76242) { fail("the artifact part census changed"); }
+    const std::map<StorageLayout, std::uint64_t> expected = {
+        {StorageLayout::BatchedBlockScaleK16M128x4V1, 73728},
+        {StorageLayout::BlockScaleM128K128V1, 1536},
+        {StorageLayout::ContiguousLeV1, 682},
+        {StorageLayout::RowPagedG16x4KV1, 128},
+        {StorageLayout::RowSplitK128V1, 168},
+    };
+    if (parts_per_layout != expected) {
+        fail("the artifact part census per layout changed");
+    }
+
+    for (const auto& [object, intervals] : parts_per_object) {
+        const auto* tensor = std::get_if<TensorDescriptor>(reader.find(object));
+        const auto axes   = view_axes(*tensor);
+        const auto total  = axes.matrices * axes.rows * axes.columns;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> sorted = intervals;
+        std::sort(sorted.begin(), sorted.end());
+        std::uint64_t cursor = 0;
+        for (const auto& [begin, end] : sorted) {
+            if (begin != cursor) { fail("the parts of an object do not tile it: " + object); }
+            cursor = end;
+        }
+        if (cursor != total) { fail("the parts of an object do not cover it: " + object); }
+    }
+
+    std::cout << "flash-next part bindings: " << parts << " intervals over "
+              << parts_per_object.size()
+              << " objects, every one a rectangle of its object's logical axes\n";
+}
+
 } // namespace
 
 int main() {
@@ -437,6 +550,7 @@ int main() {
         test_q8_g32_geometry_and_scales();
         test_nvfp4_expert_shard_smoke();
         test_nvfp4_column_shard_smoke();
+        test_part_bindings_map_to_logical_views();
     } catch (const std::exception& error) {
         std::cerr << "flash-next real artifact test failed: " << error.what() << "\n";
         return 1;

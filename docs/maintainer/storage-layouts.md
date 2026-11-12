@@ -524,3 +524,28 @@ Row slicing of the stack selects whole experts, and each selected expert contrib
 block, its 128-row scale tiles and its FP32 divisor, exactly as the single-matrix rule does.
 Column slicing takes one 64-aligned column range and narrows every expert with the single-matrix
 blockscale rule; the FP32 divisor of each expert is replicated.
+
+## 12. Element intervals
+
+A v3 binding part names the elements a parameter occupies inside one object, counted in the
+object's logical element order. That order is the same for every layout: matrix-major, and inside
+one matrix row-major over the logical columns. The logical axes follow the object's rank:
+
+| Rank | Matrix axis | Row axis | Column axis |
+|---|---|---|---|
+| 3 | `shape[0]` | `shape[1]` | `shape[2]` |
+| 2 | one matrix | `shape[0]` | `shape[1]` |
+| 1 | one matrix | `shape[0]` | one column |
+| 0 | one matrix | one row | one column |
+
+A rank-four or higher contiguous tensor keeps `shape[0]` as the matrix axis, the last dimension as
+the column axis, and the dimensions between them as the row axis.
+
+The row-split layout counts the logical columns only. `K_pad` is physical geometry (section 3.1)
+and is not part of the element order, so an interval that reaches into the pad is outside the
+tensor.
+
+`tensor_element_interval_view` maps a half open element interval to the rectangle it covers: the
+matrices, the rows of each matrix, and the columns of each row. An interval must lie inside the
+tensor and must be such a rectangle; an interval that no rectangle describes is rejected rather
+than approximated.

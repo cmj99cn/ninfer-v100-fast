@@ -1154,4 +1154,149 @@ BatchedBlockScaleGeometry batched_block_scale_geometry(NumericFormat format,
     return out;
 }
 
+namespace {
+
+// The logical axes an element interval is expressed in: a stack of matrices, and inside one matrix
+// the rows and the columns.
+struct ViewAxes {
+    std::uint64_t matrices = 1;
+    std::uint64_t rows     = 1;
+    std::uint64_t columns  = 1;
+};
+
+// The axes of a contiguous tensor: its shape is row-major, so the leading axis is the matrix
+// stack, the trailing axis is the column axis, and what lies between them is the row axis.
+ViewAxes contiguous_view_axes(std::span<const std::uint64_t> shape) {
+    for (const auto dimension : shape) {
+        if (dimension == 0) { throw ArtifactError("tensor shape dimensions must be positive"); }
+    }
+    ViewAxes axes;
+    if (shape.size() >= 3) {
+        axes.matrices = shape[0];
+        for (std::size_t index = 1; index + 1 < shape.size(); ++index) {
+            axes.rows = checked_mul(axes.rows, shape[index], "tensor row count");
+        }
+        axes.columns = shape.back();
+    } else if (shape.size() == 2) {
+        axes.rows    = shape[0];
+        axes.columns = shape[1];
+    } else if (shape.size() == 1) {
+        axes.rows = shape[0];
+    }
+    return axes;
+}
+
+// The axes of a layout, with its format and rank validated the way the layout's own geometry
+// validates them.
+ViewAxes element_view_axes(StorageLayout layout, NumericFormat format,
+                           std::span<const std::uint64_t> shape) {
+    switch (layout) {
+    case StorageLayout::ContiguousLeV1:
+        (void)direct_word_bytes(format);
+        return contiguous_view_axes(shape);
+    case StorageLayout::RowSplitK128V1: {
+        const auto geometry = row_split_geometry(format, shape);
+        return ViewAxes{1, geometry.rows, geometry.columns};
+    }
+    case StorageLayout::RowScaleV1: {
+        const auto geometry = row_scale_geometry(format, shape);
+        return ViewAxes{1, geometry.rows, geometry.columns};
+    }
+    case StorageLayout::GgmlK256V1:
+        if (format != NumericFormat::GGML_K || shape.size() != 2 || shape[0] == 0 ||
+            shape[1] == 0 || shape[1] % 256 != 0) {
+            throw ArtifactError("ggml-k256-v1 requires GGML_K [N,K] with K divisible by 256");
+        }
+        return ViewAxes{1, shape[0], shape[1]};
+    case StorageLayout::BlockScaleK16M128x4V1: {
+        const auto geometry = block_scale_geometry(format, shape);
+        return ViewAxes{1, geometry.rows, geometry.columns};
+    }
+    case StorageLayout::RowPagedG16x4KV1: {
+        const auto geometry = row_paged_nf4_geometry(format, shape);
+        return ViewAxes{1, geometry.rows, geometry.columns};
+    }
+    case StorageLayout::BlockScaleM128K128V1: {
+        const auto geometry = block_scale_m128_k128_geometry(format, shape);
+        return ViewAxes{geometry.matrices, geometry.rows, geometry.columns};
+    }
+    case StorageLayout::BatchedBlockScaleK16M128x4V1: {
+        const auto geometry = batched_block_scale_geometry(format, shape);
+        return ViewAxes{geometry.matrices, geometry.rows, geometry.columns};
+    }
+    }
+    throw ArtifactError("unknown tensor layout");
+}
+
+} // namespace
+
+ElementIntervalView tensor_element_interval_view(StorageLayout layout, NumericFormat format,
+                                                 std::span<const std::uint64_t> shape,
+                                                 std::uint64_t begin, std::uint64_t count) {
+    if (count == 0) {
+        throw ArtifactError("element interval view: an empty interval has no rectangle");
+    }
+    const ViewAxes axes   = element_view_axes(layout, format, shape);
+    const auto per_matrix = checked_mul(axes.rows, axes.columns, "matrix element count");
+    const auto total      = checked_mul(axes.matrices, per_matrix, "tensor element count");
+    const auto end        = checked_add(begin, count, "element interval end");
+    if (end > total) {
+        throw ArtifactError("element interval view: the interval reaches past the last element");
+    }
+
+    const auto matrix       = begin / per_matrix;
+    const auto offset       = begin % per_matrix;
+    const auto row          = offset / axes.columns;
+    const auto column       = offset % axes.columns;
+    const auto matrix_first = checked_mul(matrix, per_matrix, "element interval offset");
+    const auto row_first    = checked_add(
+        matrix_first, checked_mul(row, axes.columns, "element interval offset"),
+        "element interval offset");
+
+    ElementIntervalView view;
+    view.layout        = layout;
+    view.linear_begin  = begin;
+    view.element_count = count;
+
+    if (column != 0) {
+        // The interval starts inside a row, so it is a run of columns of that row, and it must not
+        // reach into the next one.
+        if (end > checked_add(row_first, axes.columns, "element interval row end")) {
+            throw ArtifactError("element interval view: the interval is not a rectangle");
+        }
+        view.matrix_begin = matrix;
+        view.matrix_count = 1;
+        view.row_begin    = row;
+        view.row_count    = 1;
+        view.column_begin = column;
+        view.column_count = count;
+        return view;
+    }
+
+    if (count % axes.columns != 0) {
+        throw ArtifactError("element interval view: the interval is not a rectangle");
+    }
+    const auto rows_covered = count / axes.columns;
+    if (rows_covered <= axes.rows - row) {
+        view.matrix_begin = matrix;
+        view.matrix_count = 1;
+        view.row_begin    = row;
+        view.row_count    = rows_covered;
+        view.column_begin = 0;
+        view.column_count = axes.columns;
+        return view;
+    }
+    // The interval reaches past the matrix it starts in, so it must cover whole matrices.
+    if (row != 0 || rows_covered % axes.rows != 0) {
+        throw ArtifactError("element interval view: the interval is not a rectangle");
+    }
+    view.matrix_begin = matrix;
+    view.matrix_count = rows_covered / axes.rows;
+    view.row_begin    = 0;
+    view.row_count    = axes.rows;
+    view.column_begin = 0;
+    view.column_count = axes.columns;
+    return view;
+}
+
 } // namespace ninfer::artifact

@@ -168,6 +168,43 @@ struct BatchedBlockScaleGeometry {
 BatchedBlockScaleGeometry batched_block_scale_geometry(NumericFormat format,
                                                        std::span<const std::uint64_t> shape);
 
+// --- Element intervals (v3 binding parts) -----------------------------------------------------
+//
+// A v3 binding part names the elements a parameter occupies inside one object, counted in the
+// object's own logical element order. `tensor_element_interval_view` turns such an interval into
+// the logical rectangle it covers: which matrices, which rows of each matrix, and which columns
+// of each row.
+//
+// The logical axes of a view follow the object's rank: a rank-three object is a stack of matrices,
+// a rank-two object is one matrix, and a rank-one object is one axis of rows. The matrix axis is
+// the object's shape[0] when it has one, the row axis is the matrix's output-feature axis, and
+// the column axis is its input-feature axis.
+//
+// Every layout the reader accepts counts its elements matrix-major and, inside one matrix,
+// row-major over the logical columns. The row-split layout counts the logical columns only: the
+// padded K of its physical groups is not part of the logical order, so an interval that reaches
+// into the pad is outside the tensor.
+//
+// An interval that no rectangle describes is an error: the view never approximates one.
+struct ElementIntervalView {
+    StorageLayout layout = StorageLayout::ContiguousLeV1;
+    std::uint64_t matrix_begin = 0;
+    std::uint64_t matrix_count = 0;
+    std::uint64_t row_begin = 0;
+    std::uint64_t row_count = 0;
+    std::uint64_t column_begin = 0;
+    std::uint64_t column_count = 0;
+    std::uint64_t linear_begin = 0;
+    std::uint64_t element_count = 0;
+};
+
+// The logical rectangle the half open element interval [begin, begin + count) covers inside a
+// tensor of the given layout, format and shape. The interval must lie inside the tensor and must
+// be a rectangle of the tensor's logical axes; anything else throws ArtifactError.
+ElementIntervalView tensor_element_interval_view(StorageLayout layout, NumericFormat format,
+                                                 std::span<const std::uint64_t> shape,
+                                                 std::uint64_t begin, std::uint64_t count);
+
 // --- Tensor slicing (TP2 sharded materialization) ---------------------------------------------
 //
 // A shard of a tensor is a *standalone tensor of the same layout and format* whose logical shape
