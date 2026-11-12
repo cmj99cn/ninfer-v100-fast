@@ -322,6 +322,9 @@ Weight staged_weight_view(NumericFormat format, const void* payload, std::int32_
 
 Tensor staged_tensor_view(DType dtype, const void* payload,
                           std::initializer_list<std::int32_t> shape) {
+    if (dtype == DType::NF4_G16_E4M3S || dtype == DType::FP8_E4M3FN_BLOCK128_BF16S) {
+        throw ArtifactError("decode lands in the qwen3.8-flash-next package");
+    }
     // Tensor is a non-owning view whose constructor takes a mutable pointer; the underlying
     // host/device backing is caller-owned and treated read-only through the view.
     return Tensor(const_cast<void*>(payload), dtype, shape);

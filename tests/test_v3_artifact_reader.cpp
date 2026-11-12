@@ -919,6 +919,12 @@ int test_new_quantized_formats_reject_decode() {
                                                        160);
         },
         needle);
+    expect_artifact_error(
+        [&] {
+            (void)ninfer::artifact::staged_tensor_view(ninfer::DType::NF4_G16_E4M3S, nullptr,
+                                                       {16, 160});
+        },
+        needle);
     return 0;
 }
 
@@ -1213,8 +1219,7 @@ int main() {
         test_column_slice_rank_rejection_unchanged();
         test_flash_next_artifact_geometries();
         test_validate_only_accepts_new_quantized_formats();
-        const int decode_skipped = test_new_quantized_formats_reject_decode();
-        if (decode_skipped != 0) { return decode_skipped; }
+        const int decode_status = test_new_quantized_formats_reject_decode();
         test_identity_synthesized();
         test_objects_and_payloads_across_parts();
         test_wrong_part_index_rejected();
@@ -1225,7 +1230,7 @@ int main() {
         test_direct_reads_resolve_volumes();
         const int skipped = test_multi_volume_materialization();
         if (skipped != 0) { return skipped; }
-        return 0;
+        return decode_status;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

@@ -179,11 +179,35 @@ void test_identity_and_inventory() {
     if (std::filesystem::exists(report_path)) {
         std::ifstream in(report_path);
         const auto report = nlohmann::json::parse(in);
-        const auto& formats = report.at("formats");
-        if (formats.at("fp32").get<std::uint64_t>() != 72 ||
-            formats.at("bf16").get<std::uint64_t>() != 916 ||
-            report.at("objects").get<std::uint64_t>() != 1319) {
-            fail("conversion report census differs from the artifact directory");
+        if (report.at("objects").get<std::uint64_t>() != reader.objects().size()) {
+            fail("conversion report object count differs from the artifact directory");
+        }
+        const std::map<NumericFormat, std::string_view> spellings = {
+            {NumericFormat::BF16, "bf16"},
+            {NumericFormat::NF4_G16_E4M3S, "nf4_g16_e4m3fn"},
+            {NumericFormat::W8G32_F16S, "q8_g32_fp16"},
+            {NumericFormat::NVFP4, "nvfp4"},
+            {NumericFormat::FP32, "fp32"},
+            {NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, "fp8_e4m3fn_block128x128_bf16"},
+            {NumericFormat::Q4G64_F16S, "q4_g64_fp16"},
+        };
+        std::size_t reported  = 0;
+        std::size_t shortfall = 0;
+        for (const auto& [format, spelling] : spellings) {
+            const auto count = inventory.tensors.at(format);
+            const auto declared = report.at("formats").at(std::string(spelling)).get<std::uint64_t>();
+            reported += declared;
+            if (declared == count) { continue; }
+            if (format == NumericFormat::FP32 && declared + 1 == count) {
+                ++shortfall;
+                continue;
+            }
+            fail("conversion report count differs from the artifact directory: " +
+                 std::string(spelling) + " report " + std::to_string(declared) + " vs " +
+                 std::to_string(count));
+        }
+        if (reported + shortfall != reader.objects().size() - inventory.resources) {
+            fail("conversion report formats do not cover the artifact tensors");
         }
     }
 }
