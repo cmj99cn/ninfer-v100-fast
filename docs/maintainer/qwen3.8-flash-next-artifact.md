@@ -132,7 +132,9 @@ gdn_conv_channels   = 2 * gdn_key_width + gdn_value_width   = 4096+6144 = 10240
 hc_lowrank          = 320
 rotary_dim          = head_dim * partial_rotary_factor      = 256 * 0.25 = 64
 indexer_block_budget = indexer_budget / indexer_compress_ratio = 2048 / 4 = 512
-ple_head_width      = ple_embed_dim / split_ngram_parts      = 2560 / 128 = 160
+ple_heads            = (ngram_size - 1) * heads_per_ngram = 2 * 8     = 16
+ple_head_width      = ple_embed_dim / ple_heads           = 2560 / 16 = 160
+split_ngram_parts    = 128                                   (the number of NF4 table shards)
 ```
 
 Two invariants follow from the configuration and must hold for any consumer: the MRoPE sections

@@ -1291,4 +1291,11 @@ ElementIntervalView tensor_element_interval_view(StorageLayout layout, NumericFo
     return view;
 }
 
+std::uint64_t tensor_logical_element_count(StorageLayout layout, NumericFormat format,
+                                           std::span<const std::uint64_t> shape) {
+    const ViewAxes axes = element_view_axes(layout, format, shape);
+    const auto per_matrix = checked_mul(axes.rows, axes.columns, "matrix element count");
+    return checked_mul(axes.matrices, per_matrix, "tensor element count");
+}
+
 } // namespace ninfer::artifact

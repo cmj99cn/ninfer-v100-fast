@@ -220,6 +220,15 @@ ElementIntervalView tensor_element_interval_view(StorageLayout layout, NumericFo
                                                  std::span<const std::uint64_t> shape,
                                                  std::uint64_t begin, std::uint64_t count);
 
+// The number of logical elements of a tensor: the elements in the tensor's own logical order,
+// without the padding a layout adds for its groups or tiles. A rank-three object counts the
+// elements of every matrix it stacks, a rank-two object its rows and columns, a rank-one object
+// its rows. It is the element count of the whole tensor, so
+// `tensor_element_interval_view(layout, format, shape, 0, count)` is the rectangle of the whole
+// tensor.
+std::uint64_t tensor_logical_element_count(StorageLayout layout, NumericFormat format,
+                                           std::span<const std::uint64_t> shape);
+
 // --- Tensor slicing (TP2 sharded materialization) ---------------------------------------------
 //
 // A shard of a tensor is a *standalone tensor of the same layout and format* whose logical shape

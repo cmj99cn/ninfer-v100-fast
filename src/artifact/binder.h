@@ -101,6 +101,11 @@ public:
     // targets use this read-only probe to bind them only when the startup feature selects them.
     [[nodiscard]] bool has_tensor(std::string_view name) const noexcept;
 
+    // The v3 directory metadata of the artifact: the per component configuration, the parameter
+    // binding table and the operator use edges. A target that binds parameters by name reads the
+    // binding table here; the binder itself binds objects, not names.
+    [[nodiscard]] const V3Directory& directory() const noexcept { return reader_.v3_directory(); }
+
     // The artifact's own stored numeric format for a tensor object. Binding the vocabulary
     // endpoints from this value keeps the artifact (FP8/FP16/BF16) authoritative instead of a
     // compile-time per-profile guess.
