@@ -8,7 +8,33 @@ The first public release was `v0.1.0` (2026-10-27). `v0.2.0` (2026-11-07) adds
 the FP16 text runtime, closes the BFCL multi-turn quality gap, and removes the
 FP16 path's decode/prefill regression. `v0.2.1` (2026-11-09) fixes Vision under
 the FP16 text runtime. `v0.2.2` (2026-11-11) fixes TP peer-access setup for
-device lists that do not start at device 0.
+device lists that do not start at device 0. `v0.2.3` (2026-11-12) fixes
+multi-instance routing against a warm home and surfaces host-cache diagnostics.
+
+## [0.2.3] - 2026-11-12
+
+### Fixed
+
+- Multi-instance admission billed every request at its reuse-blind gross page
+  count (`ceil((prompt + max + margin) / 64)`), so a warm home whose free pages
+  covered only the net bill was filtered out and a cold instance could evict it.
+  The router now derives the per-candidate net requirement (gross minus the
+  candidate's device-resident prefix; a host-manifest restore still allocates
+  device pages and does not reduce it), and the permit reserves exactly those
+  net pages instead of the gross upper bound.
+
+### Added
+
+- `--host-cache-mib` capacity documentation: the 80/20 block/snapshot budget
+  split, the per-slab sizing formula (`tp × per-rank page bytes`), and worked
+  examples for the TP2 NVFP4 profile (`1024` MiB ≈ 373 block slabs ≈ 24K host
+  prefix tokens; `12288` MiB ≈ 4485 slabs ≈ 287K).
+- Host-tier allocation-failure counters (`block_alloc_failures` /
+  `snapshot_alloc_failures` in `HostCacheMetrics`, exposed as Prometheus
+  `ninfer_prefix_cache_host_alloc_failures_total{kind="block|snapshot"}` and
+  JSON fields). Only caller-visible failures count; an allocation recovered by
+  evicting an older slab or manifest does not. Sustained growth means the host
+  budget is smaller than the working set and write-throughs are being skipped.
 
 ## [0.2.2] - 2026-11-11
 
