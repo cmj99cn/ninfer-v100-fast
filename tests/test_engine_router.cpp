@@ -224,7 +224,9 @@ int test_capacity_filter_and_home_slack() {
         },
     };
     std::vector<RouteCandidate> candidates{
-        make_candidate(1, 8192, 64, 0, 0, 4),
+        // Gross 67 pages do not fit, and its 8192-token prefix does not reduce this request's net
+        // bill below 3 pages, so the capacity filter still excludes it.
+        make_candidate(1, 8192, 2, 0, 0, 4),
         make_candidate(2, 4096, 128, 0, 0, 4),
         RouteCandidate{
             .instance = 3,
@@ -319,6 +321,71 @@ int test_sub_prompt_manifest_is_a_hint() {
     return failures;
 }
 
+// A warm candidate whose free pages cover only the net requirement (gross minus the device-resident
+// prefix) must stay admissible and beat a cold candidate with room for the gross bill.
+int test_device_frontier_reduces_admission_pages() {
+    const Clock::time_point now = Clock::now();
+    std::array<PendingRequest, 1> pending{
+        PendingRequest{
+            .id = 1, .prompt_tokens = 4096, .max_tokens = 128, .required_pages = 67,
+            .enqueued = now, .has_home = false,
+        },
+    };
+    std::vector<RouteCandidate> candidates{
+        make_candidate(1, 4096, 3, 0, 0, 4),
+        make_candidate(2, 0, 67, 0, 0, 4),
+    };
+
+    const EngineRouter router;
+    const auto decision = router.pick(pending, provider_for(candidates), instance_ids(candidates), now);
+    int failures = check(decision.has_value(), "net-page routing returned no decision");
+    if (failures != 0) { return failures; }
+    failures += check(decision->instance == 1, "the warm candidate was filtered by the gross page bill");
+    failures += check(decision->reserved_pages == 3, "the decision did not carry the net page reservation");
+    return failures;
+}
+
+// A host-manifest restore still allocates device pages, so only the device frontier reduces the
+// reservation; the manifest frontier remains a hint and must not lower `reserved_pages`.
+int test_manifest_frontier_does_not_reduce_admission_pages() {
+    const Clock::time_point now = Clock::now();
+    std::array<PendingRequest, 1> pending{
+        PendingRequest{
+            .id = 1, .prompt_tokens = 4096, .max_tokens = 128, .required_pages = 67,
+            .enqueued = now, .has_home = false,
+        },
+    };
+    RouteCandidate manifest_only{
+        .instance = 1,
+        .probe = {.device_frontier = 0, .manifest_frontier = 2048, .manifest_id = 7},
+        .capacity = {
+            .free_pages = 66,
+            .total_pages = 4096,
+            .max_concurrency = 4,
+        },
+    };
+    std::vector<RouteCandidate> no_room{manifest_only, make_candidate(2, 0, 67, 0, 0, 4)};
+
+    const EngineRouter router;
+    const auto filtered = router.pick(pending, provider_for(no_room), instance_ids(no_room), now);
+    int failures = check(filtered.has_value(), "manifest-only routing returned no decision");
+    if (failures != 0) { return failures; }
+    failures += check(filtered->instance == 2,
+                      "a manifest frontier reduced the device-page admission bill");
+
+    manifest_only.capacity.free_pages = 67;
+    std::vector<RouteCandidate> fits{manifest_only, make_candidate(2, 0, 67, 0, 0, 4)};
+    const auto decision = router.pick(pending, provider_for(fits), instance_ids(fits), now);
+    failures += check(decision.has_value(), "manifest hint routing returned no decision");
+    if (decision.has_value()) {
+        failures += check(decision->instance == 1, "the manifest hint did not win");
+        failures += check(decision->use_hint, "the manifest hint was not selected");
+        failures += check(decision->reserved_pages == 67,
+                          "the manifest hint reduced the device-page reservation");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -332,6 +399,8 @@ int main() {
     failures += test_capacity_filter_and_home_slack();
     failures += test_full_prompt_manifest_is_not_a_hint();
     failures += test_sub_prompt_manifest_is_a_hint();
+    failures += test_device_frontier_reduces_admission_pages();
+    failures += test_manifest_frontier_does_not_reduce_admission_pages();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

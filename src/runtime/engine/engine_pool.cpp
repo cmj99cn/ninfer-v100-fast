@@ -237,7 +237,7 @@ std::optional<runtime::RouteDecision> EnginePool::pick_locked() const {
 void EnginePool::apply_locked(const std::shared_ptr<Entry>& entry,
                               const runtime::RouteDecision& decision) {
     if (entry->routed) { return; }
-    auto permit = std::make_shared<Permit>(*this, decision.instance, entry->route.required_pages);
+    auto permit = std::make_shared<Permit>(*this, decision.instance, decision.reserved_pages);
     entry->permit   = permit;
     entry->instance = decision.instance;
     if (decision.use_hint && decision.manifest_frontier > 0) {

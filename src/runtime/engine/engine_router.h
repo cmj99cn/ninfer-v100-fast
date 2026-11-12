@@ -11,10 +11,11 @@
 
 namespace ninfer::runtime {
 
-// One ingress request awaiting a routing decision. `required_pages` is the authoritative filter
-// input for `pick`: the caller computes it as
+// One ingress request awaiting a routing decision. `required_pages` is the reuse-blind gross
+// upper bound, computed by the caller as
 // `ceil((prompt_tokens + max_tokens + safety_margin_tokens) / 64)` from the router Config before
-// enqueueing; `pick` consumes the stored value and never re-derives the formula.
+// enqueueing; the router subtracts each candidate's device-resident prefix to derive the net
+// page requirement per candidate.
 struct PendingRequest {
     // Assigned by the pool on admission; callers leave it 0.
     std::uint64_t id = 0;
@@ -47,6 +48,9 @@ struct RouteDecision {
     bool use_hint = false;
     std::uint64_t manifest_id = 0;
     std::uint32_t manifest_frontier = 0;
+    // Net pages to reserve on the chosen instance: gross `required_pages` minus the candidate's
+    // device-resident prefix. The pool's permit holds exactly this many pages.
+    std::uint32_t reserved_pages = 0;
 };
 
 // Pure host-side scoring over pending requests and candidate capacity views: no device work, no
@@ -66,12 +70,13 @@ public:
 
     // Chooses the (pending, candidate) pair with the deepest usable prefix. For every pending the
     // provider is called once per instance in `instances`, so each (pending, candidate) pair is
-    // scored with its own probe. Candidates must have room for the pending's `required_pages` (the
-    // single authority, computed by the caller) and a free lane. The home bonus applies only to an
-    // idle home candidate. Equal scores break by `(pending_requests, active_requests, instance)`
-    // ascending, and equal best scores across pendings keep the earlier (queue-head) pending. An aged
-    // queue head dispatches to its own best candidate regardless of deeper prefixes elsewhere in the
-    // queue. `nullopt` only when no pending has any fitting candidate.
+    // scored with its own probe. Candidates must have room for the pending's net page requirement
+    // (gross `required_pages` minus the candidate's device-resident prefix) and a free lane. The
+    // home bonus applies only to an idle home candidate. Equal scores break by
+    // `(pending_requests, active_requests, instance)` ascending, and equal best scores across
+    // pendings keep the earlier (queue-head) pending. An aged queue head dispatches to its own
+    // best candidate regardless of deeper prefixes elsewhere in the queue. `nullopt` only when no
+    // pending has any fitting candidate.
     [[nodiscard]] std::optional<RouteDecision> pick(std::span<const PendingRequest> pending,
                                       const CandidateProvider& provider,
                                       std::span<const std::uint32_t> instances,

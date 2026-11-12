@@ -43,11 +43,16 @@ void check(bool condition, const char* message) {
 // One scripted instance view: a fixed capacity reading, no probe chain, no device.
 class FakeView : public PoolInstanceView {
 public:
-    FakeView(std::uint32_t max_concurrency, std::uint32_t free_pages)
-        : max_concurrency_(max_concurrency), free_pages_(free_pages) {}
+    FakeView(std::uint32_t max_concurrency, std::uint32_t free_pages,
+             std::uint32_t device_frontier = 0)
+        : max_concurrency_(max_concurrency), free_pages_(free_pages),
+          device_frontier_(device_frontier) {}
 
     ninfer::PrefixProbe probe(std::span<const std::uint64_t> hashes) const override {
-        return ninfer::PrefixProbe{.block_tokens = 64};
+        return ninfer::PrefixProbe{
+            .device_frontier = device_frontier_,
+            .block_tokens = 64,
+        };
     }
 
     ninfer::CapacitySnapshot capacity() const override {
@@ -65,6 +70,7 @@ public:
 private:
     std::uint32_t max_concurrency_;
     std::uint32_t free_pages_;
+    std::uint32_t device_frontier_;
 };
 
 EnginePool::GroupOptions group(int device) {
@@ -280,6 +286,29 @@ void test_permit_timeout_is_queue_timeout() {
     check(pool.permits_held() == 0, "wait() did not release the permits");
 }
 
+// A warm home whose free pages cover only the net requirement (gross minus its device-resident
+// prefix) must win, and its permit must reserve that net bill, not the reuse-blind gross one.
+void test_warm_home_reserves_net_pages() {
+    EnginePool::Options options;
+    options.groups                  = {group(0), group(1)};
+    options.global_pending_requests = 16;
+
+    std::vector<std::unique_ptr<PoolInstanceView>> views;
+    views.push_back(std::make_unique<FakeView>(2, 40, 2048));
+    views.push_back(std::make_unique<FakeView>(2, 67, 0));
+    EnginePool pool(options, std::move(views));
+
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    PoolHandle warm = pool.admit(pending(67, 0, false), deadline);
+    check(warm.instance() == 0, "the warm home was filtered by the gross page bill");
+    check(pool.permits_held() == 1, "the warm-home permit was not held");
+
+    // Instance 0 has 40 free pages minus the 35 reserved for the warm permit, so a second request
+    // cannot reserve another net 35 there; instance 1 still fits the gross 67.
+    PoolHandle second = pool.admit(pending(67, 0, false), deadline);
+    check(second.instance() == 1, "the net permit did not bound the warm instance's free pages");
+}
+
 } // namespace
 
 int main() {
@@ -288,6 +317,7 @@ int main() {
     test_cancel_waiter_releases_permit();
     test_global_queue_full_is_overloaded();
     test_permit_timeout_is_queue_timeout();
+    test_warm_home_reserves_net_pages();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

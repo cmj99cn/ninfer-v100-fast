@@ -1,13 +1,30 @@
 #include "runtime/engine/engine_router.h"
 
+#include <algorithm>
 #include <vector>
 
 namespace ninfer::runtime {
 
 namespace {
 
-[[nodiscard]] bool has_room(const RouteCandidate& candidate, std::uint32_t required_pages) noexcept {
-    return candidate.capacity.free_pages >= required_pages &&
+// Net device pages the request newly allocates on this candidate. The device-resident prefix
+// (device_frontier) is shared with the candidate's cache, so only tokens beyond it need fresh
+// pages; a manifest (host-tier) restore still allocates device pages and does not reduce the
+// page bill. `required_pages` on the pending request stays the reuse-blind gross upper bound;
+// the router derives the per-candidate net requirement from the same formula minus the reuse.
+[[nodiscard]] std::uint32_t net_required_pages(const RouteCandidate& candidate,
+                                               const PendingRequest& request,
+                                               const EngineRouter::Config& config) noexcept {
+    const std::uint64_t reuse =
+        std::min<std::uint64_t>(candidate.probe.device_frontier, request.prompt_tokens);
+    const std::uint64_t tokens = static_cast<std::uint64_t>(request.prompt_tokens) +
+                                 request.max_tokens + config.safety_margin_tokens - reuse;
+    return static_cast<std::uint32_t>((tokens + config.block_tokens - 1) / config.block_tokens);
+}
+
+[[nodiscard]] bool has_room(const RouteCandidate& candidate, const PendingRequest& request,
+                            const EngineRouter::Config& config) noexcept {
+    return candidate.capacity.free_pages >= net_required_pages(candidate, request, config) &&
            candidate.capacity.active_requests + candidate.capacity.pending_requests <
                candidate.capacity.max_concurrency;
 }
@@ -49,14 +66,15 @@ namespace {
 }
 
 // Index of the best fitting candidate for one pending, or nullopt when none has room. The filter
-// consumes `request.required_pages` as the single authority; the router never re-derives it.
+// derives the per-candidate net page requirement (gross `required_pages` minus the candidate's
+// device-resident prefix); a warm home is no longer evicted by a reuse-blind gross check.
 [[nodiscard]] std::optional<std::size_t> best_candidate(const PendingRequest& request,
                                         std::span<const RouteCandidate> candidates,
                                         const EngineRouter::Config& config) {
     std::optional<std::size_t> best;
     for (std::size_t i = 0; i < candidates.size(); ++i) {
         const RouteCandidate& candidate = candidates[i];
-        if (!has_room(candidate, request.required_pages)) { continue; }
+        if (!has_room(candidate, request, config)) { continue; }
         if (!best.has_value() || score(candidate, request, config) > score(candidates[*best], request, config) ||
             (score(candidate, request, config) == score(candidates[*best], request, config) &&
              tie_breaks_before(candidate, candidates[*best]))) {
@@ -67,7 +85,8 @@ namespace {
 }
 
 [[nodiscard]] RouteDecision decision_for(std::size_t pending_index, const RouteCandidate& candidate,
-                                         const PendingRequest& request) {
+                                         const PendingRequest& request,
+                                         const EngineRouter::Config& config) {
     const std::uint32_t manifest = usable_manifest_frontier(candidate, request);
     return RouteDecision{
         .pending_index = pending_index,
@@ -75,6 +94,7 @@ namespace {
         .use_hint = manifest > 0,
         .manifest_id = manifest > 0 ? candidate.probe.manifest_id : 0,
         .manifest_frontier = manifest,
+        .reserved_pages = net_required_pages(candidate, request, config),
     };
 }
 
@@ -93,7 +113,7 @@ std::optional<RouteDecision> EngineRouter::pick(std::span<const PendingRequest> 
     }
     const auto head_best = best_candidate(pending[0], head_candidates, config_);
     if (head_best.has_value() && now - pending[0].enqueued >= config_.fairness_aging) {
-        return decision_for(0, head_candidates[*head_best], pending[0]);
+        return decision_for(0, head_candidates[*head_best], pending[0], config_);
     }
 
     std::optional<std::size_t> chosen_pending;
@@ -115,7 +135,7 @@ std::optional<RouteDecision> EngineRouter::pick(std::span<const PendingRequest> 
         }
     }
     if (!chosen_pending.has_value()) { return std::nullopt; }
-    return decision_for(*chosen_pending, chosen_candidate, pending[*chosen_pending]);
+    return decision_for(*chosen_pending, chosen_candidate, pending[*chosen_pending], config_);
 }
 
 } // namespace ninfer::runtime
