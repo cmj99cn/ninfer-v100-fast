@@ -525,13 +525,18 @@ block, its 128-row scale tiles and its FP32 divisor, exactly as the single-matri
 Column slicing takes one 64-aligned column range and narrows every expert with the single-matrix
 blockscale rule; the FP32 divisor of each expert is replicated.
 
+The stack's axis 0 is its expert axis, and it is the axis `tensor_row_slice` splits for a batched
+object. The element intervals of section 12 name that same axis as the matrix axis: an expert
+number is a matrix number, and the rows inside one expert's own `[N,K]` matrix are that matrix's
+output-feature rows.
+
 ## 12. Element intervals
 
 A v3 binding part names the elements a parameter occupies inside one object, counted in the
 object's logical element order. That order is the same for every layout: matrix-major, and inside
 one matrix row-major over the logical columns. The logical axes follow the object's rank:
 
-| Rank | Matrix axis | Row axis | Column axis |
+| Rank | Matrix axis | Matrix-internal row axis | Column axis |
 |---|---|---|---|
 | 3 | `shape[0]` | `shape[1]` | `shape[2]` |
 | 2 | one matrix | `shape[0]` | `shape[1]` |
@@ -539,7 +544,13 @@ one matrix row-major over the logical columns. The logical axes follow the objec
 | 0 | one matrix | one row | one column |
 
 A rank-four or higher contiguous tensor keeps `shape[0]` as the matrix axis, the last dimension as
-the column axis, and the dimensions between them as the row axis.
+the column axis, and the product of the dimensions between them as the matrix-internal row axis.
+
+The matrix axis and the matrix-internal row axis are different axes. `tensor_row_slice` splits
+axis 0, which is the matrix axis of a rank-three object -- the expert axis of a batched expert
+library (section 11) -- and the matrix-internal row axis of a rank-two object. An element interval
+of a batched object therefore names an expert in its matrix range and a row inside that expert's
+own matrix in its matrix-internal row range.
 
 The row-split layout counts the logical columns only. `K_pad` is physical geometry (section 3.1)
 and is not part of the element order, so an interval that reaches into the pad is outside the
@@ -548,4 +559,5 @@ tensor.
 `tensor_element_interval_view` maps a half open element interval to the rectangle it covers: the
 matrices, the rows of each matrix, and the columns of each row. An interval must lie inside the
 tensor and must be such a rectangle; an interval that no rectangle describes is rejected rather
-than approximated.
+than approximated, and so is an empty interval, which has no rectangle. A rejected interval
+reports the layout, the interval and the object's element count.

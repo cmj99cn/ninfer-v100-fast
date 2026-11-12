@@ -450,22 +450,24 @@ void check_view_covers(const TensorDescriptor& tensor,
     if (view.element_count != end - begin) {
         fail("the view of a part does not count the part's elements: " + parameter);
     }
-    const auto first = view.matrix_begin * per_matrix + view.row_begin * axes.columns +
+    const auto first = view.matrix_begin * per_matrix + view.matrix_row_begin * axes.columns +
                        view.column_begin;
     if (first != begin) {
         fail("the view of a part does not start at the part's first element: " + parameter);
     }
     const auto last = (view.matrix_begin + view.matrix_count - 1) * per_matrix +
-                      (view.row_begin + view.row_count - 1) * axes.columns + view.column_begin +
+                      (view.matrix_row_begin + view.matrix_row_count - 1) * axes.columns +
+                      view.column_begin +
                       view.column_count - 1;
     if (last + 1 != end) {
         fail("the view of a part does not end at the part's last element: " + parameter);
     }
     const bool contiguous =
         view.matrix_count == 1
-            ? (view.row_count == 1 ||
+            ? (view.matrix_row_count == 1 ||
                (view.column_begin == 0 && view.column_count == axes.columns))
-            : (view.row_begin == 0 && view.row_count == axes.rows && view.column_begin == 0 &&
+            : (view.matrix_row_begin == 0 && view.matrix_row_count == axes.rows &&
+               view.column_begin == 0 &&
                view.column_count == axes.columns);
     if (!contiguous) {
         fail("the view of a part is not a rectangle of the logical axes: " + parameter);

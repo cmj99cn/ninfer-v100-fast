@@ -1156,16 +1156,12 @@ BatchedBlockScaleGeometry batched_block_scale_geometry(NumericFormat format,
 
 namespace {
 
-// The logical axes an element interval is expressed in: a stack of matrices, and inside one matrix
-// the rows and the columns.
 struct ViewAxes {
     std::uint64_t matrices = 1;
     std::uint64_t rows     = 1;
     std::uint64_t columns  = 1;
 };
 
-// The axes of a contiguous tensor: its shape is row-major, so the leading axis is the matrix
-// stack, the trailing axis is the column axis, and what lies between them is the row axis.
 ViewAxes contiguous_view_axes(std::span<const std::uint64_t> shape) {
     for (const auto dimension : shape) {
         if (dimension == 0) { throw ArtifactError("tensor shape dimensions must be positive"); }
@@ -1186,8 +1182,6 @@ ViewAxes contiguous_view_axes(std::span<const std::uint64_t> shape) {
     return axes;
 }
 
-// The axes of a layout, with its format and rank validated the way the layout's own geometry
-// validates them.
 ViewAxes element_view_axes(StorageLayout layout, NumericFormat format,
                            std::span<const std::uint64_t> shape) {
     switch (layout) {
@@ -1233,69 +1227,67 @@ ViewAxes element_view_axes(StorageLayout layout, NumericFormat format,
 ElementIntervalView tensor_element_interval_view(StorageLayout layout, NumericFormat format,
                                                  std::span<const std::uint64_t> shape,
                                                  std::uint64_t begin, std::uint64_t count) {
-    if (count == 0) {
-        throw ArtifactError("element interval view: an empty interval has no rectangle");
-    }
     const ViewAxes axes   = element_view_axes(layout, format, shape);
     const auto per_matrix = checked_mul(axes.rows, axes.columns, "matrix element count");
     const auto total      = checked_mul(axes.matrices, per_matrix, "tensor element count");
     const auto end        = checked_add(begin, count, "element interval end");
+    const std::string context =
+        "element interval view: layout " + std::string(layout_name(layout)) + ", begin " +
+        std::to_string(begin) + ", count " + std::to_string(count) + ", object elements " +
+        std::to_string(total);
+    if (count == 0) {
+        throw ArtifactError(context + ": an empty interval has no rectangle");
+    }
     if (end > total) {
-        throw ArtifactError("element interval view: the interval reaches past the last element");
+        throw ArtifactError(context + ": the interval reaches past the last element");
     }
 
-    const auto matrix       = begin / per_matrix;
-    const auto offset       = begin % per_matrix;
-    const auto row          = offset / axes.columns;
-    const auto column       = offset % axes.columns;
-    const auto matrix_first = checked_mul(matrix, per_matrix, "element interval offset");
-    const auto row_first    = checked_add(
-        matrix_first, checked_mul(row, axes.columns, "element interval offset"),
-        "element interval offset");
+    const auto matrix = begin / per_matrix;
+    const auto offset = begin % per_matrix;
+    const auto row    = offset / axes.columns;
+    const auto column = offset % axes.columns;
+    const auto row_first = checked_add(
+        checked_mul(matrix, per_matrix, "element interval offset"),
+        checked_mul(row, axes.columns, "element interval offset"), "element interval offset");
+    const auto row_end   = checked_add(row_first, axes.columns, "element interval row end");
 
     ElementIntervalView view;
     view.layout        = layout;
     view.linear_begin  = begin;
     view.element_count = count;
 
-    if (column != 0) {
-        // The interval starts inside a row, so it is a run of columns of that row, and it must not
-        // reach into the next one.
-        if (end > checked_add(row_first, axes.columns, "element interval row end")) {
-            throw ArtifactError("element interval view: the interval is not a rectangle");
-        }
-        view.matrix_begin = matrix;
-        view.matrix_count = 1;
-        view.row_begin    = row;
-        view.row_count    = 1;
-        view.column_begin = column;
-        view.column_count = count;
+    if (end <= row_end) {
+        view.matrix_begin     = matrix;
+        view.matrix_count     = 1;
+        view.matrix_row_begin = row;
+        view.matrix_row_count = 1;
+        view.column_begin     = column;
+        view.column_count     = count;
         return view;
     }
 
-    if (count % axes.columns != 0) {
-        throw ArtifactError("element interval view: the interval is not a rectangle");
+    if (column != 0 || count % axes.columns != 0) {
+        throw ArtifactError(context + ": the interval is not a rectangle");
     }
     const auto rows_covered = count / axes.columns;
     if (rows_covered <= axes.rows - row) {
-        view.matrix_begin = matrix;
-        view.matrix_count = 1;
-        view.row_begin    = row;
-        view.row_count    = rows_covered;
-        view.column_begin = 0;
-        view.column_count = axes.columns;
+        view.matrix_begin     = matrix;
+        view.matrix_count     = 1;
+        view.matrix_row_begin = row;
+        view.matrix_row_count = rows_covered;
+        view.column_begin     = 0;
+        view.column_count     = axes.columns;
         return view;
     }
-    // The interval reaches past the matrix it starts in, so it must cover whole matrices.
     if (row != 0 || rows_covered % axes.rows != 0) {
-        throw ArtifactError("element interval view: the interval is not a rectangle");
+        throw ArtifactError(context + ": the interval is not a rectangle");
     }
-    view.matrix_begin = matrix;
-    view.matrix_count = rows_covered / axes.rows;
-    view.row_begin    = 0;
-    view.row_count    = axes.rows;
-    view.column_begin = 0;
-    view.column_count = axes.columns;
+    view.matrix_begin     = matrix;
+    view.matrix_count     = rows_covered / axes.rows;
+    view.matrix_row_begin = 0;
+    view.matrix_row_count = axes.rows;
+    view.column_begin     = 0;
+    view.column_count     = axes.columns;
     return view;
 }
 

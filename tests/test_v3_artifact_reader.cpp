@@ -234,6 +234,26 @@ void expect_artifact_error(Function&& function, std::string_view needle) {
     throw std::runtime_error("invalid v3 multi-part artifact was accepted");
 }
 
+// A rejection has to name the layout, the interval and the object's element count, so that the
+// failing part of an artifact can be located.
+template <typename Function>
+void expect_artifact_error_mentions(Function&& function,
+                                    std::initializer_list<std::string_view> needles) {
+    try {
+        function();
+    } catch (const ArtifactError& error) {
+        const std::string_view message = error.what();
+        for (const auto needle : needles) {
+            if (message.find(needle) == std::string_view::npos) {
+                throw std::runtime_error(std::string("the rejection does not mention ") +
+                                         std::string(needle) + ": " + std::string(message));
+            }
+        }
+        return;
+    }
+    throw std::runtime_error("an invalid element interval was accepted");
+}
+
 // The v3 container spells its formats, layouts and encodings in lower case snake case. The table
 // accepts every spelling an upstream v3 artifact uses; it is a superset of the narrow 27B adapter,
 // not a claim about upstream's complete legal set. A value's canonical name is the spelling of the
@@ -1070,8 +1090,8 @@ struct ViewExpectation {
     ViewAxes axes;
     std::uint64_t matrix_begin = 0;
     std::uint64_t matrix_count = 0;
-    std::uint64_t row_begin    = 0;
-    std::uint64_t row_count    = 0;
+    std::uint64_t matrix_row_begin = 0;
+    std::uint64_t matrix_row_count = 0;
     std::uint64_t column_begin = 0;
     std::uint64_t column_count = 0;
 };
@@ -1086,7 +1106,8 @@ std::vector<std::uint64_t> view_element_indices(const ninfer::artifact::ElementI
     indices.reserve(static_cast<std::size_t>(view.element_count));
     for (std::uint64_t matrix = view.matrix_begin;
          matrix < view.matrix_begin + view.matrix_count; ++matrix) {
-        for (std::uint64_t row = view.row_begin; row < view.row_begin + view.row_count; ++row) {
+        for (std::uint64_t row = view.matrix_row_begin;
+             row < view.matrix_row_begin + view.matrix_row_count; ++row) {
             for (std::uint64_t column = view.column_begin;
                  column < view.column_begin + view.column_count; ++column) {
                 indices.push_back(matrix * per_matrix + row * axes.columns + column);
@@ -1109,7 +1130,8 @@ void expect_element_view(StorageLayout layout, NumericFormat format,
             "the element interval view does not report the requested interval");
     }
     if (view.matrix_begin != expected.matrix_begin || view.matrix_count != expected.matrix_count ||
-        view.row_begin != expected.row_begin || view.row_count != expected.row_count ||
+        view.matrix_row_begin != expected.matrix_row_begin ||
+        view.matrix_row_count != expected.matrix_row_count ||
         view.column_begin != expected.column_begin ||
         view.column_count != expected.column_count) {
         throw std::runtime_error(
@@ -1130,16 +1152,40 @@ void test_element_view_contiguous() {
     const std::array<std::uint64_t, 2> shape = {4, 6};
     expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 0, 24,
                         ViewExpectation{{1, 4, 6}, 0, 1, 0, 4, 0, 6});
-    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 6, 12,
-                        ViewExpectation{{1, 4, 6}, 0, 1, 1, 2, 0, 6});
-    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 7, 5,
-                        ViewExpectation{{1, 4, 6}, 0, 1, 1, 1, 1, 5});
     expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 23, 1,
                         ViewExpectation{{1, 4, 6}, 0, 1, 3, 1, 5, 1});
+
+    // A run of columns inside one row is a rectangle, whichever end of the row it starts from.
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 6, 3,
+                        ViewExpectation{{1, 4, 6}, 0, 1, 1, 1, 0, 3});
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 7, 5,
+                        ViewExpectation{{1, 4, 6}, 0, 1, 1, 1, 1, 5});
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 8, 4,
+                        ViewExpectation{{1, 4, 6}, 0, 1, 1, 1, 2, 4});
+
+    // A run of whole rows is a rectangle as well.
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 6, 12,
+                        ViewExpectation{{1, 4, 6}, 0, 1, 1, 2, 0, 6});
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 0, 18,
+                        ViewExpectation{{1, 4, 6}, 0, 1, 0, 3, 0, 6});
 
     const std::array<std::uint64_t, 1> vector = {5};
     expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, vector, 2, 3,
                         ViewExpectation{{1, 5, 1}, 0, 1, 2, 3, 0, 1});
+
+    // A rank-three contiguous tensor is a stack of matrices, and a rank-four one keeps its first
+    // dimension as the matrix axis and the product of the dimensions between the first and the
+    // last as the matrix-internal row axis.
+    const std::array<std::uint64_t, 3> stack = {2, 3, 4};
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, stack, 0, 24,
+                        ViewExpectation{{2, 3, 4}, 0, 2, 0, 3, 0, 4});
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, stack, 12, 12,
+                        ViewExpectation{{2, 3, 4}, 1, 1, 0, 3, 0, 4});
+    const std::array<std::uint64_t, 4> deep = {2, 3, 4, 5};
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, deep, 0, 120,
+                        ViewExpectation{{2, 12, 5}, 0, 2, 0, 12, 0, 5});
+    expect_element_view(StorageLayout::ContiguousLeV1, NumericFormat::BF16, deep, 70, 2,
+                        ViewExpectation{{2, 12, 5}, 1, 1, 2, 1, 0, 2});
 
     // An interval that crosses a row boundary is not a rectangle of the logical axes.
     expect_artifact_error(
@@ -1147,6 +1193,13 @@ void test_element_view_contiguous() {
             const std::array<std::uint64_t, 2> shape = {4, 6};
             (void)ninfer::artifact::tensor_element_interval_view(
                 StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 7, 6);
+        },
+        "rectangle");
+    expect_artifact_error(
+        [] {
+            const std::array<std::uint64_t, 2> shape = {4, 6};
+            (void)ninfer::artifact::tensor_element_interval_view(
+                StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 0, 20);
         },
         "rectangle");
     expect_artifact_error(
@@ -1163,6 +1216,22 @@ void test_element_view_contiguous() {
                 StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 0, 0);
         },
         "empty");
+
+    // A rejection names the layout, the interval and the object's element count.
+    expect_artifact_error_mentions(
+        [] {
+            const std::array<std::uint64_t, 2> shape = {4, 6};
+            (void)ninfer::artifact::tensor_element_interval_view(
+                StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 7, 6);
+        },
+        {"contiguous-le-v1", "begin 7", "count 6", "object elements 24"});
+    expect_artifact_error_mentions(
+        [] {
+            const std::array<std::uint64_t, 2> shape = {4, 6};
+            (void)ninfer::artifact::tensor_element_interval_view(
+                StorageLayout::ContiguousLeV1, NumericFormat::BF16, shape, 0, 25);
+        },
+        {"contiguous-le-v1", "begin 0", "count 25", "object elements 24"});
     expect_artifact_error(
         [] {
             const std::array<std::uint64_t, 2> shape = {4, 6};
@@ -1286,8 +1355,8 @@ void test_element_view_remaining_layouts() {
     expect_artifact_error(
         [] {
             const std::array<std::uint64_t, 2> ggml = {2, 128};
-            (void)ninfer::artifact::tensor_element_interval_view(StorageLayout::GgmlK256V1,
-                                                                NumericFormat::GGML_K, ggml, 0, 256);
+            (void)ninfer::artifact::tensor_element_interval_view(
+                StorageLayout::GgmlK256V1, NumericFormat::GGML_K, ggml, 0, 256);
         },
         "divisible by 256");
 }

@@ -177,21 +177,36 @@ BatchedBlockScaleGeometry batched_block_scale_geometry(NumericFormat format,
 //
 // The logical axes of a view follow the object's rank: a rank-three object is a stack of matrices,
 // a rank-two object is one matrix, and a rank-one object is one axis of rows. The matrix axis is
-// the object's shape[0] when it has one, the row axis is the matrix's output-feature axis, and
-// the column axis is its input-feature axis.
+// the object's shape[0] when it has one, the matrix-internal row axis is the matrix's
+// output-feature axis, and the column axis is its input-feature axis. A contiguous tensor of rank
+// four or more keeps shape[0] as the matrix axis and its last dimension as the column axis, and
+// takes the product of the dimensions between them as the matrix-internal row axis.
+//
+// The matrix axis and the matrix-internal row axis are not the same axis. `tensor_row_slice`
+// splits axis 0, which is the matrix axis of a rank-three object -- the expert axis of a batched
+// expert library -- and the matrix-internal row axis of a rank-two object. A view of a batched
+// object therefore reports an expert number in `matrix_begin` and a row number inside that
+// expert's own matrix in `matrix_row_begin`.
 //
 // Every layout the reader accepts counts its elements matrix-major and, inside one matrix,
 // row-major over the logical columns. The row-split layout counts the logical columns only: the
 // padded K of its physical groups is not part of the logical order, so an interval that reaches
 // into the pad is outside the tensor.
 //
-// An interval that no rectangle describes is an error: the view never approximates one.
+// An interval that no rectangle describes is an error: the view never approximates one. An empty
+// interval has no rectangle either, so it is an error as well. A rejected interval reports the
+// layout, the interval and the object's element count.
+//
+// The view reports the layout it was asked about, the first element index of the interval and the
+// number of elements in it; all three follow from the arguments. Whether the rectangle covers the
+// whole tensor is decided by the three extents `matrix_count`, `matrix_row_count` and
+// `column_count`.
 struct ElementIntervalView {
     StorageLayout layout = StorageLayout::ContiguousLeV1;
     std::uint64_t matrix_begin = 0;
     std::uint64_t matrix_count = 0;
-    std::uint64_t row_begin = 0;
-    std::uint64_t row_count = 0;
+    std::uint64_t matrix_row_begin = 0;
+    std::uint64_t matrix_row_count = 0;
     std::uint64_t column_begin = 0;
     std::uint64_t column_count = 0;
     std::uint64_t linear_begin = 0;
