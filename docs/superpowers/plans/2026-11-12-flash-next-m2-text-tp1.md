@@ -125,7 +125,7 @@ git commit -m "feat(artifact): expose the v3 directory config, bindings and uses
 ### 任务 2：元素区间 → 逻辑视图（布局知识）
 
 **文件：**
-- 修改：`src/artifact/storage_layouts.h` / `src/artifact/storage_layouts.cpp`
+- 修改：`src/artifact/reader.h`（`StorageLayout` 与几何 API 的声明处；本仓没有独立的 storage_layouts.h）/ `src/artifact/storage_layouts.cpp`
 - 测试：`tests/test_v3_artifact_reader.cpp`（新增用例）
 
 - [ ] **步骤 1：编写失败的测试**
@@ -147,7 +147,7 @@ git commit -m "feat(artifact): expose the v3 directory config, bindings and uses
 
 - [ ] **步骤 3：实现**
 
-在 `src/artifact/storage_layouts.h` 增加：
+在 `src/artifact/reader.h` 增加：
 
 ```cpp
 struct ElementIntervalView {
@@ -175,7 +175,7 @@ ElementIntervalView tensor_element_interval_view(StorageLayout layout, NumericFo
 - [ ] **步骤 5：Commit**
 
 ```bash
-git add src/artifact/storage_layouts.h src/artifact/storage_layouts.cpp tests/test_v3_artifact_reader.cpp tests/targets/test_flash_next_reader_real.cpp
+git add src/artifact/reader.h src/artifact/storage_layouts.cpp tests/test_v3_artifact_reader.cpp tests/targets/test_flash_next_reader_real.cpp
 git commit -m "feat(artifact): map element intervals to logical layout views"
 ```
 
@@ -338,7 +338,7 @@ void hc_final_mix(const Tensor& normalized, const HcFinalMixWeights& weights,
 
 `HcMixWeights{ down_injection (BF16 [324,10240], 行 [320,324) 为 injection), up (BF16 [10240,320]) }`、`HcFinalMixWeights{ down (BF16 [320,10240]), up (BF16 [10240,320]) }`（BF16 行连续，行序 = `s*2560+d`）。
 
-实现：`hc_norm` 用 FP32 统计 + BF16 输出（`1+w` 不先舍入到 BF16）；`hc_combine` 输出 BF16；`hc_mix` 的 down_injection 与 up 用 `ops::linear` 的 BF16 路径（必要时新增 `linear_split` 在任务 7 一并提供）。
+实现：`hc_norm` 用 FP32 统计 + BF16 输出（`1+w` 不先舍入到 BF16）；`hc_combine` 输出 BF16；`hc_mix` 的 down_injection 与 up 用 `ops::linear` 的 BF16 路径（必要时新增 `linear_split` 在任务 6 一并提供）。
 
 - [ ] **步骤 4：运行测试验证通过**
 
@@ -640,7 +640,7 @@ git commit -m "feat(tools): add the qwen3.8-flash-next reference model and parit
 - **步骤扫描**：每个任务都有"写失败测试 → 跑失败 → 实现 → 跑通过 → 提交"的可执行步骤；数学与索引约定全部指向任务 3 建立的维护者文档（上游权威），不在计划里复述实现。
 - **类型一致性**：`Role`/`roles::parameter_name`（任务 3）、`HcMixWeights`/`HcFinalMixWeights`（任务 5）、`QsaProjectionView`/`QsaBlockSelection`（任务 6）、`MoeNvfp4Weights`（任务 7）、`V3Directory`/`V3Use`（任务 1）在后续任务中同名同指；`Variant`/`WeightsProfile`/`TextConfig` 与 `qwen3_6` 家族同形。
 - **审查重点**：五条审查重点分别由任务 8（PLE hash/行地址）、任务 6（QSA 块选择）、任务 7（NVFP4 专家几何）、任务 5（HC 注入系数）、任务 10/任务 5（GDN 的 Z 与卷积位置）中的具体断言钉住。
-- **比例**：计划 10 个任务、约 560 行，对应规格 §5/§6/§8 的一个里程碑；公式细节落在维护者文档而非计划内。
+- **比例**：计划 11 个任务，对应规格 §5/§6/§8 的一个里程碑；公式细节落在维护者文档而非计划内。
 
 ## 计划未尽事项（留给后续里程碑）
 
