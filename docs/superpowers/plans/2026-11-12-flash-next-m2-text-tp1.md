@@ -133,9 +133,9 @@ git commit -m "feat(artifact): expose the v3 directory config, bindings and uses
 `tensor_element_interval_view(layout, format, shape, begin, count)` 返回结构化视图；对 5 种布局各写一个用例，断言"视图描述的元素集合恰好等于请求的区间"（用几何公式独立复算元素数）：
 
 - `contiguous_le_v1`：`{linear_begin, count}`；
-- `row_split_k128_v1`（W8/Q4/Q5/Q6）：`{row_begin, row_count, column_begin, column_count}`（元素序 = 行主序、逻辑列、不含 K pad）；
+- `row_split_k128_v1`（W8/Q4/Q5/Q6）：`{matrix_row_begin, matrix_row_count, column_begin, column_count}`（元素序 = 行主序、逻辑列、不含 K pad）；
 - `row_paged_g16_4k_v1`（NF4）：同上（每行 160 元素）；
-- `batched_block_scale_k16_m128x4_v1`：`{matrix_begin, matrix_count, row_begin, row_count, column_begin, column_count}`（元素序 = 矩阵主序、矩阵内行主序）；
+- `batched_block_scale_k16_m128x4_v1`：`{matrix_begin, matrix_count, matrix_row_begin, matrix_row_count, column_begin, column_count}`（元素序 = 矩阵主序、矩阵内行主序）；
 - `block_scale_m128_k128_v1`：rank-2 与 rank-3 各自的矩阵/行/列描述。
 
 非矩形区间必须显式报错，不得返回错误矩形；越界区间必须报错。
@@ -154,8 +154,8 @@ struct ElementIntervalView {
     StorageLayout layout = StorageLayout::ContiguousLeV1;
     std::uint64_t matrix_begin = 0;
     std::uint64_t matrix_count = 0;
-    std::uint64_t row_begin = 0;
-    std::uint64_t row_count = 0;
+    std::uint64_t matrix_row_begin = 0;
+    std::uint64_t matrix_row_count = 0;
     std::uint64_t column_begin = 0;
     std::uint64_t column_count = 0;
     std::uint64_t linear_begin = 0;
@@ -197,7 +197,7 @@ git commit -m "feat(artifact): map element intervals to logical layout views"
 | `text/layers/N/moe_hc/{down,inject,norm,up}` | 各 48 | 每层 MoE HC |
 | `text/layers/N/gdn/{query,key,value,z,a_projection,b_projection,a_log,dt_bias,convolution,norm,output}` | 各 36 | GDN 层：q/k/v/z 属 `[16384,2560]` 的 q8_g32 行拆父权重（行 [0,2048)、[2048,4096)、[4096,10240)、[10240,16384)）；a/b 控制投影属 `[96,2560]` BF16 对象（行 [0,48)、[48,96)） |
 | `text/layers/N/attention/{query,key,value,index_key,index_query,output,output_gate,query_norm,index_query_norm,key_norm,index_key_norm}` | 各 12 | QSA 层：**两个对象、两种布局**——`query`/`output_gate` 属 `[12288,2560]` 的 q8_g32 行拆父权重（行 [0,6144) 与 [6144,12288)）；`key`/`value`/`index_query`/`index_key` 属 `[1664,2560]` 的 BF16 连续父权重（行 [0,512)、[512,1024)、[1024,1536)、[1536,1664)）。那个 13952×2560 的 BF16 父权重属 **MTP** 层（M3），不是文本 QSA |
-| `text/layers/N/moe/{router,shared_score,shared/gate,shared/up,shared/down,experts/gate,experts/up,experts/down}` | 各 48 | MoE 层（router（512 专家行）、shared_score（1 行）、shared/gate（640 行）、shared/up（640 行）同属一个 `[1793,2560]` 的 q8_g32 父权重：行 [0,512)、[512,513)、[513,1153)、[1153,1793)；`shared/down` 是独立对象；`experts/gate`/`experts/up` 是 `[512,1280,2560]` 专家库的**矩阵内行区间**（每个专家矩阵行 [0,640) 与 [640,1280)）；`experts/down` 是独立的 `[512,2560,640]` 对象，每个矩阵整段） |
+| `text/layers/N/moe/{router,shared_score,shared/gate,shared/up,shared/down,experts/gate,experts/up,experts/down}` | 各 48 | MoE 层（router（512 专家行）、shared_score（1 行）、shared/gate（640 行）、shared/up（640 行）同属一个 `[1793,2560]` 的 BF16 连续父权重：行 [0,512)、[512,513)、[513,1153)、[1153,1793)；`shared/down` 是独立对象；`experts/gate`/`experts/up` 是 `[512,1280,2560]` 专家库的**矩阵内行区间**（每个专家矩阵行 [0,640) 与 [640,1280)）；`experts/down` 是独立的 `[512,2560,640]` 对象，每个矩阵整段） |
 | `text/layers/N/ple/{table,key,value,norm_key,norm_query,norm_conv,convolution}` | 各 1 | PLE（仅第 1 层；`table` 是 128 个 NF4 分页 shard） |
 | `text/{token_embedding,output_head,final_hc/norm,final_hc/down,final_hc/up}` | 各 1 | 嵌入、主头、末层 HC |
 
