@@ -111,7 +111,7 @@ with open(p,'rb') as f:
 print(len(d['bindings']), len(d['uses']), sorted(d['components']))
 EOF
 ```
-预期：`1786 1205 ['mtp','text','vision']`。把这三个数字写进任务 2 的绑定完整性断言。
+预期：`1786 1205 ['mtp','text','vision']`。把这三个数字写进任务 3 的绑定完整性断言。
 
 - [ ] **步骤 6：Commit**
 
@@ -122,7 +122,64 @@ git commit -m "feat(artifact): expose the v3 directory config, bindings and uses
 
 ---
 
-### 任务 2：Flash-Next 权重角色映射与维护者文档
+### 任务 2：元素区间 → 逻辑视图（布局知识）
+
+**文件：**
+- 修改：`src/artifact/storage_layouts.h` / `src/artifact/storage_layouts.cpp`
+- 测试：`tests/test_v3_artifact_reader.cpp`（新增用例）
+
+- [ ] **步骤 1：编写失败的测试**
+
+`tensor_element_interval_view(layout, format, shape, begin, count)` 返回结构化视图；对 5 种布局各写一个用例，断言"视图描述的元素集合恰好等于请求的区间"（用几何公式独立复算元素数）：
+
+- `contiguous_le_v1`：`{linear_begin, count}`；
+- `row_split_k128_v1`（W8/Q4/Q5/Q6）：`{row_begin, row_count, column_begin, column_count}`（元素序 = 行主序、逻辑列、不含 K pad）；
+- `row_paged_g16_4k_v1`（NF4）：同上（每行 160 元素）；
+- `batched_block_scale_k16_m128x4_v1`：`{matrix_begin, matrix_count, row_begin, row_count, column_begin, column_count}`（元素序 = 矩阵主序、矩阵内行主序）；
+- `block_scale_m128_k128_v1`：rank-2 与 rank-3 各自的矩阵/行/列描述。
+
+非矩形区间必须显式报错，不得返回错误矩形；越界区间必须报错。
+
+- [ ] **步骤 2：运行测试验证失败**
+
+运行：`/home/cmj/strata/.venv/bin/ninja -C build ninfer_v3_artifact_reader_test && ./build/tests/ninfer_v3_artifact_reader_test`
+预期：编译失败（函数不存在）。
+
+- [ ] **步骤 3：实现**
+
+在 `src/artifact/storage_layouts.h` 增加：
+
+```cpp
+struct ElementIntervalView {
+    StorageLayout layout = StorageLayout::ContiguousLeV1;
+    std::uint64_t matrix_begin = 0;
+    std::uint64_t matrix_count = 0;
+    std::uint64_t row_begin = 0;
+    std::uint64_t row_count = 0;
+    std::uint64_t column_begin = 0;
+    std::uint64_t column_count = 0;
+    std::uint64_t linear_begin = 0;
+    std::uint64_t element_count = 0;
+};
+ElementIntervalView tensor_element_interval_view(StorageLayout layout, NumericFormat format,
+                                                 std::span<const std::uint64_t> shape,
+                                                 std::uint64_t begin, std::uint64_t count);
+```
+
+元素序定义必须与工件一致（工件实测：batched NVFP4 = 矩阵主序 + 矩阵内行主序；row-split = 行主序逻辑列；NF4 = 行主序）。区间必须落在对象内，且必须能表示为「矩阵区间 × 行区间 × 列区间」的笛卡尔积，否则抛 `ArtifactError`。
+
+- [ ] **步骤 4：真实工件核对**
+
+在 `tests/targets/test_flash_next_reader_real.cpp` 增加一个 env 门控用例：遍历工件 `part_bindings` 的每一条区间，断言视图元素数 == 区间长度且视图可表示为矩形。
+
+- [ ] **步骤 5：Commit**
+
+```bash
+git add src/artifact/storage_layouts.h src/artifact/storage_layouts.cpp tests/test_v3_artifact_reader.cpp tests/targets/test_flash_next_reader_real.cpp
+git commit -m "feat(artifact): map element intervals to logical layout views"
+```
+
+### 任务 3：Flash-Next 权重角色映射与维护者文档
 
 **文件：**
 - 创建：`src/targets/qwen3_8_flash_next/impl/load/roles.h`（角色枚举与参数名常量）
@@ -130,22 +187,23 @@ git commit -m "feat(artifact): expose the v3 directory config, bindings and uses
 - 创建：`docs/maintainer/qwen3.8-flash-next-artifact.md`（语义与几何权威）
 - 测试：`tests/targets/qwen3_8_flash_next/test_roles.cpp`
 
-- [ ] **步骤 1：确定角色命名空间（读工件）**
+- [ ] **步骤 1：确定角色命名空间（工件实测，下表是唯一事实来源）**
 
-运行（一次性取证，输出进文档）：
-```bash
-python3 - <<'EOF'
-import json,struct,collections,re
-p='/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer'
-with open(p,'rb') as f:
-    h=f.read(32); jl=struct.unpack_from('<Q',h,8)[0]; d=json.loads(f.read(jl))
-names=sorted(d['bindings'])
-print(len(names))
-pat=collections.Counter(re.sub(r'\d+','N',n) for n in names)
-for k,v in sorted(pat.items()): print(v,k)
-EOF
-```
-预期：打印按数字归一化后的参数名模式与计数（形如 `text/layers/N/attention_hc/down`、`text/layers/N/attention/query` 等）。把这张表作为角色映射表的**唯一事实来源**写进 `roles.h` 的常量区。
+工件目录 `bindings` 共 1786 条，按前缀：`text` 1308、`mtp` 36、`vision` 441、`proposal` 1。`text/*` 的参数名模式（数字归一化后的计数）：
+
+| 模式 | 计数 | 角色 |
+|---|---:|---|
+| `text/layers/N/attention_hc/{down,inject,norm,up}` | 各 48 | 每层 attention HC（下投影 320×10240、注入 4×10240、范数 10240、上投影 10240×320） |
+| `text/layers/N/moe_hc/{down,inject,norm,up}` | 各 48 | 每层 MoE HC |
+| `text/layers/N/gdn/{query,key,value,z,a_projection,b_projection,a_log,dt_bias,convolution,norm,output}` | 各 36 | GDN 层（q/k/v/z 同属一个 16384×2560 的父权重；a/b 控制投影同属一个父权重） |
+| `text/layers/N/attention/{query,key,value,index_key,index_query,output,output_gate,query_norm,index_query_norm,key_norm,index_key_norm}` | 各 12 | QSA 层（query/key/value/index_key/index_query/output_gate 同属一个 13952×2560 的 BF16 父权重，按宽度轴连续排列：key\|value\|index_key\|query\|output_gate\|index_query） |
+| `text/layers/N/moe/{router,shared_score,shared/gate,shared/up,shared/down,experts/gate,experts/up,experts/down}` | 各 48 | MoE 层（router 与 shared_score 属一个 513×2560 父权重；experts 三个角色是 512 专家库的矩阵内行区间：gate = 专家矩阵行 [0,640)、up = 行 [640,1280)） |
+| `text/layers/N/ple/{table,key,value,norm_key,norm_query,norm_conv,convolution}` | 各 1 | PLE（仅第 1 层；`table` 是 128 个 NF4 分页 shard） |
+| `text/{token_embedding,output_head,final_hc/norm,final_hc/down,final_hc/up}` | 各 1 | 嵌入、主头、末层 HC |
+
+`mtp/*`（36 条）与 `proposal/head`（1 条）属 M3，`vision/*`（441 条）属 M6：角色枚举里**不**为它们建条目，任务 4 的覆盖断言只针对 `text/*` 的 1308 条。
+
+把这张表写进 `roles.h` 的常量区（参数名常量 + 计数），并在维护者文档里原样保留。
 
 - [ ] **步骤 2：编写失败的测试**
 
@@ -189,7 +247,7 @@ git commit -m "feat(flash-next): map artifact parameter names to weight roles"
 
 ---
 
-### 任务 3：包骨架、registry 接线与装载计划（不执行前向）
+### 任务 4：包骨架、registry 接线与装载计划（不执行前向）
 
 **文件：**
 - 创建：`src/targets/qwen3_8_flash_next/export/ninfer/targets/qwen3_8_flash_next/package.h`
@@ -204,8 +262,8 @@ git commit -m "feat(flash-next): map artifact parameter names to weight roles"
 - `Package::model_id == "qwen3.8-flash-next"`、`Package::weights_id == "nvfp4"`、`Package::resolve_weights("qwen3.8-flash-next", "nvfp4")` 命中本包；`resolve_weights("qwen3.8-27b", "nvfp4")` 不命中本包。
 - 用任务 1 的 fixture 风格写一个合成 v3 工件（`components.text.config` 含上表常量、`bindings` 覆盖 48 层的必要角色），断言 `bind_artifact` 产出的 `BindingPlan`：
   - 每个被绑对象在工件 `bindings` 中有对应参数名；
-  - 绑定覆盖 `text/embedding`、`text/output_head`、`text/final_hc/*`、48 层各自的 HC/GDN 或 QSA/MoE 角色；
-  - 未被任何角色认领的 `bindings` 条目为 0（真实工件上 1786 条绑定必须被 100% 认领，允许一个对象承载多个角色）。
+  - 绑定覆盖 `text/token_embedding`、`text/output_head`、`text/final_hc/*`、48 层各自的 HC/GDN 或 QSA/MoE 角色；
+  - 真实工件上 `text/*` 的 1308 条绑定必须 100% 被认领（允许一个对象承载多个角色）；`mtp/*`（36）、`vision/*`（441）、`proposal/head`（1）由 M3/M6 认领，本阶段必须在诊断里显式记为"未认领"并给出计数，不得静默忽略。
 - 断言 TP1 下每层的 routed 专家库是整对象复制，TP2 计划在 M4（本任务只断言 tp=1）。
 
 - [ ] **步骤 2：运行测试验证失败**
@@ -215,7 +273,7 @@ git commit -m "feat(flash-next): map artifact parameter names to weight roles"
 
 - [ ] **步骤 3：实现包骨架与 registry 接线**
 
-- `impl/config.h`：`namespace ninfer::targets::qwen3_8_flash_next::detail { struct TextConfig { ... } }`，常量全部取自任务 2 文档（hidden 2560、layers 48、qsa_layers = `l%4==3`、hc_streams 4、hc_lowrank 320、residual_width 10240、query_heads 24、kv_heads 2、head_dim 256、index_heads 4、index_kv_heads 1、index_head_dim 128、index_compress 4、index_budget 2048 → block_budget 512、gdn_key_heads 16、gdn_value_heads 48、gdn_head_dim 128、conv_kernel 4、experts 512、experts_per_tok 10、expert_intermediate 640、shared_intermediate 640、vocab 248320、rope_theta 1e7、rope_sections {11,11,10}、partial_rotary 0.25 → rotary_dim 64、norm_eps 1e-6、ple_layer_ids {1}、ple_ngram 3、ple_heads_per_ngram 8、ple_split_parts 128、ple_conv_kernel 4、ple_conv_dilation 3）。
+- `impl/config.h`：`namespace ninfer::targets::qwen3_8_flash_next::detail { struct TextConfig { ... } }`，常量全部取自任务 3 文档（hidden 2560、layers 48、qsa_layers = `l%4==3`、hc_streams 4、hc_lowrank 320、residual_width 10240、query_heads 24、kv_heads 2、head_dim 256、index_heads 4、index_kv_heads 1、index_head_dim 128、index_compress 4、index_budget 2048 → block_budget 512、gdn_key_heads 16、gdn_value_heads 48、gdn_head_dim 128、conv_kernel 4、experts 512、experts_per_tok 10、expert_intermediate 640、shared_intermediate 640、vocab 248320、rope_theta 1e7、rope_sections {11,11,10}、partial_rotary 0.25 → rotary_dim 64、norm_eps 1e-6、ple_layer_ids {1}、ple_ngram 3、ple_heads_per_ngram 8、ple_split_parts 128、ple_conv_kernel 4、ple_conv_dilation 3）。
 - `export/.../package.h`：`struct Package { static constexpr std::string_view model_id = "qwen3.8-flash-next"; static constexpr std::string_view weights_id = "nvfp4"; static constexpr std::string_view target_key = "qwen3_8_flash_next"; static WeightsProfile resolve_weights(std::string_view, std::string_view); static ModelSamplingDefaults sampling_defaults(); static detail::LoadPlan plan_load(artifact::Binder&, WeightsProfile, int tp); ... };`
 - `impl/load/bindings.{h,cpp}`：`bind_artifact(Binder&, WeightsProfile, int tp)` 按角色遍历 48 层，构造 `BindingPlan`（含每层 HC/GDN 或 QSA/MoE 的对象句柄与形状），并把工件 `bindings` 中未被认领的参数名收集为诊断。
 - `src/targets/registry.h`：新增 `LoadedQwen3_8_FlashNext` / `Qwen3_8_FlashNextInstance`，`ActiveTarget` 增加 `std::unique_ptr<Qwen3_8_FlashNextInstance>` 备选；`src/targets/registry.cpp` 的 `construct_target` 增加 `identity.model_id == Qwen3_8_FlashNext::model_id` 分支，复用现有 `construct_registered<Target, Loaded, Instance>` 模板。
@@ -233,7 +291,7 @@ git commit -m "feat(flash-next): add the package skeleton and registry wiring"
 
 ---
 
-### 任务 4：HC 四路残差算子（六个入口 + oracle）
+### 任务 5：HC 四路残差算子（六个入口 + oracle）
 
 **文件：**
 - 创建：`include/ninfer/ops/gated_residual.h`
@@ -260,7 +318,7 @@ git commit -m "feat(flash-next): add the package skeleton and registry wiring"
 
 - [ ] **步骤 3：实现契约头与实现**
 
-`include/ninfer/ops/gated_residual.h` 按仓库 Op 契约格式（`Op:` / `Math / indexing:` / `Logical shapes:` / `Supported domain:` / `Numeric:` / `Effects:` / `Workspace:` / `Execution:`）写六个入口的精确数学（照任务 2 文档第 4 节，逐字一致），签名：
+`include/ninfer/ops/gated_residual.h` 按仓库 Op 契约格式（`Op:` / `Math / indexing:` / `Logical shapes:` / `Supported domain:` / `Numeric:` / `Effects:` / `Workspace:` / `Execution:`）写六个入口的精确数学（照任务 3 文档第 4 节，逐字一致），签名：
 
 ```cpp
 void hc_expand_norm(const Tensor& embedding, const Tensor& norm_weight, float epsilon,
@@ -280,7 +338,7 @@ void hc_final_mix(const Tensor& normalized, const HcFinalMixWeights& weights,
 
 `HcMixWeights{ down_injection (BF16 [324,10240], 行 [320,324) 为 injection), up (BF16 [10240,320]) }`、`HcFinalMixWeights{ down (BF16 [320,10240]), up (BF16 [10240,320]) }`（BF16 行连续，行序 = `s*2560+d`）。
 
-实现：`hc_norm` 用 FP32 统计 + BF16 输出（`1+w` 不先舍入到 BF16）；`hc_combine` 输出 BF16；`hc_mix` 的 down_injection 与 up 用 `ops::linear` 的 BF16 路径（必要时新增 `linear_split` 在任务 6 一并提供）。
+实现：`hc_norm` 用 FP32 统计 + BF16 输出（`1+w` 不先舍入到 BF16）；`hc_combine` 输出 BF16；`hc_mix` 的 down_injection 与 up 用 `ops::linear` 的 BF16 路径（必要时新增 `linear_split` 在任务 7 一并提供）。
 
 - [ ] **步骤 4：运行测试验证通过**
 
@@ -295,7 +353,7 @@ git commit -m "feat(ops): add the four-stream gated residual ops"
 
 ---
 
-### 任务 5：QSA 四件套 + `linear_split`（五入口 + oracle）
+### 任务 6：QSA 四件套 + `linear_split`（五入口 + oracle）
 
 **文件：**
 - 创建：`include/ninfer/ops/qsa.h`、`include/ninfer/ops/linear_split.h`
@@ -353,7 +411,7 @@ git commit -m "feat(ops): add the QSA indexed attention ops and packed linear sp
 
 ---
 
-### 任务 6：NVFP4 路由专家（top-10 归一化 + grouped GEMM + oracle）
+### 任务 7：NVFP4 路由专家（top-10 归一化 + grouped GEMM + oracle）
 
 **文件：**
 - 创建：`include/ninfer/ops/moe_nvfp4.h`
@@ -402,7 +460,7 @@ git commit -m "feat(ops): add NVFP4 routed experts with top-10 normalization"
 
 ---
 
-### 任务 7：PLE（hash、行查表、gate、conv + oracle）
+### 任务 8：PLE（hash、行查表、gate、conv + oracle）
 
 **文件：**
 - 创建：`include/ninfer/ops/ple.h`
@@ -438,7 +496,7 @@ git commit -m "feat(ops): add the PLE hash, lookup, gate and convolution ops"
 
 ---
 
-### 任务 8：家族运行时骨架（准入 → prefill → decode → 发布）
+### 任务 9：家族运行时骨架（准入 → prefill → decode → 发布）
 
 **文件：**
 - 创建：`src/targets/qwen4_exp/export/ninfer/targets/qwen4_exp/runtime.h`、`export/ninfer/targets/qwen4_exp/frontend.h`
@@ -480,7 +538,7 @@ git commit -m "feat(qwen4-exp): add the identity-free family runtime skeleton"
 
 ---
 
-### 任务 9：文本主干（HC → 48 层 → 主头）与缩减配置 greedy
+### 任务 10：文本主干（HC → 48 层 → 主头）与缩减配置 greedy
 
 **文件：**
 - 创建：`src/targets/qwen4_exp/impl/runtime/text_context.h`、`text_context_impl.h`
@@ -501,7 +559,7 @@ M2 的执行配置（写入 `docs/maintainer/qwen3.8-flash-next-artifact.md` 的
 `test_text_forward.cpp`（env 门控 `NINFER_FLASH_NEXT_ARTIFACT`，无工件返回 77）：
 - 用真实工件装载前 4 层，喂 8 个 token 的提示，断言：
   - 产出 1 个 greedy token，token id 在 `[0, 248320)`；
-  - 与任务 10 的参考模型在同配置下的 greedy token **完全一致**（参考模型未就绪前该断言用占位参考值，写成读环境变量 `NINFER_FLASH_NEXT_REFERENCE_TOKEN` 的比较；任务 10 落地后改为直接调用参考模型）；
+  - 与任务 11 的参考模型在同配置下的 greedy token **完全一致**（参考模型未就绪前该断言用占位参考值，写成读环境变量 `NINFER_FLASH_NEXT_REFERENCE_TOKEN` 的比较；任务 11 落地后改为直接调用参考模型）；
   - 重复同一提示两次得到相同 token（确定性）；
   - GDN 状态在两轮 decode 后被更新（FP32 状态池的条数随层数增长）。
 
@@ -536,7 +594,7 @@ git commit -m "feat(flash-next): run the four-stream text trunk through the QSA 
 
 ---
 
-### 任务 10：参考模型与端到端 parity
+### 任务 11：参考模型与端到端 parity
 
 **文件：**
 - 创建：`tools/reference/qwen3_8_flash_next/{__init__.py,config.py,bindings.py,weights.py,ops.py,model.py,state.py,text.py,cli.py,requirements.txt}`
@@ -578,10 +636,10 @@ git commit -m "feat(tools): add the qwen3.8-flash-next reference model and parit
 
 ## 自检记录
 
-- **规格覆盖度**：M2 的目标是"家族 + 包骨架 + 单卡 greedy 出 token + 参考 parity + PLE/HC/QSA/GDN/MoE 全链路"。任务 1/2 提供容器与语义基线，任务 3 提供包与 registry，任务 4–7 提供四个缺位算子族，任务 8 提供家族运行时，任务 9 提供文本主干与 greedy，任务 10 提供参考与 parity。规格 §8 的 M2 条目逐项有对应任务；MTP（M3）、TP2 与专家缓存（M4）、发布面与性能（M5）、Vision（M6）按里程碑留在后续计划，不在本计划内。
-- **步骤扫描**：每个任务都有"写失败测试 → 跑失败 → 实现 → 跑通过 → 提交"的可执行步骤；数学与索引约定全部指向任务 2 建立的维护者文档（上游权威），不在计划里复述实现。
-- **类型一致性**：`Role`/`roles::parameter_name`（任务 2）、`HcMixWeights`/`HcFinalMixWeights`（任务 4）、`QsaProjectionView`/`QsaBlockSelection`（任务 5）、`MoeNvfp4Weights`（任务 6）、`V3Directory`/`V3Use`（任务 1）在后续任务中同名同指；`Variant`/`WeightsProfile`/`TextConfig` 与 `qwen3_6` 家族同形。
-- **审查重点**：五条审查重点分别由任务 7（PLE hash/行地址）、任务 5（QSA 块选择）、任务 6（NVFP4 专家几何）、任务 4（HC 注入系数）、任务 9/任务 4（GDN 的 Z 与卷积位置）中的具体断言钉住。
+- **规格覆盖度**：M2 的目标是"家族 + 包骨架 + 单卡 greedy 出 token + 参考 parity + PLE/HC/QSA/GDN/MoE 全链路"。任务 1/2 提供容器与语义基线，任务 4 提供包与 registry，任务 5–7 提供四个缺位算子族，任务 9 提供家族运行时，任务 10 提供文本主干与 greedy，任务 11 提供参考与 parity。规格 §8 的 M2 条目逐项有对应任务；MTP（M3）、TP2 与专家缓存（M4）、发布面与性能（M5）、Vision（M6）按里程碑留在后续计划，不在本计划内。
+- **步骤扫描**：每个任务都有"写失败测试 → 跑失败 → 实现 → 跑通过 → 提交"的可执行步骤；数学与索引约定全部指向任务 3 建立的维护者文档（上游权威），不在计划里复述实现。
+- **类型一致性**：`Role`/`roles::parameter_name`（任务 3）、`HcMixWeights`/`HcFinalMixWeights`（任务 5）、`QsaProjectionView`/`QsaBlockSelection`（任务 6）、`MoeNvfp4Weights`（任务 7）、`V3Directory`/`V3Use`（任务 1）在后续任务中同名同指；`Variant`/`WeightsProfile`/`TextConfig` 与 `qwen3_6` 家族同形。
+- **审查重点**：五条审查重点分别由任务 8（PLE hash/行地址）、任务 6（QSA 块选择）、任务 7（NVFP4 专家几何）、任务 5（HC 注入系数）、任务 10/任务 5（GDN 的 Z 与卷积位置）中的具体断言钉住。
 - **比例**：计划 10 个任务、约 560 行，对应规格 §5/§6/§8 的一个里程碑；公式细节落在维护者文档而非计划内。
 
 ## 计划未尽事项（留给后续里程碑）
