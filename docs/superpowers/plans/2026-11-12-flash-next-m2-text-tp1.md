@@ -252,8 +252,7 @@ git commit -m "feat(flash-next): map artifact parameter names to weight roles"
 **文件：**
 - 创建：`src/targets/qwen3_8_flash_next/export/ninfer/targets/qwen3_8_flash_next/package.h`
 - 创建：`src/targets/qwen3_8_flash_next/impl/config.h`、`impl/package.cpp`
-- 修改：`src/targets/registry.h` / `src/targets/registry.cpp`（第三个 `ActiveTarget` 备选 + `construct_target` 分支）
-- 修改：`src/CMakeLists.txt`（`add_subdirectory(targets/qwen3_8_flash_next)`）
+- 创建：`src/targets/qwen3_8_flash_next/CMakeLists.txt`（本里程碑先产出**独立静态库目标** `ninfer_flash_next_package`，测试链接它；按账本 R1，本任务**不**接入 `ninfer_engine`、**不**改 `src/targets/registry.{h,cpp}`——家族模板尚不存在，engine 无法链接；registry 与 Engine 接线属任务 8）
 - 测试：`tests/targets/qwen3_8_flash_next/test_load_plan.cpp`
 
 - [ ] **步骤 1：编写失败的测试**
@@ -276,7 +275,7 @@ git commit -m "feat(flash-next): map artifact parameter names to weight roles"
 - `impl/config.h`：`namespace ninfer::targets::qwen3_8_flash_next::detail { struct TextConfig { ... } }`，常量全部取自任务 3 文档（hidden 2560、layers 48、qsa_layers = `l%4==3`、hc_streams 4、hc_lowrank 320、residual_width 10240、query_heads 24、kv_heads 2、head_dim 256、index_heads 4、index_kv_heads 1、index_head_dim 128、index_compress 4、index_budget 2048 → block_budget 512、gdn_key_heads 16、gdn_value_heads 48、gdn_head_dim 128、conv_kernel 4、experts 512、experts_per_tok 10、expert_intermediate 640、shared_intermediate 640、vocab 248320、rope_theta 1e7、rope_sections {11,11,10}、partial_rotary 0.25 → rotary_dim 64、norm_eps 1e-6、ple_layer_ids {1}、ple_ngram 3、ple_heads_per_ngram 8、ple_split_parts 128、ple_conv_kernel 4、ple_conv_dilation 3）。
 - `export/.../package.h`：`struct Package { static constexpr std::string_view model_id = "qwen3.8-flash-next"; static constexpr std::string_view weights_id = "nvfp4"; static constexpr std::string_view target_key = "qwen3_8_flash_next"; static WeightsProfile resolve_weights(std::string_view, std::string_view); static ModelSamplingDefaults sampling_defaults(); static detail::LoadPlan plan_load(artifact::Binder&, WeightsProfile, int tp); ... };`
 - `impl/load/bindings.{h,cpp}`：`bind_artifact(Binder&, WeightsProfile, int tp)` 按角色遍历 48 层，构造 `BindingPlan`（含每层 HC/GDN 或 QSA/MoE 的对象句柄与形状），并把工件 `bindings` 中未被认领的参数名收集为诊断。
-- `src/targets/registry.h`：新增 `LoadedQwen3_8_FlashNext` / `Qwen3_8_FlashNextInstance`，`ActiveTarget` 增加 `std::unique_ptr<Qwen3_8_FlashNextInstance>` 备选；`src/targets/registry.cpp` 的 `construct_target` 增加 `identity.model_id == Qwen3_8_FlashNext::model_id` 分支，复用现有 `construct_registered<Target, Loaded, Instance>` 模板。
+- 包以独立静态库目标 `ninfer_flash_next_package` 产出（`src/targets/qwen3_8_flash_next/CMakeLists.txt`），不接入 `ninfer_engine`、不改 registry（账本 R1：接线归任务 8）。
 
 - [ ] **步骤 4：运行测试验证通过**
 
@@ -285,8 +284,8 @@ git commit -m "feat(flash-next): map artifact parameter names to weight roles"
 - [ ] **步骤 5：Commit**
 
 ```bash
-git add src/targets/qwen3_8_flash_next src/targets/registry.h src/targets/registry.cpp src/CMakeLists.txt tests/CMakeLists.txt tests/targets/qwen3_8_flash_next/test_load_plan.cpp
-git commit -m "feat(flash-next): add the package skeleton and registry wiring"
+git add src/targets/qwen3_8_flash_next tests/CMakeLists.txt tests/targets/qwen3_8_flash_next/test_load_plan.cpp
+git commit -m "feat(flash-next): add the package skeleton and the binding plan"
 ```
 
 ---
@@ -420,7 +419,7 @@ git commit -m "feat(ops): add the QSA indexed attention ops and packed linear sp
 
 - [ ] **步骤 1：编写失败的测试**
 
-- 路由：router 权重 BF16 `[513,2560]`（512 专家 + 1 shared 行），对每个 token 取 top-10，`norm_topk_prob=true` → 概率 = softmax(top-10 logits) 归一化，共享专家行给 sigmoid 分数；断言 top-10 的选择与 tie 规则（并列时专家 id 小者先）、归一化后和为 1；
+- 路由：router 权重是 BF16 连续父权重 `[1793,2560]` 的行 [0,512)（512 专家行），shared_score 是行 [512,513)，shared gate/up 是行 [513,1153)/[1153,1793)；对每个 token 取 top-10，`norm_topk_prob=true` → 概率 = softmax(top-10 logits) 归一化，共享专家行给 sigmoid 分数；断言 top-10 的选择与 tie 规则（并列时专家 id 小者先）、归一化后和为 1；
 - grouped gate_up/down：真实几何 512 专家、hidden 2560、intermediate 640、gate_up `[512,1280,2560]`、down `[512,2560,640]`（batched blockscale 布局），取 4 个专家做 FP32 oracle 比对：oracle 按存储码本解 NVFP4（4-bit code + 16 元素组 E4M3 scale + 每矩阵 FP32 除数）后做 FP32 GEMM；**op 原地消费整块专家库 payload + 每个角色在矩阵内的行区间**（gate 行 [0,640)、up 行 [640,1280)、down 整段），不先做物理拷贝（拷贝会按 128 行带重组 swizzle 缩放 tile，比原地解码更贵）；
 - 共享专家：BF16 SwiGLU 路径，带 `sigmoid(l[E])` 门控，贡献一次且不被路由系数缩放。
 
