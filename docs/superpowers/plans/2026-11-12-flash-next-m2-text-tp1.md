@@ -525,15 +525,22 @@ git commit -m "feat(ops): add the PLE hash, lookup, gate and convolution ops"
 - `impl/runtime/schedule.h`：`prefill_text_chunk`、`ordinary_decode_batch`、`sample_from_hidden`。
 - `impl/runtime/workspace_recipe.h`：workspace 根与容量（隐藏 2560、残差 10240、QSA 缓冲区、MoE scratch、PLE 缓冲）。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [ ] **步骤 4：公开包接口与 registry 接线（任务 4 审查记录的要求）**
+
+- 公开 `LoadPlan` 必须暴露 `materialization()`（返回完整类型的 `artifact::MaterializationPlan`），否则 `src/targets/registry.cpp` 的 `construct_registered` 模板无法复用；`BindingPlan` 保持内部类型。
+- `Package::resolve_weights` 必须改成与兄弟包一致的 `ArtifactIdentity → WeightsProfile`（身份判定留给 registry），不能返回 `std::optional`。
+- `src/targets/registry.h`：新增 `LoadedQwen3_8_FlashNext` / `Qwen3_8_FlashNextInstance`，`ActiveTarget` 增加 `std::unique_ptr<Qwen3_8_FlashNextInstance>` 备选；`src/targets/registry.cpp` 的 `construct_target` 增加 `identity.model_id == Qwen3_8_FlashNext::model_id` 分支，复用 `construct_registered<Target, Loaded, Instance>` 模板。
+- `src/CMakeLists.txt`：把 `ninfer_flash_next_package` 与家族库接入 `ninfer_engine`。
+
+- [ ] **步骤 5：运行测试验证通过**
 
 运行：同步骤 2。预期：PASS。
 
-- [ ] **步骤 5：Commit**
+- [ ] **步骤 6：Commit**
 
 ```bash
-git add src/targets/qwen4_exp tests/targets/qwen3_8_flash_next/test_program_lifecycle.cpp tests/CMakeLists.txt
-git commit -m "feat(qwen4-exp): add the identity-free family runtime skeleton"
+git add src/targets/qwen4_exp src/targets/qwen3_8_flash_next src/targets/registry.h src/targets/registry.cpp src/CMakeLists.txt tests/targets/qwen3_8_flash_next/test_program_lifecycle.cpp tests/CMakeLists.txt
+git commit -m "feat(qwen4-exp): add the identity-free family runtime skeleton and registry wiring"
 ```
 
 ---
