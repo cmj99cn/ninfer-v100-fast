@@ -25,8 +25,9 @@ These are closed identities, not templates. A format/layout combination not pres
 unsupported. In particular, a direct format cannot use a quantized layout, grouped
 signed-integer formats cannot use `contiguous-le-v1`, and `NVFP4` cannot use
 `row-split-k128-v1`. `FP8_E4M3FN_ROW_BF16S` can use only `row-scale-v1`; a bare E4M3FN code plane
-is not a compatible direct tensor. The three v3 layouts in the last three rows are read and sliced
-here; their logical decode belongs to the qwen3.8-flash-next package (see section 7).
+is not a compatible direct tensor. The three v3 layouts in the last three rows are read and validated here; the block-scaled and
+batched layouts are also sliced here, while the paged layout has no slice form (section 9).
+Their logical decode belongs to the qwen3.8-flash-next package (see section 7).
 
 Object alignment applies to the object's payload-relative `offset` in the `.ninfer` JSON. Internal
 plane offsets and padding belong to the selected layout. Inter-object padding belongs to the
@@ -389,8 +390,9 @@ Dequantized values follow the reconstruction rule in `tensor-formats.md`. This d
 not select a quantization encoder, output dtype, accumulation dtype, kernel, runtime device layout,
 or model consumer.
 
-The v3 layouts of sections 9 to 11 are sized, validated and sliced by this repository, which
-preserves their encoded bytes and their layout geometry. Their logical decode is implemented by
+The v3 layouts of sections 9 to 11 are sized and validated by this repository, which preserves
+their encoded bytes and their layout geometry; the block-scaled and batched layouts are sliced as
+well. Their logical decode is implemented by
 the qwen3.8-flash-next package: the paged NF4 codes and group scale bytes, the block-scaled FP8
 codes and 128x128 block scale words, and the batched NVFP4 codes, swizzled group scales and
 per-matrix FP32 weight divisors are decoded there.
@@ -454,8 +456,8 @@ row_offset(row) + code_bytes_per_row + g
 
 The last four bytes of the payload hold the matrix-level FP32 scale.
 
-This layout has no slice form: a paged expert shard is replicated whole, so a row or column slice
-request is rejected.
+This layout has no slice form: a paged object is replicated whole, so a row or column slice request
+is rejected.
 
 ## 10. `block_scale_m128_k128_v1`
 

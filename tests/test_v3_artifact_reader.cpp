@@ -226,10 +226,11 @@ void expect_artifact_error(Function&& function, std::string_view needle) {
     throw std::runtime_error("invalid v3 multi-part artifact was accepted");
 }
 
-// The v3 container spells its formats, layouts and encodings in lower case snake case. Its
-// spelling table is upstream's legal set, and every spelling denotes a public enum value. A
-// value's canonical name is the spelling of the container that introduced it, so the values the
-// v3 container introduced round trip through the v3 table.
+// The v3 container spells its formats, layouts and encodings in lower case snake case. The table
+// accepts every spelling an upstream v3 artifact uses; it is a superset of the narrow 27B adapter,
+// not a claim about upstream's complete legal set. A value's canonical name is the spelling of the
+// container that introduced it, so the values the v3 container introduced round trip through the
+// v3 table.
 void test_v3_spelling_round_trip() {
     struct FormatCase {
         std::string_view spelling;

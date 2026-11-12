@@ -676,8 +676,8 @@ TensorSlice tensor_row_slice(StorageLayout layout, NumericFormat format,
 
     if (layout == StorageLayout::RowPagedG16x4KV1) {
         throw ArtifactError(
-            "tensor slice: row_paged_g16_4k_v1 has no slice form in this milestone; the paged "
-            "expert shard is replicated whole");
+            "tensor slice: row_paged_g16_4k_v1 has no slice form; the paged object is "
+            "replicated whole");
     }
     throw ArtifactError("unknown tensor layout");
 }
@@ -689,7 +689,7 @@ TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
     if (layout == StorageLayout::BatchedBlockScaleK16M128x4V1 ||
         layout == StorageLayout::BlockScaleM128K128V1) {
         require_slice(shape.size() == 2 || shape.size() == 3,
-                      "this storage layout requires a rank-two or rank-three shape");
+                      "a block-scaled column slice requires a rank-two or rank-three shape");
     } else {
         require_slice(shape.size() == 2, "a column slice requires a rank-two shape");
     }
@@ -786,8 +786,8 @@ TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
 
     if (layout == StorageLayout::RowPagedG16x4KV1) {
         throw ArtifactError(
-            "tensor slice: row_paged_g16_4k_v1 has no slice form in this milestone; the paged "
-            "expert shard is replicated whole");
+            "tensor slice: row_paged_g16_4k_v1 has no slice form; the paged object is "
+            "replicated whole");
     }
 
     if (layout == StorageLayout::BlockScaleM128K128V1) {
@@ -866,7 +866,6 @@ TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
         return out;
     }
 
-    require_slice(shape.size() == 2, "a column slice requires a rank-two shape");
     const std::uint64_t rows        = shape[0];
     // Row-split-k128 shards may extend into the parent's padded K (align_up(K, 128)): when the
     // logical K is not itself 128-aligned, the final rank's column range legitimately covers the

@@ -121,7 +121,7 @@ git commit -m "feat(artifact): accept v3 formats and layouts for Flash-Next"
 用例（全部硬编码期望值，按全局约束公式）：
 - `nf4_paged_geometry`：`row_paged_nf4_geometry(NF4_G16_E4M3S, [2500012,160])` → `row_bytes=90, rows_per_page=45, page_count=55556, matrix_scale_offset=227557376, encoded_bytes=227557380`；`k%16!=0` 或格式不符抛错。
 - `block128_geometry`：`block_scale_m128_k128_geometry(FP8_E4M3FN_BLOCK128_BF16S, [2560,640])` → `code_plane_bytes=1638400, scale_plane_offset=1638400, scale_plane_bytes=200, encoded_bytes=1638600`；`n%128||k%128` 抛错。
-- `batched_blockscale_geometry`：`batched_block_scale_geometry(NVFP4, [512,1280,2560])` → 单矩阵 `code_plane_bytes=1638400, scale_plane_bytes=204800, matrix_stride=1843200, matrices=512, encoded_bytes=943720448`（512×1843200 + 512×4）；`[512,2560,640]` → `matrix_stride=921600, encoded_bytes=471859200+2048`；`n%128||k%64` 抛错。
+- `batched_blockscale_geometry`：`batched_block_scale_geometry(NVFP4, [512,1280,2560])` → `matrices=512, code_plane_bytes=838860800（=512×1638400）, scale_plane_bytes=104857600（=512×204800）, weight_divisor_offset=943718400, encoded_bytes=943720448（尾部 512×4 FP32 矩阵尺度）`；`[512,2560,640]` → `code_plane_bytes=419430400, scale_plane_bytes=52428800, encoded_bytes=471861248`；`n%128||k%64` 抛错。
 - `batched_slices`：对 `[512,1280,2560]` 断言 `tensor_row_slice`（专家区间 `[0,256)`）与 `tensor_column_slice`（K 区间 `[0,1280)`，TP2 每专家半宽）产生的 `encoded_bytes` 与拷贝数符合"逐矩阵应用现有 BlockScale 切分"的构造（256 个专家块的拷贝区间数与单矩阵规则一致）。
 
 - [ ] **步骤 2：运行测试验证失败**
@@ -134,8 +134,8 @@ git commit -m "feat(artifact): accept v3 formats and layouts for Flash-Next"
 `storage_layouts.cpp`：
 - `RowPagedNf4Geometry row_paged_nf4_geometry(NumericFormat, span<const u64> shape)`：按公式实现；只接受 `NF4_G16_E4M3S` 与二维 `[rows, k]`、`k%16==0`；
 - `Block128Geometry block_scale_m128_k128_geometry(NumericFormat, shape)`：复用 `row_scale_geometry` 的平面骨架（码面 + 256 对齐 + 缩放面），块 128×128、BF16 缩放 2B；
-- `BatchedBlockScaleGeometry batched_block_scale_geometry(NumericFormat, shape)`：`matrices = shape[0]`，逐矩阵复用现有 `block_scale_geometry(NVFP4, [shape[1], shape[2]])`，矩阵间紧凑拼接，每矩阵尾随 4B FP32 除数；`tensor_encoded_size` 分派补齐；
-- 切分：`tensor_row_slice`/`tensor_column_slice` 对 `BatchedBlockScaleK16M128x4V1` 按"逐矩阵应用现有 BlockScale 规则"实现（行切分=整专家区间、列切分=单 K 区间且 `k%16==0`）；`RowPagedG16x4KV1` 本期不实现切分（PLE 按整 shard 复制/分派），调用即抛。
+- `BatchedBlockScaleGeometry batched_block_scale_geometry(NumericFormat, shape)`：`matrices = shape[0]`，逐矩阵复用现有 `block_scale_geometry(NVFP4, [shape[1], shape[2]])`，排布为 [全部码面][全部缩放面（矩阵主序，每矩阵缩放面连续）][全部矩阵的 4B FP32 除数]；`tensor_encoded_size` 分派补齐；
+- 切分：`tensor_row_slice`/`tensor_column_slice` 对 `BatchedBlockScaleK16M128x4V1` 按"逐矩阵应用现有 BlockScale 规则"实现（行切分=整专家区间、列切分=单 K 区间且 `k%64==0`）；`RowPagedG16x4KV1` 无切分形式（PLE 按整 shard 复制/分派），调用即抛。
 
 - [ ] **步骤 4：运行测试验证通过**
 
