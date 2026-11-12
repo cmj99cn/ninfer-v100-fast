@@ -67,6 +67,10 @@ ninfer_add_test(ninfer_v3_artifact_reader_test
   SOURCES test_v3_artifact_reader.cpp
   LIBRARIES ninfer_artifact)
 set_tests_properties(ninfer_v3_artifact_reader_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_flash_next_reader_real_test
+  SOURCES targets/test_flash_next_reader_real.cpp
+  LIBRARIES ninfer_artifact)
+set_tests_properties(ninfer_flash_next_reader_real_test PROPERTIES SKIP_RETURN_CODE 77)
 # Host-only: no artifact, no device. Byte-level TP2 shard slice geometry per storage layout.
 ninfer_add_test(ninfer_tensor_slice_test
   SOURCES test_tensor_slice.cpp
