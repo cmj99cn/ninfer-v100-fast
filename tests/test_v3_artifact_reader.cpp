@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -369,6 +370,8 @@ void test_v3_directory_metadata() {
     options.components = Json{
         {"text",
          Json{{"target", "text"},
+              {"resources", Json{{"tokenizer.json", "resource/text/tokenizer.json"},
+                                 {"chat_template.jinja", "resource/text/chat_template.jinja"}}},
               {"config",
                Json{{"hidden_size", 2560},
                     {"num_hidden_layers", 48},
@@ -379,7 +382,11 @@ void test_v3_directory_metadata() {
                      Json{{"rope_theta", 10000000},
                           {"partial_rotary_factor", 0.25},
                           {"mrope_section", Json::array({11, 11, 10})}}}}}}},
-        {"vision", Json{{"target", "text"}, {"config", Json{{"depth", 27}}}}},
+        {"vision", Json{{"target", "text"},
+                        {"resources",
+                         Json{{"preprocessor_config.json",
+                               "resource/vision/preprocessor_config.json"}}},
+                        {"config", Json{{"depth", 27}}}}},
     };
     options.bindings = Json{
         {"text/layers/0/attention_hc/down", Json{{"object", "weight/000001"}}},
@@ -392,6 +399,15 @@ void test_v3_directory_metadata() {
         Json{{"parameter", "text/layers/0/attention_hc/down"},
              {"input", "text/layers/0/attention_hc/normalized_streams"},
              {"activation_policy", "A16Only"}},
+        Json{{"parameter", "text/layers/0/moe/experts/gate"},
+             {"input", "text/layers/0/moe_input"},
+             {"activation_policy", "AllowA4"},
+             {"auxiliaries",
+              Json{{"activation_input_divisor",
+                    Json{{"parts",
+                          Json::array({Json{
+                                        {"object", "auxiliary/shared/expert_activation_divisors"},
+                                        {"range", Json::array({0, 1})}}})}}}}}},
     });
 
     const auto fixture =
@@ -424,6 +440,16 @@ void test_v3_directory_metadata() {
         throw std::runtime_error("the v3 directory vision configuration mismatch");
     }
 
+    if (directory.component_resources.size() != 2 ||
+        directory.component_resources.at("text").at("tokenizer.json") !=
+            "resource/text/tokenizer.json" ||
+        directory.component_resources.at("text").at("chat_template.jinja") !=
+            "resource/text/chat_template.jinja" ||
+        directory.component_resources.at("vision").at("preprocessor_config.json") !=
+            "resource/vision/preprocessor_config.json") {
+        throw std::runtime_error("the v3 directory component resource mismatch");
+    }
+
     if (directory.bindings.size() != 1 ||
         directory.bindings.at("text/layers/0/attention_hc/down") != "weight/000001") {
         throw std::runtime_error("the v3 directory binding table mismatch");
@@ -439,7 +465,7 @@ void test_v3_directory_metadata() {
         throw std::runtime_error("a binding that names no object was reported");
     }
 
-    if (directory.uses.size() != 1) {
+    if (directory.uses.size() != 2) {
         throw std::runtime_error("the v3 directory use count mismatch");
     }
     const auto& use = directory.uses.front();
@@ -447,6 +473,20 @@ void test_v3_directory_metadata() {
         use.input != "text/layers/0/attention_hc/normalized_streams" ||
         use.activation_policy != "A16Only") {
         throw std::runtime_error("the v3 directory use edge mismatch");
+    }
+    if (!use.auxiliaries.empty()) {
+        throw std::runtime_error("a use edge without auxiliaries reported one");
+    }
+    const auto& moe = directory.uses.back();
+    if (moe.parameter != "text/layers/0/moe/experts/gate" ||
+        moe.input != "text/layers/0/moe_input" || moe.activation_policy != "AllowA4") {
+        throw std::runtime_error("the v3 directory expert use edge mismatch");
+    }
+    const auto divisor = moe.auxiliaries.find("activation_input_divisor");
+    if (divisor == moe.auxiliaries.end() || divisor->second.size() != 1 ||
+        divisor->second.front().object != "auxiliary/shared/expert_activation_divisors" ||
+        divisor->second.front().begin != 0 || divisor->second.front().end != 1) {
+        throw std::runtime_error("the v3 directory use auxiliary mismatch");
     }
 }
 
@@ -958,6 +998,50 @@ void test_flash_next_directory_metadata() {
         throw std::runtime_error("the Flash-Next vision or mtp configuration mismatch");
     }
 
+    const auto& text_resources = directory.component_resources.at("text");
+    if (text_resources.size() != 5 ||
+        text_resources.at("tokenizer.json") != "resource/text/tokenizer.json" ||
+        text_resources.at("tokenizer_config.json") != "resource/text/tokenizer_config.json" ||
+        text_resources.at("chat_template.jinja") != "resource/text/chat_template.jinja" ||
+        text_resources.at("generation_config.json") != "resource/text/generation_config.json" ||
+        text_resources.at("ple_hash_controls") != "resource/text/ple_hash_controls") {
+        throw std::runtime_error("the Flash-Next text resource census mismatch");
+    }
+    const auto& vision_resources = directory.component_resources.at("vision");
+    if (vision_resources.size() != 2 ||
+        vision_resources.at("preprocessor_config.json") !=
+            "resource/vision/preprocessor_config.json" ||
+        vision_resources.at("video_preprocessor_config.json") !=
+            "resource/vision/video_preprocessor_config.json") {
+        throw std::runtime_error("the Flash-Next vision resource census mismatch");
+    }
+
+    std::size_t with_auxiliaries = 0;
+    std::set<std::uint64_t> covered;
+    for (const auto& use : directory.uses) {
+        if (use.auxiliaries.empty()) { continue; }
+        ++with_auxiliaries;
+        if (use.auxiliaries.size() != 1) {
+            throw std::runtime_error("the Flash-Next use auxiliary role count mismatch");
+        }
+        const auto divisor = use.auxiliaries.find("activation_input_divisor");
+        if (divisor == use.auxiliaries.end() || divisor->second.size() != 1) {
+            throw std::runtime_error("the Flash-Next use auxiliary divisor mismatch");
+        }
+        const auto& part = divisor->second.front();
+        if (part.object != "auxiliary/shared/expert_activation_divisors" ||
+            part.end <= part.begin) {
+            throw std::runtime_error("the Flash-Next use auxiliary part mismatch");
+        }
+        for (auto element = part.begin; element < part.end; ++element) { covered.insert(element); }
+    }
+    if (with_auxiliaries != 144) {
+        throw std::runtime_error("the Flash-Next use auxiliary census mismatch");
+    }
+    if (covered.size() != 96 || *covered.begin() != 0 || *covered.rbegin() != 95) {
+        throw std::runtime_error("the Flash-Next use auxiliary coverage mismatch");
+    }
+
     if (directory.bindings.size() + directory.part_bindings.size() != 1786) {
         throw std::runtime_error("the Flash-Next binding census mismatch");
     }
@@ -967,7 +1051,8 @@ void test_flash_next_directory_metadata() {
     std::cout << "flash-next directory: " << directory.component_config.size() << " components, "
               << directory.bindings.size() << " object bindings, "
               << directory.part_bindings.size() << " part bindings, " << directory.uses.size()
-              << " uses\n";
+              << " uses (" << with_auxiliaries << " with auxiliaries), "
+              << directory.component_resources.size() << " component resource maps\n";
 }
 
 std::vector<PlacedObject> new_format_objects(std::uint64_t& fp8_offset,

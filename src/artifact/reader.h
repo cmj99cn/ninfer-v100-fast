@@ -259,14 +259,6 @@ struct ArtifactIdentity {
     bool operator==(const ArtifactIdentity&) const = default;
 };
 
-// One operator use edge of a v3 directory: the parameter that consumes the input, and the
-// activation policy the consuming operator runs under.
-struct V3Use {
-    std::string parameter;
-    std::string input;
-    std::string activation_policy;
-};
-
 // One part of a parameter binding: the element range the parameter occupies inside one object.
 // The range is a half open [begin, end) interval of elements, counted in the object's own
 // element order.
@@ -276,21 +268,38 @@ struct V3BindingPart {
     std::uint64_t end   = 0;
 };
 
+// One operator use edge of a v3 directory: the parameter that consumes the input, and the
+// activation policy the consuming operator runs under. The auxiliaries of an edge are the
+// auxiliary inputs it reads: the role name, such as "activation_input_divisor", to the parts of
+// the objects that carry the role.
+struct V3Use {
+    std::string parameter;
+    std::string input;
+    std::string activation_policy;
+    std::map<std::string, std::vector<V3BindingPart>> auxiliaries;
+};
+
 // The directory metadata of a v3 container: the per component configuration, the parameter
 // binding table and the operator use edges.
 //
 // A configuration value is always text, so a consumer never has to know whether the directory
 // spelled a number, a boolean or a string: a number is its shortest round trip form, a boolean
 // is "true" or "false", and a string is itself. A nested configuration object is flattened into
-// dot joined key paths ("rope_parameters.rope_theta"). An array is not a scalar: its elements
-// are joined into one comma separated value when every element is a scalar, and the array is
-// skipped otherwise.
+// dot joined key paths ("rope_parameters.rope_theta"). An array is not a scalar: an array whose
+// elements are all scalars is stored as its elements joined by commas
+// ("layer_types" -> "linear_attention,indexed_attention"), and a key whose array holds an
+// element that is not a scalar, or holds no element at all, is skipped. A joined array is not
+// reversible when one of its elements contains a comma itself.
 //
 // A binding names either one object or a list of parts. The bindings that name one object are in
 // `bindings`; the bindings that name parts are in `part_bindings`, so that a binding is never
 // dropped silently. A binding that names neither is not reported.
+//
+// `component_resources` names the resources a component owns: the resource role, such as
+// "tokenizer.json", to the id of the object that carries it.
 struct V3Directory {
     std::map<std::string, std::map<std::string, std::string>> component_config;
+    std::map<std::string, std::map<std::string, std::string>> component_resources;
     std::map<std::string, std::string> bindings;
     std::map<std::string, std::vector<V3BindingPart>> part_bindings;
     std::vector<V3Use> uses;

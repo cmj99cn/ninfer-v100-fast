@@ -356,16 +356,48 @@ void v3_flatten_config(const Json& value, const std::string& path,
     if (v3_is_scalar(value)) { out.emplace(path, v3_scalar_text(value)); }
 }
 
+bool v3_parse_parts(const Json& value, std::vector<V3BindingPart>& out) {
+    if (!value.is_object()) { return false; }
+    const auto parts = value.find("parts");
+    if (parts == value.end() || !parts->is_array() || parts->empty()) { return false; }
+    std::vector<V3BindingPart> resolved;
+    for (const auto& part : *parts) {
+        if (!part.is_object()) { return false; }
+        const auto id    = part.find("object");
+        const auto range = part.find("range");
+        if (id == part.end() || !id->is_string() || range == part.end() ||
+            !range->is_array() || range->size() != 2 || !v3_is_index((*range)[0]) ||
+            !v3_is_index((*range)[1])) {
+            return false;
+        }
+        resolved.push_back(V3BindingPart{id->get<std::string>(),
+                                         (*range)[0].get<std::uint64_t>(),
+                                         (*range)[1].get<std::uint64_t>()});
+    }
+    out = std::move(resolved);
+    return true;
+}
+
 void v3_parse_components(const Json& directory, V3Directory& out) {
     const auto components = directory.find("components");
     if (components == directory.end() || !components->is_object()) { return; }
     for (const auto& [name, component] : components->items()) {
         if (!component.is_object()) { continue; }
         const auto config = component.find("config");
-        if (config == component.end() || !config->is_object()) { continue; }
-        std::map<std::string, std::string> flattened;
-        v3_flatten_config(*config, "", flattened);
-        out.component_config.emplace(name, std::move(flattened));
+        if (config != component.end() && config->is_object()) {
+            std::map<std::string, std::string> flattened;
+            v3_flatten_config(*config, "", flattened);
+            out.component_config.emplace(name, std::move(flattened));
+        }
+        const auto resources = component.find("resources");
+        if (resources != component.end() && resources->is_object()) {
+            std::map<std::string, std::string> roles;
+            for (const auto& [role, object] : resources->items()) {
+                if (!object.is_string()) { continue; }
+                roles.emplace(role, object.get<std::string>());
+            }
+            out.component_resources.emplace(name, std::move(roles));
+        }
     }
 }
 
@@ -381,28 +413,8 @@ void v3_parse_bindings(const Json& directory, V3Directory& out) {
         }
         // A binding that names no single object names parts of objects instead. Its parts are
         // reported separately, so that a parameter is never dropped silently.
-        const auto parts = binding.find("parts");
-        if (parts == binding.end() || !parts->is_array() || parts->empty()) { continue; }
         std::vector<V3BindingPart> resolved;
-        bool complete = true;
-        for (const auto& part : *parts) {
-            if (!part.is_object()) {
-                complete = false;
-                break;
-            }
-            const auto id    = part.find("object");
-            const auto range = part.find("range");
-            if (id == part.end() || !id->is_string() || range == part.end() ||
-                !range->is_array() || range->size() != 2 || !v3_is_index((*range)[0]) ||
-                !v3_is_index((*range)[1])) {
-                complete = false;
-                break;
-            }
-            resolved.push_back(V3BindingPart{id->get<std::string>(),
-                                             (*range)[0].get<std::uint64_t>(),
-                                             (*range)[1].get<std::uint64_t>()});
-        }
-        if (!complete) { continue; }
+        if (!v3_parse_parts(binding, resolved)) { continue; }
         out.part_bindings.emplace(name, std::move(resolved));
     }
 }
@@ -422,6 +434,14 @@ void v3_parse_uses(const Json& directory, V3Directory& out) {
         if (const auto policy = entry.find("activation_policy");
             policy != entry.end() && policy->is_string()) {
             use.activation_policy = policy->get<std::string>();
+        }
+        const auto auxiliaries = entry.find("auxiliaries");
+        if (auxiliaries != entry.end() && auxiliaries->is_object()) {
+            for (const auto& [role, auxiliary] : auxiliaries->items()) {
+                std::vector<V3BindingPart> parts;
+                if (!v3_parse_parts(auxiliary, parts)) { continue; }
+                use.auxiliaries.emplace(role, std::move(parts));
+            }
         }
         out.uses.push_back(std::move(use));
     }
