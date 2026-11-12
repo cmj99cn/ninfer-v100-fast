@@ -29,6 +29,10 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::RowScaleV1;
     case NumericFormat::GGML_K:
         return StorageLayout::GgmlK256V1;
+    case NumericFormat::NF4_G16_E4M3S:
+        return StorageLayout::RowPagedG16x4KV1;
+    case NumericFormat::FP8_E4M3FN_BLOCK128_BF16S:
+        return StorageLayout::BlockScaleM128K128V1;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -57,6 +61,10 @@ QType qtype_for(NumericFormat format) {
         return QType::FP8_E4M3FN_ROW_BF16S;
     case NumericFormat::GGML_K:
         return QType::GGML_K;
+    case NumericFormat::NF4_G16_E4M3S:
+        return QType::NF4_G16_E4M3S;
+    case NumericFormat::FP8_E4M3FN_BLOCK128_BF16S:
+        return QType::FP8_E4M3FN_BLOCK128_BF16S;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -71,8 +79,19 @@ DType dtype_for(NumericFormat format) {
         return DType::FP32;
     case NumericFormat::I32:
         return DType::I32;
+    case NumericFormat::NF4_G16_E4M3S:
+        return DType::NF4_G16_E4M3S;
+    case NumericFormat::FP8_E4M3FN_BLOCK128_BF16S:
+        return DType::FP8_E4M3FN_BLOCK128_BF16S;
     default:
         throw std::logic_error("quantized format has no direct dtype");
+    }
+}
+
+void require_decode_implemented(NumericFormat format) {
+    if (format == NumericFormat::NF4_G16_E4M3S ||
+        format == NumericFormat::FP8_E4M3FN_BLOCK128_BF16S) {
+        throw ArtifactError("decode lands in the qwen3.8-flash-next package");
     }
 }
 
@@ -237,6 +256,7 @@ void require_placement_bytes(const MaterializedArtifact& materialized, ObjectHan
 Tensor materialized_tensor(const MaterializedArtifact& materialized, ObjectHandle handle,
                            NumericFormat format, std::initializer_list<std::int32_t> internal_shape,
                            int device) {
+    require_decode_implemented(format);
     std::uint64_t elements = 1;
     for (const std::int32_t extent : internal_shape) {
         if (extent <= 0) {
@@ -251,6 +271,7 @@ Tensor materialized_tensor(const MaterializedArtifact& materialized, ObjectHandl
 Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
                            NumericFormat format, std::int32_t rows, std::int32_t columns,
                            int device) {
+    require_decode_implemented(format);
     if (format == NumericFormat::GGML_K) {
         Weight out{};
         out.payload = materialized.device_data(handle, device);
@@ -283,6 +304,7 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
 
 Weight staged_weight_view(NumericFormat format, const void* payload, std::int32_t rows,
                           std::int32_t columns) {
+    require_decode_implemented(format);
     if (format == NumericFormat::NVFP4 || format == NumericFormat::GGML_K) {
         throw std::invalid_argument("staged_weight_view: unsupported format");
     }

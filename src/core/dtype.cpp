@@ -24,6 +24,9 @@ std::size_t dtype_size(DType dtype) {
         return 1;
     case DType::I4NL:
         return 1;
+    case DType::NF4_G16_E4M3S:
+    case DType::FP8_E4M3FN_BLOCK128_BF16S:
+        throw std::invalid_argument("packed codec has no per-element dtype size");
     }
     throw std::invalid_argument("invalid DType");
 }

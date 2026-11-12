@@ -1,6 +1,7 @@
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
+#include "artifact/typed_binding.h"
 #include "core/device.h"
 
 #include <nlohmann/json.hpp>
@@ -802,6 +803,125 @@ void test_flash_next_artifact_geometries() {
               << block128 << " block128)\n";
 }
 
+std::vector<PlacedObject> new_format_objects(std::uint64_t& fp8_offset,
+                                             std::uint64_t& payload_bytes) {
+    const std::array<std::uint64_t, 2> nf4_shape = {16, 160};
+    const std::array<std::uint64_t, 2> fp8_shape = {128, 128};
+    const auto nf4_bytes = ninfer::artifact::row_paged_nf4_geometry(NumericFormat::NF4_G16_E4M3S,
+                                                                     nf4_shape)
+                               .encoded_bytes;
+    const auto fp8_bytes = ninfer::artifact::block_scale_m128_k128_geometry(
+                               NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, fp8_shape)
+                               .encoded_bytes;
+    fp8_offset    = align_up(nf4_bytes, 256);
+    payload_bytes = fp8_offset + fp8_bytes;
+    return {
+        {Json{{"id", "nf4"},
+              {"kind", "tensor"},
+              {"format", "nf4_g16_e4m3fn"},
+              {"layout", "row_paged_g16_4k_v1"},
+              {"shape", Json::array({16, 160})},
+              {"bytes", nf4_bytes}},
+         0, 0},
+        {Json{{"id", "fp8_block"},
+              {"kind", "tensor"},
+              {"format", "fp8_e4m3fn_block128x128_bf16"},
+              {"layout", "block_scale_m128_k128_v1"},
+              {"shape", Json::array({128, 128})},
+              {"bytes", fp8_bytes}},
+         0, fp8_offset},
+    };
+}
+
+void test_validate_only_accepts_new_quantized_formats() {
+    std::uint64_t fp8_offset    = 0;
+    std::uint64_t payload_bytes = 0;
+    const auto objects          = new_format_objects(fp8_offset, payload_bytes);
+    const auto fixture = write_v3_multi_part(objects, {marker_payload(payload_bytes, 0x11)});
+    Reader reader(fixture.entry);
+    ninfer::artifact::Binder binder(reader);
+
+    const auto nf4 = ninfer::artifact::bind_tensor(
+        binder, "nf4", NumericFormat::NF4_G16_E4M3S, {16, 160},
+        ninfer::artifact::TensorPlacement::ValidateOnly);
+    const auto fp8_block = ninfer::artifact::bind_tensor(
+        binder, "fp8_block", NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, {128, 128},
+        ninfer::artifact::TensorPlacement::ValidateOnly);
+    const auto plan = binder.finish();
+
+    const auto* nf4_tensor = std::get_if<TensorDescriptor>(&binder.descriptor(nf4));
+    const auto* fp8_tensor = std::get_if<TensorDescriptor>(&binder.descriptor(fp8_block));
+    if (nf4_tensor == nullptr || nf4_tensor->format != NumericFormat::NF4_G16_E4M3S ||
+        nf4_tensor->layout != StorageLayout::RowPagedG16x4KV1 || fp8_tensor == nullptr ||
+        fp8_tensor->format != NumericFormat::FP8_E4M3FN_BLOCK128_BF16S ||
+        fp8_tensor->layout != StorageLayout::BlockScaleM128K128V1) {
+        throw std::runtime_error("the binder did not resolve the new quantized formats");
+    }
+    if (plan.object_count != 2 || !plan.device_objects.empty() || !plan.host_objects.empty() ||
+        plan.device_capacity_bytes[0] != 0 || plan.host_capacity_bytes[0] != 0) {
+        throw std::runtime_error("validate-only placed bytes for a new quantized format");
+    }
+}
+
+int test_new_quantized_formats_reject_decode() {
+    std::uint64_t fp8_offset    = 0;
+    std::uint64_t payload_bytes = 0;
+    const auto objects          = new_format_objects(fp8_offset, payload_bytes);
+    const auto fixture = write_v3_multi_part(objects, {marker_payload(payload_bytes, 0x22)});
+    Reader reader(fixture.entry);
+
+    int device_count              = 0;
+    const cudaError_t count_error = cudaGetDeviceCount(&device_count);
+    if (count_error == cudaErrorNoDevice || count_error == cudaErrorInsufficientDriver) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    CUDA_CHECK(count_error);
+    if (device_count == 0) {
+        std::cout << "SKIP: no CUDA devices\n";
+        return 77;
+    }
+
+    ninfer::artifact::Binder binder(reader);
+    const auto nf4 = ninfer::artifact::bind_tensor(
+        binder, "nf4", NumericFormat::NF4_G16_E4M3S, {16, 160},
+        ninfer::artifact::TensorPlacement::Device);
+    const auto fp8_block = ninfer::artifact::bind_tensor(
+        binder, "fp8_block", NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, {128, 128},
+        ninfer::artifact::TensorPlacement::Device);
+    const auto plan = binder.finish();
+
+    ninfer::DeviceContext device(0);
+    auto materialized = ninfer::artifact::materialize(reader, plan, device);
+
+    constexpr std::string_view needle = "decode lands in the qwen3.8-flash-next package";
+    expect_artifact_error(
+        [&] {
+            (void)ninfer::artifact::materialized_weight(
+                materialized, nf4, NumericFormat::NF4_G16_E4M3S, 16, 160);
+        },
+        needle);
+    expect_artifact_error(
+        [&] {
+            (void)ninfer::artifact::materialized_weight(
+                materialized, fp8_block, NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, 128, 128);
+        },
+        needle);
+    expect_artifact_error(
+        [&] {
+            (void)ninfer::artifact::materialized_tensor(
+                materialized, nf4, NumericFormat::NF4_G16_E4M3S, {16, 160});
+        },
+        needle);
+    expect_artifact_error(
+        [&] {
+            (void)ninfer::artifact::staged_weight_view(NumericFormat::NF4_G16_E4M3S, nullptr, 16,
+                                                       160);
+        },
+        needle);
+    return 0;
+}
+
 void test_identity_synthesized() {
     const auto fixture =
         write_v3_multi_part(canonical_objects(),
@@ -1092,6 +1212,9 @@ int main() {
         test_paged_layout_has_no_slice();
         test_column_slice_rank_rejection_unchanged();
         test_flash_next_artifact_geometries();
+        test_validate_only_accepts_new_quantized_formats();
+        const int decode_skipped = test_new_quantized_formats_reject_decode();
+        if (decode_skipped != 0) { return decode_skipped; }
         test_identity_synthesized();
         test_objects_and_payloads_across_parts();
         test_wrong_part_index_rejected();
