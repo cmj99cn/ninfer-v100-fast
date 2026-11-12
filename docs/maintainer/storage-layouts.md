@@ -392,7 +392,7 @@ or model consumer.
 
 The v3 layouts of sections 9 to 11 are sized and validated by this repository, which preserves
 their encoded bytes and their layout geometry; the block-scaled and batched layouts are sliced as
-well. Their logical decode is implemented by
+well. Their logical decode lands in
 the qwen3.8-flash-next package: the paged NF4 codes and group scale bytes, the block-scaled FP8
 codes and 128x128 block scale words, and the batched NVFP4 codes, swizzled group scales and
 per-matrix FP32 weight divisors are decoded there.

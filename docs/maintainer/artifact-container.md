@@ -332,8 +332,9 @@ For the upstream v3 multi-volume container of §2.4 the same reader opens the co
 resolves a logical offset to the volume that holds it, and exposes the same object descriptors and
 payload spans; only the framing and the address mapping differ from version 2. A read range is cut
 at the volume boundaries before it reaches the device, so no copied byte comes from another volume;
-the read of such a range may still carry up to 4095 bytes of block padding past the volume that
-holds the bytes.
+the direct read of such a range may still copy up to 4095 bytes of block slack past the range; the
+materializer truncates each piece at the volume boundary, so no copied byte is written past the
+range into a shard.
 
 The JSON and name index are cold-load data. A model binder resolves them once; inference does not
 reparse JSON or perform per-layer/per-token directory lookups.

@@ -912,11 +912,11 @@ private:
         std::vector<Piece> result;
         std::uint64_t copied = 0;
         while (copied < available) {
-            const auto& volume = volume_for(logical_offset + copied);
+            const std::size_t index = volume_index_for(logical_offset + copied);
+            const auto& volume = volumes_[index];
             const auto local   = logical_offset + copied - volume.logical_begin;
             const auto count   = std::min(available - copied, volume.payload_bytes - local);
-            result.push_back(Piece{static_cast<std::size_t>(&volume - volumes_.data()),
-                                   volume.file_base + local, logical_offset + copied, count});
+            result.push_back(Piece{index, volume.file_base + local, logical_offset + copied, count});
             copied += count;
         }
         return result;
@@ -1119,9 +1119,10 @@ private:
         throw ArtifactError("v3 object kind must be 'tensor' or 'resource'");
     }
 
-    const Volume& volume_for(std::uint64_t logical_offset) const {
-        for (const auto& volume : volumes_) {
-            if (logical_offset < volume.logical_begin + volume.payload_bytes) { return volume; }
+    std::size_t volume_index_for(std::uint64_t logical_offset) const {
+        for (std::size_t index = 0; index < volumes_.size(); ++index) {
+            const auto& volume = volumes_[index];
+            if (logical_offset < volume.logical_begin + volume.payload_bytes) { return index; }
         }
         throw ArtifactError("v3 payload offset is beyond the artifact payload");
     }
