@@ -422,7 +422,7 @@ git commit -m "feat(ops): add the QSA indexed attention ops and packed linear sp
 
 - 路由：router 权重 BF16 `[513,2560]`（512 专家 + 1 shared 行），对每个 token 取 top-10，`norm_topk_prob=true` → 概率 = softmax(top-10 logits) 归一化，共享专家行给 sigmoid 分数；断言 top-10 的选择与 tie 规则（并列时专家 id 小者先）、归一化后和为 1；
 - grouped gate_up/down：真实几何 512 专家、hidden 2560、intermediate 640、gate_up `[512,1280,2560]`、down `[512,2560,640]`（batched blockscale 布局），取 4 个专家做 FP32 oracle 比对：oracle 按存储码本解 NVFP4（4-bit code + 16 元素组 E4M3 scale + 每矩阵 FP32 除数）后做 FP32 GEMM；**op 原地消费整块专家库 payload + 每个角色在矩阵内的行区间**（gate 行 [0,640)、up 行 [640,1280)、down 整段），不先做物理拷贝（拷贝会按 128 行带重组 swizzle 缩放 tile，比原地解码更贵）；
-- 共享专家：BF16 SwiGLU 路径贡献一次。
+- 共享专家：BF16 SwiGLU 路径，带 `sigmoid(l[E])` 门控，贡献一次且不被路由系数缩放。
 
 - [ ] **步骤 2：运行测试验证失败**
 
@@ -435,17 +435,18 @@ git commit -m "feat(ops): add the QSA indexed attention ops and packed linear sp
 
 ```cpp
 struct MoeNvfp4Weights {
-    Weight router;          // BF16 contiguous [513,2560]
-    Weight routed_gate_up;  // batched blockscale [512,1280,2560]
-    Weight routed_down;     // batched blockscale [512,2560,640]
-    Weight shared_gate_up;  // BF16 [1280,2560]
-    Weight shared_down;     // BF16 [640,1280]
+    // 路由/共享同属一个 BF16 连续父权重 [1793,2560]（工件实测）：router 行 [0,512)、
+    // shared_score 行 [512,513)、shared gate 行 [513,1153)、shared up 行 [1153,1793)
+    Weight router_shared;   // BF16 contiguous [1793,2560]
+    Weight shared_down;     // BF16 contiguous [2560,640]（独立对象）
+    Weight routed_gate_up;  // batched NVFP4 [512,1280,2560]，gate = 每矩阵行 [0,640)、up = 行 [640,1280)
+    Weight routed_down;     // batched NVFP4 [512,2560,640]（每矩阵整段）
 };
 void moe_routed_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& destination,
                       WorkspaceArena& workspace, cudaStream_t stream);
 ```
 
-数值契约：路由 top-10 + `norm_topk_prob`（softmax 在 top-10 内归一化）、每专家贡献按路由系数缩放求和、共享专家贡献一次（不加路由系数）、输出累加到 `destination`。
+数值契约：路由 top-10 + `norm_topk_prob`（softmax 在 top-10 内归一化）、每专家贡献按路由系数缩放求和、**共享专家带 `sigmoid(l[E])` 门控、贡献一次且不被 top-10 路由系数缩放**（上游 `include/ninfer/ops/moe.h` 的 `topk_softmax_route` 与 `topk_softmax_swiglu_moe` 契约）、输出累加到 `destination`。
 
 - [ ] **步骤 4：运行测试验证通过**
 
