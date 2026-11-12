@@ -83,7 +83,7 @@ constexpr bool suffixes_are_unique() {
 
 static_assert(table_matches_the_enumeration());
 static_assert(suffixes_are_unique());
-static_assert(kRoleSpecs.size() == kRoleCount);
+static_assert(kRoleCount == 50);
 static_assert(static_cast<std::size_t>(Role::PleConvolution) + 1 == kRoleCount);
 
 constexpr std::array<Role, kRoleCount> kRoleOrder = [] {

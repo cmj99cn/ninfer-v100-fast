@@ -108,10 +108,10 @@ void test_role_set_matches_the_pattern_table() {
                 "the pattern table repeats a role");
         expected_bindings += entry.count;
     }
-    require(expected_bindings == roles::kTextBindingCount,
+    require(expected_bindings == roles::kTextNameCount,
             "the pattern table counts " + std::to_string(expected_bindings) +
                 " text parameters; the artifact declares " +
-                std::to_string(roles::kTextBindingCount));
+                std::to_string(roles::kTextNameCount));
 
     std::set<std::string> produced;
     for (const auto role : roles::all_roles()) {
@@ -189,12 +189,41 @@ void test_layer_of_and_role_of() {
     require(!roles::role_of("text").has_value(), "a prefix has no role");
 }
 
-void test_real_artifact_binding_coverage() {
-    const char* artifact = std::getenv("NINFER_FLASH_NEXT_V3_ARTIFACT");
-    if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "skip: NINFER_FLASH_NEXT_V3_ARTIFACT is not set\n";
-        return;
+std::string layers_text(const std::set<std::uint32_t>& layers) {
+    std::string out = "[";
+    for (const auto layer : layers) {
+        if (out.size() > 1) { out += ","; }
+        out += std::to_string(layer);
     }
+    out += "]";
+    return out;
+}
+
+std::set<std::uint32_t> expected_layers_of(std::string_view pattern,
+                                            const std::set<std::uint32_t>& every_layer) {
+    constexpr std::string_view kLayerPrefix = "text/layers/N/";
+    if (!pattern.starts_with(kLayerPrefix)) { return {}; }
+    const auto rest     = pattern.substr(kLayerPrefix.size());
+    const auto slash    = rest.find('/');
+    const auto family   = rest.substr(0, slash);
+    std::set<std::uint32_t> layers;
+    if (family == "gdn") {
+        for (const auto layer : every_layer) {
+            if (layer % 4 != 3) { layers.insert(layer); }
+        }
+    } else if (family == "attention") {
+        for (const auto layer : every_layer) {
+            if (layer % 4 == 3) { layers.insert(layer); }
+        }
+    } else if (family == "ple") {
+        layers.insert(roles::kPleLayer);
+    } else {
+        layers = every_layer;
+    }
+    return layers;
+}
+
+void test_real_artifact_binding_coverage(const char* artifact) {
     Reader reader(artifact);
     const auto& directory = reader.v3_directory();
 
@@ -205,12 +234,14 @@ void test_real_artifact_binding_coverage() {
     for (const auto& entry : directory.part_bindings) {
         if (entry.first.starts_with("text/")) { text_parameters.insert(entry.first); }
     }
-    require(text_parameters.size() == roles::kTextBindingCount,
+    require(text_parameters.size() == roles::kTextNameCount,
             "the artifact holds " + std::to_string(text_parameters.size()) +
                 " text parameters; the role table expects " +
-                std::to_string(roles::kTextBindingCount));
+                std::to_string(roles::kTextNameCount));
 
     std::map<roles::Role, std::uint32_t> claimed;
+    std::map<roles::Role, std::set<std::uint32_t>> claimed_layers;
+    std::set<std::uint32_t> artifact_layers;
     for (const auto& name : text_parameters) {
         const auto role = roles::role_of(name);
         require(role.has_value(), "the artifact parameter " + name + " has no role");
@@ -218,8 +249,8 @@ void test_real_artifact_binding_coverage() {
         const auto layer = roles::layer_of(name);
         if (roles::is_layer_scoped(*role)) {
             require(layer.has_value(), "the artifact parameter " + name + " has no layer");
-            require(*layer < roles::kTextLayers,
-                    "the artifact parameter " + name + " names a layer outside the artifact");
+            claimed_layers[*role].insert(*layer);
+            artifact_layers.insert(*layer);
         } else {
             require(!layer.has_value(),
                     "the global artifact parameter " + name + " names a layer");
@@ -237,9 +268,28 @@ void test_real_artifact_binding_coverage() {
     require(claimed.size() == std::size(kExpectedRoles),
             "the artifact parameters do not cover every role");
 
+    const std::uint32_t layer_count = *artifact_layers.rbegin() + 1;
+    require(layer_count == 48,
+            "the artifact holds " + std::to_string(layer_count) + " layers; it holds 48");
+    std::set<std::uint32_t> every_layer;
+    for (std::uint32_t layer = 0; layer < layer_count; ++layer) { every_layer.insert(layer); }
+    require(artifact_layers == every_layer, "the artifact layers are not a contiguous range");
+
+    for (const auto& entry : kExpectedRoles) {
+        const auto expected_layers = expected_layers_of(entry.pattern, every_layer);
+        const auto found = claimed_layers.find(entry.role);
+        const auto actual = found == claimed_layers.end() ? std::set<std::uint32_t>{}
+                                                          : found->second;
+        require(actual == expected_layers,
+                "the role of " + std::string(entry.pattern) + " occupies " +
+                    std::to_string(actual.size()) + " layers " + layers_text(actual) +
+                    "; it should occupy " + std::to_string(expected_layers.size()) + " layers " +
+                    layers_text(expected_layers));
+    }
+
     std::set<std::string> generated;
     for (const auto role : roles::all_roles()) {
-        for (std::uint32_t layer = 0; layer < roles::kTextLayers; ++layer) {
+        for (std::uint32_t layer = 0; layer < layer_count; ++layer) {
             generated.insert(roles::parameter_name(role, layer));
         }
     }
@@ -250,23 +300,30 @@ void test_real_artifact_binding_coverage() {
     for (const auto& name : generated) {
         if (text_parameters.count(name) != 0) { ++present; }
     }
-    require(present == roles::kTextBindingCount,
+    require(present == roles::kTextNameCount,
             "the role table spells " + std::to_string(present) +
                 " artifact parameters; the artifact holds " +
-                std::to_string(roles::kTextBindingCount));
+                std::to_string(roles::kTextNameCount));
 
     std::cout << "flash-next roles: " << text_parameters.size() << " text parameters claim "
-              << claimed.size() << " roles exactly\n";
+              << claimed.size() << " roles exactly, over " << layer_count << " layers\n";
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool artifact_mode = argc > 1 && std::string_view(argv[1]) == "artifact";
     try {
         test_role_set_matches_the_pattern_table();
         test_parameter_names_of_a_layer();
         test_layer_of_and_role_of();
-        test_real_artifact_binding_coverage();
+        if (!artifact_mode) { return 0; }
+        const char* artifact = std::getenv("NINFER_FLASH_NEXT_V3_ARTIFACT");
+        if (artifact == nullptr || *artifact == '\0') {
+            std::cout << "skip: NINFER_FLASH_NEXT_V3_ARTIFACT is not set\n";
+            return 77;
+        }
+        test_real_artifact_binding_coverage(artifact);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

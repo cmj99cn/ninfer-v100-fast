@@ -75,7 +75,9 @@ ninfer_add_test(ninfer_flash_next_roles_test
   SOURCES targets/qwen3_8_flash_next/test_roles.cpp
           ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_flash_next/impl/load/roles.cpp
   LIBRARIES ninfer_artifact)
-set_tests_properties(ninfer_flash_next_roles_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_flash_next_roles_artifact_test
+  COMMAND ninfer_flash_next_roles_test artifact)
+set_tests_properties(ninfer_flash_next_roles_artifact_test PROPERTIES SKIP_RETURN_CODE 77)
 # Host-only: no artifact, no device. Byte-level TP2 shard slice geometry per storage layout.
 ninfer_add_test(ninfer_tensor_slice_test
   SOURCES test_tensor_slice.cpp

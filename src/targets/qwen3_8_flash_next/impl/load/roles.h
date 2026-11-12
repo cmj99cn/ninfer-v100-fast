@@ -19,8 +19,10 @@
 // the three global roles -- the token embedding, the output head and the final HC -- do not
 // carry a layer. The role table is layer-index agnostic: it spells a well formed name for any
 // layer index, and the caller owns the knowledge of which layer owns a role (the PLE roles
-// exist in one layer only). The `mtp/*`, `vision/*` and `proposal/*` namespaces of the same
-// artifact belong to later milestones and have no role here.
+// exist in one layer only). The number of Text layers and the kind of each layer are
+// configuration facts and belong to the package's configuration, not to this table. The
+// `mtp/*`, `vision/*` and `proposal/*` namespaces of the same artifact belong to later
+// milestones and have no role here.
 namespace ninfer::targets::qwen3_8_flash_next::detail::roles {
 
 enum class Role : std::uint8_t {
@@ -79,22 +81,19 @@ enum class Role : std::uint8_t {
 // The number of roles. One role per `text/*` parameter name pattern of the artifact.
 inline constexpr std::size_t kRoleCount = 50;
 
-// The `text/*` parameter count of the artifact, and the per-pattern counts of its name table.
-inline constexpr std::uint32_t kTextBindingCount = 1308;
-inline constexpr std::uint32_t kAttentionHcBindingCount = 48;
-inline constexpr std::uint32_t kMoeHcBindingCount = 48;
-inline constexpr std::uint32_t kGdnBindingCount = 36;
-inline constexpr std::uint32_t kQsaBindingCount = 12;
-inline constexpr std::uint32_t kMoeBindingCount = 48;
-inline constexpr std::uint32_t kPleBindingCount = 1;
-inline constexpr std::uint32_t kGlobalBindingCount = 1;
+// How many parameter names of the artifact each name pattern contributes. These count names,
+// not layers.
+inline constexpr std::uint32_t kTextNameCount = 1308;
+inline constexpr std::uint32_t kAttentionHcNameCount = 48;
+inline constexpr std::uint32_t kMoeHcNameCount = 48;
+inline constexpr std::uint32_t kGdnNameCount = 36;
+inline constexpr std::uint32_t kQsaNameCount = 12;
+inline constexpr std::uint32_t kMoeNameCount = 48;
+inline constexpr std::uint32_t kPleNameCount = 1;
+inline constexpr std::uint32_t kGlobalNameCount = 1;
 
-// The Text layers of the artifact and the layer kinds among them.
-inline constexpr std::uint32_t kTextLayers = 48;
-inline constexpr std::uint32_t kGdnLayers = 36;
-inline constexpr std::uint32_t kQsaLayers = 12;
-
-// The layer that owns the PLE parameters.
+// The layer the PLE parameter names live in. The PLE names are `text/layers/1/ple/*`, so this
+// is a fact about the names themselves.
 inline constexpr std::uint32_t kPleLayer = 1;
 
 // Every role, in enumeration order.

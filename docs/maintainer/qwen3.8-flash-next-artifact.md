@@ -60,7 +60,7 @@ The seven resources are `resource/text/tokenizer.json`, `resource/text/tokenizer
 
 ### 1.3 Where these measurements come from
 
-Every number in this reference is read out of the artifact's v3 directory JSON:
+Every measured number in this reference is read out of the artifact's v3 directory JSON:
 
 - `components.text.config` gives the model configuration (section 2);
 - `bindings` and `part_bindings` give the parameter names, their objects and their element
@@ -72,7 +72,9 @@ Every number in this reference is read out of the artifact's v3 directory JSON:
 The `Reader` exposes the directory as `Reader::v3_directory()`
 (`src/artifact/reader.h`), and `tensor_element_interval_view` maps an element range onto the
 logical view of its layout (`src/artifact/storage_layouts.cpp`). All 76,242 part ranges of this
-artifact are rectangles in their own layout.
+artifact are rectangles in their own layout. The one conclusion of this reference that the
+directory does not state is the PLE shard-to-global-row assignment; it is marked as a
+derivation in section 8.1.
 
 ## 2. The text configuration
 
@@ -168,7 +170,9 @@ name-to-role mapping. There is exactly one role per `text/*` name pattern, and t
 the exact inverse of the artifact's names: `roles::role_of` maps every `text/*` binding to
 exactly one role, and `roles::parameter_name` spells the artifact's name for every role and
 layer. The test `tests/targets/qwen3_8_flash_next/test_roles.cpp` asserts that bijection
-against the real artifact.
+against the real artifact, and pins the layer set of every role family: the GDN roles occupy
+the 36 layers with `l % 4 != 3`, the QSA roles the 12 layers with `l % 4 == 3`, the HC and MoE
+roles all 48 layers, and the PLE roles layer 1 alone.
 
 The role enumeration is:
 
@@ -206,11 +210,22 @@ The remaining 478 bindings of the same artifact are deliberately not covered by 
 | `proposal/head` | 1 | the full-vocabulary Q4 draft head, `[248320, 2560]` `q4_g64_fp16` | M3 |
 | `vision/*` | 441 | 27 vision blocks (attention, MLP, norms) plus patch embedding, position embedding and merger | M6 |
 
-The MTP QSA layer is the reason the artifact also carries a `[13952, 2560]` BF16 parent: its
-`key`, `value` and `index_key` occupy rows `[0,1024)`, `[1024,1152)` and `[1152,1280)` of that
-parent, followed by `query` (rows `[1280,7424)`), `output_gate` (rows `[7424,13568)`) and
-`index_query` (rows `[13568,13952)`). The text QSA layer does **not** use that parent; it has
-its own two parents (section 4.3).
+The MTP QSA layer is the reason the artifact also carries a `[13952, 2560]` BF16 parent. Its
+six projections are six row ranges of that parent, in the upstream binding order
+`{key, value, index_key, query, gate, index_query}` (upstream
+`src/models/qwen4_exp/execution/parameters.cpp:68`):
+
+| Parameter | Rows | Width | Width source |
+|---|---|---:|---|
+| `key` | `[0,512)` | 512 | `kv_width = kv_heads * head_dim = 2 * 256` |
+| `value` | `[512,1024)` | 512 | `kv_width` |
+| `index_key` | `[1024,1152)` | 128 | `index_key_width = indexer_kv_heads * indexer_head_dim = 1 * 128` |
+| `query` | `[1152,7296)` | 6144 | `query_width = query_heads * head_dim = 24 * 256` |
+| `output_gate` | `[7296,13440)` | 6144 | `query_width` |
+| `index_query` | `[13440,13952)` | 512 | `index_query_width = indexer_n_heads * indexer_head_dim = 4 * 128` |
+
+The widths sum to `512 + 512 + 128 + 6144 + 6144 + 512 = 13952`, the height of the parent. The
+text QSA layer does **not** use that parent; it has its own two parents (section 4.3).
 
 ## 4. Geometry of the text parameters
 
@@ -219,18 +234,30 @@ layout and shape, and the element range the parameter occupies inside the object
 half-open `[begin, end)` element intervals in the object's own element order; "rows" gives the
 same interval as a row range of a rank-two object.
 
+**Every layer owns its own objects.** The Object column names the object of the **first layer
+of the pattern** -- layer 0 for the HC, GDN and MoE families, layer 3 for the QSA family, layer
+1 for PLE -- and the object ids grow with the layer: `attention_hc/norm` is `weight/000530` in
+layer 0 and `weight/000540` in layer 1; `gdn/query` is `weight/000229` in layer 0 and
+`weight/000234` in layer 1; `moe/router` is `weight/000228` in layer 0 and `weight/000233` in
+layer 1; the routed expert bank of layer 0 is `weight/000000` / `weight/000001` and that of
+layer 1 is `weight/000002` / `weight/000003`; the QSA layer 3 uses `weight/000245` /
+`weight/000246` and the QSA layer 7 uses `weight/000265` / `weight/000266`. The `text/*`
+bindings reference 954 distinct objects, distributed over the 48 layers. What a pattern shares
+across the layers is its **format, layout, shape and element range**; only the object id
+changes.
+
 ### 4.1 The four-stream HC
 
 | Parameter | Object | Format | Layout | Shape | Range | Rows |
 |---|---|---|---|---|---|---|
-| `attention_hc/norm` | `weight/000530` | bf16 | contiguous | `[10240]` | whole | — |
-| `attention_hc/down` | `weight/000226` | bf16 | contiguous | `[324, 10240]` | `[0, 3276800)` | `[0,320)` |
-| `attention_hc/inject` | `weight/000226` | bf16 | contiguous | `[324, 10240]` | `[3276800, 3317760)` | `[320,324)` |
-| `attention_hc/up` | `weight/000531` | bf16 | contiguous | `[10240, 320]` | whole | — |
-| `moe_hc/norm` | `weight/000532` | bf16 | contiguous | `[10240]` | whole | — |
-| `moe_hc/down` | `weight/000227` | bf16 | contiguous | `[324, 10240]` | `[0, 3276800)` | `[0,320)` |
-| `moe_hc/inject` | `weight/000227` | bf16 | contiguous | `[324, 10240]` | `[3276800, 3317760)` | `[320,324)` |
-| `moe_hc/up` | `weight/000533` | bf16 | contiguous | `[10240, 320]` | whole | — |
+| `attention_hc/norm` | `weight/000530` | bf16 | contiguous_le_v1 | `[10240]` | whole | — |
+| `attention_hc/down` | `weight/000226` | bf16 | contiguous_le_v1 | `[324, 10240]` | `[0, 3276800)` | `[0,320)` |
+| `attention_hc/inject` | `weight/000226` | bf16 | contiguous_le_v1 | `[324, 10240]` | `[3276800, 3317760)` | `[320,324)` |
+| `attention_hc/up` | `weight/000531` | bf16 | contiguous_le_v1 | `[10240, 320]` | whole | — |
+| `moe_hc/norm` | `weight/000532` | bf16 | contiguous_le_v1 | `[10240]` | whole | — |
+| `moe_hc/down` | `weight/000227` | bf16 | contiguous_le_v1 | `[324, 10240]` | `[0, 3276800)` | `[0,320)` |
+| `moe_hc/inject` | `weight/000227` | bf16 | contiguous_le_v1 | `[324, 10240]` | `[3276800, 3317760)` | `[320,324)` |
+| `moe_hc/up` | `weight/000533` | bf16 | contiguous_le_v1 | `[10240, 320]` | whole | — |
 
 The HC "down" and "inject" parameters are two row ranges of one `[324, 10240]` parent: the
 down projection is rows `[0,320)` and the injection projection is the four rows `[320,324)`.
@@ -240,7 +267,7 @@ index `c = d + 2560*s` of the residual.
 
 `final_hc` has the same shape family without the injection rows: `final_hc/norm` is
 `weight/000527` `[10240]`, `final_hc/down` is `weight/000528` `[320, 10240]` and `final_hc/up` is
-`weight/000529` `[10240, 320]`, all BF16 contiguous.
+`weight/000529` `[10240, 320]`, all BF16 with layout `contiguous_le_v1`.
 
 ### 4.2 GDN
 
@@ -250,12 +277,12 @@ index `c = d + 2560*s` of the residual.
 | `gdn/key` | `weight/000229` | q8_g32_fp16 | row_split_k128_v1 | `[16384, 2560]` | `[5242880, 10485760)` | `[2048,4096)` |
 | `gdn/value` | `weight/000229` | q8_g32_fp16 | row_split_k128_v1 | `[16384, 2560]` | `[10485760, 26214400)` | `[4096,10240)` |
 | `gdn/z` | `weight/000229` | q8_g32_fp16 | row_split_k128_v1 | `[16384, 2560]` | `[26214400, 41943040)` | `[10240,16384)` |
-| `gdn/a_projection` | `weight/000230` | bf16 | contiguous | `[96, 2560]` | `[0, 122880)` | `[0,48)` |
-| `gdn/b_projection` | `weight/000230` | bf16 | contiguous | `[96, 2560]` | `[122880, 245760)` | `[48,96)` |
-| `gdn/a_log` | `weight/000537` | fp32 | contiguous | `[48]` | whole | — |
-| `gdn/dt_bias` | `weight/000538` | fp32 | contiguous | `[48]` | whole | — |
-| `gdn/convolution` | `weight/000536` | bf16 | contiguous | `[4, 10240]` | whole | — |
-| `gdn/norm` | `weight/000539` | bf16 | contiguous | `[128]` | whole | — |
+| `gdn/a_projection` | `weight/000230` | bf16 | contiguous_le_v1 | `[96, 2560]` | `[0, 122880)` | `[0,48)` |
+| `gdn/b_projection` | `weight/000230` | bf16 | contiguous_le_v1 | `[96, 2560]` | `[122880, 245760)` | `[48,96)` |
+| `gdn/a_log` | `weight/000537` | fp32 | contiguous_le_v1 | `[48]` | whole | — |
+| `gdn/dt_bias` | `weight/000538` | fp32 | contiguous_le_v1 | `[48]` | whole | — |
+| `gdn/convolution` | `weight/000536` | bf16 | contiguous_le_v1 | `[4, 10240]` | whole | — |
+| `gdn/norm` | `weight/000539` | bf16 | contiguous_le_v1 | `[128]` | whole | — |
 | `gdn/output` | `weight/000535` | q8_g32_fp16 | row_split_k128_v1 | `[2560, 6144]` | whole | — |
 
 The four input projections share one `[16384, 2560]` Q8 group-32 row-split parent in the order
@@ -271,39 +298,39 @@ stored tap-major (`[4 taps, 10240 channels]`), which is the transpose of the run
 |---|---|---|---|---|---|---|
 | `attention/query` | `weight/000245` | q8_g32_fp16 | row_split_k128_v1 | `[12288, 2560]` | `[0, 15728640)` | `[0,6144)` |
 | `attention/output_gate` | `weight/000245` | q8_g32_fp16 | row_split_k128_v1 | `[12288, 2560]` | `[15728640, 31457280)` | `[6144,12288)` |
-| `attention/key` | `weight/000246` | bf16 | contiguous | `[1664, 2560]` | `[0, 1310720)` | `[0,512)` |
-| `attention/value` | `weight/000246` | bf16 | contiguous | `[1664, 2560]` | `[1310720, 2621440)` | `[512,1024)` |
-| `attention/index_query` | `weight/000246` | bf16 | contiguous | `[1664, 2560]` | `[2621440, 3932160)` | `[1024,1536)` |
-| `attention/index_key` | `weight/000246` | bf16 | contiguous | `[1664, 2560]` | `[3932160, 4259840)` | `[1536,1664)` |
+| `attention/key` | `weight/000246` | bf16 | contiguous_le_v1 | `[1664, 2560]` | `[0, 1310720)` | `[0,512)` |
+| `attention/value` | `weight/000246` | bf16 | contiguous_le_v1 | `[1664, 2560]` | `[1310720, 2621440)` | `[512,1024)` |
+| `attention/index_query` | `weight/000246` | bf16 | contiguous_le_v1 | `[1664, 2560]` | `[2621440, 3932160)` | `[1024,1536)` |
+| `attention/index_key` | `weight/000246` | bf16 | contiguous_le_v1 | `[1664, 2560]` | `[3932160, 4259840)` | `[1536,1664)` |
 | `attention/output` | `weight/000569` | q8_g32_fp16 | row_split_k128_v1 | `[2560, 6144]` | whole | — |
-| `attention/query_norm` | `weight/000570` | bf16 | contiguous | `[256]` | whole | — |
-| `attention/key_norm` | `weight/000571` | bf16 | contiguous | `[256]` | whole | — |
-| `attention/index_query_norm` | `weight/000572` | bf16 | contiguous | `[128]` | whole | — |
-| `attention/index_key_norm` | `weight/000573` | bf16 | contiguous | `[128]` | whole | — |
+| `attention/query_norm` | `weight/000570` | bf16 | contiguous_le_v1 | `[256]` | whole | — |
+| `attention/key_norm` | `weight/000571` | bf16 | contiguous_le_v1 | `[256]` | whole | — |
+| `attention/index_query_norm` | `weight/000572` | bf16 | contiguous_le_v1 | `[128]` | whole | — |
+| `attention/index_key_norm` | `weight/000573` | bf16 | contiguous_le_v1 | `[128]` | whole | — |
 
 The text QSA layer has two parents and two layouts: the query and the output gate are the two
 halves of one `[12288, 2560]` Q8 group-32 row-split parent (`query` rows `[0,6144)`, gate rows
 `[6144,12288)`), while `key`, `value`, `index_query` and `index_key` are four row ranges of one
-`[1664, 2560]` BF16 contiguous parent in the order `K | V | index-Q | index-K`
+`[1664, 2560]` BF16 `contiguous_le_v1` parent in the order `K | V | index-Q | index-K`
 (`512 | 512 | 512 | 128` rows). The upstream consumer keeps these two representations apart:
 `MainQsaProjection` binds `{query, gate}` and `{key, value, index_query, index_key}` as two
-separate projections (`src/models/qwen4_exp/execution/parameters.cpp:74-79`).
+separate projections (upstream `src/models/qwen4_exp/execution/parameters.cpp:70-71`).
 
 ### 4.4 MoE
 
 | Parameter | Object | Format | Layout | Shape | Range | Rows |
 |---|---|---|---|---|---|---|
-| `moe/router` | `weight/000228` | bf16 | contiguous | `[1793, 2560]` | `[0, 1310720)` | `[0,512)` |
-| `moe/shared_score` | `weight/000228` | bf16 | contiguous | `[1793, 2560]` | `[1310720, 1313280)` | `[512,513)` |
-| `moe/shared/gate` | `weight/000228` | bf16 | contiguous | `[1793, 2560]` | `[1313280, 2951680)` | `[513,1153)` |
-| `moe/shared/up` | `weight/000228` | bf16 | contiguous | `[1793, 2560]` | `[2951680, 4590080)` | `[1153,1793)` |
-| `moe/shared/down` | `weight/000534` | bf16 | contiguous | `[2560, 640]` | whole | — |
+| `moe/router` | `weight/000228` | bf16 | contiguous_le_v1 | `[1793, 2560]` | `[0, 1310720)` | `[0,512)` |
+| `moe/shared_score` | `weight/000228` | bf16 | contiguous_le_v1 | `[1793, 2560]` | `[1310720, 1313280)` | `[512,513)` |
+| `moe/shared/gate` | `weight/000228` | bf16 | contiguous_le_v1 | `[1793, 2560]` | `[1313280, 2951680)` | `[513,1153)` |
+| `moe/shared/up` | `weight/000228` | bf16 | contiguous_le_v1 | `[1793, 2560]` | `[2951680, 4590080)` | `[1153,1793)` |
+| `moe/shared/down` | `weight/000534` | bf16 | contiguous_le_v1 | `[2560, 640]` | whole | — |
 | `moe/experts/gate` | `weight/000000` | nvfp4 | batched_block_scale_k16_m128x4_v1 | `[512, 1280, 2560]` | 512 parts | matrix rows `[0,640)` |
 | `moe/experts/up` | `weight/000000` | nvfp4 | batched_block_scale_k16_m128x4_v1 | `[512, 1280, 2560]` | 512 parts | matrix rows `[640,1280)` |
 | `moe/experts/down` | `weight/000001` | nvfp4 | batched_block_scale_k16_m128x4_v1 | `[512, 2560, 640]` | 512 parts | whole matrix |
 
 The router, the shared logit and the shared expert's gate and up projections are four row
-ranges of one `[1793, 2560]` BF16 contiguous parent: 512 router rows, one shared logit row, and
+ranges of one `[1793, 2560]` BF16 `contiguous_le_v1` parent: 512 router rows, one shared logit row, and
 640+640 shared expert rows. The first 513 rows are the routing control weight `[513, 2560]`
 (`E+1` rows: the routed logits, then one independent shared logit); the remaining 1280 rows
 are the shared expert's gate_up `[1280, 2560]`. The shared down projection is an independent
@@ -320,12 +347,12 @@ per expert, and each part is a matrix range of the batched object.
 | Parameter | Object | Format | Layout | Shape | Range | Rows |
 |---|---|---|---|---|---|---|
 | `ple/table` | `weight/000098` .. `weight/000225` (128 shards) | nf4_g16_e4m3fn | row_paged_g16_4k_v1 | `[2500012, 160]` | `[0, 400001920)` each | whole shard |
-| `ple/key` | `weight/000236` | bf16 | contiguous | `[12800, 2560]` | `[0, 26214400)` | `[0,10240)` |
-| `ple/value` | `weight/000236` | bf16 | contiguous | `[12800, 2560]` | `[26214400, 32768000)` | `[10240,12800)` |
-| `ple/norm_key` | `weight/000550` | bf16 | contiguous | `[10240]` | whole | — |
-| `ple/norm_query` | `weight/000551` | bf16 | contiguous | `[10240]` | whole | — |
-| `ple/norm_conv` | `weight/000552` | bf16 | contiguous | `[10240]` | whole | — |
-| `ple/convolution` | `weight/000553` | bf16 | contiguous | `[4, 10240]` | whole | — |
+| `ple/key` | `weight/000236` | bf16 | contiguous_le_v1 | `[12800, 2560]` | `[0, 26214400)` | `[0,10240)` |
+| `ple/value` | `weight/000236` | bf16 | contiguous_le_v1 | `[12800, 2560]` | `[26214400, 32768000)` | `[10240,12800)` |
+| `ple/norm_key` | `weight/000550` | bf16 | contiguous_le_v1 | `[10240]` | whole | — |
+| `ple/norm_query` | `weight/000551` | bf16 | contiguous_le_v1 | `[10240]` | whole | — |
+| `ple/norm_conv` | `weight/000552` | bf16 | contiguous_le_v1 | `[10240]` | whole | — |
+| `ple/convolution` | `weight/000553` | bf16 | contiguous_le_v1 | `[4, 10240]` | whole | — |
 
 The PLE key and value projections are two row ranges of one `[12800, 2560]` BF16 parent: the key
 projection is `[10240, 2560]` (the four streams of 2560 features) and the value projection is
@@ -344,8 +371,8 @@ hash addresses.
 
 | Parameter | Object | Format | Layout | Shape |
 |---|---|---|---|---|
-| `text/token_embedding` | `weight/000525` | bf16 | contiguous | `[248320, 2560]` |
-| `text/output_head` | `weight/000526` | bf16 | contiguous | `[248320, 2560]` |
+| `text/token_embedding` | `weight/000525` | bf16 | contiguous_le_v1 | `[248320, 2560]` |
+| `text/output_head` | `weight/000526` | bf16 | contiguous_le_v1 | `[248320, 2560]` |
 
 Both are full-vocabulary BF16 matrices (1,271,398,400 B each). The MTP component reuses the same
 two objects (`mtp/token_embedding`, `mtp/output_head`).
@@ -392,6 +419,17 @@ further scaling at this step.
 `hc_combine` followed by `hc_grouped_rmsnorm` over the **actual BF16 words** of
 `updated_residual`, with the next HC's norm weight as the offset gain. The gain `1 + w` is not
 rounded to BF16.
+
+The upstream contract declares a second `hc_combine_norm` overload as well (upstream lines
+69-76): a unit-weight broadcast-add followed by the same grouped offset RMSNorm, with the
+math, the BF16 residual boundary, the layouts and the alias rules of the injection overload at
+coefficient 1. It neither reads nor creates an injection tensor.
+
+**This repository does not take that overload.** Every combine of the Flash-Next text trunk
+carries an injection: the upstream trunk calls the injection overload at both of its combine
+sites (upstream `src/models/qwen4_exp/execution/text.cpp:129` and `:134`), and the PLE path has
+its own `ple_conv_add_norm`. The unit-weight overload therefore has no call site, and the
+operation contract this repository writes does not include it.
 
 ### 5.5 `hc_mix` (upstream lines 78-115)
 
@@ -614,8 +652,20 @@ the triple, so one token addresses 16 rows. The row space is therefore partition
 heads: head `h` owns the global rows `[offsets[h], offsets[h] + vocab_sizes[h])`.
 
 The sixteen vocabulary sizes sum to 320,001,446 global rows, while the table holds
-`128 * 2,500,012 = 320,001,536` rows. The 90 rows of difference are the unused tail of the
-last shard, so global row `r` lives in shard `r / 2500012` at row `r % 2500012` of that shard.
+`128 * 2,500,012 = 320,001,536` rows.
+
+**The shard assignment below is a derivation, not a measurement.** The artifact directory does
+not record the global row range of each shard: every shard's binding claims the whole object
+(`[0, 400001920)`), and only the conversion report's `methods` entries show that shard `i`
+comes from the source tensor `ple_embedding.ngram_embedding.shard_i.weight`. The assignment
+follows from the ordered shard list together with the hash controls: the global row space is
+partitioned among the heads by `offsets`, the shards hold the global rows in order, and the 90
+rows of difference are the unused tail of the last shard. On that reading, global row `r`
+would live in shard `r / 2500012` at row `r % 2500012` of that shard.
+
+**The PLE implementation must not copy this section.** Task 8 must pin the mapping with a
+per-token oracle against the reference model: a wrong shard or a wrong row offset selects a
+plausible but wrong embedding, and no shape or range assertion can see it.
 
 ### 8.2 The row lookup
 
