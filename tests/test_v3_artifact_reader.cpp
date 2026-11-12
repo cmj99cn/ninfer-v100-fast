@@ -2,6 +2,7 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "artifact/typed_binding.h"
+#include "artifact_fixture.h"
 #include "core/device.h"
 
 #include <nlohmann/json.hpp>
@@ -37,6 +38,7 @@ using ninfer::artifact::SliceRange;
 using ninfer::artifact::StorageLayout;
 using ninfer::artifact::TensorDescriptor;
 using Json = nlohmann::json;
+using ninfer::test::artifact_fixture::write_fixture;
 
 constexpr std::array<std::uint8_t, 8> kEntryMagic = {'N', 'I', 'N', 'F', 'E', 'R', 0, 3};
 constexpr std::array<std::uint8_t, 8> kPartMagic  = {'N', 'I', 'N', 'P', 'R', 'T', 0, 3};
@@ -56,6 +58,9 @@ struct FixtureOptions {
     std::uint64_t part2_index    = 2;
     bool part2_foreign_id        = false;
     bool swap_part_contents      = false;
+    Json components              = Json::object();
+    Json bindings                = Json::object();
+    Json uses                    = Json::array();
 };
 
 struct PlacedObject {
@@ -157,9 +162,9 @@ V3Fixture write_v3_multi_part(const std::vector<PlacedObject>& objects,
         {"metadata", Json{{"name", "qwen3.8-flash-next"}}},
         {"files", std::move(files)},
         {"objects", Json::array()},
-        {"bindings", Json::object()},
-        {"uses", Json::array()},
-        {"components", Json::object()},
+        {"bindings", options.bindings},
+        {"uses", options.uses},
+        {"components", options.components},
     };
     for (const PlacedObject& placed : objects) {
         Json object = placed.spec;
@@ -357,6 +362,117 @@ void test_v3_unknown_spelling_rejected() {
     expect_artifact_error([&] { Reader reader(fixture.entry); }, "unknown v3 tensor format");
 }
 
+// The v3 directory carries the component configuration, the parameter binding table and the
+// operator use edges. The reader reports all three without a JSON type in its public interface.
+void test_v3_directory_metadata() {
+    FixtureOptions options;
+    options.components = Json{
+        {"text",
+         Json{{"target", "text"},
+              {"config",
+               Json{{"hidden_size", 2560},
+                    {"num_hidden_layers", 48},
+                    {"tie_word_embeddings", false},
+                    {"rms_norm_eps", 1e-06},
+                    {"layer_types", Json::array({"linear_attention", "indexed_attention"})},
+                    {"rope_parameters",
+                     Json{{"rope_theta", 10000000},
+                          {"partial_rotary_factor", 0.25},
+                          {"mrope_section", Json::array({11, 11, 10})}}}}}}},
+        {"vision", Json{{"target", "text"}, {"config", Json{{"depth", 27}}}}},
+    };
+    options.bindings = Json{
+        {"text/layers/0/attention_hc/down", Json{{"object", "weight/000001"}}},
+        {"text/layers/0/attention_hc/up",
+         Json{{"parts", Json::array({Json{{"object", "weight/000002"},
+                                         {"range", Json::array({0, 1024})}}})}}},
+        {"text/unbound", Json{{"kind", "unresolved"}}},
+    };
+    options.uses = Json::array({
+        Json{{"parameter", "text/layers/0/attention_hc/down"},
+             {"input", "text/layers/0/attention_hc/normalized_streams"},
+             {"activation_policy", "A16Only"}},
+    });
+
+    const auto fixture =
+        write_v3_multi_part(canonical_objects(),
+                            {marker_payload(kPartPayloadBytes, 0x11),
+                             marker_payload(kPartPayloadBytes, 0x22),
+                             marker_payload(kPartPayloadBytes, 0x33)},
+                            options);
+    Reader reader(fixture.entry);
+    const auto& directory = reader.v3_directory();
+
+    if (directory.component_config.size() != 2) {
+        throw std::runtime_error("the v3 directory component count mismatch");
+    }
+    const auto text = directory.component_config.find("text");
+    if (text == directory.component_config.end()) {
+        throw std::runtime_error("the v3 directory does not report the text component");
+    }
+    const auto& config = text->second;
+    if (config.at("hidden_size") != "2560" || config.at("num_hidden_layers") != "48" ||
+        config.at("tie_word_embeddings") != "false" || config.at("rms_norm_eps") != "1e-06" ||
+        config.at("layer_types") != "linear_attention,indexed_attention" ||
+        config.at("rope_parameters.rope_theta") != "10000000" ||
+        config.at("rope_parameters.partial_rotary_factor") != "0.25" ||
+        config.at("rope_parameters.mrope_section") != "11,11,10") {
+        throw std::runtime_error("the v3 directory text configuration mismatch");
+    }
+    const auto vision = directory.component_config.find("vision");
+    if (vision == directory.component_config.end() || vision->second.at("depth") != "27") {
+        throw std::runtime_error("the v3 directory vision configuration mismatch");
+    }
+
+    if (directory.bindings.size() != 1 ||
+        directory.bindings.at("text/layers/0/attention_hc/down") != "weight/000001") {
+        throw std::runtime_error("the v3 directory binding table mismatch");
+    }
+    const auto parts = directory.part_bindings.find("text/layers/0/attention_hc/up");
+    if (parts == directory.part_bindings.end() || parts->second.size() != 1 ||
+        parts->second.front().object != "weight/000002" || parts->second.front().begin != 0 ||
+        parts->second.front().end != 1024) {
+        throw std::runtime_error("the v3 directory part binding mismatch");
+    }
+    if (directory.bindings.count("text/unbound") != 0 ||
+        directory.part_bindings.count("text/unbound") != 0) {
+        throw std::runtime_error("a binding that names no object was reported");
+    }
+
+    if (directory.uses.size() != 1) {
+        throw std::runtime_error("the v3 directory use count mismatch");
+    }
+    const auto& use = directory.uses.front();
+    if (use.parameter != "text/layers/0/attention_hc/down" ||
+        use.input != "text/layers/0/attention_hc/normalized_streams" ||
+        use.activation_policy != "A16Only") {
+        throw std::runtime_error("the v3 directory use edge mismatch");
+    }
+}
+
+// A v2 artifact carries no v3 directory, so the reader reports an empty one instead of failing.
+void test_v2_directory_is_empty() {
+    const Json directory{
+        {"identity", {{"model_id", "fixture-model"}, {"weights_id", "fixture-weights"}}},
+        {"objects", Json::array({
+                        {{"name", "bf16"},
+                         {"kind", "tensor"},
+                         {"shape", {2, 3}},
+                         {"format", "BF16"},
+                         {"layout", "contiguous-le-v1"},
+                         {"offset", 0},
+                         {"bytes", 12}},
+                    })},
+    };
+    const auto fixture = write_fixture(directory, "v2_directory");
+    Reader reader(fixture.path);
+    const auto& v3 = reader.v3_directory();
+    if (!v3.component_config.empty() || !v3.bindings.empty() || !v3.part_bindings.empty() ||
+        !v3.uses.empty()) {
+        throw std::runtime_error("a v2 artifact reported v3 directory metadata");
+    }
+}
+
 // The v3 directory an upstream artifact carries, read from the container header.
 Json read_v3_directory(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
@@ -427,6 +543,11 @@ void test_public_table_covers_upstream_v3_artifact() {
     if (reader.identity().model_id != "qwen3.8-27b" || reader.identity().weights_id != "nvfp4" ||
         reader.objects().empty()) {
         throw std::runtime_error("the 27B narrow adapter did not open the upstream v3 artifact");
+    }
+    const auto& v3 = reader.v3_directory();
+    if (!v3.component_config.empty() || !v3.bindings.empty() || !v3.part_bindings.empty() ||
+        !v3.uses.empty()) {
+        throw std::runtime_error("the 27B narrow adapter reported v3 directory metadata");
     }
     std::cout << "upstream v3 artifact: " << tensors << " tensors, " << resources
               << " resources, every spelling accepted by the shared table\n";
@@ -802,6 +923,51 @@ void test_flash_next_artifact_geometries() {
     std::cout << "flash-next artifact: " << tensors << " tensors, every byte count matches its "
               << "geometry (" << paged << " paged, " << batched_blockscale << " batched, "
               << block128 << " block128)\n";
+}
+
+// The upstream Flash-Next directory carries the component configuration, the parameter binding
+// table and the operator use edges. The reader reports the census the artifact ships.
+// NINFER_FLASH_NEXT_V3_ARTIFACT=
+//   /home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer
+void test_flash_next_directory_metadata() {
+    const char* artifact = std::getenv("NINFER_FLASH_NEXT_V3_ARTIFACT");
+    if (artifact == nullptr || *artifact == '\0') {
+        std::cout << "skip: NINFER_FLASH_NEXT_V3_ARTIFACT is not set\n";
+        return;
+    }
+    Reader reader(artifact);
+    const auto& directory = reader.v3_directory();
+
+    if (directory.component_config.size() != 3 ||
+        directory.component_config.count("text") == 0 ||
+        directory.component_config.count("mtp") == 0 ||
+        directory.component_config.count("vision") == 0) {
+        throw std::runtime_error("the Flash-Next directory component census mismatch");
+    }
+    const auto& config = directory.component_config.at("text");
+    if (config.at("hidden_size") != "2560" || config.at("num_hidden_layers") != "48" ||
+        config.at("hc_count") != "4" || config.at("hc_lowrank") != "320" ||
+        config.at("indexer_budget") != "2048" || config.at("num_experts") != "512" ||
+        config.at("num_experts_per_tok") != "10" || config.at("moe_intermediate_size") != "640" ||
+        config.at("ple_shard_shape") != "2500012,160" ||
+        config.at("rope_parameters.mrope_section") != "11,11,10") {
+        throw std::runtime_error("the Flash-Next text configuration mismatch");
+    }
+    if (directory.component_config.at("vision").at("depth") != "27" ||
+        directory.component_config.at("mtp").at("num_hidden_layers") != "1") {
+        throw std::runtime_error("the Flash-Next vision or mtp configuration mismatch");
+    }
+
+    if (directory.bindings.size() + directory.part_bindings.size() != 1786) {
+        throw std::runtime_error("the Flash-Next binding census mismatch");
+    }
+    if (directory.uses.size() != 1205) {
+        throw std::runtime_error("the Flash-Next use census mismatch");
+    }
+    std::cout << "flash-next directory: " << directory.component_config.size() << " components, "
+              << directory.bindings.size() << " object bindings, "
+              << directory.part_bindings.size() << " part bindings, " << directory.uses.size()
+              << " uses\n";
 }
 
 std::vector<PlacedObject> new_format_objects(std::uint64_t& fp8_offset,
@@ -1208,6 +1374,8 @@ int main() {
         test_v3_spelling_round_trip();
         test_v3_object_spelling_reaches_the_reader();
         test_v3_unknown_spelling_rejected();
+        test_v3_directory_metadata();
+        test_v2_directory_is_empty();
         test_public_table_covers_upstream_v3_artifact();
         test_nf4_paged_geometry();
         test_nf4_paged_addressing();
@@ -1219,6 +1387,7 @@ int main() {
         test_paged_layout_has_no_slice();
         test_column_slice_rank_rejection_unchanged();
         test_flash_next_artifact_geometries();
+        test_flash_next_directory_metadata();
         test_validate_only_accepts_new_quantized_formats();
         const int decode_status = test_new_quantized_formats_reject_decode();
         test_identity_synthesized();

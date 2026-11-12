@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -300,6 +301,138 @@ std::string v3_metadata_name(const Json& directory) {
         return {};
     }
     return directory.at("metadata").at("name").get<std::string>();
+}
+
+bool v3_is_scalar(const Json& value) {
+    return value.is_string() || value.is_boolean() || value.is_number();
+}
+
+// One element index of a binding range: a nonnegative integer.
+bool v3_is_index(const Json& value) {
+    return value.is_number_unsigned() ||
+           (value.is_number_integer() && value.get<std::int64_t>() >= 0);
+}
+
+// The text form of one configuration scalar: a number is its shortest round trip form and a
+// boolean is "true" or "false".
+std::string v3_scalar_text(const Json& value) {
+    if (value.is_string()) { return value.get_ref<const std::string&>(); }
+    if (value.is_boolean()) { return value.get<bool>() ? "true" : "false"; }
+    if (value.is_number_unsigned()) { return std::to_string(value.get<std::uint64_t>()); }
+    if (value.is_number_integer()) { return std::to_string(value.get<std::int64_t>()); }
+    const double number = value.get<double>();
+    std::array<char, 64> buffer{};
+    const auto result = std::to_chars(buffer.data(), buffer.data() + buffer.size(), number);
+    if (result.ec != std::errc{}) {
+        throw ArtifactError("v3 configuration number has no text form");
+    }
+    return std::string(buffer.data(), result.ptr);
+}
+
+// Flattens a configuration object into dot joined key paths. A nested object becomes a path
+// prefix, an array is not a scalar: its elements are joined into one comma separated value when
+// every element is a scalar, and the array is skipped otherwise.
+void v3_flatten_config(const Json& value, const std::string& path,
+                        std::map<std::string, std::string>& out) {
+    if (value.is_object()) {
+        for (const auto& [key, member] : value.items()) {
+            v3_flatten_config(member, path.empty() ? key : path + "." + key, out);
+        }
+        return;
+    }
+    if (value.is_array()) {
+        if (value.empty()) { return; }
+        std::string joined;
+        bool first = true;
+        for (const auto& element : value) {
+            if (!v3_is_scalar(element)) { return; }
+            if (!first) { joined.push_back(','); }
+            first = false;
+            joined += v3_scalar_text(element);
+        }
+        out.emplace(path, std::move(joined));
+        return;
+    }
+    if (v3_is_scalar(value)) { out.emplace(path, v3_scalar_text(value)); }
+}
+
+void v3_parse_components(const Json& directory, V3Directory& out) {
+    const auto components = directory.find("components");
+    if (components == directory.end() || !components->is_object()) { return; }
+    for (const auto& [name, component] : components->items()) {
+        if (!component.is_object()) { continue; }
+        const auto config = component.find("config");
+        if (config == component.end() || !config->is_object()) { continue; }
+        std::map<std::string, std::string> flattened;
+        v3_flatten_config(*config, "", flattened);
+        out.component_config.emplace(name, std::move(flattened));
+    }
+}
+
+void v3_parse_bindings(const Json& directory, V3Directory& out) {
+    const auto bindings = directory.find("bindings");
+    if (bindings == directory.end() || !bindings->is_object()) { return; }
+    for (const auto& [name, binding] : bindings->items()) {
+        if (!binding.is_object()) { continue; }
+        const auto object = binding.find("object");
+        if (object != binding.end() && object->is_string()) {
+            out.bindings.emplace(name, object->get<std::string>());
+            continue;
+        }
+        // A binding that names no single object names parts of objects instead. Its parts are
+        // reported separately, so that a parameter is never dropped silently.
+        const auto parts = binding.find("parts");
+        if (parts == binding.end() || !parts->is_array() || parts->empty()) { continue; }
+        std::vector<V3BindingPart> resolved;
+        bool complete = true;
+        for (const auto& part : *parts) {
+            if (!part.is_object()) {
+                complete = false;
+                break;
+            }
+            const auto id    = part.find("object");
+            const auto range = part.find("range");
+            if (id == part.end() || !id->is_string() || range == part.end() ||
+                !range->is_array() || range->size() != 2 || !v3_is_index((*range)[0]) ||
+                !v3_is_index((*range)[1])) {
+                complete = false;
+                break;
+            }
+            resolved.push_back(V3BindingPart{id->get<std::string>(),
+                                             (*range)[0].get<std::uint64_t>(),
+                                             (*range)[1].get<std::uint64_t>()});
+        }
+        if (!complete) { continue; }
+        out.part_bindings.emplace(name, std::move(resolved));
+    }
+}
+
+void v3_parse_uses(const Json& directory, V3Directory& out) {
+    const auto uses = directory.find("uses");
+    if (uses == directory.end() || !uses->is_array()) { return; }
+    for (const auto& entry : *uses) {
+        if (!entry.is_object()) { continue; }
+        const auto parameter = entry.find("parameter");
+        if (parameter == entry.end() || !parameter->is_string()) { continue; }
+        V3Use use;
+        use.parameter = parameter->get<std::string>();
+        if (const auto input = entry.find("input"); input != entry.end() && input->is_string()) {
+            use.input = input->get<std::string>();
+        }
+        if (const auto policy = entry.find("activation_policy");
+            policy != entry.end() && policy->is_string()) {
+            use.activation_policy = policy->get<std::string>();
+        }
+        out.uses.push_back(std::move(use));
+    }
+}
+
+V3Directory v3_parse_directory(const Json& directory) {
+    V3Directory out;
+    v3_parse_components(directory, out);
+    v3_parse_bindings(directory, out);
+    v3_parse_uses(directory, out);
+    return out;
 }
 
 class Qwen38Nvfp4V3Adapter {
@@ -828,6 +961,7 @@ public:
         resolve_identity(directory);
         open_volumes(entry_path, directory, entry_payload_start);
         parse_objects(directory);
+        directory_ = v3_parse_directory(directory);
     }
 
     static bool recognizes(std::string_view metadata_name) noexcept {
@@ -835,6 +969,8 @@ public:
     }
 
     const ArtifactIdentity& identity() const noexcept { return identity_; }
+
+    const V3Directory& directory() const noexcept { return directory_; }
 
     const std::vector<ObjectDescriptor>& objects() const noexcept { return objects_; }
 
@@ -1131,6 +1267,7 @@ private:
     std::vector<std::unique_ptr<MappedFile>> owned_;
     std::vector<Volume> volumes_;
     ArtifactIdentity identity_;
+    V3Directory directory_;
     std::vector<ObjectDescriptor> objects_;
     ObjectIndex index_;
     std::uint64_t file_bytes_    = 0;
@@ -1305,6 +1442,7 @@ struct Reader::Impl {
     MappedFile file;
     std::unique_ptr<V3MultiPartReader> multipart;
     ArtifactIdentity identity;
+    V3Directory directory;
     std::vector<ObjectDescriptor> entries;
     std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> index;
     std::unordered_map<std::string, std::vector<std::byte>, TransparentStringHash, std::equal_to<>>
@@ -1328,6 +1466,13 @@ const ObjectDescriptor* Reader::find(std::string_view name) const noexcept {
     if (impl_->multipart) { return impl_->multipart->find(name); }
     const auto it = impl_->index.find(name);
     return it == impl_->index.end() ? nullptr : &impl_->entries[it->second];
+}
+
+// The v3 container path reads the directory metadata; the v2 path and the 27B narrow adapter
+// carry none, so they report an empty directory.
+const V3Directory& Reader::v3_directory() const noexcept {
+    if (impl_->multipart) { return impl_->multipart->directory(); }
+    return impl_->directory;
 }
 
 std::uint64_t Reader::file_bytes() const noexcept {

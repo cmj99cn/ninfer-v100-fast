@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -258,6 +259,43 @@ struct ArtifactIdentity {
     bool operator==(const ArtifactIdentity&) const = default;
 };
 
+// One operator use edge of a v3 directory: the parameter that consumes the input, and the
+// activation policy the consuming operator runs under.
+struct V3Use {
+    std::string parameter;
+    std::string input;
+    std::string activation_policy;
+};
+
+// One part of a parameter binding: the element range the parameter occupies inside one object.
+// The range is a half open [begin, end) interval of elements, counted in the object's own
+// element order.
+struct V3BindingPart {
+    std::string object;
+    std::uint64_t begin = 0;
+    std::uint64_t end   = 0;
+};
+
+// The directory metadata of a v3 container: the per component configuration, the parameter
+// binding table and the operator use edges.
+//
+// A configuration value is always text, so a consumer never has to know whether the directory
+// spelled a number, a boolean or a string: a number is its shortest round trip form, a boolean
+// is "true" or "false", and a string is itself. A nested configuration object is flattened into
+// dot joined key paths ("rope_parameters.rope_theta"). An array is not a scalar: its elements
+// are joined into one comma separated value when every element is a scalar, and the array is
+// skipped otherwise.
+//
+// A binding names either one object or a list of parts. The bindings that name one object are in
+// `bindings`; the bindings that name parts are in `part_bindings`, so that a binding is never
+// dropped silently. A binding that names neither is not reported.
+struct V3Directory {
+    std::map<std::string, std::map<std::string, std::string>> component_config;
+    std::map<std::string, std::string> bindings;
+    std::map<std::string, std::vector<V3BindingPart>> part_bindings;
+    std::vector<V3Use> uses;
+};
+
 class Reader {
 public:
     static constexpr std::size_t direct_io_alignment = 4096;
@@ -273,6 +311,9 @@ public:
     const ArtifactIdentity& identity() const noexcept;
     const std::vector<ObjectDescriptor>& objects() const noexcept;
     const ObjectDescriptor* find(std::string_view name) const noexcept;
+    // The v3 directory metadata. A v2 artifact carries none, and the 27B narrow adapter projects
+    // the v3 directory away, so both report an empty directory.
+    const V3Directory& v3_directory() const noexcept;
 
     std::uint64_t file_bytes() const noexcept;
     std::uint64_t payload_offset() const noexcept;
