@@ -248,6 +248,10 @@ add_library(ninfer_ops STATIC
   ops/sparse_moe/prefill/sparse_moe_prefill_plan.cpp
   ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
   ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
+  ops/moe_nvfp4/route.cu
+  ops/moe_nvfp4/grouped.cu
+  ops/moe_nvfp4/shared.cu
+  ops/moe_nvfp4/moe_nvfp4.cpp
   ops/linear/linear.cpp
   ops/linear/split/linear_split.cu
   ops/qsa/qsa_prepare.cu
