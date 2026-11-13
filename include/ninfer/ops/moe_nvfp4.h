@@ -134,8 +134,10 @@ void moe_routed_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& d
 
 /**
  * Minimum call-local workspace capacity for every T in the inclusive
- * [min_tokens, max_tokens] interval. Measured from a 256-byte-aligned arena cursor, including
- * internal alignment but excluding trailing padding. Invalid intervals throw.
+ * [min_tokens, max_tokens] interval. The Op takes one contiguous block aligned to 256 bytes at
+ * the arena cursor holding the route ids, coefficients, and shared gate in that order; each
+ * region is 4-byte aligned inside the block, so no internal alignment padding is added and the
+ * reported capacity is that 256-aligned block size. Invalid intervals throw.
  */
 [[nodiscard]] std::size_t moe_nvfp4_workspace_capacity_bytes(std::int32_t min_tokens,
                                                               std::int32_t max_tokens);

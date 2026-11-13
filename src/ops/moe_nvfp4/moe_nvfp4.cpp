@@ -17,7 +17,6 @@ constexpr std::int32_t kTopK         = 10;
 constexpr std::int32_t kHidden       = 2560;
 constexpr std::int32_t kIntermediate = 640;
 constexpr std::int32_t kParentRows   = 1793;
-constexpr std::int32_t kControlRows  = 513;
 
 struct AddressRange {
     std::uintptr_t begin = 0;

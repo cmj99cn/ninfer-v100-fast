@@ -27,11 +27,6 @@ __device__ __forceinline__ std::size_t batched_nvfp4_scale_offset(std::int32_t r
            static_cast<std::size_t>((row % 128) / 32) * 4U + static_cast<std::size_t>(group % 4);
 }
 
-// One warp decodes one stored row of one matrix of a batched NVFP4 stack and contracts it
-// with the activation vector. The decode follows the stored codebook: 4-bit E2M1 code, the
-// E4M3 scale of the 16-element group, and the FP32 weight divisor of that matrix. The
-// activation is the represented BF16 column, so the operand is the stored code directly;
-// there is no activation quantization and no repacking.
 __device__ __forceinline__ float batched_nvfp4_warp_dot(const std::uint8_t* codes_row,
                                                          const std::uint8_t* matrix_scales,
                                                          float inverse_divisor, std::int32_t row,
@@ -61,8 +56,6 @@ __device__ __forceinline__ float batched_nvfp4_warp_dot(const std::uint8_t* code
     return warp_reduce_sum(accumulator);
 }
 
-// Same stored-codebook contraction with an FP32 activation vector (the SwiGLU activation
-// produced inside the block).
 __device__ __forceinline__ float batched_nvfp4_warp_dot_f32(const std::uint8_t* codes_row,
                                                              const std::uint8_t* matrix_scales,
                                                              float inverse_divisor, std::int32_t row,
