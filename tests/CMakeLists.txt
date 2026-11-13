@@ -388,6 +388,7 @@ set(ninfer_op_tests
   sigmoid_mul
   rmsnorm
   gated_rmsnorm
+  gated_residual
   l2norm
   gated_delta_net
   causal_conv1d_silu

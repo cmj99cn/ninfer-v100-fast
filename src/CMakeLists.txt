@@ -109,6 +109,10 @@ add_library(ninfer_ops STATIC
   ops/launcher/scatter.cu
   ops/launcher/sigmoid_gate_mul.cu
   ops/launcher/silu_and_mul.cu
+  ops/gated_residual/hc_combine.cu
+  ops/gated_residual/hc_mix.cu
+  ops/gated_residual/hc_norm.cu
+  ops/gated_residual/gated_residual.cpp
   ops/launcher/vision_attention.cu
   ops/launcher/vision_pos_embed.cu
   # Gated DeltaNet Linear Attention core.
