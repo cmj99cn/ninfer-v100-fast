@@ -252,6 +252,10 @@ add_library(ninfer_ops STATIC
   ops/moe_nvfp4/grouped.cu
   ops/moe_nvfp4/shared.cu
   ops/moe_nvfp4/moe_nvfp4.cpp
+  ops/ple/hash.cpp
+  ops/ple/lookup.cu
+  ops/ple/gate.cu
+  ops/ple/conv.cu
   ops/linear/linear.cpp
   ops/linear/split/linear_split.cu
   ops/qsa/qsa_prepare.cu

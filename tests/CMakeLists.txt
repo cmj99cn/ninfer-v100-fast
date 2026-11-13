@@ -530,6 +530,9 @@ ninfer_add_op_test(ninfer_sparse_moe_test
 ninfer_add_op_test(ninfer_moe_nvfp4_test
   SOURCES ops/moe_nvfp4_test.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_ple_test
+  SOURCES ops/ple_test.cpp
+  LIBRARIES ninfer_ops ninfer_artifact)
 ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES ops/test_mtp_pack.cpp
   LIBRARIES ninfer_ops)
