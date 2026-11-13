@@ -57,6 +57,10 @@ constexpr std::array<RouteSpec, 6> k27Routes{{
 // candidate_is_legal), so the SIMT sibling is SimtWarpRowC8 -- a warp-per-row
 // dot product, legal to 8*65535 columns, which is far beyond any context this
 // engine serves. Without this, a3b traps on its first GDN layer.
+constexpr std::array<RouteSpec, 1> kFlashRoutes{{
+    {{1, kAnyCols}, Bf16GdnGatingScheduleId::SimtWarpRowC8},
+}};
+
 constexpr std::array<RouteSpec, 1> k35Routes{{
     {{1, kAnyCols}, Bf16GdnGatingScheduleId::SimtWarpRowC8},
 }};
@@ -84,6 +88,7 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
 
 static_assert(catalog_is_closed(k27Routes, kAnyCols));
 static_assert(catalog_is_closed(k35Routes, kAnyCols));
+static_assert(catalog_is_closed(kFlashRoutes, kAnyCols));
 
 bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;
@@ -91,6 +96,10 @@ bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
 
 bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 32 && problem.input_rows == 2048;
+}
+
+bool is_flash_next(const Bf16GdnGatingProblem& problem) noexcept {
+    return problem.heads == 48 && problem.input_rows == 2560;
 }
 
 bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
@@ -191,6 +200,17 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
         }
     }
 
+    if (is_flash_next(problem)) {
+        switch (schedule) {
+        case Bf16GdnGatingScheduleId::SimtWarpRowC4:
+            return problem.cols <= 4 * 65'535;
+        case Bf16GdnGatingScheduleId::SimtWarpRowC8:
+            return problem.cols <= 8 * 65'535;
+        default:
+            return false;
+        }
+    }
+
     switch (schedule) {
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
         return problem.cols <= 4 * 65'535;
@@ -247,6 +267,11 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
                                                stream);
         return;
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
+        if (is_flash_next(problem)) {
+            bf16_gdn_gating_proj_flash_next_simt_c8_launch(x, a_weight, b_weight, A_log, dt_bias, g,
+                                                            beta, stream);
+            return;
+        }
         bf16_gdn_gating_proj_35_simt_c8_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
                                                stream);
         return;
@@ -355,7 +380,7 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
 
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
     if (problem.cols < 1) { return false; }
-    return is_27(problem) || is_35(problem);
+    return is_27(problem) || is_35(problem) || is_flash_next(problem);
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
@@ -395,6 +420,12 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
                 }
                 return bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaUnsplit,
                                                          problem);
+            }
+        }
+    } else if (is_flash_next(problem)) {
+        for (const RouteSpec& route : kFlashRoutes) {
+            if (route.cols.contains(problem.cols) && candidate_is_legal(route.schedule, problem)) {
+                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
             }
         }
     } else {

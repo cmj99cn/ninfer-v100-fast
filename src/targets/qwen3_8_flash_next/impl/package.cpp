@@ -46,13 +46,13 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
 
 class LoadedModel::Impl {
 public:
-    Impl(WeightsProfile weights_profile_in, RuntimeModelView view_in,
+    Impl(WeightsProfile weights_profile_in, LoadedModelData&& data_in,
          qwen4_exp::FrontendResources resources_in, int tensor_parallel)
-        : weights_profile(weights_profile_in), view(std::move(view_in)),
+        : weights_profile(weights_profile_in), data(std::move(data_in)),
           resources(std::move(resources_in)), tp(tensor_parallel) {}
 
     WeightsProfile weights_profile;
-    RuntimeModelView view;
+    LoadedModelData data;
     qwen4_exp::FrontendResources resources;
     int tp = 1;
 };
@@ -124,9 +124,10 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
         resources = qwen4_exp::take_frontend_resources(materialized, plan.impl_->resources);
     }
 
-    auto impl = std::make_unique<LoadedModel::Impl>(plan.impl_->weights_profile,
-                                                     detail::RuntimeModelView{.tp = plan.impl_->tp},
-                                                     std::move(resources), plan.impl_->tp);
+    auto impl = std::make_unique<LoadedModel::Impl>(
+        plan.impl_->weights_profile,
+        detail::LoadedModelData(plan.impl_->bindings, materialized, detail::TextConfig::layers),
+        std::move(resources), plan.impl_->tp);
     plan.impl_.reset();
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
@@ -157,9 +158,9 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan,
         throw std::invalid_argument("loaded model shard width does not match the execution context");
     }
 
-    std::array<const detail::RuntimeModelView*, artifact::kMaximumDevices> models{};
+    std::array<const detail::Variant::ModelView*, artifact::kMaximumDevices> models{};
     for (int rank = 0; rank < execution.tp; ++rank) {
-        models[static_cast<std::size_t>(rank)] = &model.impl_->view;
+        models[static_cast<std::size_t>(rank)] = &model.impl_->data.view();
     }
     return qwen4_exp::create_program<detail::Variant>(models, model.impl_->weights_profile,
                                                        std::move(plan), execution, options);

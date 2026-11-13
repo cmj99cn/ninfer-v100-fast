@@ -74,6 +74,10 @@ GdnControlParentGeometry require_control_parent(const Weight& parent) {
         require_control_weight(parent, 96, 5120, "ab_weight");
         return {.input_rows = 5120, .heads = 48};
     }
+    if (parent.n == 96 && parent.k == 2560) {
+        require_control_weight(parent, 96, 2560, "ab_weight");
+        return {.input_rows = 2560, .heads = 48};
+    }
     if (parent.n == 64 && parent.k == 2048) {
         require_control_weight(parent, 64, 2048, "ab_weight");
         return {.input_rows = 2048, .heads = 32};

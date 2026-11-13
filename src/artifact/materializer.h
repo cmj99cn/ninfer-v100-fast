@@ -60,6 +60,7 @@ public:
     [[nodiscard]] std::span<const std::byte> host_staging(int device) const;
     const std::byte* host_staging_data(ObjectHandle handle, int device) const;
     std::uint64_t host_staging_bytes(ObjectHandle handle, int device) const;
+    [[nodiscard]] bool is_materialized(ObjectHandle handle, int device = 0) const noexcept;
     std::span<const std::byte> resource_bytes(ObjectHandle handle) const;
     std::vector<std::byte> take_resource_bytes(ObjectHandle handle);
 

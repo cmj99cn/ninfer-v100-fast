@@ -4,6 +4,7 @@
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
 #include <ninfer/targets/qwen4_exp/frontend.h>
+#include <ninfer/targets/qwen4_exp/model_view.h>
 
 #include <array>
 #include <cstddef>

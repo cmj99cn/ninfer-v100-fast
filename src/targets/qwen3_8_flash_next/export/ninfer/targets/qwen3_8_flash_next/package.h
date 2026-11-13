@@ -36,14 +36,6 @@ enum class WeightsProfile : std::uint8_t {
     Nvfp4,
 };
 
-struct RuntimeModelView {
-    int tp = 1;
-
-    [[nodiscard]] const RuntimeModelView& view(int rank) const {
-        return rank == 0 ? *this : *this;
-    }
-};
-
 // The binding plan of one load: which artifact objects hold which weight roles and in which geometry.
 //
 // The plan is a binding fact, not a placement: it names the object of every weight role, the
@@ -105,7 +97,6 @@ struct Package {
     using PreparedPrompt     = qwen4_exp::PreparedPrompt;
     using PreparedPromptData = qwen4_exp::PreparedPromptData;
     using OutputSession      = qwen4_exp::OutputSession;
-    using RuntimeModelView   = detail::RuntimeModelView;
     using SequencePlanner = qwen4_exp::SequencePlanner<detail::Variant>;
     using SequencePlan    = qwen4_exp::SequencePlan<detail::Variant>;
     using RequestBasePlan = qwen4_exp::RequestBasePlan<detail::Variant>;

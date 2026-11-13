@@ -5,6 +5,8 @@
 #include "targets/qwen3_8_flash_next/impl/config.h"
 #include "targets/qwen3_8_flash_next/impl/load/geometry.h"
 #include "targets/qwen3_8_flash_next/impl/load/roles.h"
+#include "targets/qwen3_8_flash_next/impl/variant.h"
+#include <ninfer/targets/qwen4_exp/model_view.h>
 #include <ninfer/targets/qwen3_8_flash_next/package.h>
 
 #include <array>
@@ -132,5 +134,24 @@ struct BindingPlan {
 };
 
 [[nodiscard]] BindingPlan bind_artifact(artifact::Binder& binder, WeightsProfile profile, int tp);
+
+// The load-time geometric views of a binding plan: every entry names the device bytes the load
+// placed for that role and the geometry the Op consumes. Nothing is decoded or repacked here; the
+// batched NVFP4 planes are positioned, not expanded.
+class LoadedModelData {
+public:
+    LoadedModelData(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
+                    std::size_t loaded_layers);
+
+    LoadedModelData(const LoadedModelData&)            = delete;
+    LoadedModelData& operator=(const LoadedModelData&) = delete;
+    LoadedModelData(LoadedModelData&&)                 = default;
+    LoadedModelData& operator=(LoadedModelData&&)      = default;
+
+    [[nodiscard]] const Variant::ModelView& view() const noexcept { return model_; }
+
+private:
+    Variant::ModelView model_;
+};
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

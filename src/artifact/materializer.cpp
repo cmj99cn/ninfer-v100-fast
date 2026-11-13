@@ -84,6 +84,12 @@ struct ReadSpan {
 
 } // namespace
 
+bool MaterializedArtifact::is_materialized(ObjectHandle handle, int device) const noexcept {
+    if (device < 0 || device >= stats_.device_count) { return false; }
+    if (handle.index >= objects_.size()) { return false; }
+    return objects_[handle.index].device[static_cast<std::size_t>(device)] != nullptr;
+}
+
 void* MaterializedArtifact::device_data(ObjectHandle handle) const { return device_data(handle, 0); }
 
 void* MaterializedArtifact::device_data(ObjectHandle handle, int device) const {

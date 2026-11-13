@@ -261,6 +261,83 @@ __global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restr
     }
 }
 
+
+constexpr int kFlashN = 48;
+constexpr int kFlashK = 2560;
+
+template <int ColsPerTile>
+__global__ void bf16_gdn_gating_proj_flash_next_simt_kernel(const __nv_bfloat16* __restrict__ x,
+                                                            const __nv_bfloat16* __restrict__ a_weight,
+                                                            const __nv_bfloat16* __restrict__ b_weight,
+                                                            const float* __restrict__ A_log,
+                                                            const float* __restrict__ dt_bias,
+                                                            float* __restrict__ g, float* __restrict__ beta,
+                                                            std::int32_t t) {
+    static_assert(ColsPerTile == 4 || ColsPerTile == 8);
+    const int lane        = static_cast<int>(threadIdx.x);
+    const int logical_row = static_cast<int>(blockIdx.x);
+    const bool is_b       = logical_row >= kFlashN;
+    const int row         = is_b ? logical_row - kFlashN : logical_row;
+    const int col0        = static_cast<int>(blockIdx.y) * ColsPerTile;
+    const int ncols       = min(ColsPerTile, t - col0);
+    const auto* weight    = is_b ? b_weight : a_weight;
+    const auto* wrow      = weight + static_cast<std::int64_t>(row) * kFlashK;
+
+    float acc[ColsPerTile];
+#pragma unroll
+    for (int col = 0; col < ColsPerTile; ++col) { acc[col] = 0.0f; }
+
+    constexpr int kVecs = kFlashK / 8;
+    for (int vec = lane; vec < kVecs; vec += 32) {
+        const uint4 wv   = load_vec<uint4>(wrow + vec * 8);
+        const float2 wf0 = bf16x2_bits_to_float2(wv.x);
+        const float2 wf1 = bf16x2_bits_to_float2(wv.y);
+        const float2 wf2 = bf16x2_bits_to_float2(wv.z);
+        const float2 wf3 = bf16x2_bits_to_float2(wv.w);
+#pragma unroll
+        for (int col = 0; col < ColsPerTile; ++col) {
+            if (col < ncols) {
+                const uint4 xv =
+                    load_vec<uint4>(x + static_cast<std::int64_t>(col0 + col) * kFlashK + vec * 8);
+                const float2 xf0 = bf16x2_bits_to_float2(xv.x);
+                const float2 xf1 = bf16x2_bits_to_float2(xv.y);
+                const float2 xf2 = bf16x2_bits_to_float2(xv.z);
+                const float2 xf3 = bf16x2_bits_to_float2(xv.w);
+                acc[col]         = fmaf(wf0.x, xf0.x, acc[col]);
+                acc[col]         = fmaf(wf0.y, xf0.y, acc[col]);
+                acc[col]         = fmaf(wf1.x, xf1.x, acc[col]);
+                acc[col]         = fmaf(wf1.y, xf1.y, acc[col]);
+                acc[col]         = fmaf(wf2.x, xf2.x, acc[col]);
+                acc[col]         = fmaf(wf2.y, xf2.y, acc[col]);
+                acc[col]         = fmaf(wf3.x, xf3.x, acc[col]);
+                acc[col]         = fmaf(wf3.y, xf3.y, acc[col]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int col = 0; col < ColsPerTile; ++col) {
+        if (col < ncols) {
+            const float sum = warp_reduce_sum(acc[col]);
+            if (lane == 0) {
+                const std::int64_t out_index = static_cast<std::int64_t>(col0 + col) * kFlashN + row;
+                if (is_b) {
+                    beta[out_index] = sigmoid(sum);
+                } else {
+                    g[out_index] = -expf(A_log[row]) * softplus(sum + dt_bias[row]);
+                }
+            }
+        }
+    }
+}
+
+void require_shape_flash_next(const Weight& w, const char* name) {
+    if (w.n != kFlashN || w.k != kFlashK || w.shape[0] != kFlashN || w.shape[1] != kFlashK) {
+        throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
+                                    " requires contiguous BF16 [48,2560]");
+    }
+}
+
 void require_shape(const Weight& w, const char* name) {
     if (w.n != kN || w.k != kK || w.shape[0] != kN || w.shape[1] != kK) {
         throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
@@ -687,6 +764,23 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
     launch_bf16_prefill_mma<Bf16Gdn35Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
                                                      b_weight, A_log, dt_bias, nullptr, g, beta,
                                                      stream);
+}
+
+void bf16_gdn_gating_proj_flash_next_simt_c8_launch(const Tensor& x, const Weight& a_weight,
+                                                     const Weight& b_weight, const Tensor& A_log,
+                                                     const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                                                     cudaStream_t stream) {
+    require_shape_flash_next(a_weight, "a_weight");
+    require_shape_flash_next(b_weight, "b_weight");
+    const dim3 grid(static_cast<unsigned>(2 * kFlashN),
+                    static_cast<unsigned>(div_up(x.ne[1], 8)), 1u);
+    bf16_gdn_gating_proj_flash_next_simt_kernel<8><<<grid, 32, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const __nv_bfloat16*>(a_weight.qdata),
+        static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(A_log.data),
+        static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
+        static_cast<float*>(beta.data), x.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops::detail
