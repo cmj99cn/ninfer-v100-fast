@@ -91,6 +91,7 @@ private:
     std::unique_ptr<SequencePlanImpl> plan_;
     std::array<LaneState, kMaximumConcurrency> lanes_{};
     TextState state_;
+    WorkspaceArena activations_;
     WorkspaceArena workspace_;
     TextTrunk trunk_;
     std::vector<TokenId> round_tokens_;

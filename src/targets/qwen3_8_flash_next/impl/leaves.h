@@ -52,9 +52,9 @@ struct AttentionProjectionLeaf {
 };
 
 struct GdnProjectionLeaf {
-    static void project(const Tensor& hidden, const GdnProjectionWeights& weights, Tensor& qkv,
-                        Tensor& z, Tensor& g, Tensor& beta, WorkspaceArena& workspace,
-                        cudaStream_t stream);
+    static void project(const Tensor& hidden, const GdnProjectionWeights& weights, Tensor& query,
+                        Tensor& key, Tensor& value, Tensor& z, Tensor& g, Tensor& beta,
+                        WorkspaceArena& workspace, cudaStream_t stream);
 
     [[nodiscard]] static std::size_t workspace_capacity_bytes(std::int32_t tokens);
 };

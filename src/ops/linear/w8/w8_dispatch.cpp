@@ -97,6 +97,18 @@ W8Launch select_w8_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t
             if (t <= 48) { return launch_w8_small_t; }
             return launch_w8_mma_r64_c128;
         }
+        if (n == 2560) {
+            if (t <= 4) { return launch_w8_simt_r8_c4; }
+            if (t <= 16) { return launch_w8_simt_r8_c8; }
+            return launch_w8_mma_r64_c128;
+        }
+        break;
+    case 2560:
+        if (n == 2048 || n == 6144 || n == 2560) {
+            if (t <= 4) { return launch_w8_simt_r8_c4; }
+            if (t <= 16) { return launch_w8_simt_r8_c8; }
+            return n == 2048 ? launch_w8_mma_r32_c128 : launch_w8_mma_r64_c128;
+        }
         break;
     case 17408:
         if (n == 5120) {

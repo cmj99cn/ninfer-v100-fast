@@ -1,7 +1,10 @@
 #pragma once
 
+#include "ninfer/ops/ple.h"
+
 #include "targets/qwen4_exp/impl/runtime/instance.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
@@ -39,6 +42,46 @@ struct WorkspaceRecipe {
         .lane_capacity_bytes = lane * max_concurrency,
         .request_transient_capacity_bytes = transient,
     };
+}
+
+// Device bytes held by one in-flight text forward: the trunk's own per-token activations plus the
+// single largest layer group (QSA, or GDN together with the PLE block on the PLE layer). The
+// trunk rewinds this arena at every forward and at every layer, so the peak is one forward plus
+// one layer group rather than one group per layer.
+[[nodiscard]] inline std::size_t text_activation_capacity_bytes(std::uint32_t prefill_chunk) noexcept {
+    const std::size_t tokens   = prefill_chunk == 0 ? 1 : prefill_chunk;
+    const std::size_t hidden   = TextConfig::hidden;
+    const std::size_t channels = TextConfig::residual_width;
+    const std::size_t streams  = TextConfig::hc_streams;
+
+    // Trunk activations: the embedding, three four-stream tensors, the block input, the stream
+    // injection, the mixer, mixture and sample hidden states, and the vocabulary logits.
+    const std::size_t trunk_per_token =
+        (17 * hidden + static_cast<std::size_t>(TextConfig::vocab)) * kBf16Bytes +
+        (streams + 2) * sizeof(std::uint32_t);
+
+    const std::size_t qsa_per_token =
+        (4 * static_cast<std::size_t>(TextConfig::query_width) +
+         2 * static_cast<std::size_t>(TextConfig::kv_width) +
+         2 * static_cast<std::size_t>(TextConfig::index_query_width) +
+         static_cast<std::size_t>(TextConfig::index_key_width)) *
+            kBf16Bytes +
+        (static_cast<std::size_t>(TextConfig::index_block_budget) + 1) * sizeof(std::uint32_t);
+
+    const std::size_t gdn_per_token =
+        (2 * static_cast<std::size_t>(TextConfig::gdn_key_width) +
+         4 * static_cast<std::size_t>(TextConfig::gdn_value_width) +
+         2 * static_cast<std::size_t>(TextConfig::gdn_conv_channels)) *
+            kBf16Bytes +
+        2 * static_cast<std::size_t>(TextConfig::gdn_value_heads) * sizeof(float);
+
+    const std::size_t ple_per_token =
+        (2 * static_cast<std::size_t>(TextConfig::ple_embed_dim) + 3 * channels) * kBf16Bytes;
+    const std::size_t ple_history =
+        channels * static_cast<std::size_t>(ops::kPleConvWindow) * kBf16Bytes;
+
+    const std::size_t layer_per_token = std::max(qsa_per_token, gdn_per_token + ple_per_token);
+    return align_up((trunk_per_token + layer_per_token) * tokens + ple_history + 8, 16);
 }
 
 } // namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS

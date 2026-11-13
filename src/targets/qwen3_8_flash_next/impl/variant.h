@@ -21,7 +21,7 @@ struct Variant {
     using GraphExecutionProfile = qwen4_exp::GraphExecutionProfile;
 
     static constexpr float attention_scale             = 1.0F;
-    static constexpr float gdn_scale                   = 1.0F;
+    static constexpr float gdn_scale                   = 0.08838834764831845F;
     static constexpr std::uint32_t prefill_chunk_alignment = 64;
     static constexpr std::uint32_t maximum_context     = TextConfig::max_position_embeddings;
 
@@ -44,9 +44,10 @@ struct Variant {
     }
 
     static void gdn_projection_control(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                       Tensor& qkv, Tensor& z, Tensor& g, Tensor& beta,
-                                       WorkspaceArena& workspace, cudaStream_t stream) {
-        GdnProjectionLeaf::project(hidden, weights, qkv, z, g, beta, workspace, stream);
+                                       Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                       Tensor& g, Tensor& beta, WorkspaceArena& workspace,
+                                       cudaStream_t stream) {
+        GdnProjectionLeaf::project(hidden, weights, query, key, value, z, g, beta, workspace, stream);
     }
 
     static void post_mixer(const Tensor& hidden, const MoeWeights& weights, Tensor& destination,

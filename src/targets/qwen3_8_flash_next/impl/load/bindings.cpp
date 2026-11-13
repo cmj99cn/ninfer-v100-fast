@@ -622,29 +622,34 @@ std::int64_t align_up_256(std::int64_t value) noexcept {
     return (value + 255) / 256 * 256;
 }
 
-Weight part_weight(const artifact::MaterializedArtifact& materialized, const BoundParameter& parameter,
-                   std::int32_t rows, std::int32_t columns) {
-    const auto handle = artifact::ObjectHandle{static_cast<std::size_t>(parameter.parts.front().object)};
+artifact::ObjectHandle object_handle(const BindingPlan& plan, const BoundParameter& parameter) {
+    return plan.objects[static_cast<std::size_t>(parameter.parts.front().object)].handle;
+}
+
+Weight part_weight(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
+                   const BoundParameter& parameter, std::int32_t rows, std::int32_t columns) {
+    const auto handle = object_handle(plan, parameter);
     if (!materialized.is_materialized(handle)) { return Weight{}; }
     return artifact::materialized_weight(materialized, handle, role_geometry(parameter.role).format,
                                          rows, columns, 0);
 }
 
-Tensor part_tensor(const artifact::MaterializedArtifact& materialized, const BoundParameter& parameter,
-                   std::initializer_list<std::int32_t> shape) {
-    const auto handle = artifact::ObjectHandle{static_cast<std::size_t>(parameter.parts.front().object)};
+Tensor part_tensor(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
+                   const BoundParameter& parameter, std::initializer_list<std::int32_t> shape) {
+    const auto handle = object_handle(plan, parameter);
     if (!materialized.is_materialized(handle)) { return Tensor{}; }
     return artifact::materialized_tensor(materialized, handle, role_geometry(parameter.role).format,
                                          shape, 0);
 }
 
-BatchedNvfp4Weight part_library(const artifact::MaterializedArtifact& materialized,
+BatchedNvfp4Weight part_library(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
                                 const BoundParameter& parameter) {
     const ExpertLibrary& library = parameter.library.value();
+    const auto library_handle = library.handle;
     BatchedNvfp4Weight weight;
-    if (!materialized.is_materialized(library.handle)) { return weight; }
-    weight.payload      = materialized.device_data(library.handle);
-    weight.payload_bytes = materialized.device_bytes(library.handle, 0);
+    if (!materialized.is_materialized(library_handle)) { return weight; }
+    weight.payload      = materialized.device_data(library_handle);
+    weight.payload_bytes = materialized.device_bytes(library_handle, 0);
     weight.qtype        = QType::NVFP4;
     weight.layout       = QuantLayout::BatchedBlockScaleK16M128x4;
     weight.group_size   = 16U;
@@ -663,12 +668,16 @@ BatchedNvfp4Weight part_library(const artifact::MaterializedArtifact& materializ
     return weight;
 }
 
-qwen4_exp::HcWeights hc_view(const artifact::MaterializedArtifact& materialized, const HcPlan& plan) {
+qwen4_exp::HcWeights hc_view(const BindingPlan& bindings, const artifact::MaterializedArtifact& materialized,
+                  const HcPlan& plan, std::int32_t down_rows) {
     return qwen4_exp::HcWeights{
-        .down_injection = part_weight(materialized, plan.down, TextConfig::hc_lowrank + TextConfig::hc_streams,
+        .down_injection = part_weight(bindings, materialized, plan.down, down_rows,
                                       TextConfig::residual_width),
-        .up = part_weight(materialized, plan.up, TextConfig::residual_width, TextConfig::hc_lowrank),
-        .norm = part_tensor(materialized, plan.norm, {TextConfig::residual_width}),
+        .up = part_weight(bindings, materialized, plan.up, TextConfig::residual_width,
+                          TextConfig::hc_lowrank),
+        .norm = part_tensor(bindings, materialized, plan.norm,
+                            {TextConfig::residual_width / TextConfig::hc_streams,
+                             TextConfig::hc_streams}),
     };
 }
 
@@ -680,72 +689,76 @@ LoadedModelData::LoadedModelData(const BindingPlan& plan,
     model_.tp = 1;
     model_.loaded_layers = loaded_layers;
 
-    model_.embedding = part_weight(materialized, plan.token_embedding, TextConfig::vocab,
+    model_.embedding = part_weight(plan, materialized, plan.token_embedding, TextConfig::vocab,
                                    TextConfig::hidden);
-    model_.output_head = part_weight(materialized, plan.output_head, TextConfig::vocab,
+    model_.output_head = part_weight(plan, materialized, plan.output_head, TextConfig::vocab,
                                      TextConfig::hidden);
-    model_.final_hc = hc_view(materialized, plan.final_hc);
+    model_.final_hc = hc_view(plan, materialized, plan.final_hc, TextConfig::hc_lowrank);
 
     model_.ple = qwen4_exp::PleWeights{
-        .key        = part_weight(materialized, plan.ple.key, TextConfig::residual_width,
+        .key        = part_weight(plan, materialized, plan.ple.key, TextConfig::residual_width,
                                   TextConfig::hidden),
-        .value      = part_weight(materialized, plan.ple.value, TextConfig::hidden,
+        .value      = part_weight(plan, materialized, plan.ple.value, TextConfig::hidden,
                                   TextConfig::hidden),
-        .norm_key   = part_tensor(materialized, plan.ple.norm_key, {TextConfig::residual_width}),
-        .norm_query = part_tensor(materialized, plan.ple.norm_query, {TextConfig::residual_width}),
-        .norm_conv  = part_tensor(materialized, plan.ple.norm_conv, {TextConfig::residual_width}),
-        .kernel     = part_tensor(materialized, plan.ple.convolution,
+        .norm_key   = part_tensor(plan, materialized, plan.ple.norm_key, {TextConfig::residual_width}),
+        .norm_query = part_tensor(plan, materialized, plan.ple.norm_query, {TextConfig::residual_width}),
+        .norm_conv  = part_tensor(plan, materialized, plan.ple.norm_conv, {TextConfig::residual_width}),
+        .kernel     = part_tensor(plan, materialized, plan.ple.convolution,
                                   {TextConfig::ple_conv_kernel, TextConfig::residual_width}),
     };
 
     for (std::size_t layer = 0; layer < loaded_layers; ++layer) {
         const LayerPlan& source = plan.layers[layer];
         auto& target = model_.layers[layer];
-        target.attention_hc = hc_view(materialized, source.attention_hc);
-        target.moe_hc       = hc_view(materialized, source.moe_hc);
+        target.attention_hc = hc_view(plan, materialized, source.attention_hc,
+                                      TextConfig::hc_lowrank + TextConfig::hc_streams);
+        target.moe_hc = hc_view(plan, materialized, source.moe_hc,
+                                TextConfig::hc_lowrank + TextConfig::hc_streams);
 
         if (TextConfig::is_qsa_layer(static_cast<int>(layer))) {
             const QsaPlan& qsa = std::get<QsaPlan>(source.mixer);
             target.attention_projection = AttentionProjectionWeights{
-                .query_gate        = part_weight(materialized, qsa.query, 2 * TextConfig::query_width,
+                .query_gate        = part_weight(plan, materialized, qsa.query, 2 * TextConfig::query_width,
                                                  TextConfig::hidden),
-                .key_value         = part_weight(materialized, qsa.key, 2 * TextConfig::kv_width +
+                .key_value         = part_weight(plan, materialized, qsa.key, 2 * TextConfig::kv_width +
                                                  TextConfig::index_query_width +
                                                  TextConfig::index_key_width, TextConfig::hidden),
-                .query_norm        = part_tensor(materialized, qsa.query_norm, {TextConfig::head_dim}),
-                .key_norm          = part_tensor(materialized, qsa.key_norm, {TextConfig::head_dim}),
-                .index_query_norm  = part_tensor(materialized, qsa.index_query_norm,
+                .query_norm        = part_tensor(plan, materialized, qsa.query_norm, {TextConfig::head_dim}),
+                .key_norm          = part_tensor(plan, materialized, qsa.key_norm, {TextConfig::head_dim}),
+                .index_query_norm  = part_tensor(plan, materialized, qsa.index_query_norm,
                                                  {TextConfig::index_head_dim}),
-                .index_key_norm    = part_tensor(materialized, qsa.index_key_norm,
+                .index_key_norm    = part_tensor(plan, materialized, qsa.index_key_norm,
                                                  {TextConfig::index_head_dim}),
-                .output            = part_weight(materialized, qsa.output, TextConfig::hidden,
+                .output            = part_weight(plan, materialized, qsa.output, TextConfig::hidden,
                                                  TextConfig::query_width),
             };
         } else {
             const GdnPlan& gdn = std::get<GdnPlan>(source.mixer);
             target.gdn_projection = GdnProjectionWeights{
-                .qkvz       = part_weight(materialized, gdn.query,
+                .qkvz       = part_weight(plan, materialized, gdn.query,
                                           TextConfig::gdn_conv_channels + TextConfig::gdn_value_width,
                                           TextConfig::hidden),
-                .control    = part_weight(materialized, gdn.a_projection, 2 * TextConfig::gdn_value_heads,
+                .control    = part_weight(plan, materialized, gdn.a_projection, 2 * TextConfig::gdn_value_heads,
                                           TextConfig::hidden),
-                .a_log      = part_tensor(materialized, gdn.a_log, {TextConfig::gdn_value_heads}),
-                .dt_bias    = part_tensor(materialized, gdn.dt_bias, {TextConfig::gdn_value_heads}),
-                .convolution = part_tensor(materialized, gdn.convolution,
+                .a_log      = part_tensor(plan, materialized, gdn.a_log, {TextConfig::gdn_value_heads}),
+                .dt_bias    = part_tensor(plan, materialized, gdn.dt_bias, {TextConfig::gdn_value_heads}),
+                .convolution = part_tensor(plan, materialized, gdn.convolution,
                                            {TextConfig::gdn_conv_kernel, TextConfig::gdn_conv_channels}),
-                .norm       = part_tensor(materialized, gdn.norm, {128}),
-                .output     = part_weight(materialized, gdn.output, TextConfig::hidden,
+                .norm       = part_tensor(plan, materialized, gdn.norm, {128}),
+                .output     = part_weight(plan, materialized, gdn.output, TextConfig::hidden,
                                           TextConfig::gdn_value_width),
             };
         }
 
         target.post_mixer = ops::MoeNvfp4Weights{
-            .router_shared    = part_weight(materialized, source.moe.router,
-                                            TextConfig::experts + 1, TextConfig::hidden),
-            .shared_down      = part_weight(materialized, source.moe.shared_down, TextConfig::hidden,
+            .router_shared    = part_weight(plan, materialized, source.moe.router,
+                                            TextConfig::experts + 1 +
+                                                2 * TextConfig::shared_intermediate,
+                                            TextConfig::hidden),
+            .shared_down      = part_weight(plan, materialized, source.moe.shared_down, TextConfig::hidden,
                                             TextConfig::shared_intermediate),
-            .routed_gate_up   = part_library(materialized, source.moe.routed_gate),
-            .routed_down      = part_library(materialized, source.moe.routed_down),
+            .routed_gate_up   = part_library(plan, materialized, source.moe.routed_gate),
+            .routed_down      = part_library(plan, materialized, source.moe.routed_down),
         };
     }
 }

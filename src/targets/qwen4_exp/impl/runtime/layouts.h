@@ -34,6 +34,7 @@ struct SequencePlanImpl<NINFER_QWEN4EXP_VARIANT> {
     int tp                                 = 1;
     std::size_t device_reservation_bytes   = 0;
     std::size_t workspace_capacity_bytes   = 0;
+    std::size_t activation_capacity_bytes  = 0;
     std::size_t request_transient_capacity_bytes = 0;
 };
 

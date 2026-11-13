@@ -25,8 +25,9 @@ ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevi
     : weights_profile_(weights_profile), models_(models), execution_(execution), options_(options),
       plan_(std::move(plan)), state_(execution_.primary(), *models_[0],
                                     std::max<std::uint32_t>(plan_->prefill_chunk, 1)),
+      activations_(std::max<std::size_t>(plan_->activation_capacity_bytes, 1)),
       workspace_(std::max<std::size_t>(plan_->workspace_capacity_bytes, 1)),
-      trunk_(*models_[0], state_, workspace_, execution_.primary().stream) {
+      trunk_(*models_[0], state_, activations_, workspace_, execution_.primary().stream) {
     if (plan_ == nullptr) { throw std::logic_error("qwen4_exp program received an empty sequence plan"); }
     if (execution_.tp != plan_->tp) {
         throw std::invalid_argument("qwen4_exp program execution width does not match the sequence plan");

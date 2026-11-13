@@ -6,6 +6,8 @@
 #include "ninfer/ops/moe_nvfp4.h"
 
 #include <array>
+#include <cstdio>
+#include <stdexcept>
 #include <span>
 
 namespace ninfer::targets::qwen3_8_flash_next::detail {
@@ -63,16 +65,11 @@ std::size_t AttentionProjectionLeaf::workspace_capacity_bytes(std::int32_t token
 }
 
 void GdnProjectionLeaf::project(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                Tensor& qkv, Tensor& z, Tensor& g, Tensor& beta,
-                                WorkspaceArena& workspace, cudaStream_t stream) {
+                                Tensor& query, Tensor& key, Tensor& value, Tensor& z, Tensor& g,
+                                Tensor& beta, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope = workspace.scope();
 
-    std::array<Tensor, 4> outputs{
-        qkv.slice(0, 0, TextConfig::gdn_key_width),
-        qkv.slice(0, TextConfig::gdn_key_width, TextConfig::gdn_key_width),
-        qkv.slice(0, 2 * TextConfig::gdn_key_width, TextConfig::gdn_value_width),
-        z,
-    };
+    std::array<Tensor, 4> outputs{query, key, value, z};
     ops::linear_split(hidden, weights.qkvz, kGdnSegments, outputs, ops::LinearPolicy::A16Only, workspace,
                       stream);
     ops::gdn_gating_proj(hidden, weights.control, weights.a_log, weights.dt_bias, workspace, g, beta,

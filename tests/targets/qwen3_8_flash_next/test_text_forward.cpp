@@ -6,7 +6,9 @@
 #include "ninfer/ops/ple.h"
 #include "targets/qwen3_8_flash_next/impl/load/bindings.h"
 
+#include <algorithm>
 #include <cstdlib>
+#include <optional>
 #include <variant>
 #include <filesystem>
 #include <iostream>
@@ -62,24 +64,28 @@ std::vector<std::string> ple_shard_names(const detail::BindingPlan& plan) {
 }
 
 void place_reduced(const detail::BindingPlan& plan, artifact::Binder& binder) {
-    std::vector<bool> reduced(plan.objects.size(), false);
+    std::size_t object_slots = 0;
+    for (const auto& object : plan.objects) { object_slots = std::max(object_slots, object.handle.index + 1); }
+    std::vector<bool> reduced(object_slots, false);
     for (const auto* parameter : plan.parameters()) {
         if (parameter->role == roles::Role::PleTable) { continue; }
         if (parameter->layer >= kLoadedLayers) { continue; }
-        for (const auto& part : parameter->parts) { reduced[part.object] = true; }
+        for (const auto& part : parameter->parts) {
+            reduced[plan.objects[static_cast<std::size_t>(part.object)].handle.index] = true;
+        }
+        if (parameter->library.has_value()) {
+            reduced[parameter->library->handle.index] = true;
+        }
     }
-    std::uint64_t reduced_bytes = 0;
     for (const auto& object : plan.objects) {
         const auto handle = object.handle;
         if (reduced[static_cast<std::size_t>(handle.index)] &&
             std::holds_alternative<artifact::TensorDescriptor>(binder.descriptor(handle))) {
-            reduced_bytes += std::get<artifact::TensorDescriptor>(binder.descriptor(handle)).bytes;
             binder.materialize_on_device(handle);
         } else {
             binder.validate_only(handle);
         }
     }
-    std::cerr << "reduced materialization footprint: " << reduced_bytes / (1024 * 1024) << " MiB\n";
 }
 
 std::size_t gdn_state_signature(const rt::TextState& state) {
@@ -111,9 +117,12 @@ TokenId run_prompt(DeviceContext& device, const detail::BindingPlan& plan,
     staged_rows.copy_from_host(staged.data(), staged.size());
     DeviceBuffer rows_buffer(rows.size() * 4);
     rows_buffer.copy_from_host(rows.data(), rows.size() * 4);
+    state.set_ple_rows(static_cast<const std::uint32_t*>(rows_buffer.p), rows.size());
+    state.set_ple_staged_rows(static_cast<const std::uint8_t*>(staged_rows.p), staged.size());
 
-    DeviceArena workspace(1 << 24);
-    rt::TextTrunk trunk(data.view(), state, workspace, device.stream);
+    DeviceArena activations(1 << 28);
+    DeviceArena workspace(1 << 26);
+    rt::TextTrunk trunk(data.view(), state, activations, workspace, device.stream);
 
     const std::span<const TokenId> prompt{kPrompt.data(), kPrompt.size()};
     const TokenId first = trunk.prefill(prompt);
@@ -137,12 +146,16 @@ int main() {
         return 77;
     }
 
-    const char* reference_text = std::getenv("NINFER_FLASH_NEXT_REFERENCE_TOKEN");
-    if (reference_text == nullptr) {
-        std::cout << "SKIP: NINFER_FLASH_NEXT_REFERENCE_TOKEN is not set\n";
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        std::cout << "SKIP: no CUDA device\n";
         return 77;
     }
-    const TokenId reference = static_cast<TokenId>(std::stoll(reference_text));
+
+    const char* reference_text = std::getenv("NINFER_FLASH_NEXT_REFERENCE_TOKEN");
+    const std::optional<TokenId> reference =
+        reference_text != nullptr ? std::optional<TokenId>{static_cast<TokenId>(std::stoll(reference_text))}
+                                  : std::nullopt;
 
     DeviceContext device(0);
     artifact::Reader reader(path);
@@ -195,11 +208,17 @@ int main() {
     const TokenId first = run_prompt(device, plan, materialized, controls, staged, rows, divisors);
     require(first >= 0 && first < static_cast<TokenId>(detail::TextConfig::vocab),
            "the greedy token is outside the vocabulary");
-    require(first == reference, "the greedy token " + std::to_string(first) + " does not match the reference token " + std::to_string(reference));
-
     const TokenId repeated = run_prompt(device, plan, materialized, controls, staged, rows, divisors);
     require(repeated == first, "the trunk is not deterministic across repeated runs");
 
-    std::cout << "OK flash-next text trunk: token " << first << "\n";
+    if (reference.has_value()) {
+        require(first == *reference, "the greedy token " + std::to_string(first) +
+                                         " does not match the reference token " +
+                                         std::to_string(*reference));
+    } else {
+        std::cout << "SKIP: the reference token parity check (NINFER_FLASH_NEXT_REFERENCE_TOKEN)\n";
+    }
+
+    std::cout << "OK flash-next text trunk: token " << first << " deterministic\n";
     return 0;
 }

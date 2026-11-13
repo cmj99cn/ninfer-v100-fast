@@ -54,6 +54,8 @@ public:
     }
 
     void set_ple_controls(const ops::PleHashControls& controls);
+    void set_ple_rows(const std::uint32_t* rows, std::size_t entries);
+    void set_ple_staged_rows(const std::uint8_t* staged, std::size_t bytes);
     void set_ple_divisors(const float* divisors);
     void publish_tail();
 
@@ -89,8 +91,8 @@ private:
 // leaves.
 class TextTrunk {
 public:
-    TextTrunk(const ModelView& model, TextState& state, WorkspaceArena& workspace,
-             cudaStream_t stream);
+    TextTrunk(const ModelView& model, TextState& state, WorkspaceArena& activations,
+             WorkspaceArena& workspace, cudaStream_t stream);
 
     TokenId prefill(std::span<const TokenId> tokens);
     TokenId decode(TokenId token);
@@ -105,6 +107,7 @@ private:
 
     const ModelView& model_;
     TextState& state_;
+    WorkspaceArena& activations_;
     WorkspaceArena& workspace_;
     cudaStream_t stream_;
 };
