@@ -569,6 +569,7 @@ int verify_graph_capture_case(const char* label, std::uint32_t seed) {
     return failures;
 }
 
+#ifdef NINFER_VOLTA_BUILD
 int verify_graph_capture_mix_case(const char* label, std::uint32_t seed) {
     constexpr std::int32_t columns = 3;
     const std::int32_t channels    = kHidden * kStreams;
@@ -641,6 +642,7 @@ int verify_graph_capture_mix_case(const char* label, std::uint32_t seed) {
     cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");
     return failures;
 }
+#endif
 
 int verify_workspace_contract() {
     int failures = 0;
@@ -728,15 +730,20 @@ int main() {
     failures += run_combine_case("hc_combine M=1", 1, 2301U, false);
     failures += run_combine_case("hc_combine M=1 in place", 1, 2302U, true);
     failures += run_combine_case("hc_combine M=7", 7, 2303U, false);
+    failures += run_combine_case("hc_combine M=7 in place", 7, 2304U, true);
     failures += run_combine_norm_case("hc_combine_norm M=1", 1, 2401U, false);
     failures += run_combine_norm_case("hc_combine_norm M=1 in place", 1, 2403U, true);
     failures += run_combine_norm_case("hc_combine_norm M=7", 7, 2402U, false);
     failures += run_mix_case("hc_mix M=1", 1, 2501U, false);
-    failures += run_mix_case("hc_mix M=7", 7, 2502U, false);
     failures += run_mix_case("hc_final_mix M=1", 1, 2601U, true);
+#ifdef NINFER_VOLTA_BUILD
+    failures += run_mix_case("hc_mix M=7", 7, 2502U, false);
     failures += run_mix_case("hc_final_mix M=7", 7, 2602U, true);
+#endif
     failures += verify_graph_capture_case("hc_expand_norm graph", 2701U);
+#ifdef NINFER_VOLTA_BUILD
     failures += verify_graph_capture_mix_case("hc_mix graph", 2801U);
+#endif
     failures += verify_workspace_contract();
 
     std::cout << (failures ? "FAIL" : "OK") << " gated_residual\n";

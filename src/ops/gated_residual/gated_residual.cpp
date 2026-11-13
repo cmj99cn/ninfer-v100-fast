@@ -83,6 +83,22 @@ void require_bf16_geometry(const Weight& weight, const char* label, std::int32_t
 void require_bf16_weight(const Weight& weight, const char* label, std::int32_t rows,
                          std::int32_t columns) {
     require_bf16_geometry(weight, label, rows, columns);
+    for (int index = 0; index < 4; ++index) {
+        if (weight.shape[index] != weight.padded_shape[index]) {
+            throw std::invalid_argument(std::string("gated_residual: ") + label +
+                                        " must not be padded");
+        }
+    }
+    if (weight.shape[0] != weight.n || weight.shape[1] != weight.k) {
+        throw std::invalid_argument(std::string("gated_residual: ") + label +
+                                    " has an inconsistent shape");
+    }
+    const auto required_bytes = static_cast<std::uint64_t>(weight.n) *
+                                static_cast<std::uint64_t>(weight.k) * 2;
+    if (weight.payload_bytes < required_bytes) {
+        throw std::invalid_argument(std::string("gated_residual: ") + label +
+                                    " has too small a payload");
+    }
     if (weight.qdata == nullptr || !aligned_to(weight.qdata, 16)) {
         throw std::invalid_argument(std::string("gated_residual: ") + label +
                                     " must be 16-byte aligned");

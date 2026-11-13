@@ -39,10 +39,11 @@ namespace ninfer::ops {
  *   Qwen3.8-Flash-Next text package registers H = 2560 and S = 4.
  *
  * Numeric:
- *   The statistic is accumulated in FP32. The oracle evaluates the formula in FP64 from the
- *   represented inputs; the BF16 output is promoted and compared against that result, so the
- *   output storage rounding belongs to the Op's numerical criterion and not to the oracle.
- *   Reduction association, staging and accumulator precision are implementation choices.
+ *   The statistic must be accumulated in FP32; that accumulator precision is a required
+ *   implementation profile. The oracle evaluates the formula in FP64 from the represented
+ *   inputs; the BF16 output is promoted and compared against that result, so the output
+ *   storage rounding belongs to the Op's numerical criterion and not to the oracle. Reduction
+ *   association and staging are implementation choices.
  *
  * Effects:
  *   Writes all of residual and all of normalized. The two outputs are mutually disjoint and
@@ -82,10 +83,11 @@ void hc_expand_norm(const Tensor& embedding, const Tensor& norm_weight, float ep
  *   Qwen3.8-Flash-Next text package registers H = 2560 and S = 4.
  *
  * Numeric:
- *   The statistic is accumulated in FP32. The oracle evaluates the formula in FP64 from the
- *   represented inputs; the BF16 output is promoted and compared against that result, so the
- *   output storage rounding belongs to the Op's numerical criterion and not to the oracle.
- *   Reduction association, staging and accumulator precision are implementation choices.
+ *   The statistic must be accumulated in FP32; that accumulator precision is a required
+ *   implementation profile. The oracle evaluates the formula in FP64 from the represented
+ *   inputs; the BF16 output is promoted and compared against that result, so the output
+ *   storage rounding belongs to the Op's numerical criterion and not to the oracle. Reduction
+ *   association and staging are implementation choices.
  *
  * Effects:
  *   Writes all of normalized. The output is disjoint from every input. Read-only inputs may
@@ -265,7 +267,9 @@ struct HcFinalMixWeights {
  *   BF16 normalized and weights, FP32 injection, 16-byte aligned bases, M > 0. The weights
  *   have exactly the declared native BF16 geometry, without bias or padding. The
  *   Qwen3.8-Flash-Next text package registers H = 2560, S = 4 and R = 320, which binds
- *   down_injection [324, 10240] and up [10240, 320].
+ *   down_injection [324, 10240] and up [10240, 320]. M > 1 requires a Volta build or a BF16
+ *   linear problem registered for these geometries; M = 1 uses an architecture-independent
+ *   GEMV path.
  *
  * Numeric:
  *   The oracle evaluates the complete formula in FP64 from the represented inputs and keeps
@@ -320,7 +324,8 @@ void hc_mix(const Tensor& normalized, const HcMixWeights& weights, WorkspaceAren
  *   BF16 normalized and weights, 16-byte aligned bases, M > 0. The weights have exactly the
  *   declared native BF16 geometry, without bias or padding. The Qwen3.8-Flash-Next text
  *   package registers H = 2560, S = 4 and R = 320, which binds down [320, 10240] and up
- *   [10240, 320].
+ *   [10240, 320]. M > 1 requires a Volta build or a BF16 linear problem registered for these
+ *   geometries; M = 1 uses an architecture-independent GEMV path.
  *
  * Numeric:
  *   The oracle evaluates the complete formula in FP64 from the represented inputs and keeps
