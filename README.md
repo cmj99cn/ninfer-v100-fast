@@ -16,7 +16,7 @@
 
 ## 发布版本
 
-当前版本：**v0.2.3（2026-11-12）**（首个公开版本 v0.1.0，2026-10-27）。版本说明与已知限制见 [`CHANGELOG.md`](CHANGELOG.md)。
+当前版本：**v0.2.4（2026-11-13）**（首个公开版本 v0.1.0，2026-10-27）。版本说明与已知限制见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ---
 
@@ -82,12 +82,14 @@ decode/prefill 性能回退（详见“速度”节）。
 
 ---
 
-## 当前进度（v0.2.3，截至 2026-11-12）
+## 当前进度（v0.2.4，截至 2026-11-13）
 
 本版本在 v0.1.0 之上完成 FP16 text runtime，修复 BFCL 多轮质量，消除 FP16 路径的
 decode/prefill 回退，修复 FP16 text runtime 下 Vision 请求的 scatter dtype 失败
 （TP1、TP2 与多实例均已实测），并修复 `--devices` 不从 0 开始时 TP mailbox 的
-P2P 使能崩溃。BFCL `multi_turn_base` 全量：**no-spec 86/200 = 43.0%、
+P2P 使能崩溃。v0.2.3 修复多实例下温暖 home 被 reuse-blind gross 页账单挤出，补齐
+host tier 容量公式与分配失败指标；v0.2.4 消除多实例接纳被解码实例执行锁卡死——候选改为
+非阻塞读取，忙实例本轮跳过，请求留在全局 pending 队列。BFCL `multi_turn_base` 全量：**no-spec 86/200 = 43.0%、
 MTP-3 87/200 = 43.5%**。MTP-3 decode 四点
 （262144 上下文、INT8 KV、FP16-embedding 制品）：**104.7 / 98.9 / 109.6 / 98.1 tok/s**。
 
@@ -469,7 +471,7 @@ A Tesla V100 inference engine based on NInfer: single-process TP2 (TP4 remains a
 
 ## Release
 
-Current release: **v0.2.3 (2026-11-12)** (first public release v0.1.0, 2026-10-27). See [`CHANGELOG.md`](CHANGELOG.md) for release notes and known limitations.
+Current release: **v0.2.4 (2026-11-13)** (first public release v0.1.0, 2026-10-27). See [`CHANGELOG.md`](CHANGELOG.md) for release notes and known limitations.
 
 ---
 
@@ -537,12 +539,16 @@ See [`TEMP_WORKAROUNDS.md`](TEMP_WORKAROUNDS.md) for all temporary changes and r
 
 ---
 
-## Current Status (v0.2.3, as of 2026-11-12)
+## Current Status (v0.2.4, as of 2026-11-13)
 
 This version adds the FP16 text runtime on top of v0.1.0, fixes BFCL multi-turn quality,
 removes the FP16 path's decode/prefill regression, fixes the Vision `scatter` dtype
 failure under the FP16 text runtime (verified at TP1, TP2, and multi-instance), and fixes
-the TP mailbox P2P setup that crashed when `--devices` did not start at 0. BFCL `multi_turn_base`, full 200:
+the TP mailbox P2P setup that crashed when `--devices` did not start at 0. v0.2.3 fixes
+warm-home routing against the reuse-blind gross page bill and adds the host-tier capacity
+formula and allocation-failure metrics; v0.2.4 removes the multi-instance admission stall
+behind a decoding instance by reading each candidate non-blockingly and skipping a busy
+instance for that round. BFCL `multi_turn_base`, full 200:
 **no-spec 86/200 = 43.0%, MTP-3 87/200 = 43.5%**. MTP-3 decode at four points (262144 context, INT8 KV, FP16-embedding artifact):
 **104.7 / 98.9 / 109.6 / 98.1 tok/s**.
 

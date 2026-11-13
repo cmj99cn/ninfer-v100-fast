@@ -10,6 +10,25 @@ FP16 path's decode/prefill regression. `v0.2.1` (2026-11-09) fixes Vision under
 the FP16 text runtime. `v0.2.2` (2026-11-11) fixes TP peer-access setup for
 device lists that do not start at device 0. `v0.2.3` (2026-11-12) fixes
 multi-instance routing against a warm home and surfaces host-cache diagnostics.
+`v0.2.4` (2026-11-13) removes the multi-instance admission stall behind a
+decoding instance.
+
+## [0.2.4] - 2026-11-13
+
+### Fixed
+
+- Multi-instance admission stalled behind a decoding instance. `EnginePool::admit`
+  probed every instance while holding the pool lock, and that probe waited on the
+  executor's execution lock, which the worker holds across a decode/prefill unit.
+  New requests waited for the instance to go fully idle, and `/metrics` scrapes
+  serialized behind the same pool lock. The router now reads each candidate's
+  prefix probe and capacity with one non-blocking `try_lock`; an instance that is
+  mid-unit reports no readable view and is skipped for that dispatch round, so the
+  request waits in the global pending queue instead of inside `admit()`. The
+  aged-head and home-affinity rules apply to the readable candidates; if a queue
+  head's only fitting instance is busy it stays pending and a newer request may be
+  dispatched first. Admission remains the only queue: no request is preempted and
+  the permit still reserves the candidate's net page bill.
 
 ## [0.2.3] - 2026-11-12
 
