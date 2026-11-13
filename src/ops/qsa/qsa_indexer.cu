@@ -45,7 +45,7 @@ __device__ __forceinline__ void heap_sift_down(float* scores, int* blocks, int s
         if (right < size && candidate_better(scores[left], blocks[left], scores[right], blocks[right])) {
             worse = right;
         }
-        if (!candidate_better(scores[worse], blocks[worse], scores[index], blocks[index])) { break; }
+        if (!candidate_better(scores[index], blocks[index], scores[worse], blocks[worse])) { break; }
         const float score = scores[index];
         const int block   = blocks[index];
         scores[index]     = scores[worse];

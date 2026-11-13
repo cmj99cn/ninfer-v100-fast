@@ -812,7 +812,7 @@ int run_indexer_cases(cudaStream_t stream, WorkspaceArena& arena) {
     failures += run_indexer(i3, stream, arena);
 
     IndexerCase i5;
-    i5.label = "qsa_indexer repeated replacement";
+    i5.label = "qsa_indexer distinct scores";
     i5.T = 1;
     i5.B = 1;
     i5.axes = 1;
@@ -823,9 +823,15 @@ int run_indexer_cases(cudaStream_t stream, WorkspaceArena& arena) {
     i5.positions = {2399};
     i5.page_table.resize(64);
     for (std::int32_t page = 0; page < 64; ++page) i5.page_table[static_cast<std::size_t>(page)] = page;
-    i5.index_query = integer_inputs(static_cast<std::size_t>(kIndexDim) * kIndexHeads, 51U);
-    i5.index_keys = integer_inputs(static_cast<std::size_t>(kIndexDim) * kQsaIndexBlockPageSize * 64,
-                                   52U);
+    i5.index_query.assign(static_cast<std::size_t>(kIndexDim) * kIndexHeads, double_bf16(0.0));
+    i5.index_query[0] = double_bf16(1.0);
+    i5.index_keys.assign(static_cast<std::size_t>(kIndexDim) * kQsaIndexBlockPageSize * 64,
+                         double_bf16(0.0));
+    for (std::int32_t g = 0; g < 600; ++g) {
+        const float value = (1.0F + static_cast<float>(g % 256) / 256.0F) *
+                            std::ldexp(1.0F, g / 256);
+        i5.index_keys[static_cast<std::size_t>(g) * kIndexDim] = double_bf16(value);
+    }
     failures += run_indexer(i5, stream, arena);
 
     IndexerCase i4;
