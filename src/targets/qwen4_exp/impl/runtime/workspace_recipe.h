@@ -44,18 +44,12 @@ struct WorkspaceRecipe {
     };
 }
 
-// Device bytes held by one in-flight text forward: the trunk's own per-token activations plus the
-// single largest layer group (QSA, or GDN together with the PLE block on the PLE layer). The
-// trunk rewinds this arena at every forward and at every layer, so the peak is one forward plus
-// one layer group rather than one group per layer.
 [[nodiscard]] inline std::size_t text_activation_capacity_bytes(std::uint32_t prefill_chunk) noexcept {
     const std::size_t tokens   = prefill_chunk == 0 ? 1 : prefill_chunk;
     const std::size_t hidden   = TextConfig::hidden;
     const std::size_t channels = TextConfig::residual_width;
     const std::size_t streams  = TextConfig::hc_streams;
 
-    // Trunk activations: the embedding, three four-stream tensors, the block input, the stream
-    // injection, the mixer, mixture and sample hidden states, and the vocabulary logits.
     const std::size_t trunk_per_token =
         (17 * hidden + static_cast<std::size_t>(TextConfig::vocab)) * kBf16Bytes +
         (streams + 2) * sizeof(std::uint32_t);
