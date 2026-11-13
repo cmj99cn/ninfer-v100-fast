@@ -249,6 +249,11 @@ add_library(ninfer_ops STATIC
   ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
   ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
   ops/linear/linear.cpp
+  ops/linear/split/linear_split.cu
+  ops/qsa/qsa_prepare.cu
+  ops/qsa/qsa_indexer.cu
+  ops/qsa/qsa_sparse_gqa.cu
+  ops/qsa/qsa_tail_extract.cu
   ops/wrapper/add_bias.cpp
   ops/wrapper/argmax.cpp
   ops/wrapper/cast.cpp
