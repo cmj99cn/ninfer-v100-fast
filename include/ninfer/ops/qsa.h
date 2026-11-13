@@ -84,6 +84,12 @@ struct QsaTailStateView {
     Tensor first_rope;
 };
 
+/** Read-only projection of the tail state consumed by qsa_tail_extract. */
+struct ConstQsaTailStateView {
+    Tensor raw_keys;
+    Tensor first_rope;
+};
+
 /**
  * Persistent QSA cache planes and page table. All tensors are contiguous and dimension 0 fastest.
  *
@@ -93,7 +99,9 @@ struct QsaTailStateView {
  *   page_table    I32 [logical_pages, table_rows]
  *
  * Main token p uses logical page p/64, row p%64; index block g uses logical page g/16, row g%16.
- * For an index block g, the first token of that block is token 4g.
+ * For an index block g, the first token of that block is token 4g. Every page table entry for a
+ * logical page the call reads must name a valid physical page in the plane; the Op does not mask
+ * out-of-range entries.
  */
 struct QsaCacheView {
     Tensor k_pages;
@@ -102,7 +110,8 @@ struct QsaCacheView {
     Tensor page_table;
 };
 
-/** Read-only projection of the index plane and page table used by qsa_indexer. */
+/** Read-only projection of the index plane and page table used by qsa_indexer. The page-table
+ * rule of QsaCacheView applies. */
 struct ConstQsaIndexCacheView {
     Tensor index_k_pages;
     Tensor page_table;
@@ -306,7 +315,7 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate, const QsaCac
  *   Enqueues on the given stream, allocates no device memory, keeps no persistent state and
  *   supports CUDA Graph capture and replay at bound addresses.
  */
-void qsa_tail_extract(const QsaTailStateView& before, const QsaRawRecordReadView& records,
+void qsa_tail_extract(const ConstQsaTailStateView& before, const QsaRawRecordReadView& records,
                       const Tensor& base_positions, const Tensor& valid_columns,
                       QsaTailStateView& after, cudaStream_t stream);
 

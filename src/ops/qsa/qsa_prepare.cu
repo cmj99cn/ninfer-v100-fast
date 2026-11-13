@@ -74,7 +74,7 @@ __global__ void prepare_key_value_kernel(
     const __nv_bfloat16* weight, const int* positions, const int* valid_columns,
     const int* table_rows, int tokens, int batch, int axes, int head_dim, int kv_heads,
     float epsilon, int rotary_dim, float theta, const int* page_table,
-    int logical_pages, int pages_total, __nv_bfloat16* k_pages, __half* v_pages) {
+    int logical_pages, __nv_bfloat16* k_pages, __half* v_pages) {
     extern __shared__ float shared[];
     float* values = shared;
     float* sums   = shared + head_dim;
@@ -93,11 +93,9 @@ __global__ void prepare_key_value_kernel(
     const int position = qsa_row_position(positions, t, b, batch, axes);
     const int table_row = table_rows[b];
     const int page      = position / kQsaTokenPageSize;
-    if (page < 0 || page >= logical_pages) { return; }
     const int row  = position % kQsaTokenPageSize;
     const int physical = page_table[static_cast<std::int64_t>(page) +
                                     static_cast<std::int64_t>(logical_pages) * table_row];
-    if (physical < 0 || physical >= pages_total) { return; }
     const std::int64_t cache_base =
         head_dim * (static_cast<std::int64_t>(row) +
                     kQsaTokenPageSize * (static_cast<std::int64_t>(kv_head) +
@@ -154,9 +152,8 @@ __global__ void prepare_index_blocks_kernel(
     const __nv_bfloat16* index_key, const __nv_bfloat16* index_key_norm,
     const int* positions, const int* valid_columns, const int* table_rows,
     const __nv_bfloat16* tail_keys, const int* tail_rope, int tokens, int batch, int axes,
-    int index_dim, int record_width, int rotary_dim, float theta, float epsilon,
-    const int* page_table, int logical_pages, int physical_pages, int compress,
-    __nv_bfloat16* index_pages) {
+    int index_dim, int rotary_dim, float theta, float epsilon,
+    const int* page_table, int logical_pages, int compress, __nv_bfloat16* index_pages) {
     extern __shared__ float shared[];
     float* values = shared;
     float* sums   = shared + index_dim;
@@ -212,12 +209,10 @@ __global__ void prepare_index_blocks_kernel(
     }
 
     const int logical_page = g / kQsaIndexBlockPageSize;
-    if (logical_page < 0 || logical_page >= logical_pages) { return; }
     const int table_row = table_rows[b];
     const int physical =
         page_table[static_cast<std::int64_t>(logical_page) +
                    static_cast<std::int64_t>(logical_pages) * table_row];
-    if (physical < 0 || physical >= physical_pages) { return; }
     const int row = g % kQsaIndexBlockPageSize;
     const std::int64_t cache_base =
         index_dim * (static_cast<std::int64_t>(row) +
@@ -226,7 +221,6 @@ __global__ void prepare_index_blocks_kernel(
         index_pages[cache_base + d] =
             __float2bfloat16_rn(qsa_rope_dim(values, d, rotary_dim, theta, rho0, rho1, rho2));
     }
-    (void)record_width;
 }
 
 std::int64_t positive_grid(std::int64_t value, const char* label) {
@@ -375,8 +369,6 @@ void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters&
     qsa_require_contiguous(records.base_positions, "record base positions must be contiguous");
 
     const int logical_pages = cache.page_table.ne[0];
-    const int physical_pages = cache.k_pages.ne[3];
-    const int index_pages    = cache.index_k_pages.ne[3];
 
     const auto* projected_query = static_cast<const __nv_bfloat16*>(projected.query.data);
     const auto* projected_key = static_cast<const __nv_bfloat16*>(projected.key.data);
@@ -423,7 +415,7 @@ void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters&
                                2 * head_dim * sizeof(float), stream>>>(
         projected_key, projected_value, key_norm, positions, valid_columns, table_rows, tokens,
         batch_sz, axes, head_dim, kv_heads, parameters.rms_epsilon, parameters.rotary_dim,
-        parameters.theta, page_table, logical_pages, physical_pages,
+        parameters.theta, page_table, logical_pages,
         static_cast<__nv_bfloat16*>(cache.k_pages.data),
         static_cast<__half*>(cache.v_pages.data));
 
@@ -438,8 +430,8 @@ void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters&
                                        static_cast<unsigned>(batch_sz)),
                                   128, 2 * index_dim * sizeof(float), stream>>>(
         projected_index_key, index_key_norm, positions, valid_columns, table_rows, tail_keys,
-        tail_rope, tokens, batch_sz, axes, index_dim, record_width, parameters.rotary_dim,
-        parameters.theta, parameters.rms_epsilon, page_table, logical_pages, index_pages,
+        tail_rope, tokens, batch_sz, axes, index_dim, parameters.rotary_dim,
+        parameters.theta, parameters.rms_epsilon, page_table, logical_pages,
         kQsaIndexCompress, static_cast<__nv_bfloat16*>(cache.index_k_pages.data));
     CUDA_CHECK(cudaGetLastError());
 }

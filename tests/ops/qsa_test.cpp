@@ -652,7 +652,7 @@ int run_tail_extract(const TailCase& c, cudaStream_t stream) {
     DeviceBuffer d_after_rope(static_cast<std::size_t>(3) * c.B * 4);
     d_after_rope.fill(0);
 
-    QsaTailStateView before{
+    ConstQsaTailStateView before{
         tensor(d_before_keys.p, DType::BF16, {kIndexDim, kCompress, c.B}),
         tensor(d_before_rope.p, DType::I32, {3, c.B})};
     QsaRawRecordReadView records{
@@ -810,6 +810,23 @@ int run_indexer_cases(cudaStream_t stream, WorkspaceArena& arena) {
     i3.index_keys[static_cast<std::size_t>(0 + kIndexDim * (4 + kQsaIndexBlockPageSize * 31))] = double_bf16(1.0);
     i3.index_keys[static_cast<std::size_t>(0 + kIndexDim * (0 + kQsaIndexBlockPageSize * 32))] = double_bf16(1.0);
     failures += run_indexer(i3, stream, arena);
+
+    IndexerCase i5;
+    i5.label = "qsa_indexer repeated replacement";
+    i5.T = 1;
+    i5.B = 1;
+    i5.axes = 1;
+    i5.logical_pages = 64;
+    i5.index_pages = 64;
+    i5.valid = {1};
+    i5.table_rows = {0};
+    i5.positions = {2399};
+    i5.page_table.resize(64);
+    for (std::int32_t page = 0; page < 64; ++page) i5.page_table[static_cast<std::size_t>(page)] = page;
+    i5.index_query = integer_inputs(static_cast<std::size_t>(kIndexDim) * kIndexHeads, 51U);
+    i5.index_keys = integer_inputs(static_cast<std::size_t>(kIndexDim) * kQsaIndexBlockPageSize * 64,
+                                   52U);
+    failures += run_indexer(i5, stream, arena);
 
     IndexerCase i4;
     i4.label = "qsa_indexer invalid row";

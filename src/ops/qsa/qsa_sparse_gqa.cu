@@ -42,7 +42,7 @@ __global__ void sparse_gqa_kernel(const __nv_bfloat16* query, const __nv_bfloat1
                                   const int* positions, const int* valid_columns,
                                   const int* table_rows, int tokens, int batch, int axes,
                                   int head_dim, int q_heads, int kv_heads, const int* page_table,
-                                  int logical_pages, int physical_pages,
+                                  int logical_pages,
                                   const __nv_bfloat16* k_pages, const __half* v_pages,
                                   const int* selection, const int* counts,
                                   __nv_bfloat16* out) {
@@ -227,7 +227,7 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate, const QsaCac
         static_cast<const int*>(batch.table_rows.data), tokens, batch_sz,
         batch.positions.ne[1], head_dim, q_heads, kv_heads,
         static_cast<const int*>(cache.page_table.data), cache.page_table.ne[0],
-        cache.k_pages.ne[3], static_cast<const __nv_bfloat16*>(cache.k_pages.data),
+        static_cast<const __nv_bfloat16*>(cache.k_pages.data),
         static_cast<const __half*>(cache.v_pages.data),
         static_cast<const int*>(selected.selection.data),
         static_cast<const int*>(selected.counts.data), static_cast<__nv_bfloat16*>(out.data));

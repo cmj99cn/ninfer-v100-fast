@@ -98,6 +98,8 @@ Weight segment_weight(const Weight& parent, const LinearSplitSegment& segment) {
         sub.qdata = static_cast<const std::uint8_t*>(parent.qdata) +
                     static_cast<std::size_t>(segment.row_begin) * parent.k * sizeof(std::uint16_t);
         sub.payload = sub.qdata;
+        sub.payload_bytes = static_cast<std::size_t>(segment.row_count) * parent.k *
+                            sizeof(std::uint16_t);
         return sub;
     }
 
@@ -110,6 +112,8 @@ Weight segment_weight(const Weight& parent, const LinearSplitSegment& segment) {
                           static_cast<std::size_t>(segment.row_begin) * planes.high_row;
     sub.scales = static_cast<const std::uint8_t*>(parent.scales) +
                  static_cast<std::size_t>(segment.row_begin) * planes.scale_row;
+    sub.payload_bytes = static_cast<std::size_t>(segment.row_count) * planes.code_row;
+    sub.high_plane_bytes = static_cast<std::size_t>(segment.row_count) * planes.high_row;
     return sub;
 }
 

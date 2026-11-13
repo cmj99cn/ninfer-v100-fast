@@ -56,9 +56,13 @@ struct LinearSplitSegment {
  *   Batched NVFP4, row-scaled FP8 and every other layout are rejected explicitly.
  *
  * Numeric:
- *   Each segment has the same numerical contract as ops::linear on the equivalent standalone
- *   weight. The oracle is an independent ops::linear() invocation on a segment weight generated
- *   from the same logical parent rows; the two BF16 outputs are compared elementwise.
+ *   Each segment has the same numerical contract as ops::linear. The governing oracle is an
+ *   independent naive FP64 evaluation of the logical formula from the represented public inputs,
+ *   decoding every packed code with the exact stored scale over the segment's own row interval,
+ *   compared with a criterion appropriate to BF16 output rounding. Equality with an ops::linear()
+ *   invocation on an equivalent standalone weight is supplementary evidence rather than the
+ *   criterion, because the accumulation grouping depends on the row extent and bit-identical
+ *   results are not guaranteed.
  *
  * Effects:
  *   Writes every output in full. x, the parent weight and the outputs are pairwise non-overlapping

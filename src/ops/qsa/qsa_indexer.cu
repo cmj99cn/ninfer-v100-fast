@@ -59,7 +59,7 @@ __device__ __forceinline__ void heap_sift_down(float* scores, int* blocks, int s
 __global__ void indexer_kernel(const __nv_bfloat16* index_query, const int* positions,
                                const int* valid_columns, int tokens, int batch, int axes,
                                const int* table_rows, int index_dim, int index_heads,
-                               const int* page_table, int logical_pages, int physical_pages,
+                               const int* page_table, int logical_pages,
                                const __nv_bfloat16* index_pages, int* selection, int* counts,
                                int capacity) {
     __shared__ float heap_score[512];
@@ -97,7 +97,7 @@ __global__ void indexer_kernel(const __nv_bfloat16* index_query, const int* posi
             const int physical =
                 page_table[static_cast<std::int64_t>(logical_page) +
                            static_cast<std::int64_t>(logical_pages) * table_row];
-            if (physical >= 0 && physical < physical_pages) {
+            {
                 const std::int64_t key_base =
                     index_dim * (static_cast<std::int64_t>(row) +
                                  kQsaIndexBlockPageSize * static_cast<std::int64_t>(physical));
@@ -220,7 +220,6 @@ void qsa_indexer(const Tensor& index_query, const ConstQsaIndexCacheView& cache,
             : nullptr,
         tokens, batch_sz, batch.positions.ne[1], static_cast<const int*>(batch.table_rows.data),
         index_dim, heads, static_cast<const int*>(cache.page_table.data), cache.page_table.ne[0],
-        cache.index_k_pages.ne[3],
         static_cast<const __nv_bfloat16*>(cache.index_k_pages.data),
         static_cast<int*>(selected.selection.data), static_cast<int*>(selected.counts.data),
         kQsaSelectionCapacity);

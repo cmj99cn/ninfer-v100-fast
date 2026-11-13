@@ -66,7 +66,7 @@ __global__ void tail_extract_kernel(const __nv_bfloat16* before_keys, const int*
 
 } // namespace
 
-void qsa_tail_extract(const QsaTailStateView& before, const QsaRawRecordReadView& records,
+void qsa_tail_extract(const ConstQsaTailStateView& before, const QsaRawRecordReadView& records,
                       const Tensor& base_positions, const Tensor& valid_columns,
                       QsaTailStateView& after, cudaStream_t stream) {
     using detail::qsa_require;
