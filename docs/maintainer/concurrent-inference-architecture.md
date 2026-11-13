@@ -125,7 +125,9 @@ backfilled decode-ready requests 仍进入同一个 maximal compact batch。
 
 多实例 serving 在多个 Engine 之上放一个 `EnginePool`。pool 是唯一的 admission 队列：请求先在
 有界全局 FIFO 中等待，`EnginePool` 的路由器选择一个实例并用 permit 同时预留 lane 和 KV 页，
-然后才调用该实例的 Engine。每实例 `max_pending_requests` 固定为 1，Engine 内队列只承载已经路由给
+然后才调用该实例的 Engine。路由器读取实例状态时不等待执行锁：一次 `try_to_lock` 同时取 prefix
+probe 和 capacity snapshot，读不到（该实例正在执行一个 unit）时该候选本轮跳过，请求留在全局
+队列等下一次 pick。每实例 `max_pending_requests` 固定为 1，Engine 内队列只承载已经路由给
 它的那一个请求，不承担第二层公平性；route 决策、queue-full 和 deadline 语义见
 [多实例共享缓存](multi-instance.md)。
 

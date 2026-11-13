@@ -6,9 +6,9 @@
 // share one `SharedModel` reader and one `SharedHostTier`, and each keep a single-slot pending queue
 // (`max_pending_requests == 1`) that only carries the request already routed to it. The pool is the
 // only admission queue: `submit` turns a prepared prompt into a pending entry, waits for
-// `EngineRouter::pick` to return a feasible candidate, and then reserves a lane and `required_pages`
-// KV pages on that instance under one pool lock. A `Permit` is that reservation and `PoolHandle`
-// owns it for the request's lifetime.
+// `EngineRouter::pick` to return a feasible candidate, and then reserves a lane and the decision's
+// net `reserved_pages` KV pages on that instance under one pool lock. A `Permit` is that reservation
+// and `PoolHandle` owns it for the request's lifetime.
 //
 // The pool's capacity view for one instance is its own authority for lane occupancy -- one permit is
 // one lane claim -- and for page availability: the instance's reported free pages minus the pages
@@ -50,19 +50,27 @@ struct PoolInstanceMetrics {
 // Per-instance view the pool's admission core reads. Production binds it to a real Engine; host tests
 // inject a scripted view so the permit logic runs with no artifact, no device and no Engine
 // construction.
+// Probe and capacity captured together under one non-blocking execution-lock attempt.
+struct InstanceProbe {
+    PrefixProbe probe;
+    CapacitySnapshot capacity;
+};
+
 class PoolInstanceView {
 public:
     virtual ~PoolInstanceView() = default;
-    virtual PrefixProbe probe(std::span<const std::uint64_t> hashes) const = 0;
-    virtual CapacitySnapshot capacity() const = 0;
+    // `nullopt` when the instance is mid-unit: the router skips it that dispatch round rather
+    // than wait behind its execution lock.
+    [[nodiscard]] virtual std::optional<InstanceProbe>
+    try_probe(std::span<const std::uint64_t> hashes) const = 0;
 };
 
-// One applied admission decision: a lane plus `required_pages` pages on one instance, held until the
-// request completes or its handle is destroyed.
+// One applied admission decision: a lane plus the decision's net `reserved_pages` on one instance,
+// held until the request completes or its handle is destroyed.
 class Permit {
 public:
-    Permit(EnginePool& pool, std::uint32_t instance, std::uint32_t required_pages) noexcept
-        : pool_(&pool), instance_(instance), required_pages_(required_pages) {}
+    Permit(EnginePool& pool, std::uint32_t instance, std::uint32_t reserved_pages) noexcept
+        : pool_(&pool), instance_(instance), reserved_pages_(reserved_pages) {}
 
     ~Permit() { release(); }
 
@@ -70,7 +78,7 @@ public:
     Permit& operator=(const Permit&) = delete;
 
     [[nodiscard]] std::uint32_t instance() const noexcept { return instance_; }
-    [[nodiscard]] std::uint32_t required_pages() const noexcept { return required_pages_; }
+    [[nodiscard]] std::uint32_t reserved_pages() const noexcept { return reserved_pages_; }
 
     // Idempotent; called by `PoolHandle::wait()` and by the handle destructor.
     void release() noexcept;
@@ -84,7 +92,7 @@ private:
 
     EnginePool* pool_;
     std::uint32_t instance_;
-    std::uint32_t required_pages_;
+    std::uint32_t reserved_pages_;
     bool released_ = false;
 };
 
@@ -167,7 +175,8 @@ public:
                                     std::chrono::steady_clock::time_point pending_deadline = {});
 
     // Admission core: the global queue plus the permit. `required_pages` on the pending is the
-    // authority the router consumes; the caller computes it. Host tests drive this directly.
+    // reuse-blind gross upper bound the caller computed; the router derives each candidate's net
+    // bill from it and the permit holds that net bill. Host tests drive this directly.
     [[nodiscard]] PoolHandle admit(runtime::PendingRequest pending,
                                    std::chrono::steady_clock::time_point pending_deadline = {});
 
@@ -209,8 +218,8 @@ private:
     void initialize();
     void validate_groups() const;
     void normalize_pending();
-    runtime::RouteCandidate candidate_locked(const runtime::PendingRequest& pending,
-                                             std::uint32_t instance) const;
+    std::optional<runtime::RouteCandidate> candidate_locked(
+        const runtime::PendingRequest& pending, std::uint32_t instance) const;
     std::optional<runtime::RouteDecision> pick_locked() const;
     void apply_locked(const std::shared_ptr<Entry>& entry, const runtime::RouteDecision& decision);
     void erase_locked(const std::shared_ptr<Entry>& entry);

@@ -180,13 +180,18 @@ committed decode tok/s、客户端 TTFT、MTP acceptance（来自 `--request-log
 
 `EnginePool::submit`：
 
-1. 把 prepared prompt 转成全局 pending entry；`required_pages =
-   ceil((prompt_tokens + requested_output_tokens + 64) / 64)`。
+1. 把 prepared prompt 转成全局 pending entry；`required_pages` 是调用方按
+   `ceil((prompt_tokens + requested_output_tokens + safety_margin_tokens) / block_tokens)` 算出的
+   **reuse-blind gross 上界**（默认 `margin = 64`、`block_tokens = 64`）。
 2. 入全局 FIFO；队列已满立即返回 `RequestErrorKind::Overloaded`（HTTP 429，
    `server_overloaded`）。
-3. `EngineRouter` 为每个 `(pending, instance)` 读取该实例的 prefix probe 和 capacity snapshot，
-   在所有有 room 的候选中评分。
-4. 选中后在 pool 锁内同时预留一条 lane 和 `required_pages` 个 KV 页，生成 permit；permit 是
+3. `EngineRouter` 为每个 `(pending, instance)` **非阻塞**读取该实例的 prefix probe 和 capacity
+   snapshot（一次 `try_to_lock` 同时取两者），按 **per-candidate 净额** `reserved_pages =
+   ceil((prompt + output + margin - min(device_frontier, prompt)) / block_tokens)` 判断 room，
+   并在有 room 的可读候选中评分。该实例正在执行一个 unit 时读不到，这个候选本轮跳过，请求留在
+   全局队列等下一次 pick；所有候选都读不到时 `pick()` 返回 `nullopt`。manifest（host tier）
+   frontier 不扣减净额——host 恢复仍要分配 device 页，它只是 hint。
+4. 选中后在 pool 锁内同时预留一条 lane 和 `decision.reserved_pages` 个 KV 页，生成 permit；permit 是
    该请求在实例上的唯一 resource claim。
 5. 锁外调用目标 Engine 的 `submit`。Engine 拒绝时归还 permit。
 
@@ -203,9 +208,13 @@ committed decode tok/s、客户端 TTFT、MTP acceptance（来自 `--request-log
 
 - 前缀深度取 `max(device_frontier, manifest_frontier)`；manifest 命中同时产生跨实例
   `PrefixReuseHint`。
-- admission 时 home 是该 prompt 在 pool 内 device frontier 最深的实例；当 home 空闲且深度差距
-  不超过 `--affinity-slack-tokens` 时优先 home。
-- 等待超过 `--fairness-aging-ms` 的队头请求直接取自己的最佳候选，避免饿死。
+- admission 时 home 是该 prompt 在 pool 内 device frontier 最深的**可读**实例；当 home 空闲且深度差距
+  不超过 `--affinity-slack-tokens` 时优先 home。admission 那一刻 home 不可读（正在执行 unit）则
+  不记录 home，该请求失去 `+affinity` 平局加分，后续 pick 的前缀深度评分仍然生效。
+- 等待超过 `--fairness-aging-ms` 的队头请求直接取自己**可读**的最佳候选，避免饿死。若它所有合适
+  候选此刻都不可读，它留在全局队列等下一轮，此时后面的 pending 可能先被派发到空闲实例；这是把
+  「请求阻塞在 `admit()` 内部等某个实例的执行锁」换成「请求在全局队列里等」的必然取舍——不再有
+  任何请求被单个在途 unit 卡住，`/metrics` 也不再被池锁串到执行锁上。
 - 同分依次比较 `pending_requests`、`active_requests`、实例序号。
 - 不会为了等待更深的前缀而空闲 lane。
 
@@ -269,9 +278,10 @@ Prometheus 输出不增加任何 instance 行，单组文本输出与之前一�
 
 已运行的 host 证据（无 GPU、无 artifact）：
 
-- `ninfer_engine_pool_test`：全局队列、permit 的 lane+KV 预留、queue-full 429、
-  permit-timeout 503、取消释放。
-- `ninfer_engine_router_test`：pairwise probe、home bonus、aging、tie-break。
+- `ninfer_engine_pool_test`：全局队列、permit 的 lane+KV 预留（按 `reserved_pages` 净额）、
+  queue-full 429、permit-timeout 503、取消释放、不可读实例本轮跳过。
+- `ninfer_engine_router_test`：pairwise probe、home bonus、aging、tie-break、净额准入、
+  忙实例本轮跳过。
 - `ninfer_shared_host_tier_test`、`ninfer_prefix_cache_host_test`、
   `ninfer_prefix_cache_index_test`：manifest 注册/引用/淘汰、foreign import/commit/release、
   host 页所有权。

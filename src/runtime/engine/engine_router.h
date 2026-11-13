@@ -39,8 +39,11 @@ struct RouteCandidate {
 };
 
 // Builds the candidate view for one (pending, instance) pair. The caller owns the probe and capacity
-// source; the router only scores what the provider returns.
-using CandidateProvider = std::function<RouteCandidate(const PendingRequest&, std::uint32_t instance)>;
+// source; the router only scores what the provider returns. `nullopt` means the instance is
+// mid-unit (its execution lock is held): the router skips it that dispatch round instead of
+// waiting behind it, and re-examines it on a later pick.
+using CandidateProvider =
+    std::function<std::optional<RouteCandidate>(const PendingRequest&, std::uint32_t instance)>;
 
 struct RouteDecision {
     std::size_t pending_index = 0;

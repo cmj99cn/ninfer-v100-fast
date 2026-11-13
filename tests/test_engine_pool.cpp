@@ -44,24 +44,27 @@ void check(bool condition, const char* message) {
 class FakeView : public PoolInstanceView {
 public:
     FakeView(std::uint32_t max_concurrency, std::uint32_t free_pages,
-             std::uint32_t device_frontier = 0)
+             std::uint32_t device_frontier = 0, bool readable = true)
         : max_concurrency_(max_concurrency), free_pages_(free_pages),
-          device_frontier_(device_frontier) {}
+          device_frontier_(device_frontier), readable_(readable) {}
 
-    ninfer::PrefixProbe probe(std::span<const std::uint64_t> hashes) const override {
-        return ninfer::PrefixProbe{
-            .device_frontier = device_frontier_,
-            .block_tokens = 64,
-        };
-    }
-
-    ninfer::CapacitySnapshot capacity() const override {
-        return ninfer::CapacitySnapshot{
-            .free_pages = free_pages_,
-            .total_pages = 4096,
-            .max_concurrency = max_concurrency_,
-            .max_context = 262144,
-            .prefill_chunk = 1024,
+    std::optional<ninfer::InstanceProbe>
+    try_probe(std::span<const std::uint64_t> hashes) const override {
+        if (!readable_) { return std::nullopt; }
+        return ninfer::InstanceProbe{
+            .probe =
+                ninfer::PrefixProbe{
+                    .device_frontier = device_frontier_,
+                    .block_tokens = 64,
+                },
+            .capacity =
+                ninfer::CapacitySnapshot{
+                    .free_pages = free_pages_,
+                    .total_pages = 4096,
+                    .max_concurrency = max_concurrency_,
+                    .max_context = 262144,
+                    .prefill_chunk = 1024,
+                },
         };
     }
 
@@ -71,6 +74,7 @@ private:
     std::uint32_t max_concurrency_;
     std::uint32_t free_pages_;
     std::uint32_t device_frontier_;
+    bool readable_;
 };
 
 EnginePool::GroupOptions group(int device) {
@@ -309,6 +313,24 @@ void test_warm_home_reserves_net_pages() {
     check(second.instance() == 1, "the net permit did not bound the warm instance's free pages");
 }
 
+// An instance that cannot be read (mid-unit) is skipped this round instead of stalling admission
+// behind its execution lock: the request is routed to the readable instance.
+void test_mid_unit_instance_is_skipped() {
+    EnginePool::Options options;
+    options.groups                  = {group(0), group(1)};
+    options.global_pending_requests = 16;
+
+    std::vector<std::unique_ptr<PoolInstanceView>> views;
+    views.push_back(std::make_unique<FakeView>(2, 67, 0, false));
+    views.push_back(std::make_unique<FakeView>(2, 67, 0, true));
+    EnginePool pool(options, std::move(views));
+
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    PoolHandle routed = pool.admit(pending(67, 0, false), deadline);
+    check(routed.instance() == 1, "admission waited on the mid-unit instance");
+    check(pool.permits_held() == 1, "the permit was not held on the readable instance");
+}
+
 } // namespace
 
 int main() {
@@ -318,6 +340,7 @@ int main() {
     test_global_queue_full_is_overloaded();
     test_permit_timeout_is_queue_timeout();
     test_warm_home_reserves_net_pages();
+    test_mid_unit_instance_is_skipped();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

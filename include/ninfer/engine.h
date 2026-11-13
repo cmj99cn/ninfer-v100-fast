@@ -5,6 +5,7 @@
 #include <chrono>
 #include <memory>
 #include <span>
+#include <optional>
 #include <utility>
 
 namespace ninfer {
@@ -130,6 +131,12 @@ public:
     // scheduler's active/pending counts, and the startup-fixed execution facts. `recent_prefill_tps`
     // is 0.0 until the first prefill completes.
     [[nodiscard]] CapacitySnapshot capacity_snapshot() const;
+
+    // Non-blocking probe+capacity pair for the pool admission core: `nullopt` when this Engine
+    // is mid-unit, so the router skips a busy instance instead of waiting behind its execution
+    // lock.
+    [[nodiscard]] std::optional<std::pair<PrefixProbe, CapacitySnapshot>>
+    try_probe_and_capacity(std::span<const std::uint64_t> block_hashes) const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     void reset_memory_peaks() noexcept;
 

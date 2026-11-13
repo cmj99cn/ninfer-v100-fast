@@ -39,12 +39,38 @@ RouteCandidate make_candidate(std::uint32_t instance, std::uint32_t device_front
 // The router reads one (pending, instance) pair through the provider, so the test injects the
 // scripted view instead of a fixed candidate array. Scoring itself is the production router.
 CandidateProvider provider_for(std::vector<RouteCandidate> candidates) {
-    return [candidates = std::move(candidates)](const PendingRequest&, std::uint32_t instance) {
+    return [candidates = std::move(candidates)](
+               const PendingRequest&, std::uint32_t instance) -> std::optional<RouteCandidate> {
         for (const RouteCandidate& candidate : candidates) {
             if (candidate.instance == instance) { return candidate; }
         }
-        return RouteCandidate{.instance = instance};
+        return std::nullopt;
     };
+}
+
+// A mid-unit (busy) instance reports `nullopt` and is skipped that dispatch round: the request
+// routes to an idle instance instead of waiting behind the busy one's execution lock.
+int test_busy_instance_is_skipped() {
+    const Clock::time_point now = Clock::now();
+    std::array<PendingRequest, 1> pending{
+        PendingRequest{
+            .id = 1, .prompt_tokens = 1024, .max_tokens = 64, .required_pages = 18,
+            .enqueued = now, .has_home = false,
+        },
+    };
+    auto provider = [](const PendingRequest&,
+                       std::uint32_t instance) -> std::optional<RouteCandidate> {
+        if (instance == 1) { return std::nullopt; }
+        return make_candidate(2, 0, 1024, 0, 0, 4);
+    };
+    const std::vector<std::uint32_t> instances{1, 2};
+
+    const EngineRouter router;
+    const auto decision = router.pick(pending, provider, instances, now);
+    int failures = check(decision.has_value(), "busy-skip routing returned no decision");
+    if (failures != 0) { return failures; }
+    failures += check(decision->instance == 2, "the busy instance was not skipped");
+    return failures;
 }
 
 std::vector<std::uint32_t> instance_ids(const std::vector<RouteCandidate>& candidates) {
@@ -391,6 +417,7 @@ int test_manifest_frontier_does_not_reduce_admission_pages() {
 int main() {
     int failures = 0;
     failures += test_deepest_prefix_wins();
+    failures += test_busy_instance_is_skipped();
     failures += test_probe_is_per_pending_pair();
     failures += test_no_prefix_does_not_idle();
     failures += test_cross_pending_tie_keeps_head();

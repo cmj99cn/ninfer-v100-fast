@@ -504,6 +504,21 @@ PrefixProbe Engine::prefix_probe(std::span<const std::uint64_t> block_hashes) co
         impl_->executor);
 }
 
+std::optional<std::pair<PrefixProbe, CapacitySnapshot>>
+Engine::try_probe_and_capacity(std::span<const std::uint64_t> block_hashes) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& executor) -> std::optional<std::pair<PrefixProbe, CapacitySnapshot>> {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->try_probe_and_capacity(block_hashes);
+            }
+        },
+        impl_->executor);
+}
+
 CapacitySnapshot Engine::capacity_snapshot() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(

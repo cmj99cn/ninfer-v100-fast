@@ -236,6 +236,24 @@ public:
         return out;
     }
 
+    // Non-blocking variant for the pool admission core: `nullopt` when the worker is mid-unit
+    // (the execution mutex is held), so a busy instance is skipped this dispatch round instead
+    // of stalling pool admission behind a decode/prefill unit. Called only from the pool's
+    // admission core, never from this executor's own worker thread: `try_lock` on a mutex the
+    // calling thread already holds is not a miss, it is undefined behaviour. The stats read nests
+    // inside the execution lock in the same order as `capture_resource_metrics()`.
+    [[nodiscard]] std::optional<std::pair<PrefixProbe, CapacitySnapshot>>
+    try_probe_and_capacity(std::span<const std::uint64_t> hashes) const {
+        std::unique_lock lock(execution_mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) { return std::nullopt; }
+        PrefixProbe probe = instance_.program->prefix_probe(hashes);
+        CapacitySnapshot out = instance_.program->capacity_snapshot();
+        std::lock_guard stats_lock(stats_mutex_);
+        out.active_requests  = published_stats_.running_requests;
+        out.pending_requests = published_stats_.waiting_requests;
+        return std::make_pair(std::move(probe), std::move(out));
+    }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);

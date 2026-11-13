@@ -22,11 +22,11 @@ class EngineInstanceView final : public PoolInstanceView {
 public:
     explicit EngineInstanceView(Engine& engine) : engine_(engine) {}
 
-    PrefixProbe probe(std::span<const std::uint64_t> hashes) const override {
-        return engine_.prefix_probe(hashes);
+    std::optional<InstanceProbe> try_probe(std::span<const std::uint64_t> hashes) const override {
+        auto read = engine_.try_probe_and_capacity(hashes);
+        if (!read.has_value()) { return std::nullopt; }
+        return InstanceProbe{.probe = read->first, .capacity = read->second};
     }
-
-    CapacitySnapshot capacity() const override { return engine_.capacity_snapshot(); }
 
 private:
     Engine& engine_;
@@ -211,20 +211,22 @@ void EnginePool::normalize_pending() {
 // authority: one held permit is one lane claim. Pages are the instance's reported free pages minus
 // the pages the pool reserved for permits that instance has not yet mapped, so a permit is counted
 // once and the view never over-admits.
-runtime::RouteCandidate EnginePool::candidate_locked(const runtime::PendingRequest& pending,
-                                                     std::uint32_t instance) const {
-    CapacitySnapshot capacity = views_[instance]->capacity();
+std::optional<runtime::RouteCandidate> EnginePool::candidate_locked(
+    const runtime::PendingRequest& pending, std::uint32_t instance) const {
+    const auto read = views_[instance]->try_probe(pending.block_hashes);
+    if (!read.has_value()) { return std::nullopt; }
+    CapacitySnapshot capacity = read->capacity;
     const auto& held = permits_by_instance_[instance];
     const std::size_t mapped =
         std::min(held.size(), static_cast<std::size_t>(capacity.active_requests));
     std::uint32_t reserved = 0;
     for (std::size_t index = mapped; index < held.size(); ++index) {
-        reserved += held[index]->required_pages();
+        reserved += held[index]->reserved_pages();
     }
     capacity.free_pages = capacity.free_pages > reserved ? capacity.free_pages - reserved : 0;
     capacity.pending_requests = 0;
     capacity.active_requests  = static_cast<std::uint32_t>(held.size());
-    return runtime::RouteCandidate{instance, views_[instance]->probe(pending.block_hashes), capacity};
+    return runtime::RouteCandidate{instance, read->probe, capacity};
 }
 
 std::optional<runtime::RouteDecision> EnginePool::pick_locked() const {
@@ -262,7 +264,9 @@ std::uint32_t EnginePool::home_locked(std::span<const std::uint64_t> hashes) con
     std::uint32_t best_instance = 0;
     std::uint32_t best_frontier = 0;
     for (std::uint32_t instance = 0; instance < views_.size(); ++instance) {
-        const std::uint32_t frontier = views_[instance]->probe(hashes).device_frontier;
+        const auto read = views_[instance]->try_probe(hashes);
+        if (!read.has_value()) { continue; }
+        const std::uint32_t frontier = read->probe.device_frontier;
         if (frontier > best_frontier) {
             best_frontier   = frontier;
             best_instance   = instance;

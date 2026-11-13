@@ -69,15 +69,16 @@ namespace {
 // derives the per-candidate net page requirement (gross `required_pages` minus the candidate's
 // device-resident prefix); a warm home is no longer evicted by a reuse-blind gross check.
 [[nodiscard]] std::optional<std::size_t> best_candidate(const PendingRequest& request,
-                                        std::span<const RouteCandidate> candidates,
+                                        std::span<const std::optional<RouteCandidate>> candidates,
                                         const EngineRouter::Config& config) {
     std::optional<std::size_t> best;
     for (std::size_t i = 0; i < candidates.size(); ++i) {
-        const RouteCandidate& candidate = candidates[i];
+        if (!candidates[i].has_value()) { continue; }
+        const RouteCandidate& candidate = *candidates[i];
         if (!has_room(candidate, request, config)) { continue; }
-        if (!best.has_value() || score(candidate, request, config) > score(candidates[*best], request, config) ||
-            (score(candidate, request, config) == score(candidates[*best], request, config) &&
-             tie_breaks_before(candidate, candidates[*best]))) {
+        if (!best.has_value() || score(candidate, request, config) > score(*candidates[*best], request, config) ||
+            (score(candidate, request, config) == score(*candidates[*best], request, config) &&
+             tie_breaks_before(candidate, *candidates[*best]))) {
             best = i;
         }
     }
@@ -106,31 +107,31 @@ std::optional<RouteDecision> EngineRouter::pick(std::span<const PendingRequest> 
                                                 std::chrono::steady_clock::time_point now) const {
     if (pending.empty() || instances.empty()) { return std::nullopt; }
 
-    std::vector<RouteCandidate> head_candidates;
+    std::vector<std::optional<RouteCandidate>> head_candidates;
     head_candidates.reserve(instances.size());
     for (const std::uint32_t instance : instances) {
         head_candidates.push_back(provider(pending[0], instance));
     }
     const auto head_best = best_candidate(pending[0], head_candidates, config_);
     if (head_best.has_value() && now - pending[0].enqueued >= config_.fairness_aging) {
-        return decision_for(0, head_candidates[*head_best], pending[0], config_);
+        return decision_for(0, *head_candidates[*head_best], pending[0], config_);
     }
 
     std::optional<std::size_t> chosen_pending;
     RouteCandidate chosen_candidate{};
     std::uint64_t chosen_score = 0;
     for (std::size_t i = 0; i < pending.size(); ++i) {
-        std::vector<RouteCandidate> candidates;
+        std::vector<std::optional<RouteCandidate>> candidates;
         candidates.reserve(instances.size());
         for (const std::uint32_t instance : instances) {
             candidates.push_back(provider(pending[i], instance));
         }
         const auto best = best_candidate(pending[i], candidates, config_);
         if (!best.has_value()) { continue; }
-        const std::uint64_t s = score(candidates[*best], pending[i], config_);
+        const std::uint64_t s = score(*candidates[*best], pending[i], config_);
         if (!chosen_pending.has_value() || s > chosen_score) {
             chosen_pending   = i;
-            chosen_candidate = candidates[*best];
+            chosen_candidate = *candidates[*best];
             chosen_score     = s;
         }
     }
