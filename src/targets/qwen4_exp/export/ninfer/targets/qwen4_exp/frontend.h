@@ -42,6 +42,7 @@ struct FrontendResources {
 
 struct PreparedPromptData {
     std::vector<TokenId> token_ids;
+    std::vector<std::uint64_t> block_hashes;
 };
 
 class PreparedPrompt {
@@ -80,10 +81,10 @@ public:
                                                    FinishReason limit_reason);
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] std::vector<OutputDelta> commit_preview();
-    [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
+    [[nodiscard]] std::uint32_t reasoning_tokens() const;
 
 private:
-    std::vector<OutputDelta> pending_;
+    friend class Frontend;
 };
 
 class Frontend {

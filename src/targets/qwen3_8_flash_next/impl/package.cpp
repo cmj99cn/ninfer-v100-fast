@@ -105,7 +105,11 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     for (const auto& object : bindings.objects) {
         binder.materialize_on_device(object.handle);
     }
-    binder.validate_unconsumed_matching("");
+    binder.validate_unconsumed_matching("text/");
+    binder.validate_unconsumed_matching("resource/text/");
+    for (const auto& object : bindings.unclaimed.object_names) {
+        binder.validate_only(object);
+    }
 
     return LoadPlan(std::make_unique<LoadPlan::Impl>(weights_profile, std::move(bindings),
                                                       binder.finish(), resources, options.tp));

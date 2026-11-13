@@ -5,7 +5,6 @@
 #include "targets/qwen4_exp/impl/runtime/instance.h"
 #include "targets/qwen4_exp/impl/runtime/layouts.h"
 #include "targets/qwen4_exp/impl/runtime/program.h"
-#include "targets/qwen4_exp/impl/runtime/schedule.h"
 
 #include <array>
 #include <cstddef>
@@ -17,14 +16,6 @@
 #include <vector>
 
 namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
-
-namespace {
-
-inline runtime::AdmissionResources no_admission() noexcept {
-    return runtime::AdmissionResources{};
-}
-
-} // namespace
 
 ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevices>& models,
                                  WeightsProfile weights_profile, std::unique_ptr<SequencePlanImpl> plan,
@@ -62,8 +53,7 @@ runtime::RequestPlanSummary ProgramImplCore::make_summary(std::uint32_t prompt_t
 }
 
 std::uint32_t ProgramImplCore::page_groups_for(std::uint32_t tokens) const noexcept {
-    constexpr std::uint32_t page_tokens = 64;
-    return (tokens + page_tokens - 1) / page_tokens;
+    return (tokens + Variant::kv_page_tokens - 1) / Variant::kv_page_tokens;
 }
 
 void ProgramImplCore::clear_lane(std::uint32_t lane) noexcept {
@@ -117,20 +107,11 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
     return true;
 }
 
-bool ProgramImplCore::can_admit_lane_after_retained_eviction(std::uint32_t lane,
-                                                              const RequestPlan& plan) const noexcept {
-    return can_admit_lane(lane, plan);
-}
-
 runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept {
     return runtime::AdmissionResources{
         .active_lanes  = plan_->max_concurrency,
         .main_kv_pages = plan_->main_page_groups,
     };
-}
-
-runtime::AdmissionResources ProgramImplCore::admission_cache_residue() const noexcept {
-    return no_admission();
 }
 
 runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lane,
@@ -243,15 +224,6 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 
 void ProgramImplCore::abort_lane(std::uint32_t lane) noexcept {
     if (lane < plan_->max_concurrency) { clear_lane(lane); }
-}
-
-bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
-    (void)lane;
-    return false;
-}
-
-void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
-    (void)lane;
 }
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {

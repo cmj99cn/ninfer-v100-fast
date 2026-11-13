@@ -15,7 +15,6 @@ using Variant             = NINFER_QWEN4EXP_VARIANT;
 using WeightsProfile      = typename Variant::WeightsProfile;
 using TextConfig          = typename Variant::TextConfig;
 using ModelView           = typename Variant::ModelView;
-using PostMixerWeights    = typename Variant::PostMixerWeights;
 using GraphExecutionProfile = typename Variant::GraphExecutionProfile;
 
 using SequencePlan    = qwen4_exp::SequencePlan<Variant>;

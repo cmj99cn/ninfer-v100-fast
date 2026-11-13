@@ -259,6 +259,24 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 
+LoadedQwen3_8_FlashNext::LoadedQwen3_8_FlashNext(
+    std::unique_ptr<Qwen3_8_FlashNext::LoadedModel> stable_model, const EngineOptions& options)
+    : model(std::move(stable_model)), frontend(Qwen3_8_FlashNext::make_frontend(*model, options)) {}
+
+LoadedQwen3_8_FlashNext::~LoadedQwen3_8_FlashNext() = default;
+
+Qwen3_8_FlashNextInstance::Qwen3_8_FlashNextInstance(
+    std::unique_ptr<LoadedQwen3_8_FlashNext> stable_loaded,
+    runtime::KvCapacityResolution resolution, Qwen3_8_FlashNext::SequencePlan sequence_plan,
+    ExecutionContext& execution, const EngineOptions& options)
+    : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
+      request_memory(execution.primary(), sequence_plan.request_transient_capacity_bytes()),
+      capacity(sequence_plan.capacity()),
+      program(Qwen3_8_FlashNext::create_program(*loaded->model, std::move(sequence_plan),
+                                                execution, options)) {}
+
+Qwen3_8_FlashNextInstance::~Qwen3_8_FlashNextInstance() = default;
+
 ConstructedTarget construct_target(const EngineOptions& options, ExecutionContext& execution,
                                    SharedModel& shared) {
     validate_options(options);
@@ -281,6 +299,11 @@ ConstructedTarget construct_target(const EngineOptions& options, ExecutionContex
     if (identity.model_id == Qwen3_6_35BA3B::model_id) {
         return construct_registered<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(
             options, execution, reader, load_start, Qwen3_6_35BA3B::target_key);
+    }
+    if (identity.model_id == Qwen3_8_FlashNext::model_id) {
+        return construct_registered<Qwen3_8_FlashNext, LoadedQwen3_8_FlashNext,
+                                   Qwen3_8_FlashNextInstance>(options, execution, reader, load_start,
+                                                              Qwen3_8_FlashNext::target_key);
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' has no registered target for this device");

@@ -441,6 +441,28 @@ void collect_unclaimed(const Bindings& bindings, const std::set<std::string>& cl
     }
 }
 
+template <typename Bindings>
+void collect_unclaimed_objects(const Bindings& bindings, const std::set<std::string>& claimed,
+                               UnclaimedParameters& unclaimed) {
+    for (const auto& entry : bindings) {
+        const std::string& name = entry.first;
+        if (claimed.count(name) != 0) { continue; }
+        unclaimed.object_names.push_back(entry.second);
+    }
+}
+
+template <typename Bindings>
+void collect_unclaimed_part_objects(const Bindings& bindings, const std::set<std::string>& claimed,
+                                    UnclaimedParameters& unclaimed) {
+    for (const auto& entry : bindings) {
+        const std::string& name = entry.first;
+        if (claimed.count(name) != 0) { continue; }
+        for (const auto& part : entry.second) {
+            unclaimed.object_names.push_back(part.object);
+        }
+    }
+}
+
 } // namespace
 
 std::vector<const BoundParameter*> BindingPlan::parameters() const {
@@ -584,6 +606,8 @@ BindingPlan bind_artifact(artifact::Binder& binder, WeightsProfile profile, int 
 
     collect_unclaimed(directory.bindings, builder.claimed(), plan.unclaimed);
     collect_unclaimed(directory.part_bindings, builder.claimed(), plan.unclaimed);
+    collect_unclaimed_objects(directory.bindings, builder.claimed(), plan.unclaimed);
+    collect_unclaimed_part_objects(directory.part_bindings, builder.claimed(), plan.unclaimed);
     return plan;
 }
 

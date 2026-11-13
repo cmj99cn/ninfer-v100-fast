@@ -4,7 +4,6 @@
 #include "runtime/contract/types.h"
 #include "targets/qwen4_exp/impl/runtime/instance.h"
 #include "targets/qwen4_exp/impl/runtime/layouts.h"
-#include "targets/qwen4_exp/impl/runtime/schedule.h"
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 #include "targets/qwen4_exp/impl/runtime/workspace_recipe.h"
 
@@ -56,11 +55,7 @@ public:
                                                      const RequestBasePlan& base);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
                                       const RequestPlan& plan) const noexcept;
-    [[nodiscard]] bool
-    can_admit_lane_after_retained_eviction(std::uint32_t lane,
-                                           const RequestPlan& plan) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
-    [[nodiscard]] runtime::AdmissionResources admission_cache_residue() const noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                  PreparedPrompt&& prompt,
                                                                  RequestPlan&& plan,
@@ -75,8 +70,6 @@ public:
                                std::span<const std::uint8_t> terminal,
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
-    [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
-    void evict_retained_lane(std::uint32_t lane) noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     [[nodiscard]] MetricsSnapshot metrics() const noexcept;

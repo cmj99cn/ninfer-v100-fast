@@ -116,6 +116,7 @@ struct PlePlan {
 
 struct UnclaimedParameters {
     std::map<std::string, std::vector<std::string>> by_namespace;
+    std::vector<std::string> object_names;
 };
 
 struct BindingPlan {

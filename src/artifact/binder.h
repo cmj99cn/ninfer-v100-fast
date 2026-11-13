@@ -126,6 +126,7 @@ public:
     void stage_shard_on_host(ObjectHandle handle);
     void retain_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
+    void validate_only(std::string_view name);
     void validate_unconsumed_matching(std::string_view prefix = "");
     MaterializationPlan finish();
 

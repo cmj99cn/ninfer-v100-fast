@@ -290,6 +290,18 @@ void Binder::validate_only(ObjectHandle handle) {
     planned_[handle.index] = true;
 }
 
+void Binder::validate_only(std::string_view name) {
+    const auto& objects = reader_.objects();
+    const ObjectDescriptor* object = reader_.find(name);
+    if (object == nullptr) {
+        throw ArtifactError("required artifact object is missing: " + std::string(name));
+    }
+    const auto index = static_cast<std::size_t>(object - objects.data());
+    if (planned_[index]) { return; }
+    consumed_[index] = true;
+    planned_[index] = true;
+}
+
 void Binder::validate_unconsumed_matching(std::string_view prefix) {
     for (std::size_t i = 0; i < reader_.objects().size(); ++i) {
         if (!consumed_[i]) {

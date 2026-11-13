@@ -28,25 +28,24 @@ PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
 runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
                                                 std::uint32_t budget_remaining,
                                                 FinishReason limit_reason) {
-    pending_.clear();
-    const std::uint32_t accepted =
-        tokens.size() < budget_remaining ? static_cast<std::uint32_t>(tokens.size()) : budget_remaining;
-    for (std::uint32_t index = 0; index < accepted; ++index) {
-        pending_.push_back(OutputDelta{.channel = OutputChannel::Content, .text = ""});
-    }
-    return runtime::OutputDecision{.accepted_tokens = accepted, .finish_reason = limit_reason};
+    (void)tokens;
+    (void)budget_remaining;
+    (void)limit_reason;
+    throw std::logic_error("qwen4_exp family frontend does not detokenize generated tokens");
 }
 
 runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
-    pending_.clear();
-    return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
+    (void)reason;
+    throw std::logic_error("qwen4_exp family frontend does not finalize output");
 }
 
 std::vector<OutputDelta> OutputSession::commit_preview() {
-    return std::move(pending_);
+    throw std::logic_error("qwen4_exp family frontend does not commit output");
 }
 
-std::uint32_t OutputSession::reasoning_tokens() const noexcept { return 0; }
+std::uint32_t OutputSession::reasoning_tokens() const {
+    throw std::logic_error("qwen4_exp family frontend does not count output reasoning");
+}
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
     (void)input;

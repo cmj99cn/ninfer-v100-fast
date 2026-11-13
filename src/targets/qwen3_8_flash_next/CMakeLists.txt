@@ -1,8 +1,4 @@
-add_library(ninfer_flash_next_package INTERFACE)
-target_include_directories(ninfer_flash_next_package INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/export)
-target_link_libraries(ninfer_flash_next_package INTERFACE ninfer_qwen4_exp_runtime)
-
-target_sources(ninfer_engine PRIVATE
+add_library(ninfer_flash_next_package STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/package.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/variant.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/leaves.cpp
@@ -10,6 +6,12 @@ target_sources(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/geometry.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/roles.cpp)
 
-target_include_directories(ninfer_engine PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/impl
-  ${CMAKE_CURRENT_SOURCE_DIR}/export)
+ninfer_internal_includes(ninfer_flash_next_package)
+target_include_directories(ninfer_flash_next_package
+  PRIVATE ${CUDAToolkit_INCLUDE_DIRS}
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/export)
+target_link_libraries(ninfer_flash_next_package
+  PUBLIC
+    ninfer_qwen4_exp_family
+    ninfer_artifact
+    ninfer_core)

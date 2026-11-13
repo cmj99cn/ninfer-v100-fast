@@ -11,11 +11,6 @@ namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
 
 namespace {
 
-inline std::uint32_t align_up(std::uint32_t value, std::uint32_t alignment) {
-    if (alignment == 0) { return value; }
-    return (value + alignment - 1) / alignment * alignment;
-}
-
 inline std::uint32_t groups_for(std::uint32_t tokens, std::uint32_t page_tokens) {
     if (page_tokens == 0) { return 0; }
     return (tokens + page_tokens - 1) / page_tokens;
@@ -41,25 +36,25 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .weights_profile = weights_profile,
         .capacity        = options.max_context,
         .max_concurrency = options.max_concurrency,
-        .prefill_chunk   = align_up(options.prefill_chunk, kPrefillChunkAlignment),
+        .prefill_chunk   = static_cast<std::uint32_t>(
+            align_up(options.prefill_chunk, kPrefillChunkAlignment)),
         .device          = device.device,
         .tp              = options.tp,
     };
 
-    constexpr std::uint32_t page_tokens = 64;
-    constexpr std::size_t base_reservation_bytes = 4096;
-    constexpr std::size_t bytes_per_additional_main_page_group = 1024;
-    const std::uint32_t minimum_groups = std::max(1U, groups_for(options.max_context, page_tokens));
-    const std::uint32_t maximum_groups = std::max(minimum_groups, groups_for(kMaximumContext, page_tokens));
+    const std::uint32_t minimum_groups =
+        std::max(1U, groups_for(options.max_context, Variant::kv_page_tokens));
+    const std::uint32_t maximum_groups =
+        std::max(minimum_groups, groups_for(kMaximumContext, Variant::kv_page_tokens));
 
     planner->curve = runtime::SequenceCapacityCurve{
-        .main_page_tokens                   = page_tokens,
+        .main_page_tokens                   = Variant::kv_page_tokens,
         .minimum_main_page_groups           = minimum_groups,
         .maximum_main_page_groups           = maximum_groups,
-        .minimum_device_reservation_bytes   = base_reservation_bytes +
+        .minimum_device_reservation_bytes   = Variant::minimum_device_reservation_bytes +
                                               static_cast<std::size_t>(minimum_groups - 1) *
-                                                  bytes_per_additional_main_page_group,
-        .bytes_per_additional_main_page_group = bytes_per_additional_main_page_group,
+                                                  Variant::bytes_per_additional_main_page_group,
+        .bytes_per_additional_main_page_group = Variant::bytes_per_additional_main_page_group,
     };
     return planner;
 }
