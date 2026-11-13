@@ -798,7 +798,52 @@ The `text/*` parameters that need a new decode path are therefore the routed exp
 (batched NVFP4) and the PLE table (NF4). Every other text parameter is BF16, FP32 or a Q8
 row-split projection, all of which the repository already decodes.
 
-## 11. Provenance
+## 11. Host tier slab geometry
+
+The host tier carves its pinned budget into fixed-size slabs sized from the plane extents of the
+planned caches (`src/targets/qwen3_6/impl/state/decoder_state.cpp:37-52`, split 80% block / 20%
+snapshot in `src/targets/qwen3_6/impl/runtime/program_impl.h:626-640`). These are flash-next
+numbers; the 2.19 MiB / 373 slab / 4485 figures in `docs/maintainer/multi-instance.md` §2.1 belong
+to the 27B NVFP4 TP2+MTP-3 profile and do not transfer.
+
+Block slab (one 64-token page, INT8 group-64 KV with the FP16 scale plane). The flash-next Variant
+maps `convolution_dim` and `gdn_conv_state_width` onto `gdn_conv_channels` and
+`gdn_conv_kernel - 1`; the GDN conv of this checkpoint has no dilation, so the state width is
+`kernel - 1` (the dilation 3 belongs to the PLE conv).
+
+| Plane, per rank | Extent | Bytes |
+|---|---|---|
+| K codes | `256 × 64 × (kv_heads/tp = 1) × 1` | 16,384 |
+| V codes | same | 16,384 |
+| K scales | `(256/64) × 64 × 1 × 2` | 512 |
+| V scales | same | 512 |
+| Per QSA layer | | 33,792 |
+| Per rank (12 QSA layers) | | 405,504 |
+
+Block slab = `tp × per_rank` = **811,008 B ≈ 0.773 MiB**. A slab is a full-width page, so this total
+is tp-independent (`tp = 1` gives the same slab from `67,584 × 12`). The speculative backend pool
+contributes 0 today because this identity registers no speculative backend yet (MTP is M3); when it
+lands, the backend pool's `per_page_bytes()` adds to `per_rank_block_bytes`.
+
+Snapshot slab (one GDN continuation state image):
+
+| Part, per rank | Extent | Bytes |
+|---|---|---|
+| Conv history, per layer | `(10240/tp = 5120) × 3 × 2` | 30,720 |
+| Recurrent state, per layer | `128 × 128 × (48/tp = 24) × 4` | 1,572,864 |
+| Per layer | | 1,603,584 |
+| Per rank (36 GDN layers) | | 57,729,024 |
+
+Snapshot slab = `tp × per_rank` = **115,458,048 B ≈ 110.1 MiB**.
+
+At `--host-cache-mib 1024` the split gives 858,993,459 B of block budget → **1059 block slabs**
+(≈ 67,776 host prefix tokens) and 214,748,364 B of snapshot budget → **1 snapshot slab**. The
+snapshot slab is ~142× the block slab, so a 1024 MiB budget retains a single state image; meaningful
+snapshot retention needs a much larger budget (`--host-cache-mib 12288` → 12,704 block slabs,
+≈ 813K tokens, and 22 snapshot slabs). The smallest budget that enables the tier at all is one slab
+of each kind, which for this geometry is ≈ 551 MiB.
+
+## 12. Provenance
 
 - Artifact: `/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer`
   (entry file plus `part-0001..part-0003`).
