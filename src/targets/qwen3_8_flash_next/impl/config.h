@@ -45,6 +45,7 @@ struct TextConfig {
     static constexpr int expert_intermediate = 640;
     static constexpr int shared_intermediate = 640;
 
+    static constexpr int ple_layer            = 1;
     static constexpr int ple_embed_dim      = hidden;
     static constexpr int ple_ngram          = 3;
     static constexpr int ple_heads_per_ngram = 8;

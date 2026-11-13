@@ -90,6 +90,11 @@ private:
     EngineOptions options_;
     std::unique_ptr<SequencePlanImpl> plan_;
     std::array<LaneState, kMaximumConcurrency> lanes_{};
+    TextState state_;
+    WorkspaceArena workspace_;
+    TextTrunk trunk_;
+    std::vector<TokenId> round_tokens_;
+    std::vector<std::int32_t> round_row_counts_;
 };
 
 } // namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS

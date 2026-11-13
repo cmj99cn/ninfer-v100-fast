@@ -4,7 +4,9 @@
 #include "runtime/contract/types.h"
 #include "targets/qwen4_exp/impl/runtime/instance.h"
 #include "targets/qwen4_exp/impl/runtime/layouts.h"
+#include "core/arena.h"
 #include "targets/qwen4_exp/impl/runtime/program.h"
+#include "targets/qwen4_exp/impl/runtime/text_context.h"
 
 #include <array>
 #include <cstddef>
@@ -21,7 +23,10 @@ ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevi
                                  WeightsProfile weights_profile, std::unique_ptr<SequencePlanImpl> plan,
                                  ExecutionContext& execution, const EngineOptions& options)
     : weights_profile_(weights_profile), models_(models), execution_(execution), options_(options),
-      plan_(std::move(plan)) {
+      plan_(std::move(plan)), state_(execution_.primary(), *models_[0],
+                                    std::max<std::uint32_t>(plan_->prefill_chunk, 1)),
+      workspace_(std::max<std::size_t>(plan_->workspace_capacity_bytes, 1)),
+      trunk_(*models_[0], state_, workspace_, execution_.primary().stream) {
     if (plan_ == nullptr) { throw std::logic_error("qwen4_exp program received an empty sequence plan"); }
     if (execution_.tp != plan_->tp) {
         throw std::invalid_argument("qwen4_exp program execution width does not match the sequence plan");
@@ -193,8 +198,20 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
         }
     }
 
-    Variant::post_mixer();
-    return runtime::BatchedGeneratedRound{};
+    round_tokens_.clear();
+    round_row_counts_.clear();
+    for (const std::uint32_t lane : lanes) {
+        const LaneState& state = lanes_[lane];
+        const TokenId input = state.context.prompt_tokens.back();
+        round_tokens_.push_back(trunk_.decode(input));
+        round_row_counts_.push_back(1);
+    }
+
+    runtime::BatchedGeneratedRound round;
+    round.tokens       = round_tokens_;
+    round.row_counts   = round_row_counts_;
+    round.row_stride   = 1;
+    return round;
 }
 
 void ProgramImplCore::resolve_prefill_lane(std::uint32_t lane, bool terminal) {

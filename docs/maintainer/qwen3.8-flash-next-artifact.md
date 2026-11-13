@@ -299,6 +299,10 @@ stored tap-major (`[4 taps, 10240 channels]`), which is the transpose of the run
 `{10240, 4}` channel-major kernel view. The GDN norm weight is the per-head-dimension gain
 `[128]`.
 
+The GDN post-norm is `ops::gated_rmsnorm` with a SiLU gate, which is what `hidden_act = silu`
+selects. `output_gate_type = sigmoid` belongs to the QSA attention output gate and does not
+change the GDN post-norm.
+
 ### 4.3 QSA
 
 | Parameter | Object | Format | Layout | Shape | Range | Rows |
@@ -532,6 +536,10 @@ Cache encodings: a BF16 main cache stores BF16(k) and FP16_RNE(v). For a quantiz
 with no intermediate BF16 rounding; INT8-G64 and FP8 transform K only, while NVFP4-G16 and
 K8V4 transform both K and V. The attention consumer owns the matching Q transform and any
 value-basis inversion.
+
+Supported route gap: the implemented QSA route in this package is the BF16-K / FP16-V cache.
+INT8 group-64 is described above as a cache encoding but is not implemented here, so no test
+exercises it; the M2 acceptance run uses BF16-K / FP16-V.
 
 Index blocks: with `F = positions[0,b]` and `n = valid_columns[b]`, each newly completed block
 `g` in `[floor(F/4), floor((F+n)/4))` writes
@@ -863,3 +871,21 @@ of each kind, which for this geometry is ≈ 551 MiB.
   repository must be written to match.
 - Role table and its test: `src/targets/qwen3_8_flash_next/impl/load/roles.{h,cpp}` and
   `tests/targets/qwen3_8_flash_next/test_roles.cpp`.
+
+
+## 13. M2 acceptance configuration
+
+The M2 text acceptance run is a test configuration, not a product load configuration: the public
+Engine route always loads the full 48 layers.
+
+- The test binds the reduced role set — the first four layers with all 512 experts, the full
+  embedding and the full main head — and materializes only those objects on device. Objects
+  outside that set are validated only, which is the binder's existing placement contract.
+- The PLE table is not materialized as a device tensor. `ops::PleNf4Table` carries no per-shard
+  device base, so the lookup keeps the table on disk and stages only the rows a call addresses,
+  as §8.2 describes. Materializing all 128 shards as one device table would require changing the
+  Op contract, which this milestone does not do.
+- Greedy parity compares the produced token with `NINFER_FLASH_NEXT_REFERENCE_TOKEN`. The reference
+  value is a placeholder until the independent reference model lands; the assertion is exact and
+  is not relaxed.
+- The tokenizer is outside M2: the test feeds token ids directly.

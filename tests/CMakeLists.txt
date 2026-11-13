@@ -83,6 +83,12 @@ ninfer_add_test(ninfer_flash_next_load_plan_test
 add_test(NAME ninfer_flash_next_load_plan_artifact_test
   COMMAND ninfer_flash_next_load_plan_test artifact)
 set_tests_properties(ninfer_flash_next_load_plan_artifact_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_flash_next_text_forward_test
+  SOURCES targets/qwen3_8_flash_next/test_text_forward.cpp
+  LIBRARIES ninfer_flash_next_package)
+target_link_libraries(ninfer_flash_next_text_forward_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_flash_next_text_forward_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_flash_next_program_lifecycle_test
   SOURCES targets/qwen3_8_flash_next/test_program_lifecycle.cpp
   LIBRARIES ninfer_flash_next_package)

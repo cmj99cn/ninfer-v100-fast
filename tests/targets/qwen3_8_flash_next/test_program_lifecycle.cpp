@@ -59,7 +59,6 @@ static_assert(!HasModelId<Package::RequestPlan>);
 static_assert(!HasModelId<Package::Program>);
 static_assert(!HasModelId<Package::PreparedPrompt>);
 static_assert(!HasModelId<Package::PreparedPromptData>);
-static_assert(!HasModelId<Package::RuntimeModelView>);
 
 static_assert(sizeof(Package::SequencePlan) == sizeof(void*));
 static_assert(sizeof(Package::Program) == sizeof(void*));

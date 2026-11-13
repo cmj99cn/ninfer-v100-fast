@@ -14,4 +14,5 @@ target_link_libraries(ninfer_flash_next_package
   PUBLIC
     ninfer_qwen4_exp_family
     ninfer_artifact
-    ninfer_core)
+    ninfer_core
+    ninfer_ops)
