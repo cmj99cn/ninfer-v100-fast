@@ -50,6 +50,7 @@ enum class QuantLayout : std::uint16_t {
     RowScale            = 3,
     VoltaQpnPrepacked    = 4,
     GgmlK256            = 5,
+    BatchedBlockScaleK16M128x4 = 6,
 };
 
 struct Weight {
@@ -74,6 +75,41 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
+};
+
+struct BatchedNvfp4Weight {
+    const void* payload            = nullptr;
+    std::uint64_t payload_bytes    = 0;
+    QType qtype                    = QType::NVFP4;
+    QuantLayout layout             = QuantLayout::BatchedBlockScaleK16M128x4;
+    std::uint32_t group_size       = 16;
+
+    std::int32_t matrices  = 0;
+    std::int32_t rows      = 0;
+    std::int32_t columns   = 0;
+
+    const void* codes    = nullptr;
+    const void* scales   = nullptr;
+    const float* divisors = nullptr;
+
+    [[nodiscard]] const std::uint8_t* codes_for(std::int32_t matrix) const {
+        return static_cast<const std::uint8_t*>(codes) +
+               static_cast<std::size_t>(matrix) * rows * columns / 2U;
+    }
+
+    [[nodiscard]] const std::uint8_t* scales_for(std::int32_t matrix) const {
+        return static_cast<const std::uint8_t*>(scales) +
+               static_cast<std::size_t>(matrix) * rows * columns / 16U;
+    }
+
+    [[nodiscard]] float divisor_for(std::int32_t matrix) const { return divisors[matrix]; }
+
+    [[nodiscard]] std::size_t scale_offset(std::int32_t row, std::int32_t group) const {
+        return static_cast<std::size_t>(row / 128) * (columns / 64) * 512U +
+               static_cast<std::size_t>(row % 32) * 16U +
+               static_cast<std::size_t>((row % 128) / 32) * 4U +
+               static_cast<std::size_t>(group % 4);
+    }
 };
 
 } // namespace ninfer
