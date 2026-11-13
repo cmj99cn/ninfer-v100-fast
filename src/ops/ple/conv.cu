@@ -220,8 +220,15 @@ void ple_conv_add_norm(const Tensor& history, const Tensor& normalized_conv, con
     detail::require_disjoint(updated_residual, offsets, "updated_residual");
     detail::require_disjoint(updated_residual, counts, "updated_residual");
     detail::require_disjoint(updated_residual, next_hc_norm_weight, "updated_residual");
-    detail::require_disjoint(normalized, updated_residual, "normalized");
+    detail::require_disjoint(normalized, history, "normalized");
+    detail::require_disjoint(normalized, normalized_conv, "normalized");
+    detail::require_disjoint(normalized, residual, "normalized");
+    detail::require_disjoint(normalized, gated_value, "normalized");
+    detail::require_disjoint(normalized, kernel, "normalized");
+    detail::require_disjoint(normalized, offsets, "normalized");
+    detail::require_disjoint(normalized, counts, "normalized");
     detail::require_disjoint(normalized, next_hc_norm_weight, "normalized");
+    detail::require_disjoint(normalized, updated_residual, "normalized");
 
     detail::ple_conv_launch(history, normalized_conv, residual, gated_value, kernel, offsets, counts,
                             next_hc_norm_weight.data, epsilon, updated_residual, normalized.data, true,

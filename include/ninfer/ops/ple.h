@@ -29,8 +29,9 @@ inline constexpr float kPleGateFloor             = 1.0e-6F;
  * The PLE n-gram hash controls of the artifact.
  *
  * The 280-byte `resource/text/ple_hash_controls` payload is 35 little-endian U64 words:
- * multipliers [0, 3), vocab_sizes [3, 19) and offsets [19, 35). The payload is the only source
- * of these values; nothing in this repository restates them.
+ * multipliers [0, 3), vocab_sizes [3, 19) and offsets [19, 35). The payload is the only runtime
+ * source of these values; the qualification test and the target document restate them as pinned
+ * expectations.
  */
 struct PleHashControls {
     std::array<std::uint64_t, 3> multipliers;
@@ -193,8 +194,9 @@ void ple_lookup_rows(const PleNf4Table& table, const std::uint32_t* rows, std::s
 /**
  * Op: the PLE gate and the convolution norm it feeds.
  *
- * Math / indexing: for each live column `(t, b)` with `0 <= t < n[b]` and each stream `s`, with
- * `eps = epsilon` and `H = 2560`:
+ * Math / indexing: for every column `(t, b)` with `0 <= t < T` and each stream `s`, with
+ * `eps = epsilon` and `H = 2560` (the gate writes every column; the convolution consumes only the
+ * live columns of a round):
  *
  *   k_s[d] = Norm(projected.key[d + H * s, t, b], norm_key[d + H * s], eps)
  *   q_s[d] = Norm(residual[d, s, t, b], norm_query[d + H * s], eps)

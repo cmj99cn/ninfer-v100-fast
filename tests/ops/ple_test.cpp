@@ -33,7 +33,6 @@ using ninfer::artifact::object_name;
 using ninfer::artifact::object_offset;
 using ninfer::artifact::row_paged_nf4_geometry;
 using ninfer::artifact::row_paged_nf4_row_offset;
-using ninfer::artifact::row_paged_nf4_scale_offset;
 using ninfer::ops::PleHashControls;
 using ninfer::ops::PleNf4Table;
 using ninfer::ops::PleRowAddress;
@@ -316,7 +315,7 @@ int test_hash_and_shard_mapping() {
         const PleRowAddress address = ninfer::ops::ple_row_address(table, row);
         const std::size_t oracle_shard = static_cast<std::size_t>(row) / ninfer::ops::kPleShardRows;
         if (address.shard != oracle_shard || address.row != row % ninfer::ops::kPleShardRows) {
-            fail("the row address does not match the report-derived shard for global row " +
+            fail("the row address does not match the shard-order assumption for global row " +
                  std::to_string(row));
         }
         if (object_name(*reader.find(report_objects[address.shard])) != report_objects[address.shard]) {
@@ -513,6 +512,14 @@ int test_gate() {
     }
 
     int failures = gated.verify_guards("ple_gate gated_value");
+    const auto gated_bits = read_bits(gated.data(), channels * columns);
+    std::vector<std::uint16_t> exact_zero_gate;
+    for (std::size_t d = 0; d < ninfer::ops::kPleHidden; ++d) {
+        exact_zero_gate.push_back(f32_to_bf16(0.5F * static_cast<float>(bf16_bits_to_double(value_bits[d]))));
+    }
+    std::vector<std::uint16_t> zero_stream(gated_bits.begin() + 2 * ninfer::ops::kPleHidden,
+                                           gated_bits.begin() + 3 * ninfer::ops::kPleHidden);
+    failures += verify_exact("ple_gate gate at zero", zero_stream, exact_zero_gate);
     failures += normalized.verify_guards("ple_gate normalized_conv");
     failures += verify_reduction("ple_gate gated_value", from_device_bf16(gated.data(), channels * columns),
                                  expected_gated, kNormCriterion);
@@ -713,6 +720,32 @@ int test_state_extract() {
 
     int failures = after.verify_guards("ple_state_extract");
     failures += verify_exact("ple_state_extract", read_bits(after.data(), expected.size()), expected);
+
+    const DeviceBuffer alias_device = to_device(before_bits);
+    Tensor before_alias(alias_device.p, DType::BF16,
+                        {static_cast<std::int32_t>(channels), static_cast<std::int32_t>(window), batch});
+    Tensor after_alias(alias_device.p, DType::BF16,
+                       {static_cast<std::int32_t>(channels), static_cast<std::int32_t>(window), batch});
+    ninfer::ops::ple_state_extract(before_alias, records_view, accepted_view, after_alias, 0);
+    cuda_synchronize();
+
+    std::vector<std::uint16_t> alias = before_bits;
+    for (std::size_t b = 0; b < static_cast<std::size_t>(batch); ++b) {
+        for (std::size_t c = 0; c < channels; ++c) {
+            for (std::size_t j = 0; j < window; ++j) {
+                const std::int32_t k = accepted[b] - static_cast<std::int32_t>(window) + static_cast<std::int32_t>(j);
+                const std::size_t index = c + channels * j + channels * window * b;
+                if (k < 0) {
+                    alias[index] = alias[c + channels * static_cast<std::size_t>(9 + k) + channels * window * b];
+                } else {
+                    alias[index] = records_bits[c + channels * static_cast<std::size_t>(k) + channels * tokens * b];
+                }
+            }
+        }
+    }
+
+    failures += verify_exact("ple_state_extract alias", read_bits(alias_device.p, alias.size()), alias);
+
     if (failures == 0) std::cout << "OK ple_state_extract\n";
     return failures;
 }

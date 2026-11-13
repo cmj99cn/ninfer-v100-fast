@@ -661,7 +661,7 @@ heads: head `h` owns the global rows `[offsets[h], offsets[h] + vocab_sizes[h])`
 The sixteen vocabulary sizes sum to 320,001,446 global rows, while the table holds
 `128 * 2,500,012 = 320,001,536` rows.
 
-**The shard assignment below is a derivation, not a measurement.** The artifact directory does
+**The shard assignment is an assumption, not a proof.** The artifact directory does
 not record the global row range of each shard: every shard's binding claims the whole object
 (`[0, 400001920)`), and only the conversion report's `methods` entries show that shard `i`
 comes from the source tensor `ple_embedding.ngram_embedding.shard_i.weight`. The assignment
@@ -670,9 +670,12 @@ partitioned among the heads by `offsets`, the shards hold the global rows in ord
 rows of difference are the unused tail of the last shard. On that reading, global row `r`
 would live in shard `r / 2500012` at row `r % 2500012` of that shard.
 
-**The PLE implementation must not copy this section.** Task 8 must pin the mapping with a
-per-token oracle against the reference model: a wrong shard or a wrong row offset selects a
-plausible but wrong embedding, and no shape or range assertion can see it.
+Task 8's qualification test pins the shard index against the conversion report's `methods`
+entries for all 128 shards, their shape, layout and PLE layer role, and covers rows on both sides
+of a shard boundary. It does not prove the ordering itself: the ordered-shard assumption is
+carried forward and settled by the reference model's per-token parity in task 11, where a wrong
+shard or a wrong row offset selects a plausible but wrong embedding that no shape or range
+assertion can see.
 
 ### 8.2 The row lookup
 
@@ -791,12 +794,13 @@ layout. Against the artifact's census:
 | `q8_g32_fp16` / `row_split_k128_v1` | Usable as is. The W8 group-32 row-split GEMM exists (`src/ops/linear/w8`). |
 | `q4_g64_fp16` / `row_split_k128_v1` | Usable as is. The Q4 group-64 row-split GEMM exists (`src/ops/linear/q4`); this object is the M3 proposal head. |
 | `nvfp4` / `batched_block_scale_k16_m128x4_v1` | **Not usable yet.** The repository's NVFP4 path implements the non-batched `block_scale_k16_m128x4_v1` layout; the batched variant (per-matrix scale plane plus per-matrix FP32 divisor) has no kernel and no typed binding. The routed expert bank needs one. |
-| `nf4_g16_e4m3fn` / `row_paged_g16_4k_v1` | **Not usable yet.** The reader can address a row (`row_paged_nf4_geometry`, `row_paged_nf4_row_offset`) but the repository has no NF4 to BF16 decode Op; the PLE lookup needs one that yields the exact BF16 words of the upstream LUT. |
+| `nf4_g16_e4m3fn` / `row_paged_g16_4k_v1` | Decoded. The reader addresses a row (`row_paged_nf4_geometry`, `row_paged_nf4_row_offset`) and the PLE lookup Op (`src/ops/ple/lookup.cu`) yields the BF16 words of the codebook product divided by the stored per-shard FP32 divisor. The table is not resident as a whole: the caller stages the addressed row bytes and the 128 divisors. |
 | `fp8_e4m3fn_block128x128_bf16` / `block_scale_m128_k128_v1` | **Not usable yet.** The repository's FP8 GEMM is the row-scaled `FP8_E4M3FN_ROW_BF16S` format; the block-128x128 variant has no GEMM. Both objects of this format are the MTP expert banks (M3). |
 
-The `text/*` parameters that need a new decode path are therefore the routed expert bank
-(batched NVFP4) and the PLE table (NF4). Every other text parameter is BF16, FP32 or a Q8
-row-split projection, all of which the repository already decodes.
+The `text/*` parameter that still needs a new decode path is therefore the routed expert bank
+(batched NVFP4). The PLE table (NF4) is decoded by `src/ops/ple/lookup.cu`. Every other text
+parameter is BF16, FP32 or a Q8 row-split projection, all of which the repository already
+decodes.
 
 ## 11. Host tier slab geometry
 

@@ -43,6 +43,7 @@ __global__ __launch_bounds__(kGateBlock) void ple_gate_kernel(
             sum_query += q * q;
         }
         const float total_key = block_reduce_sum<kGateBlock>(sum_key, scratch);
+        __syncthreads();
         const float total_query = block_reduce_sum<kGateBlock>(sum_query, scratch);
         if (threadIdx.x == 0) {
             inverse_key[s] = rsqrtf(total_key / static_cast<float>(kPleHidden) + epsilon);
