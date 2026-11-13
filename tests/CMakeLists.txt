@@ -79,10 +79,15 @@ add_test(NAME ninfer_flash_next_roles_artifact_test
 set_tests_properties(ninfer_flash_next_roles_artifact_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_flash_next_load_plan_test
   SOURCES targets/qwen3_8_flash_next/test_load_plan.cpp
-  LIBRARIES ninfer_flash_next_package)
+  LIBRARIES ninfer_engine ninfer_flash_next_package ninfer_core)
 add_test(NAME ninfer_flash_next_load_plan_artifact_test
   COMMAND ninfer_flash_next_load_plan_test artifact)
 set_tests_properties(ninfer_flash_next_load_plan_artifact_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_flash_next_program_lifecycle_test
+  SOURCES targets/qwen3_8_flash_next/test_program_lifecycle.cpp
+  LIBRARIES ninfer_engine ninfer_flash_next_package ninfer_core)
+target_link_libraries(ninfer_flash_next_program_lifecycle_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_flash_next_program_lifecycle_test PROPERTIES SKIP_RETURN_CODE 77)
 # Host-only: no artifact, no device. Byte-level TP2 shard slice geometry per storage layout.
 ninfer_add_test(ninfer_tensor_slice_test
   SOURCES test_tensor_slice.cpp

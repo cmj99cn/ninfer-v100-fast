@@ -1,0 +1,235 @@
+#pragma once
+
+#include <ninfer/targets/qwen4_exp/frontend.h>
+#include "targets/qwen4_exp/impl/runtime/instance.h"
+#include "targets/qwen4_exp/impl/runtime/layouts.h"
+#include "targets/qwen4_exp/impl/runtime/program.h"
+
+#include <memory>
+#include <stdexcept>
+
+namespace ninfer::targets::qwen4_exp {
+
+using detail::NINFER_QWEN4EXP_RUNTIME_NS::Variant;
+
+template <>
+SequencePlan<Variant>::SequencePlan(
+    std::unique_ptr<detail::SequencePlanImpl<Variant>> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+template <>
+SequencePlan<Variant>::SequencePlan(SequencePlan&&) noexcept = default;
+template <>
+SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&&) noexcept = default;
+template <>
+SequencePlan<Variant>::~SequencePlan() = default;
+
+template <>
+std::uint32_t SequencePlan<Variant>::capacity() const noexcept {
+    return impl_->capacity;
+}
+template <>
+std::uint32_t SequencePlan<Variant>::kv_capacity() const noexcept {
+    return impl_->kv_capacity;
+}
+template <>
+std::uint32_t SequencePlan<Variant>::max_concurrency() const noexcept {
+    return impl_->max_concurrency;
+}
+template <>
+std::size_t SequencePlan<Variant>::device_reservation_bytes() const noexcept {
+    return impl_->device_reservation_bytes;
+}
+template <>
+std::size_t SequencePlan<Variant>::workspace_capacity_bytes() const noexcept {
+    return impl_->workspace_capacity_bytes;
+}
+template <>
+std::size_t SequencePlan<Variant>::request_transient_capacity_bytes() const noexcept {
+    return impl_->request_transient_capacity_bytes;
+}
+
+template <>
+SequencePlanner<Variant>::SequencePlanner(
+    std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+template <>
+SequencePlanner<Variant>::SequencePlanner(SequencePlanner&&) noexcept = default;
+template <>
+SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&&) noexcept = default;
+template <>
+SequencePlanner<Variant>::~SequencePlanner() = default;
+
+template <>
+const runtime::SequenceCapacityCurve& SequencePlanner<Variant>::capacity_curve() const noexcept {
+    return impl_->curve;
+}
+
+template <>
+SequencePlan<Variant> SequencePlanner<Variant>::finalize(std::uint32_t main_page_groups) && {
+    return SequencePlan<Variant>(detail::NINFER_QWEN4EXP_RUNTIME_NS::finalize_sequence_plan_impl(
+        std::move(impl_), main_page_groups));
+}
+
+template <>
+RequestBasePlan<Variant>::RequestBasePlan(
+    std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+template <>
+RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&&) noexcept = default;
+template <>
+RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&&) noexcept = default;
+template <>
+RequestBasePlan<Variant>::~RequestBasePlan() = default;
+
+template <>
+const runtime::RequestPlanSummary& RequestBasePlan<Variant>::summary() const noexcept {
+    return impl_->summary;
+}
+
+template <>
+RequestPlan<Variant>::RequestPlan(
+    std::unique_ptr<detail::RequestPlanImpl<Variant>> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+template <>
+RequestPlan<Variant>::RequestPlan(RequestPlan&&) noexcept = default;
+template <>
+RequestPlan<Variant>& RequestPlan<Variant>::operator=(RequestPlan&&) noexcept = default;
+template <>
+RequestPlan<Variant>::~RequestPlan() = default;
+
+template <>
+const runtime::RequestPlanSummary& RequestPlan<Variant>::summary() const noexcept {
+    return impl_->summary;
+}
+
+template <>
+Program<Variant>::Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+template <>
+Program<Variant>::~Program() noexcept = default;
+
+template <>
+RequestBasePlan<Variant> Program<Variant>::plan_request_base(
+    const PreparedPrompt& prompt, const runtime::ResolvedExecutionOptions& options) {
+    return impl_->plan_request_base(prompt, options);
+}
+
+template <>
+RequestPlan<Variant> Program<Variant>::plan_request_for_lane(
+    std::uint32_t lane, const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base) {
+    return impl_->plan_request_for_lane(lane, prompt, base);
+}
+
+template <>
+bool Program<Variant>::can_admit_lane(std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept {
+    return impl_->can_admit_lane(lane, plan);
+}
+
+template <>
+bool Program<Variant>::can_admit_lane_after_retained_eviction(
+    std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept {
+    return impl_->can_admit_lane_after_retained_eviction(lane, plan);
+}
+
+template <>
+runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcept {
+    return impl_->admission_capacity();
+}
+
+template <>
+runtime::AdmissionResources Program<Variant>::admission_cache_residue() const noexcept {
+    return impl_->admission_cache_residue();
+}
+
+template <>
+runtime::PrefillStepResult Program<Variant>::start_prefill_lane(
+    std::uint32_t lane, PreparedPrompt&& prompt, RequestPlan<Variant>&& plan,
+    runtime::TransientRegion transient) {
+    return impl_->start_prefill_lane(lane, std::move(prompt), std::move(plan), std::move(transient));
+}
+
+template <>
+runtime::PrefillStepResult Program<Variant>::advance_prefill_lane(std::uint32_t lane) {
+    return impl_->advance_prefill_lane(lane);
+}
+
+template <>
+runtime::BatchedGeneratedRound Program<Variant>::decode_batch(
+    std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets) {
+    return impl_->decode_batch(lanes, budgets);
+}
+
+template <>
+void Program<Variant>::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
+    impl_->resolve_prefill_lane(lane, terminal);
+}
+
+template <>
+void Program<Variant>::resolve_pending_batch(
+    std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
+    std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled) {
+    impl_->resolve_pending_batch(lanes, accepted_tokens, terminal, cancelled);
+}
+
+template <>
+void Program<Variant>::abort_lane(std::uint32_t lane) noexcept {
+    impl_->abort_lane(lane);
+}
+
+template <>
+bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
+    return impl_->has_retained_lane(lane);
+}
+
+template <>
+void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
+    impl_->evict_retained_lane(lane);
+}
+
+template <>
+MemorySummary Program<Variant>::memory_summary() const noexcept {
+    return impl_->memory_summary();
+}
+
+template <>
+MetricsSnapshot Program<Variant>::metrics() const noexcept {
+    return impl_->metrics();
+}
+
+template <>
+CapacitySnapshot Program<Variant>::capacity_snapshot() const noexcept {
+    return impl_->capacity_snapshot();
+}
+
+template <>
+void Program<Variant>::reset_memory_peaks() noexcept {
+    impl_->reset_memory_peaks();
+}
+
+template <>
+[[nodiscard]] SequencePlanner<Variant>
+make_sequence_planner<Variant>(DeviceContext& device, const EngineOptions& options,
+                               Variant::WeightsProfile weights_profile) {
+    return SequencePlanner<Variant>(detail::NINFER_QWEN4EXP_RUNTIME_NS::make_sequence_planner_impl(
+        device, options, weights_profile));
+}
+
+template <>
+[[nodiscard]] std::unique_ptr<Program<Variant>>
+create_program<Variant>(const std::array<const Variant::ModelView*, kMaximumDevices>& models,
+                        Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
+                        ExecutionContext& execution, const EngineOptions& options) {
+    if (models[0] == nullptr) { throw std::invalid_argument("rank 0 model view is null"); }
+    if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
+    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(
+        models, weights_profile, std::move(plan.impl_), execution, options);
+    plan.impl_.reset();
+    return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
+}
+
+} // namespace ninfer::targets::qwen4_exp

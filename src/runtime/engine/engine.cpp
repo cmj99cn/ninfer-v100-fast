@@ -207,10 +207,10 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 class Engine::Impl {
 public:
-    using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
-    using Executor35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
-    using Executor =
-        std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
+    using Executor27  = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
+    using Executor35  = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
+    using Executor = std::variant<std::monostate, std::unique_ptr<Executor27>,
+                                  std::unique_ptr<Executor35>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)),
@@ -224,10 +224,14 @@ public:
         std::visit(
             [&](auto& target_ptr) {
                 if (target_ptr == nullptr) { return; }
-                shared_host_tier = target_ptr->program->shared_host_tier();
-                if (shared_host_tier != nullptr) {
-                    owner_id = shared_host_tier->allocate_owner();
-                    target_ptr->program->set_shared_tier_owner(owner_id);
+                using Instance =
+                    typename std::remove_reference_t<decltype(target_ptr)>::element_type;
+                if constexpr (!std::is_same_v<Instance, targets::Qwen3_8_FlashNextInstance>) {
+                    shared_host_tier = target_ptr->program->shared_host_tier();
+                    if (shared_host_tier != nullptr) {
+                        owner_id = shared_host_tier->allocate_owner();
+                        target_ptr->program->set_shared_tier_owner(owner_id);
+                    }
                 }
             },
             active);
@@ -237,8 +241,10 @@ public:
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
                 if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
                     return std::make_unique<Executor27>(*target_ptr, options, device);
-                } else {
+                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_6_35BA3BInstance>) {
                     return std::make_unique<Executor35>(*target_ptr, options, device);
+                } else {
+                    return std::monostate{};
                 }
             },
             active);
@@ -286,16 +292,22 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
     return std::visit(
         [&](const auto& target_ptr) -> PreparedPrompt {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            auto prepared      = target_ptr->loaded->frontend.prepare(std::move(input), control);
-            PromptSummary info = prepared.summary();
-            if (info.prompt_tokens > target_ptr->capacity) {
-                throw RequestError(
-                    RequestErrorKind::ContextLengthExceeded,
-                    context_capacity_error(info.prompt_tokens, target_ptr->capacity));
+            using Instance =
+                typename std::remove_reference_t<decltype(target_ptr)>::element_type;
+            if constexpr (std::is_same_v<Instance, targets::Qwen3_8_FlashNextInstance>) {
+                throw std::logic_error("qwen4_exp family frontend is not wired into the Engine public route");
+            } else {
+                auto prepared      = target_ptr->loaded->frontend.prepare(std::move(input), control);
+                PromptSummary info = prepared.summary();
+                if (info.prompt_tokens > target_ptr->capacity) {
+                    throw RequestError(
+                        RequestErrorKind::ContextLengthExceeded,
+                        context_capacity_error(info.prompt_tokens, target_ptr->capacity));
+                }
+                const PromptPreparationStats preparation = prepared.preparation_stats();
+                return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+                    info, preparation, sampling_mode, std::move(prepared)));
             }
-            const PromptPreparationStats preparation = prepared.preparation_stats();
-            return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                info, preparation, sampling_mode, std::move(prepared)));
         },
         impl_->active);
 }
@@ -306,17 +318,23 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
     return std::visit(
         [&](const auto& target_ptr) -> PreparedPrompt {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            auto prepared      = target_ptr->loaded->frontend.prepare_tokens(std::move(token_ids),
-                                                                             allow_prefix_identity);
-            PromptSummary info = prepared.summary();
-            if (info.prompt_tokens > target_ptr->capacity) {
-                throw RequestError(
-                    RequestErrorKind::ContextLengthExceeded,
-                    context_capacity_error(info.prompt_tokens, target_ptr->capacity));
+            using Instance =
+                typename std::remove_reference_t<decltype(target_ptr)>::element_type;
+            if constexpr (std::is_same_v<Instance, targets::Qwen3_8_FlashNextInstance>) {
+                throw std::logic_error("qwen4_exp family frontend is not wired into the Engine public route");
+            } else {
+                auto prepared      = target_ptr->loaded->frontend.prepare_tokens(std::move(token_ids),
+                                                                                 allow_prefix_identity);
+                PromptSummary info = prepared.summary();
+                if (info.prompt_tokens > target_ptr->capacity) {
+                    throw RequestError(
+                        RequestErrorKind::ContextLengthExceeded,
+                        context_capacity_error(info.prompt_tokens, target_ptr->capacity));
+                }
+                const PromptPreparationStats preparation = prepared.preparation_stats();
+                return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+                    info, preparation, SamplingMode::Thinking, std::move(prepared)));
             }
-            const PromptPreparationStats preparation = prepared.preparation_stats();
-            return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                info, preparation, SamplingMode::Thinking, std::move(prepared)));
         },
         impl_->active);
 }
