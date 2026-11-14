@@ -213,7 +213,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|iq4nl] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
              "[--vision] [--cuda-graph|--no-cuda-graph] [--no-prefix-reuse] [--prefix-cache] "
-              "[--host-cache-mib N] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+              "[--host-cache-mib N] [--expert-cache-mib auto|N] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
             "[--chat-template-kwargs JSON] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -243,6 +243,10 @@ std::string serve_usage_text(const char* argv0) {
             "       earlier context was rewritten between turns. --host-cache-mib N adds a pinned\n"
             "       host-RAM tier (N MiB) so evicted blocks and snapshots survive device pressure;\n"
             "       0 keeps the cache device-only.\n"
+            "       --expert-cache-mib sizes the per-rank expert residency cache of the\n"
+            "       qwen3.8-flash-next package; auto takes the smaller of the routing-skew\n"
+            "       coverage target and the memory left after the other allocations, and an\n"
+            "       explicit value above that budget is rejected at load.\n"
             "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
             "       --chat-template-kwargs sets default chat-template options as a JSON object, e.g.\n"
             "       '{\"preserve_thinking\": true, \"reasoning_effort\": \"low\"}'. Supported keys are\n"
@@ -460,6 +464,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--host-cache-mib") {
             options.host_cache_mib = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--host-cache-mib"), "host-cache-mib"));
+        } else if (arg == "--expert-cache-mib") {
+            const char* value = require_value("--expert-cache-mib");
+            options.expert_cache_mib = std::string_view(value) == "auto"
+                ? 0
+                : static_cast<std::uint32_t>(parse_nonnegative_int(value, "expert-cache-mib"));
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {

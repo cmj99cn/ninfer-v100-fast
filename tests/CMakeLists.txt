@@ -97,6 +97,17 @@ set_tests_properties(ninfer_flash_next_sharded_bindings_artifact_test PROPERTIES
 add_test(NAME ninfer_flash_next_sharded_bindings_views_test
   COMMAND ninfer_flash_next_sharded_bindings_test views)
 set_tests_properties(ninfer_flash_next_sharded_bindings_views_test PROPERTIES SKIP_RETURN_CODE 77)
+# Host-only planning layer of the per-rank expert residency cache; the device layer is gated.
+ninfer_add_test(ninfer_flash_next_expert_cache_test
+  SOURCES targets/qwen3_8_flash_next/test_expert_cache.cpp
+  LIBRARIES ninfer_flash_next_package)
+target_link_libraries(ninfer_flash_next_expert_cache_test PRIVATE CUDA::cudart)
+add_test(NAME ninfer_flash_next_expert_cache_artifact_test
+  COMMAND ninfer_flash_next_expert_cache_test artifact)
+set_tests_properties(ninfer_flash_next_expert_cache_artifact_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_flash_next_expert_cache_device_test
+  COMMAND ninfer_flash_next_expert_cache_test device)
+set_tests_properties(ninfer_flash_next_expert_cache_device_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_flash_next_text_forward_test
   SOURCES targets/qwen3_8_flash_next/test_text_forward.cpp
   LIBRARIES ninfer_flash_next_package)

@@ -143,6 +143,12 @@ struct EngineOptions {
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     PrefixCacheOptions prefix_cache;
+    // Expert residency cache for the qwen3.8-flash-next package, in MiB per rank. `0` selects the
+    // automatic plan: the measured routing-skew coverage target, or the device memory the Engine
+    // has left for the cache, whichever gives the smaller pair count. An explicit value larger than
+    // that memory is rejected at construction with the available budget. Every other package
+    // resolves this field to zero and is unaffected by it.
+    std::uint32_t expert_cache_mib = 0;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
     // Zero selects a bounded worker count from the detected host concurrency.
