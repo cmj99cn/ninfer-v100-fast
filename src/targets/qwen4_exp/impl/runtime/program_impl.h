@@ -23,8 +23,10 @@ ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevi
                                  WeightsProfile weights_profile, std::unique_ptr<SequencePlanImpl> plan,
                                  ExecutionContext& execution, const EngineOptions& options)
     : weights_profile_(weights_profile), models_(models), execution_(execution), options_(options),
-      plan_(std::move(plan)), state_(execution_.primary(), *models_[0],
-                                    std::max<std::uint32_t>(plan_->prefill_chunk, 1)),
+      plan_(std::move(plan)),
+      state_(execution_.primary(), *models_[0],
+             std::max<std::uint32_t>(plan_->kv_capacity, plan_->capacity),
+             std::max<std::uint32_t>(plan_->prefill_chunk, 1)),
       activations_(std::max<std::size_t>(plan_->activation_capacity_bytes, 1)),
       workspace_(std::max<std::size_t>(plan_->workspace_capacity_bytes, 1)),
       trunk_(*models_[0], state_, activations_, workspace_, execution_.primary().stream) {
@@ -64,6 +66,14 @@ std::uint32_t ProgramImplCore::page_groups_for(std::uint32_t tokens) const noexc
 
 void ProgramImplCore::clear_lane(std::uint32_t lane) noexcept {
     lanes_[lane] = LaneState{};
+}
+
+void ProgramImplCore::prefill_chunk(LaneState& state, std::uint32_t begin, std::uint32_t count) {
+    const std::span<const TokenId> chunk{state.context.prompt_tokens.data() + begin, count};
+    const TokenId sampled = trunk_.prefill(chunk);
+    if (begin + count == state.context.prompt_tokens.size()) {
+        state.context.next_input = sampled;
+    }
 }
 
 RequestBasePlan ProgramImplCore::plan_request_base(const PreparedPrompt& prompt,
@@ -136,18 +146,26 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         throw std::logic_error("qwen4_exp prefill received no prompt tokens");
     }
 
+    for (const LaneState& other : lanes_) {
+        if (&other != &lanes_[lane] && other.active) {
+            throw std::logic_error("qwen4_exp text state serves one active lane");
+        }
+    }
+
+    state_.reset();
+    std::vector<TokenId>& tokens = data.token_ids;
+    const std::uint32_t chunk = std::min(plan_->prefill_chunk,
+                                         static_cast<std::uint32_t>(tokens.size()));
+    const TokenId sampled = trunk_.prefill(std::span<const TokenId>{tokens.data(), chunk});
+
     LaneState& state = lanes_[lane];
     state.active    = true;
     state.transient = std::move(transient);
-    state.context.prompt_tokens = std::move(data.token_ids);
-    state.context.processed_prompt_tokens = 0;
-    state.context.decode_ready = false;
-
-    const std::uint32_t chunk = std::min(plan_->prefill_chunk,
-                                         static_cast<std::uint32_t>(state.context.prompt_tokens.size()));
+    state.context.prompt_tokens = std::move(tokens);
     state.context.processed_prompt_tokens = chunk;
     state.context.decode_ready = state.context.processed_prompt_tokens >=
                                  static_cast<std::uint32_t>(state.context.prompt_tokens.size());
+    if (state.context.decode_ready) { state.context.next_input = sampled; }
 
     runtime::PrefillStepResult result;
     result.summary.prompt_tokens          = static_cast<std::uint32_t>(state.context.prompt_tokens.size());
@@ -170,6 +188,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t l
     const std::uint32_t remaining =
         static_cast<std::uint32_t>(state.context.prompt_tokens.size()) - state.context.processed_prompt_tokens;
     const std::uint32_t chunk = std::min(plan_->prefill_chunk, remaining);
+    prefill_chunk(state, state.context.processed_prompt_tokens, chunk);
     state.context.processed_prompt_tokens += chunk;
     state.context.decode_ready = state.context.processed_prompt_tokens >=
                                  static_cast<std::uint32_t>(state.context.prompt_tokens.size());
@@ -203,8 +222,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
     round_row_counts_.clear();
     for (const std::uint32_t lane : lanes) {
         const LaneState& state = lanes_[lane];
-        const TokenId input = state.context.prompt_tokens.back();
-        round_tokens_.push_back(trunk_.decode(input));
+        round_tokens_.push_back(trunk_.decode(state.context.next_input));
         round_row_counts_.push_back(1);
     }
 
@@ -236,6 +254,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         if (lane >= plan_->max_concurrency) {
             throw std::invalid_argument("qwen4_exp pending batch lane is outside the finalized concurrency");
         }
+        lanes_[lane].context.next_input = accepted_tokens[index];
         if (terminal[index] || cancelled[index]) { clear_lane(lane); }
     }
 }

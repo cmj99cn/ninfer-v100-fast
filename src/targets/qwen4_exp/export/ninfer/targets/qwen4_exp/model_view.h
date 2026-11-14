@@ -1,9 +1,11 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/ple.h"
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 
 namespace ninfer::targets::qwen4_exp {
 
@@ -15,8 +17,13 @@ struct HcWeights {
     Tensor norm;
 };
 
-// The PLE weights: the key and value projections over the n-gram embedding, the three offset
-// RMSNorm gains, and the tap-major dilated convolution kernel.
+struct PleRowSource {
+    void* context = nullptr;
+    void (*fetch)(void* context, const ops::PleRowAddress* addresses, std::size_t count,
+                  std::byte* destination) = nullptr;
+    const float* divisors = nullptr;
+};
+
 struct PleWeights {
     Weight key;
     Weight value;
@@ -24,6 +31,8 @@ struct PleWeights {
     Tensor norm_query;
     Tensor norm_conv;
     Tensor kernel;
+    ops::PleHashControls controls{};
+    PleRowSource rows;
 };
 
 // One text layer: the two HC sites, the mixer payload for whichever mixer the layer owns, and
@@ -46,6 +55,9 @@ struct TextModelView {
     Weight embedding;
     Weight output_head;
     HcWeights final_hc;
+    // The norm the last loaded layer's combine uses: the next layer's attention HC norm for a
+    // truncated prefix, `final_hc.norm` for the complete stack.
+    Tensor tail_norm;
     PleWeights ple;
     std::array<Layer, Layers> layers;
     std::size_t loaded_layers = 0;

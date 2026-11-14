@@ -1,5 +1,7 @@
 #include "fixture.h"
 
+#include "artifact/typed_binding.h"
+
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
@@ -20,19 +22,20 @@
 #define NINFER_QWEN4EXP_RUNTIME_NS flash_next_text_test_runtime
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 #include "targets/qwen4_exp/impl/runtime/text_context_impl.h"
+#include "targets/qwen4_exp/impl/runtime/workspace_recipe.h"
 
 namespace {
 
 using namespace ninfer;
-using ninfer_flash_next_fixture::text_config;
-
 namespace roles = ninfer::targets::qwen3_8_flash_next::detail::roles;
 namespace detail  = ninfer::targets::qwen3_8_flash_next::detail;
 namespace rt = ninfer::targets::qwen4_exp::detail::flash_next_text_test_runtime;
+namespace qwen4_exp = ninfer::targets::qwen4_exp;
 
 constexpr std::size_t kLoadedLayers = 4;
 constexpr std::size_t kPromptTokens = 8;
-constexpr std::size_t kDecodeRounds = 2;
+constexpr std::size_t kDecodeRounds = 3;
+constexpr std::uint32_t kKvCapacityTokens = 64;
 
 constexpr std::array<std::int32_t, kPromptTokens> kPrompt{1024, 7, 98140, 33, 4097, 512, 100, 2048};
 
@@ -40,36 +43,18 @@ void require(bool condition, const std::string& message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
-std::uint64_t descriptor_offset(const artifact::ObjectDescriptor& descriptor) {
-    return std::visit([](const auto& d) { return d.offset; }, descriptor);
-}
-
-std::vector<std::byte> read_range(const artifact::Reader& reader, const std::string& object,
-                                  std::uint64_t offset, std::uint64_t bytes) {
-    const auto* descriptor = reader.find(object);
-    if (descriptor == nullptr) { throw std::runtime_error("the artifact does not carry " + object); }
-    std::vector<std::byte> out(bytes);
-    const auto read = reader.read_direct(reader.payload_offset() + descriptor_offset(*descriptor) + offset,
-                                         out);
-    if (read != bytes) { throw std::runtime_error("short read for " + object); }
-    return out;
-}
-
-std::vector<std::string> ple_shard_names(const detail::BindingPlan& plan) {
-    std::vector<std::string> names;
-    for (const auto& part : plan.ple.table.parts) {
-        names.push_back(plan.objects[part.object].name);
-    }
-    return names;
-}
-
 void place_reduced(const detail::BindingPlan& plan, artifact::Binder& binder) {
     std::size_t object_slots = 0;
-    for (const auto& object : plan.objects) { object_slots = std::max(object_slots, object.handle.index + 1); }
+    for (const auto& object : plan.objects) {
+        object_slots = std::max(object_slots, object.handle.index + 1);
+    }
     std::vector<bool> reduced(object_slots, false);
     for (const auto* parameter : plan.parameters()) {
         if (parameter->role == roles::Role::PleTable) { continue; }
-        if (parameter->layer >= kLoadedLayers) { continue; }
+        const bool prefix_layer = parameter->layer < kLoadedLayers;
+        const bool prefix_tail = parameter->layer == kLoadedLayers &&
+                                 parameter->role == roles::Role::AttentionHcNorm;
+        if (!prefix_layer && !prefix_tail) { continue; }
         for (const auto& part : parameter->parts) {
             reduced[plan.objects[static_cast<std::size_t>(part.object)].handle.index] = true;
         }
@@ -90,8 +75,8 @@ void place_reduced(const detail::BindingPlan& plan, artifact::Binder& binder) {
 
 std::size_t gdn_state_signature(const rt::TextState& state) {
     std::size_t hash = 0;
-    for (std::size_t layer = 0; layer < state.gdn_state_entries(); ++layer) {
-        const Tensor state_tensor = state.recurrent_state(layer);
+    for (std::size_t entry = 0; entry < state.gdn_state_entries(); ++entry) {
+        const Tensor state_tensor = state.gdn_recurrent_state(entry);
         std::vector<std::byte> bytes(state_tensor.bytes());
         CUDA_CHECK(cudaMemcpy(bytes.data(), state_tensor.data, bytes.size(), cudaMemcpyDeviceToHost));
         for (const std::byte byte : bytes) {
@@ -101,40 +86,65 @@ std::size_t gdn_state_signature(const rt::TextState& state) {
     return hash;
 }
 
-TokenId run_prompt(DeviceContext& device, const detail::BindingPlan& plan,
-                   const artifact::MaterializedArtifact& materialized,
-                   const ops::PleHashControls& controls, const std::vector<std::byte>& staged,
-                   const std::vector<std::uint32_t>& rows, const std::vector<float>& divisors) {
-    detail::LoadedModelData data(plan, materialized, kLoadedLayers);
-    rt::TextState state(device, data.view(), static_cast<std::uint32_t>(kPromptTokens));
-    state.set_ple_controls(controls);
+std::size_t tail_signature(const rt::TextState& state) {
+    const ops::ConstQsaTailStateView tail = state.const_tail();
+    std::vector<std::byte> keys(tail.raw_keys.bytes());
+    std::vector<std::byte> rope(tail.first_rope.bytes());
+    CUDA_CHECK(cudaMemcpy(keys.data(), tail.raw_keys.data, keys.size(), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(rope.data(), tail.first_rope.data, rope.size(), cudaMemcpyDeviceToHost));
+    std::size_t hash = 0;
+    for (const std::byte byte : keys) { hash = hash * 1000003U + static_cast<std::size_t>(byte); }
+    for (const std::byte byte : rope) { hash = hash * 1000003U + static_cast<std::size_t>(byte); }
+    return hash;
+}
 
-    DeviceBuffer device_divisors(divisors.size() * 4);
-    device_divisors.copy_from_host(divisors.data(), divisors.size() * 4);
-    state.set_ple_divisors(static_cast<const float*>(device_divisors.p));
+struct RunOutcome {
+    TokenId token = 0;
+    bool gdn_updated = false;
+    std::size_t gdn_entries = 0;
+    std::array<std::size_t, kDecodeRounds + 1> tail_signatures{};
+    std::array<std::int32_t, kDecodeRounds + 1> base_positions{};
+};
 
-    DeviceBuffer staged_rows(staged.size());
-    staged_rows.copy_from_host(staged.data(), staged.size());
-    DeviceBuffer rows_buffer(rows.size() * 4);
-    rows_buffer.copy_from_host(rows.data(), rows.size() * 4);
-    state.set_ple_rows(static_cast<const std::uint32_t*>(rows_buffer.p), rows.size());
-    state.set_ple_staged_rows(static_cast<const std::uint8_t*>(staged_rows.p), staged.size());
+RunOutcome run_prompt(DeviceContext& device, const detail::Variant::ModelView& view) {
+    using ModelView = detail::Variant::ModelView;
+    rt::TextState state(device, view, kKvCapacityTokens, kPromptTokens);
 
-    DeviceArena activations(1 << 28);
-    DeviceArena workspace(1 << 26);
-    rt::TextTrunk trunk(data.view(), state, activations, workspace, device.stream);
+    const auto recipe = rt::text_workspace_recipe(kPromptTokens, 1);
+    DeviceArena activations(rt::text_activation_capacity_bytes(kPromptTokens));
+    DeviceArena workspace(recipe.lane_capacity_bytes);
+    rt::TextTrunk trunk(view, state, activations, workspace, device.stream);
 
     const std::span<const TokenId> prompt{kPrompt.data(), kPrompt.size()};
     const TokenId first = trunk.prefill(prompt);
 
+    RunOutcome outcome;
+    outcome.token = first;
+    outcome.tail_signatures[0] = tail_signature(state);
+    outcome.base_positions[0] = state.base_position();
     const std::size_t before = gdn_state_signature(state);
     TokenId token = first;
     for (std::size_t round = 0; round < kDecodeRounds; ++round) {
         token = trunk.decode(token);
+        outcome.tail_signatures[round + 1] = tail_signature(state);
+        outcome.base_positions[round + 1] = state.base_position();
     }
-    require(gdn_state_signature(state) != before, "the GDN recurrent state was not updated");
-    require(state.gdn_state_entries() == kLoadedLayers, "the GDN state pool does not grow with layers");
-    return first;
+    outcome.gdn_updated = gdn_state_signature(state) != before;
+    outcome.gdn_entries = state.gdn_state_entries();
+    return outcome;
+}
+
+struct ShiftedPleRows {
+    qwen4_exp::PleRowSource base;
+};
+
+void fetch_shifted_rows(void* context, const ops::PleRowAddress* addresses, std::size_t count,
+                        std::byte* destination) {
+    auto* shifted = static_cast<ShiftedPleRows*>(context);
+    std::vector<ops::PleRowAddress> moved(addresses, addresses + count);
+    const std::uint32_t rows = static_cast<std::uint32_t>(detail::TextConfig::ple_shard_rows);
+    for (auto& address : moved) { address.row = (address.row + 1) % rows; }
+    shifted->base.fetch(shifted->base.context, moved.data(), moved.size(), destination);
 }
 
 } // namespace
@@ -166,59 +176,74 @@ int main() {
     binder.validate_unconsumed_matching();
     const artifact::MaterializedArtifact materialized =
         artifact::materialize(reader, binder.finish(), device);
+    const std::filesystem::path artifact_path(path);
+    const detail::LoadedModelData data(plan, materialized, kLoadedLayers, artifact_path);
 
-    const auto controls_payload = reader.payload("resource/text/ple_hash_controls");
-    const ops::PleHashControls controls = ops::parse_ple_hash_controls(controls_payload.data);
+    const auto key_bytes = static_cast<std::uint64_t>(detail::TextConfig::residual_width) *
+                           detail::TextConfig::hidden * 2;
+    const auto key_base = static_cast<const std::byte*>(data.view().ple.key.payload);
+    const auto value_base = static_cast<const std::byte*>(data.view().ple.value.payload);
+    require(value_base - key_base == static_cast<std::ptrdiff_t>(key_bytes),
+            "the PLE value view does not start at the value rows");
 
-    const std::vector<std::string> shards = ple_shard_names(plan);
-    const std::array<std::uint64_t, 2> table_shape{detail::TextConfig::ple_shard_rows,
-                                                   detail::TextConfig::ple_head_width};
-    const artifact::RowPagedNf4Geometry geometry =
-        artifact::row_paged_nf4_geometry(artifact::NumericFormat::NF4_G16_E4M3S, table_shape);
+    const RunOutcome outcome = run_prompt(device, data.view());
+    require(outcome.token >= 0 && outcome.token < static_cast<TokenId>(detail::TextConfig::vocab),
+            "the greedy token is outside the vocabulary");
+    const RunOutcome repeated = run_prompt(device, data.view());
+    require(repeated.token == outcome.token, "the trunk is not deterministic across repeated runs");
 
-    std::vector<float> divisors(ops::kPleShards, 1.0F);
-    for (std::size_t shard = 0; shard < ops::kPleShards; ++shard) {
-        const auto word = read_range(reader, shards[shard], geometry.matrix_scale_offset, 4);
-        float value = 0.0F;
-        std::memcpy(&value, word.data(), sizeof(value));
-        divisors[shard] = value;
+    require(outcome.gdn_entries == 3, "the GDN state pool does not match the loaded GDN layers");
+    require(outcome.gdn_updated, "the GDN recurrent state was not updated");
+
+    for (std::size_t round = 0; round < outcome.base_positions.size(); ++round) {
+        const std::int32_t expected =
+            round == 0 ? 0 : static_cast<std::int32_t>(kPromptTokens + round - 1);
+        require(outcome.base_positions[round] == expected,
+                "the QSA record base position does not follow the round");
+    }
+    for (std::size_t first = 0; first < outcome.tail_signatures.size(); ++first) {
+        for (std::size_t other = first + 1; other < outcome.tail_signatures.size(); ++other) {
+            require(outcome.tail_signatures[first] != outcome.tail_signatures[other],
+                    "the QSA canonical tail did not advance between rounds");
+        }
     }
 
-    std::vector<std::uint64_t> ids(kPrompt.begin(), kPrompt.end());
-    std::array<std::uint64_t, 2> tail{detail::TextConfig::eos_token_id, detail::TextConfig::eos_token_id};
-    std::vector<std::uint32_t> rows;
-    for (std::uint64_t id : ids) {
-        std::vector<std::uint32_t> token_rows(ops::kPleHeads);
-        ops::ple_hash_tokens(std::span<const std::uint64_t>{&id, 1}, tail, detail::TextConfig::eos_token_id,
-                             controls, token_rows);
-        for (std::uint32_t row : token_rows) { rows.push_back(row); }
-        tail[0] = tail[1];
-        tail[1] = id;
-    }
+    ShiftedPleRows shifted{qwen4_exp::PleRowSource{data.view().ple.rows.context,
+                                                   data.view().ple.rows.fetch,
+                                                   data.view().ple.rows.divisors}};
+    auto shifted_view = data.view();
+    shifted_view.ple.rows.context = &shifted;
+    shifted_view.ple.rows.fetch = &fetch_shifted_rows;
+    const RunOutcome shifted_outcome = run_prompt(device, shifted_view);
+    require(shifted_outcome.token != outcome.token,
+            "the PLE row source did not change the sampled token");
 
-    std::vector<std::byte> staged;
-    for (std::uint32_t row : rows) {
-        const ops::PleRowAddress address = ops::ple_row_address(
-            ops::PleNf4Table{geometry, ops::kPleShards, nullptr}, row);
-        const std::uint64_t offset = artifact::row_paged_nf4_row_offset(geometry, address.row);
-        const auto bytes = read_range(reader, shards[address.shard], offset, geometry.row_bytes);
-        staged.insert(staged.end(), bytes.begin(), bytes.end());
+    auto zeroed_view = data.view();
+    std::uint64_t mixer_bytes = 16;
+    {
+        const auto encoded = artifact::tensor_encoded_size(
+            artifact::StorageLayout::RowSplitK128V1, artifact::NumericFormat::W8G32_F16S,
+            std::array<std::uint64_t, 2>{static_cast<std::uint64_t>(detail::TextConfig::hidden),
+                                         static_cast<std::uint64_t>(detail::TextConfig::gdn_value_width)});
+        mixer_bytes = encoded;
     }
-
-    const TokenId first = run_prompt(device, plan, materialized, controls, staged, rows, divisors);
-    require(first >= 0 && first < static_cast<TokenId>(detail::TextConfig::vocab),
-           "the greedy token is outside the vocabulary");
-    const TokenId repeated = run_prompt(device, plan, materialized, controls, staged, rows, divisors);
-    require(repeated == first, "the trunk is not deterministic across repeated runs");
+    DeviceBuffer zeroed_mixer(mixer_bytes);
+    zeroed_mixer.fill(0);
+    zeroed_view.layers[1].gdn_projection.output = artifact::staged_weight_view(
+        artifact::NumericFormat::W8G32_F16S, zeroed_mixer.p, detail::TextConfig::hidden,
+        detail::TextConfig::gdn_value_width);
+    const RunOutcome zeroed_outcome = run_prompt(device, zeroed_view);
+    require(zeroed_outcome.token != outcome.token,
+            "zeroing a mixer output did not change the sampled token");
 
     if (reference.has_value()) {
-        require(first == *reference, "the greedy token " + std::to_string(first) +
-                                         " does not match the reference token " +
-                                         std::to_string(*reference));
+        require(outcome.token == *reference, "the greedy token " + std::to_string(outcome.token) +
+                                                 " does not match the reference token " +
+                                                 std::to_string(*reference));
     } else {
         std::cout << "SKIP: the reference token parity check (NINFER_FLASH_NEXT_REFERENCE_TOKEN)\n";
     }
 
-    std::cout << "OK flash-next text trunk: token " << first << " deterministic\n";
+    std::cout << "OK flash-next text trunk: token " << outcome.token << " deterministic\n";
     return 0;
 }

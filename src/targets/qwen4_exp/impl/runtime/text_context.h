@@ -20,6 +20,7 @@ namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
 struct TextLaneContext {
     std::vector<TokenId> prompt_tokens;
     std::uint32_t processed_prompt_tokens = 0;
+    TokenId next_input = 0;
     bool decode_ready = false;
 };
 
@@ -27,10 +28,16 @@ struct TextLaneContext {
 // the QSA cache planes with its canonical tail and call records, and the PLE convolution history.
 class TextState {
 public:
-    TextState(DeviceContext& device, const ModelView& model, std::uint32_t max_tokens);
+    TextState(DeviceContext& device, const ModelView& model, std::uint32_t kv_capacity_tokens,
+              std::uint32_t forward_tokens);
 
-    [[nodiscard]] Tensor conv_state(std::size_t layer) const;
-    [[nodiscard]] Tensor recurrent_state(std::size_t layer) const;
+    void reset();
+    void prepare_ple_rows(std::span<const TokenId> tokens);
+    [[nodiscard]] std::int32_t base_position() const;
+
+    [[nodiscard]] Tensor gdn_conv_state(std::size_t gdn_index) const;
+    [[nodiscard]] Tensor gdn_recurrent_state(std::size_t gdn_index) const;
+    [[nodiscard]] std::size_t gdn_state_index(std::size_t layer) const;
     [[nodiscard]] std::size_t gdn_state_entries() const noexcept;
 
     [[nodiscard]] ops::QsaCacheView cache() const;
@@ -53,16 +60,30 @@ public:
         ple_tail_[1] = id;
     }
 
-    void set_ple_controls(const ops::PleHashControls& controls);
-    void set_ple_rows(const std::uint32_t* rows, std::size_t entries);
-    void set_ple_staged_rows(const std::uint8_t* staged, std::size_t bytes);
-    void set_ple_divisors(const float* divisors);
     void publish_tail();
 
 private:
+    class DeviceScope {
+    public:
+        explicit DeviceScope(int device);
+        ~DeviceScope();
+
+        DeviceScope(const DeviceScope&)            = delete;
+        DeviceScope& operator=(const DeviceScope&) = delete;
+
+    private:
+        int previous_ = -1;
+    };
+
+    DeviceScope device_scope_;
+    const qwen4_exp::PleRowSource ple_source_;
+    cudaStream_t stream_         = nullptr;
     std::size_t layers_          = 0;
-    std::size_t max_tokens_      = 0;
+    std::size_t forward_tokens_  = 0;
     std::size_t pages_           = 0;
+    std::vector<std::size_t> gdn_layers_;
+    std::vector<std::size_t> gdn_index_;
+    std::vector<std::byte> ple_staged_host_;
     std::uint32_t next_position_ = 0;
     std::uint64_t ple_tail_[2]   = {0, 0};
     ops::PleHashControls ple_controls_{};
@@ -84,6 +105,7 @@ private:
     DeviceBuffer ple_history_;
     DeviceBuffer ple_rows_;
     DeviceBuffer ple_staged_rows_;
+    DeviceBuffer ple_divisors_;
 };
 
 // The text trunk: the embedding stem, the per-layer four-stream mixer and post-mixer, and the main

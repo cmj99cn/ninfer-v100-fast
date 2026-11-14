@@ -31,6 +31,7 @@ struct FixtureObject {
     std::string encoding;
     std::uint64_t bytes  = 0;
     std::uint64_t offset = 0;
+    std::vector<std::byte> payload;
 };
 
 struct FixturePart {
@@ -101,6 +102,17 @@ public:
         object.format = format;
         object.layout = layout;
         object.shape  = std::move(shape);
+        artifact.objects.push_back(std::move(object));
+        return artifact.objects.back().id;
+    }
+
+    std::string add_resource_payload(const std::string& id, std::vector<std::byte> payload) {
+        FixtureObject object;
+        object.id       = id;
+        object.kind     = "resource";
+        object.encoding = "raw_bytes_v1";
+        object.bytes    = payload.size();
+        object.payload  = std::move(payload);
         artifact.objects.push_back(std::move(object));
         return artifact.objects.back().id;
     }
@@ -256,6 +268,30 @@ inline Json text_config() {
     };
 }
 
+inline std::vector<std::byte> flash_next_ple_hash_controls() {
+    const std::array<std::uint64_t, 3> multipliers{23703573157769ULL, 20109073645365ULL,
+                                                   8052911324071ULL};
+    const std::array<std::uint64_t, 16> vocab_sizes{
+        20000003ULL, 20000023ULL, 20000033ULL, 20000047ULL, 20000059ULL, 20000063ULL,
+        20000069ULL, 20000077ULL, 20000081ULL, 20000093ULL, 20000107ULL, 20000147ULL,
+        20000153ULL, 20000159ULL, 20000161ULL, 20000171ULL};
+    const std::array<std::uint64_t, 16> offsets{
+        0ULL, 20000003ULL, 40000026ULL, 60000059ULL, 80000106ULL, 100000165ULL, 120000228ULL,
+        140000297ULL, 160000374ULL, 180000455ULL, 200000548ULL, 220000655ULL, 240000802ULL,
+        260000955ULL, 280001114ULL, 300001275ULL};
+    std::array<std::uint64_t, 35> words{};
+    for (std::size_t index = 0; index < multipliers.size(); ++index) { words[index] = multipliers[index]; }
+    for (std::size_t index = 0; index < vocab_sizes.size(); ++index) {
+        words[3 + index] = vocab_sizes[index];
+    }
+    for (std::size_t index = 0; index < offsets.size(); ++index) {
+        words[19 + index] = offsets[index];
+    }
+    std::vector<std::byte> payload(sizeof(words));
+    std::memcpy(payload.data(), words.data(), payload.size());
+    return payload;
+}
+
 inline FixtureArtifact build_flash_next_fixture() {
     FixtureBuilder builder;
     builder.artifact.config = text_config();
@@ -398,6 +434,8 @@ inline FixtureArtifact build_flash_next_fixture() {
     const auto proposal = builder.add_object("q4_g64_fp16", "row_split_k128_v1", {248320, 2560});
     builder.bind_whole("proposal/head", proposal);
 
+    builder.add_resource_payload("resource/text/ple_hash_controls",
+                                 flash_next_ple_hash_controls());
     const auto text_tokenizer = builder.add_resource("resource/text/tokenizer.json", 1);
     const auto text_tokenizer_config = builder.add_resource("resource/text/tokenizer_config.json", 1);
     const auto text_chat_template = builder.add_resource("resource/text/chat_template.jinja", 1);
@@ -529,6 +567,15 @@ inline std::filesystem::path write_flash_next_fixture(FixtureArtifact& artifact)
     if (::ftruncate(fd, static_cast<off_t>(payload_start + cursor)) != 0) {
         ::close(fd);
         throw std::runtime_error("cannot size the fixture artifact");
+    }
+    for (const auto& object : artifact.objects) {
+        if (object.payload.empty()) { continue; }
+        if (::pwrite(fd, object.payload.data(), object.payload.size(),
+                     static_cast<off_t>(payload_start + object.offset)) !=
+            static_cast<ssize_t>(object.payload.size())) {
+            ::close(fd);
+            throw std::runtime_error("cannot write the fixture resource payload");
+        }
     }
     ::close(fd);
     return path;

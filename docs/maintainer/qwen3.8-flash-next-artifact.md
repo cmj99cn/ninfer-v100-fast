@@ -295,9 +295,9 @@ index `c = d + 2560*s` of the residual.
 The four input projections share one `[16384, 2560]` Q8 group-32 row-split parent in the order
 `Q | K | V | Z`, whose widths are `2048 | 2048 | 6144 | 6144`. The two control projections
 share one `[96, 2560]` BF16 parent in the order `A | B`, 48 rows each. The convolution is
-stored tap-major (`[4 taps, 10240 channels]`), which is the transpose of the runtime
-`{10240, 4}` channel-major kernel view. The GDN norm weight is the per-head-dimension gain
-`[128]`.
+stored tap-major: element `(tap j, channel c)` lives at `j * 10240 + c`, and the runtime
+`{10240, 4}` view is only the shape label `causal_conv1d_silu` consumes, because the kernel
+reads `weight[j * C + c]`. The GDN norm weight is the per-head-dimension gain `[128]`.
 
 The GDN post-norm is `ops::gated_rmsnorm` with a SiLU gate, which is what `hidden_act = silu`
 selects. `output_gate_type = sigmoid` belongs to the QSA attention output gate and does not
@@ -881,10 +881,17 @@ Engine route always loads the full 48 layers.
 - The test binds the reduced role set — the first four layers with all 512 experts, the full
   embedding and the full main head — and materializes only those objects on device. Objects
   outside that set are validated only, which is the binder's existing placement contract.
+- The reduced stack is a prefix truncation of the real graph, so its last loaded layer (layer 3)
+  must normalize with the layer the full graph would have used next, `text/layers/4/attention_hc/norm`.
+  That single tensor is therefore part of the reduced role set, and the final mixer
+  (`text/final_hc/{down,up}`) still produces the sample hidden. A reference model reproduces the
+  same rule: layers `[0, N)` plus the next layer's attention HC norm, then `final_hc.mix`.
 - The PLE table is not materialized as a device tensor. `ops::PleNf4Table` carries no per-shard
   device base, so the lookup keeps the table on disk and stages only the rows a call addresses,
-  as §8.2 describes. Materializing all 128 shards as one device table would require changing the
-  Op contract, which this milestone does not do.
+  as §8.2 describes. The text state derives the 16 row addresses of each forward with
+  `ple_hash_tokens`, fetches those encoded rows through the target's file-backed row source, and
+  stages them together with the 128 divisor words. Materializing all 128 shards as one device
+  table would require changing the Op contract, which this milestone does not do.
 - Greedy parity compares the produced token with `NINFER_FLASH_NEXT_REFERENCE_TOKEN`. The reference
   value is a placeholder until the independent reference model lands; the assertion is exact and
   is not relaxed.

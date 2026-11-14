@@ -75,6 +75,7 @@ public:
         Binder binder(reader, 1);
 
         ninfer::EngineOptions options;
+        options.artifact_path = path;
         options.device = execution.primary().device;
         options.tp = 1;
         options.max_context = max_context;
@@ -200,28 +201,15 @@ void test_lane_lifecycle(HostProgram& host) {
     require(program.can_admit_lane(0, lane_plan), "the family cannot admit an idle lane");
 
     ninfer::runtime::TransientRegion transient;
-    auto first = program.start_prefill_lane(0, std::move(prompt), std::move(lane_plan),
-                                            std::move(transient));
-    require(first.processed_prompt_tokens > 0, "start_prefill_lane did not process a chunk");
-    require(first.round.tokens.empty(), "start_prefill_lane produced a fabricated token");
-    require(!first.complete, "start_prefill_lane completed a prompt that still has unprocessed tokens");
+    expect_throw([&] {
+        (void)program.start_prefill_lane(0, std::move(prompt), std::move(lane_plan),
+                                         std::move(transient));
+    }, "start_prefill_lane accepted a program whose weights are not materialized");
+    require(program.can_admit_lane(0, program.plan_request_for_lane(
+                                        0, host.make_prompt(prompt_tokens), base)),
+            "a rejected prefill left the lane active");
 
-    auto second = program.advance_prefill_lane(0);
-    require(second.complete, "advance_prefill_lane did not complete the short prompt");
-    require(second.round.tokens.empty(), "advance_prefill_lane produced a fabricated token");
-
-    const std::vector<std::uint32_t> lanes{0};
-    const std::vector<ninfer::runtime::RoundBudget> budgets{
-        ninfer::runtime::RoundBudget{.generated_tokens_remaining = 1}};
-    expect_throw([&] { (void)program.decode_batch(lanes, budgets); },
-                 "decode_batch did not reach the package post-mixer leaf");
-
-    program.abort_lane(0);
-    auto after_prompt = host.make_prompt(prompt_tokens);
-    auto after_plan = program.plan_request_for_lane(0, after_prompt, base);
-    require(program.can_admit_lane(0, after_plan), "abort_lane did not release the lane");
-
-    std::cout << "flash-next lifecycle lane: prefill, decode, abort\n";
+    std::cout << "flash-next lifecycle lane: plan, admission, unmaterialized rejection\n";
 }
 
 int test_real_artifact(const char* path, const Package::WeightsProfile profile) {

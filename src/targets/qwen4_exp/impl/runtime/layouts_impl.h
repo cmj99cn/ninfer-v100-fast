@@ -79,7 +79,8 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen4_exp::detail::SequencePlannerIm
     plan->device          = planner->inputs.device;
     plan->tp              = planner->inputs.tp;
     plan->device_reservation_bytes = curve.reservation_bytes(main_page_groups);
-    const WorkspaceRecipe recipe = text_workspace_recipe(planner->inputs.max_concurrency);
+    const WorkspaceRecipe recipe =
+        text_workspace_recipe(planner->inputs.prefill_chunk, planner->inputs.max_concurrency);
     plan->workspace_capacity_bytes = recipe.lane_capacity_bytes;
     plan->activation_capacity_bytes = text_activation_capacity_bytes(planner->inputs.prefill_chunk);
     plan->request_transient_capacity_bytes = recipe.request_transient_capacity_bytes;

@@ -2,6 +2,7 @@
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
+#include "ninfer/ops/ple.h"
 #include "targets/qwen3_8_flash_next/impl/config.h"
 #include "targets/qwen3_8_flash_next/impl/load/geometry.h"
 #include "targets/qwen3_8_flash_next/impl/load/roles.h"
@@ -11,6 +12,8 @@
 
 #include <array>
 #include <cstddef>
+#include <filesystem>
+#include <memory>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -128,6 +131,7 @@ struct BindingPlan {
     HcPlan final_hc;
     std::array<LayerPlan, TextConfig::layers> layers;
     PlePlan ple;
+    artifact::ObjectHandle ple_controls;
     UnclaimedParameters unclaimed;
 
     [[nodiscard]] std::vector<const BoundParameter*> parameters() const;
@@ -135,13 +139,31 @@ struct BindingPlan {
 
 [[nodiscard]] BindingPlan bind_artifact(artifact::Binder& binder, WeightsProfile profile, int tp);
 
-// The load-time geometric views of a binding plan: every entry names the device bytes the load
-// placed for that role and the geometry the Op consumes. Nothing is decoded or repacked here; the
-// batched NVFP4 planes are positioned, not expanded.
+class PleTableSource {
+public:
+    PleTableSource(const std::filesystem::path& path, const BindingPlan& plan);
+
+    void fetch(const ops::PleRowAddress* addresses, std::size_t count,
+               std::byte* destination) const;
+
+    [[nodiscard]] const float* divisors() const noexcept { return divisors_.data(); }
+    [[nodiscard]] const ops::PleHashControls& controls() const noexcept { return controls_; }
+
+private:
+    artifact::Reader reader_;
+    std::array<std::uint64_t, ops::kPleShards> shard_offsets_{};
+    artifact::RowPagedNf4Geometry geometry_{};
+    std::array<float, ops::kPleShards> divisors_{};
+    ops::PleHashControls controls_{};
+};
+
+void fetch_ple_rows(void* context, const ops::PleRowAddress* addresses, std::size_t count,
+                    std::byte* destination);
+
 class LoadedModelData {
 public:
     LoadedModelData(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
-                    std::size_t loaded_layers);
+                    std::size_t loaded_layers, const std::filesystem::path& artifact_path);
 
     LoadedModelData(const LoadedModelData&)            = delete;
     LoadedModelData& operator=(const LoadedModelData&) = delete;
@@ -151,6 +173,7 @@ public:
     [[nodiscard]] const Variant::ModelView& view() const noexcept { return model_; }
 
 private:
+    std::unique_ptr<PleTableSource> ple_source_;
     Variant::ModelView model_;
 };
 

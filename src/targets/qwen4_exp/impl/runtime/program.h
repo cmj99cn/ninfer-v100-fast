@@ -83,6 +83,7 @@ private:
                                                            std::size_t transient_bytes) const;
     [[nodiscard]] std::uint32_t page_groups_for(std::uint32_t tokens) const noexcept;
     void clear_lane(std::uint32_t lane) noexcept;
+    void prefill_chunk(LaneState& state, std::uint32_t begin, std::uint32_t count);
 
     WeightsProfile weights_profile_;
     std::array<const ModelView*, kMaximumDevices> models_{};

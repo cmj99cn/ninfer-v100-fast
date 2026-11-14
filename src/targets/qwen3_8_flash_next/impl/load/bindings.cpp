@@ -5,6 +5,7 @@
 #include <cstddef>
 
 #include <algorithm>
+#include <cstring>
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
@@ -607,6 +608,9 @@ BindingPlan bind_artifact(artifact::Binder& binder, WeightsProfile profile, int 
     plan.ple.norm_query  = builder.bind(roles::Role::PleNormQuery, roles::kPleLayer);
     plan.ple.norm_conv   = builder.bind(roles::Role::PleNormConv, roles::kPleLayer);
     plan.ple.convolution = builder.bind(roles::Role::PleConvolution, roles::kPleLayer);
+    plan.ple_controls = binder.require_resource("resource/text/ple_hash_controls",
+                                                artifact::ResourceEncoding::RawBytesV1);
+    binder.retain_on_host(plan.ple_controls);
 
     collect_unclaimed(directory.bindings, builder.claimed(), plan.unclaimed);
     collect_unclaimed(directory.part_bindings, builder.claimed(), plan.unclaimed);
@@ -630,8 +634,22 @@ Weight part_weight(const BindingPlan& plan, const artifact::MaterializedArtifact
                    const BoundParameter& parameter, std::int32_t rows, std::int32_t columns) {
     const auto handle = object_handle(plan, parameter);
     if (!materialized.is_materialized(handle)) { return Weight{}; }
-    return artifact::materialized_weight(materialized, handle, role_geometry(parameter.role).format,
-                                         rows, columns, 0);
+    Weight weight = artifact::materialized_weight(
+        materialized, handle, role_geometry(parameter.role).format, rows, columns, 0);
+    const artifact::ElementIntervalView& view = parameter.parts.front().view;
+    if (view.matrix_row_begin == 0) { return weight; }
+    if (view.layout != artifact::StorageLayout::ContiguousLeV1 ||
+        view.matrix_row_count != static_cast<std::uint64_t>(rows)) {
+        throw std::runtime_error("part_weight requires a contiguous row interval of the bound rows");
+    }
+    const std::array<std::uint64_t, 2> one_row{1, static_cast<std::uint64_t>(columns)};
+    const std::uint64_t row_bytes = artifact::tensor_encoded_size(
+        artifact::StorageLayout::ContiguousLeV1, role_geometry(parameter.role).format, one_row);
+    const auto offset = static_cast<std::uint64_t>(view.matrix_row_begin) * row_bytes;
+    const auto* base = static_cast<const std::byte*>(weight.payload) + offset;
+    weight.payload = base;
+    weight.qdata   = base;
+    return weight;
 }
 
 Tensor part_tensor(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
@@ -683,9 +701,77 @@ qwen4_exp::HcWeights hc_view(const BindingPlan& bindings, const artifact::Materi
 
 } // namespace
 
+namespace {
+
+std::uint64_t descriptor_offset(const artifact::ObjectDescriptor& descriptor) {
+    return std::visit([](const auto& value) { return value.offset; }, descriptor);
+}
+
+} // namespace
+
+PleTableSource::PleTableSource(const std::filesystem::path& path, const BindingPlan& plan)
+    : reader_(path) {
+    if (plan.ple.table.parts.size() != ops::kPleShards) {
+        throw std::runtime_error("the PLE table does not carry one part per shard");
+    }
+    const std::array<std::uint64_t, 2> table_shape{TextConfig::ple_shard_rows,
+                                                   TextConfig::ple_head_width};
+    geometry_ = artifact::row_paged_nf4_geometry(artifact::NumericFormat::NF4_G16_E4M3S,
+                                                 table_shape);
+    const artifact::ObjectDescriptor* controls =
+        reader_.find("resource/text/ple_hash_controls");
+    if (controls == nullptr) {
+        throw std::runtime_error("the artifact does not carry the PLE hash controls");
+    }
+    std::array<std::byte, ops::kPleHashControlsBytes> controls_payload{};
+    const std::uint64_t controls_offset =
+        reader_.payload_offset() + descriptor_offset(*controls);
+    if (reader_.read_direct(controls_offset, controls_payload) != controls_payload.size()) {
+        throw std::runtime_error("the PLE hash controls were read short");
+    }
+    controls_ = ops::parse_ple_hash_controls(controls_payload);
+    for (std::size_t shard = 0; shard < ops::kPleShards; ++shard) {
+        const auto& part = plan.ple.table.parts[shard];
+        const auto& object = plan.objects[static_cast<std::size_t>(part.object)];
+        const artifact::ObjectDescriptor* descriptor = reader_.find(object.name);
+        if (descriptor == nullptr) {
+            throw std::runtime_error("the artifact does not carry the PLE shard " + object.name);
+        }
+        shard_offsets_[shard] = descriptor_offset(*descriptor);
+        std::array<std::byte, 4> word{};
+        const std::uint64_t offset = reader_.payload_offset() + shard_offsets_[shard] +
+                                     geometry_.matrix_scale_offset;
+        if (reader_.read_direct(offset, word) != word.size()) {
+            throw std::runtime_error("the PLE shard " + object.name + " has no divisor word");
+        }
+        std::memcpy(&divisors_[shard], word.data(), sizeof(float));
+    }
+}
+
+void PleTableSource::fetch(const ops::PleRowAddress* addresses, std::size_t count,
+                           std::byte* destination) const {
+    const std::uint64_t row_bytes = geometry_.row_bytes;
+    for (std::size_t index = 0; index < count; ++index) {
+        const ops::PleRowAddress& address = addresses[index];
+        const std::uint64_t offset = reader_.payload_offset() + shard_offsets_.at(address.shard) +
+                                     artifact::row_paged_nf4_row_offset(geometry_, address.row);
+        std::span<std::byte> row{destination + index * row_bytes,
+                                 static_cast<std::size_t>(row_bytes)};
+        if (reader_.read_direct(offset, row) != row.size()) {
+            throw std::runtime_error("a PLE row read was short");
+        }
+    }
+}
+
+void fetch_ple_rows(void* context, const ops::PleRowAddress* addresses, std::size_t count,
+                    std::byte* destination) {
+    static_cast<PleTableSource*>(context)->fetch(addresses, count, destination);
+}
+
 LoadedModelData::LoadedModelData(const BindingPlan& plan,
                                  const artifact::MaterializedArtifact& materialized,
-                                 std::size_t loaded_layers) {
+                                 std::size_t loaded_layers,
+                                 const std::filesystem::path& artifact_path) {
     model_.tp = 1;
     model_.loaded_layers = loaded_layers;
 
@@ -694,6 +780,14 @@ LoadedModelData::LoadedModelData(const BindingPlan& plan,
     model_.output_head = part_weight(plan, materialized, plan.output_head, TextConfig::vocab,
                                      TextConfig::hidden);
     model_.final_hc = hc_view(plan, materialized, plan.final_hc, TextConfig::hc_lowrank);
+    const BoundParameter& tail_norm = loaded_layers < static_cast<std::size_t>(TextConfig::layers)
+                                          ? plan.layers[loaded_layers].attention_hc.norm
+                                          : plan.final_hc.norm;
+    model_.tail_norm = part_tensor(plan, materialized, tail_norm,
+                                   {TextConfig::residual_width / TextConfig::hc_streams,
+                                    TextConfig::hc_streams});
+
+    ple_source_ = std::make_unique<PleTableSource>(artifact_path, plan);
 
     model_.ple = qwen4_exp::PleWeights{
         .key        = part_weight(plan, materialized, plan.ple.key, TextConfig::residual_width,
@@ -705,6 +799,9 @@ LoadedModelData::LoadedModelData(const BindingPlan& plan,
         .norm_conv  = part_tensor(plan, materialized, plan.ple.norm_conv, {TextConfig::residual_width}),
         .kernel     = part_tensor(plan, materialized, plan.ple.convolution,
                                   {TextConfig::ple_conv_kernel, TextConfig::residual_width}),
+        .controls   = ple_source_->controls(),
+        .rows       = qwen4_exp::PleRowSource{ple_source_.get(), &fetch_ple_rows,
+                                              ple_source_->divisors()},
     };
 
     for (std::size_t layer = 0; layer < loaded_layers; ++layer) {

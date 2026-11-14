@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/ops/gated_delta_net.h"
+#include "ninfer/ops/moe_nvfp4.h"
 #include "ninfer/ops/ple.h"
 
 #include "targets/qwen4_exp/impl/runtime/instance.h"
@@ -22,25 +24,29 @@ struct WorkspaceRecipe {
     return (value + alignment - 1) / alignment * alignment;
 }
 
-[[nodiscard]] inline WorkspaceRecipe text_workspace_recipe(std::uint32_t max_concurrency) noexcept {
-    const std::size_t hidden = static_cast<std::size_t>(TextConfig::hidden) * kBf16Bytes;
-    const std::size_t residual = static_cast<std::size_t>(TextConfig::residual_width) * kBf16Bytes;
-    const std::size_t qsa =
-        (static_cast<std::size_t>(TextConfig::index_query_width) +
-         static_cast<std::size_t>(TextConfig::index_key_width) +
-         static_cast<std::size_t>(TextConfig::index_block_budget)) * kBf16Bytes;
-    const std::size_t moe =
-        (static_cast<std::size_t>(TextConfig::experts_per_token) * TextConfig::expert_intermediate +
-         static_cast<std::size_t>(TextConfig::shared_intermediate)) * kBf16Bytes;
-    const std::size_t ple =
-        static_cast<std::size_t>(TextConfig::ple_heads) * TextConfig::ple_head_width *
-        TextConfig::ple_conv_kernel * kBf16Bytes;
+[[nodiscard]] inline std::size_t text_op_scratch_bytes(std::uint32_t tokens) {
+    const std::size_t count = tokens == 0 ? 1 : tokens;
+    const std::size_t hc =
+        align_up(static_cast<std::size_t>(TextConfig::hc_lowrank) * count * kBf16Bytes, 256) +
+        static_cast<std::size_t>(TextConfig::residual_width) * count * kBf16Bytes;
+    const std::size_t moe = ops::moe_nvfp4_workspace_capacity_bytes(
+        static_cast<std::int32_t>(count), static_cast<std::int32_t>(count));
+    const std::size_t gdn = ops::gated_delta_net_workspace_capacity_bytes(
+        TextConfig::gdn_key_heads, TextConfig::gdn_value_heads, true,
+        static_cast<std::int32_t>(count), static_cast<std::int32_t>(count));
+    return std::max({hc, moe, gdn});
+}
 
-    const std::size_t lane = align_up(hidden + residual + qsa + moe + ple, 16);
-    const std::size_t transient = align_up(ple, 16);
+[[nodiscard]] inline WorkspaceRecipe text_workspace_recipe(std::uint32_t prefill_chunk,
+                                                           std::uint32_t max_concurrency) {
+    const std::size_t lane = align_up(text_op_scratch_bytes(prefill_chunk), 256);
+    const std::size_t ple = align_up(
+        static_cast<std::size_t>(TextConfig::ple_heads) * TextConfig::ple_head_width *
+            TextConfig::ple_conv_kernel * kBf16Bytes,
+        16);
     return WorkspaceRecipe{
-        .lane_capacity_bytes = lane * max_concurrency,
-        .request_transient_capacity_bytes = transient,
+        .lane_capacity_bytes = lane * (max_concurrency == 0 ? 1 : max_concurrency),
+        .request_transient_capacity_bytes = ple,
     };
 }
 
@@ -52,7 +58,7 @@ struct WorkspaceRecipe {
 
     const std::size_t trunk_per_token =
         (17 * hidden + static_cast<std::size_t>(TextConfig::vocab)) * kBf16Bytes +
-        (streams + 2) * sizeof(std::uint32_t);
+        (streams + 3) * sizeof(std::uint32_t);
 
     const std::size_t qsa_per_token =
         (4 * static_cast<std::size_t>(TextConfig::query_width) +
@@ -75,7 +81,9 @@ struct WorkspaceRecipe {
         channels * static_cast<std::size_t>(ops::kPleConvWindow) * kBf16Bytes;
 
     const std::size_t layer_per_token = std::max(qsa_per_token, gdn_per_token + ple_per_token);
-    return align_up((trunk_per_token + layer_per_token) * tokens + ple_history + 8, 16);
+    const std::size_t alignment_slack = 256 * 48;
+    return align_up((trunk_per_token + layer_per_token) * tokens + ple_history + alignment_slack,
+                    16);
 }
 
 } // namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS

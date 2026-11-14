@@ -12,8 +12,6 @@
 
 namespace ninfer::targets::qwen3_8_flash_next::detail {
 
-// The QSA projection payloads: the two row-split parents consumed as row ranges, and the four
-// per-head RMSNorm gains.
 struct AttentionProjectionWeights {
     Weight query_gate;
     Weight key_value;
@@ -24,9 +22,6 @@ struct AttentionProjectionWeights {
     Weight output;
 };
 
-// The GDN projection and control payloads. `qkvz` is the four-segment row-split parent and
-// `convolution` is the tap-major artifact object seen as the channel-major kernel view the Op
-// consumes.
 struct GdnProjectionWeights {
     Weight qkvz;
     Weight control;
@@ -37,9 +32,6 @@ struct GdnProjectionWeights {
     Weight output;
 };
 
-// The post-mixer payload is the MoE Op's own weight view: the router plus shared-score parent rows,
-// the shared down projection, and the two batched banks consumed in place with the gate and up row
-// ranges inside each matrix.
 using MoeWeights = ops::MoeNvfp4Weights;
 
 struct AttentionProjectionLeaf {

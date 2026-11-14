@@ -18,15 +18,18 @@ class LoadPlan::Impl {
 public:
     Impl(WeightsProfile weights_profile_in, BindingPlan binding_in,
          artifact::MaterializationPlan materialization_in,
-         qwen4_exp::FrontendResourcePlan resources_in, int tensor_parallel)
+         qwen4_exp::FrontendResourcePlan resources_in, int tensor_parallel,
+         std::filesystem::path artifact_path_in)
         : weights_profile(weights_profile_in), bindings(std::move(binding_in)),
-          materialization(std::move(materialization_in)), resources(resources_in), tp(tensor_parallel) {}
+          materialization(std::move(materialization_in)), resources(resources_in), tp(tensor_parallel),
+          artifact_path(std::move(artifact_path_in)) {}
 
     WeightsProfile weights_profile;
     BindingPlan bindings;
     artifact::MaterializationPlan materialization;
     qwen4_exp::FrontendResourcePlan resources;
     int tp = 1;
+    std::filesystem::path artifact_path;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -112,7 +115,8 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     }
 
     return LoadPlan(std::make_unique<LoadPlan::Impl>(weights_profile, std::move(bindings),
-                                                      binder.finish(), resources, options.tp));
+                                                      binder.finish(), resources, options.tp,
+                                                      options.artifact_path));
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -126,7 +130,8 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
 
     auto impl = std::make_unique<LoadedModel::Impl>(
         plan.impl_->weights_profile,
-        detail::LoadedModelData(plan.impl_->bindings, materialized, detail::TextConfig::layers),
+        detail::LoadedModelData(plan.impl_->bindings, materialized, detail::TextConfig::layers,
+                                plan.impl_->artifact_path),
         std::move(resources), plan.impl_->tp);
     plan.impl_.reset();
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));

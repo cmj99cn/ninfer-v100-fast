@@ -16,8 +16,10 @@
 #include "ninfer/ops/scatter.h"
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 
+#include <algorithm>
 #include <cstring>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
@@ -28,26 +30,21 @@ inline constexpr std::int32_t kChannels = TextConfig::residual_width;
 inline constexpr std::int32_t kHeadDim  = TextConfig::head_dim;
 inline constexpr std::int32_t kBatch    = 1;
 
-inline void TextState::set_ple_rows(const std::uint32_t* rows, std::size_t entries) {
-    if (entries * 4 > ple_rows_.bytes) { throw std::runtime_error("PLE row staging overflow"); }
-    CUDA_CHECK(cudaMemcpy(ple_rows_.p, rows, entries * 4, cudaMemcpyDeviceToDevice));
+inline TextState::DeviceScope::DeviceScope(int device) {
+    CUDA_CHECK(cudaGetDevice(&previous_));
+    if (previous_ != device) { CUDA_CHECK(cudaSetDevice(device)); }
 }
 
-inline void TextState::set_ple_staged_rows(const std::uint8_t* staged, std::size_t bytes) {
-    if (bytes > ple_staged_rows_.bytes) { throw std::runtime_error("PLE byte staging overflow"); }
-    CUDA_CHECK(cudaMemcpy(ple_staged_rows_.p, staged, bytes, cudaMemcpyDeviceToDevice));
+inline TextState::DeviceScope::~DeviceScope() {
+    if (previous_ != -1) { (void)cudaSetDevice(previous_); }
 }
 
-inline void TextState::set_ple_controls(const ops::PleHashControls& controls) {
-    ple_controls_ = controls;
-}
-
-inline void TextState::set_ple_divisors(const float* divisors) {
-    ple_table_.divisors = divisors;
-}
-
-inline TextState::TextState(DeviceContext& device, const ModelView& model, std::uint32_t max_tokens)
-    : layers_(model.loaded_layers), max_tokens_(max_tokens), pages_(max_tokens / 64 + 1),
+inline TextState::TextState(DeviceContext& device, const ModelView& model,
+                            std::uint32_t kv_capacity_tokens, std::uint32_t forward_tokens)
+    : device_scope_(device.device), ple_source_(model.ple.rows), stream_(device.stream),
+      layers_(model.loaded_layers), forward_tokens_(forward_tokens == 0 ? 1 : forward_tokens),
+      pages_(kv_capacity_tokens / 64 + 1),
+      gdn_layers_(layers_), gdn_index_(layers_),
       conv_states_(layers_ * static_cast<std::size_t>(TextConfig::gdn_conv_channels) * 3 * 2),
       recurrent_states_(layers_ * 128 * 128 * static_cast<std::size_t>(TextConfig::gdn_value_heads) * 4),
       k_pages_(static_cast<std::size_t>(kHeadDim) * 64 * TextConfig::kv_heads * pages_ * 2),
@@ -59,13 +56,43 @@ inline TextState::TextState(DeviceContext& device, const ModelView& model, std::
       tail_first_rope_(3 * kBatch * 4),
       after_raw_keys_(static_cast<std::size_t>(TextConfig::index_head_dim) * 4 * kBatch * 2),
       after_first_rope_(3 * kBatch * 4),
-      record_raw_keys_(static_cast<std::size_t>(TextConfig::index_head_dim) * max_tokens * kBatch * 2),
-      record_rope_positions_(3 * static_cast<std::size_t>(max_tokens) * kBatch * 4),
+      record_raw_keys_(static_cast<std::size_t>(TextConfig::index_head_dim) * forward_tokens_ * kBatch * 2),
+      record_rope_positions_(3 * forward_tokens_ * kBatch * 4),
       record_base_positions_(kBatch * 4),
       ple_history_(static_cast<std::size_t>(kChannels) * ops::kPleConvWindow * kBatch * 2),
-      ple_rows_(ops::kPleHeads * static_cast<std::size_t>(max_tokens) * kBatch * 4),
-      ple_staged_rows_(ops::kPleHeads * static_cast<std::size_t>(max_tokens) * kBatch * 128) {
-    (void)device;
+      ple_rows_(ops::kPleHeads * forward_tokens_ * kBatch * 4),
+      ple_staged_rows_(ops::kPleHeads * forward_tokens_ * kBatch * 128),
+      ple_divisors_(ops::kPleShards * 4) {
+    if (ple_source_.fetch == nullptr || ple_source_.divisors == nullptr) {
+        throw std::runtime_error("the text state requires a PLE row source");
+    }
+    ple_controls_ = model.ple.controls;
+    const std::array<std::uint64_t, 2> table_shape{TextConfig::ple_shard_rows,
+                                                   TextConfig::ple_head_width};
+    ple_table_.geometry =
+        artifact::row_paged_nf4_geometry(artifact::NumericFormat::NF4_G16_E4M3S, table_shape);
+    ple_table_.shard_count = ops::kPleShards;
+    ple_table_.divisors    = static_cast<const float*>(ple_divisors_.p);
+    ple_divisors_.copy_from_host(ple_source_.divisors, ops::kPleShards * 4);
+    std::size_t gdn = 0;
+    for (std::size_t layer = 0; layer < layers_; ++layer) {
+        if (TextConfig::is_qsa_layer(static_cast<int>(layer))) {
+            gdn_index_[layer] = gdn_layers_.size();
+        } else {
+            gdn_index_[layer] = gdn;
+            gdn_layers_[gdn++] = layer;
+        }
+    }
+    gdn_layers_.resize(gdn);
+    std::vector<std::int32_t> table(pages_);
+    for (std::size_t page = 0; page < pages_; ++page) {
+        table[page] = static_cast<std::int32_t>(page);
+    }
+    page_table_.copy_from_host(table.data(), pages_ * 4);
+    reset();
+}
+
+inline void TextState::reset() {
     conv_states_.fill(0);
     recurrent_states_.fill(0);
     k_pages_.fill(0);
@@ -81,33 +108,62 @@ inline TextState::TextState(DeviceContext& device, const ModelView& model, std::
     ple_history_.fill(0);
     ple_rows_.fill(0);
     ple_staged_rows_.fill(0);
-    const std::array<std::uint64_t, 2> table_shape{TextConfig::ple_shard_rows,
-                                                   TextConfig::ple_head_width};
-    ple_table_.geometry =
-        artifact::row_paged_nf4_geometry(artifact::NumericFormat::NF4_G16_E4M3S, table_shape);
-    ple_table_.shard_count = ops::kPleShards;
-    ple_tail_[0] = TextConfig::eos_token_id;
-    ple_tail_[1] = TextConfig::eos_token_id;
-
-    std::vector<std::int32_t> table(pages_);
-    for (std::size_t page = 0; page < pages_; ++page) {
-        table[page] = static_cast<std::int32_t>(page);
-    }
-    page_table_.copy_from_host(table.data(), pages_ * 4);
+    next_position_ = 0;
+    ple_tail_[0]   = TextConfig::eos_token_id;
+    ple_tail_[1]   = TextConfig::eos_token_id;
+    ple_staged_host_.assign(ple_staged_rows_.bytes, std::byte{0});
 }
 
-inline Tensor TextState::conv_state(std::size_t layer) const {
+inline void TextState::prepare_ple_rows(std::span<const TokenId> tokens) {
+    const std::size_t count = tokens.size();
+    const std::size_t row_bytes = static_cast<std::size_t>(ple_table_.geometry.row_bytes);
+    if (count == 0) { return; }
+    if (count > forward_tokens_) { throw std::runtime_error("the PLE row round exceeds the forward width"); }
+    std::vector<std::uint64_t> ids(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        ids[index] = static_cast<std::uint64_t>(tokens[index]);
+    }
+    std::vector<std::uint32_t> rows(ops::kPleHeads * count);
+    ops::ple_hash_tokens(ids, {ple_tail_[0], ple_tail_[1]}, TextConfig::eos_token_id,
+                         ple_controls_, rows);
+    std::vector<ops::PleRowAddress> addresses(rows.size());
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        addresses[index] = ops::ple_row_address(ple_table_, rows[index]);
+    }
+    ple_staged_host_.resize(rows.size() * row_bytes);
+    ple_source_.fetch(ple_source_.context, addresses.data(), addresses.size(),
+                      ple_staged_host_.data());
+    CUDA_CHECK(cudaMemcpyAsync(ple_rows_.p, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice,
+                               stream_));
+    CUDA_CHECK(cudaMemcpyAsync(ple_staged_rows_.p, ple_staged_host_.data(),
+                               ple_staged_host_.size(), cudaMemcpyHostToDevice, stream_));
+    for (const TokenId token : tokens) { advance_ple_tail(token); }
+}
+
+inline std::int32_t TextState::base_position() const {
+    std::int32_t base = 0;
+    record_base_positions_.copy_to_host(&base, 4);
+    return base;
+}
+
+inline Tensor TextState::gdn_conv_state(std::size_t gdn_index) const {
+    const std::size_t layer = gdn_layers_.at(gdn_index);
     return Tensor(conv_states_.p + layer * static_cast<std::size_t>(TextConfig::gdn_conv_channels) * 3 * 2,
                   DType::BF16, {3, TextConfig::gdn_conv_channels});
 }
 
-inline Tensor TextState::recurrent_state(std::size_t layer) const {
+inline Tensor TextState::gdn_recurrent_state(std::size_t gdn_index) const {
+    const std::size_t layer = gdn_layers_.at(gdn_index);
     return Tensor(recurrent_states_.p +
                       layer * 128 * 128 * static_cast<std::size_t>(TextConfig::gdn_value_heads) * 4,
                   DType::FP32, {128, 128, TextConfig::gdn_value_heads});
 }
 
-inline std::size_t TextState::gdn_state_entries() const noexcept { return layers_; }
+inline std::size_t TextState::gdn_state_index(std::size_t layer) const {
+    return gdn_index_.at(layer);
+}
+
+inline std::size_t TextState::gdn_state_entries() const noexcept { return gdn_layers_.size(); }
 
 inline ops::QsaCacheView TextState::cache() const {
     const std::int32_t pages = static_cast<std::int32_t>(pages_);
@@ -167,11 +223,11 @@ inline const std::uint8_t* TextState::ple_staged_rows() const noexcept {
 inline const ops::PleNf4Table& TextState::ple_table() const noexcept { return ple_table_; }
 
 inline void TextState::publish_tail() {
-    CUDA_CHECK(cudaMemcpy(tail_raw_keys_.p, after_raw_keys_.p,
-                          static_cast<std::size_t>(TextConfig::index_head_dim) * 4 * kBatch * 2,
-                          cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(tail_first_rope_.p, after_first_rope_.p, 3 * kBatch * 4,
-                          cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(tail_raw_keys_.p, after_raw_keys_.p,
+                               static_cast<std::size_t>(TextConfig::index_head_dim) * 4 * kBatch * 2,
+                               cudaMemcpyDeviceToDevice, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(tail_first_rope_.p, after_first_rope_.p, 3 * kBatch * 4,
+                               cudaMemcpyDeviceToDevice, stream_));
 }
 
 inline TextTrunk::TextTrunk(const ModelView& model, TextState& state, WorkspaceArena& activations,
@@ -214,7 +270,8 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T, const Tensor& 
     copy_segment(k, key_width);
     copy_segment(v, 2 * key_width);
 
-    Tensor conv_state = state_.conv_state(layer);
+    const std::size_t gdn_index = state_.gdn_state_index(layer);
+    Tensor conv_state = state_.gdn_conv_state(gdn_index);
     Tensor conv_kernel =
         weights.convolution.view({TextConfig::gdn_conv_channels, TextConfig::gdn_conv_kernel});
     ops::causal_conv1d_silu(conv_in, conv_kernel, conv_state, conv_state, conv_out, stream_);
@@ -230,7 +287,7 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T, const Tensor& 
     Tensor v_recurrent = v.view({128, TextConfig::gdn_value_heads, T});
     Tensor o_recurrent = o.view({128, TextConfig::gdn_value_heads, T});
     Tensor o_normalized = on.view({128, TextConfig::gdn_value_heads, T});
-    Tensor recurrent_state = state_.recurrent_state(layer);
+    Tensor recurrent_state = state_.gdn_recurrent_state(gdn_index);
     ops::gated_delta_net(q_recurrent, k_recurrent, v_recurrent, g, beta, kGdnScale, true, workspace_,
                          recurrent_state, o_recurrent, stream_);
     ops::gated_rmsnorm(o_recurrent, weights.norm, z.view({128, TextConfig::gdn_value_heads, T}),
@@ -340,14 +397,15 @@ inline void TextTrunk::run_ple(std::int32_t T, const Tensor& residual, Tensor& u
                                             {kChannels, static_cast<std::int32_t>(ops::kPleConvWindow),
                                              kBatch});
     ops::ple_state_extract(state_.ple_history(), normalized_conv, counts, after_history, stream_);
-    CUDA_CHECK(cudaMemcpy(state_.ple_history().data, after_history.data,
-                          static_cast<std::size_t>(kChannels) * ops::kPleConvWindow * kBatch * 2,
-                          cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(state_.ple_history().data, after_history.data,
+                               static_cast<std::size_t>(kChannels) * ops::kPleConvWindow * kBatch * 2,
+                               cudaMemcpyDeviceToDevice, stream_));
 }
 
 inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
     const std::int32_t T = static_cast<std::int32_t>(tokens.size());
     auto scope = workspace_.scope();
+    state_.prepare_ple_rows(tokens);
 
     Tensor ids = activations_.alloc(DType::I32, {T});
     CUDA_CHECK(cudaMemcpyAsync(ids.data, tokens.data(), static_cast<std::size_t>(T) * 4,
@@ -359,7 +417,7 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
 
     Tensor residual    = activations_.alloc(DType::BF16, {kHidden, kStreams, T, kBatch});
     Tensor normalized  = activations_.alloc(DType::BF16, {kHidden, kStreams, T, kBatch});
-    Tensor updated     = activations_.alloc(DType::BF16, {kHidden, kStreams, T, kBatch});
+    Tensor stage       = activations_.alloc(DType::BF16, {kHidden, kStreams, T, kBatch});
     Tensor block_input = activations_.alloc(DType::BF16, {kHidden, T});
     Tensor injection   = activations_.alloc(DType::FP32, {kStreams, T});
     Tensor mixer_out   = activations_.alloc(DType::BF16, {kHidden, T});
@@ -399,7 +457,7 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
 
         const auto& moe_hc = model_.layers[layer].moe_hc;
         ops::hc_combine_norm(residual, mixer_out, injection, moe_hc.norm, TextConfig::rms_epsilon,
-                             updated, normalized, stream_);
+                             stage, normalized, stream_);
 
         ops::hc_mix(normalized, ops::HcMixWeights{moe_hc.down_injection, moe_hc.up}, workspace_,
                     block_input, injection, stream_);
@@ -408,17 +466,15 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
         Variant::post_mixer(block_input, model_.layers[layer].post_mixer, moe_out, workspace_, stream_);
 
         if (layer + 1 == static_cast<std::size_t>(TextConfig::ple_layer)) {
-            ops::hc_combine(residual, moe_out, injection, updated, stream_);
-            run_ple(T, updated, residual, normalized);
+            ops::hc_combine(stage, moe_out, injection, residual, stream_);
+            run_ple(T, residual, stage, normalized);
+            std::swap(residual, stage);
         } else {
             const Tensor& next_norm = layer + 1 < model_.loaded_layers
                                           ? model_.layers[layer + 1].attention_hc.norm
-                                          : model_.final_hc.norm;
-            ops::hc_combine_norm(residual, moe_out, injection, next_norm, TextConfig::rms_epsilon,
-                                 updated, normalized, stream_);
-        }
-        for (std::size_t t = 0; t < static_cast<std::size_t>(T); ++t) {
-            state_.advance_ple_tail(tokens[t]);
+                                          : model_.tail_norm;
+            ops::hc_combine_norm(stage, moe_out, injection, next_norm, TextConfig::rms_epsilon,
+                                 residual, normalized, stream_);
         }
     }
 
