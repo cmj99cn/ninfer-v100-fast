@@ -55,6 +55,13 @@ void require_shape(const Tensor& tensor, const char* label, DType dtype,
     }
 }
 
+void require_activation(const Tensor& tensor, const char* label) {
+    if (tensor.dtype != DType::BF16 && tensor.dtype != DType::FP16) {
+        throw std::invalid_argument(std::string("gated_residual: ") + label +
+                                    " has a wrong dtype");
+    }
+}
+
 void require_disjoint(const Tensor& output, const Tensor& input, const char* label) {
     if (overlaps(output, input)) {
         throw std::invalid_argument(std::string("gated_residual: ") + label +
@@ -68,11 +75,12 @@ void require_epsilon(float epsilon) {
     }
 }
 
-void require_bf16_geometry(const Weight& weight, const char* label, std::int32_t rows,
-                           std::int32_t columns) {
-    if (weight.qtype != QType::BF16_CTRL || weight.layout != QuantLayout::Contiguous) {
+void require_control_geometry(const Weight& weight, const char* label, std::int32_t rows,
+                              std::int32_t columns) {
+    if ((weight.qtype != QType::BF16_CTRL && weight.qtype != QType::FP16_CTRL) ||
+        weight.layout != QuantLayout::Contiguous) {
         throw std::invalid_argument(std::string("gated_residual: ") + label +
-                                    " must be a contiguous BF16 weight");
+                                    " must be a contiguous BF16 or FP16 weight");
     }
     if (weight.n != rows || weight.k != columns || weight.ndim != 2) {
         throw std::invalid_argument(std::string("gated_residual: ") + label +
@@ -80,9 +88,15 @@ void require_bf16_geometry(const Weight& weight, const char* label, std::int32_t
     }
 }
 
-void require_bf16_weight(const Weight& weight, const char* label, std::int32_t rows,
-                         std::int32_t columns) {
-    require_bf16_geometry(weight, label, rows, columns);
+void require_control_weight(const Weight& weight, const char* label, std::int32_t rows,
+                            std::int32_t columns, DType activation) {
+    require_control_geometry(weight, label, rows, columns);
+    const DType weight_dtype =
+        weight.qtype == QType::FP16_CTRL ? DType::FP16 : DType::BF16;
+    if (weight_dtype != activation) {
+        throw std::invalid_argument(std::string("gated_residual: ") + label +
+                                    " dtype does not match the activation");
+    }
     for (int index = 0; index < 4; ++index) {
         if (weight.shape[index] != weight.padded_shape[index]) {
             throw std::invalid_argument(std::string("gated_residual: ") + label +
@@ -129,10 +143,16 @@ void hc_expand_norm(const Tensor& embedding, const Tensor& norm_weight, float ep
     const std::int32_t hidden  = embedding.ne[0];
     const std::int32_t columns = embedding.ne[1];
     const std::int32_t streams = norm_weight.ne[1];
-    require_shape(embedding, "embedding", DType::BF16, {hidden, columns});
+    require_activation(embedding, "embedding");
+    require_shape(embedding, "embedding", embedding.dtype, {hidden, columns});
     require_shape(norm_weight, "norm_weight", DType::BF16, {hidden, streams});
-    require_shape(residual, "residual", DType::BF16, {hidden, streams, columns});
-    require_shape(normalized, "normalized", DType::BF16, {hidden, streams, columns});
+    require_activation(residual, "residual");
+    require_activation(normalized, "normalized");
+    require_shape(residual, "residual", residual.dtype, {hidden, streams, columns});
+    require_shape(normalized, "normalized", normalized.dtype, {hidden, streams, columns});
+    if (residual.dtype != embedding.dtype || normalized.dtype != embedding.dtype) {
+        throw std::invalid_argument("gated_residual: activation dtypes must agree");
+    }
     require_disjoint(residual, embedding, "residual");
     require_disjoint(residual, norm_weight, "residual");
     require_disjoint(normalized, embedding, "normalized");
@@ -147,9 +167,14 @@ void hc_grouped_rmsnorm(const Tensor& residual, const Tensor& norm_weight, float
     const std::int32_t hidden  = residual.ne[0];
     const std::int32_t streams = residual.ne[1];
     const std::int32_t columns = residual.ne[2];
-    require_shape(residual, "residual", DType::BF16, {hidden, streams, columns});
+    require_activation(residual, "residual");
+    require_shape(residual, "residual", residual.dtype, {hidden, streams, columns});
     require_shape(norm_weight, "norm_weight", DType::BF16, {hidden, streams});
-    require_shape(normalized, "normalized", DType::BF16, {hidden, streams, columns});
+    require_activation(normalized, "normalized");
+    require_shape(normalized, "normalized", normalized.dtype, {hidden, streams, columns});
+    if (normalized.dtype != residual.dtype) {
+        throw std::invalid_argument("gated_residual: activation dtypes must agree");
+    }
     require_disjoint(normalized, residual, "normalized");
     require_disjoint(normalized, norm_weight, "normalized");
     detail::hc_grouped_rmsnorm_launch(residual, norm_weight, epsilon, normalized, stream);
@@ -160,10 +185,17 @@ void hc_combine(const Tensor& residual, const Tensor& block_output, const Tensor
     const std::int32_t hidden  = residual.ne[0];
     const std::int32_t streams = residual.ne[1];
     const std::int32_t columns = residual.ne[2];
-    require_shape(residual, "residual", DType::BF16, {hidden, streams, columns});
-    require_shape(block_output, "block_output", DType::BF16, {hidden, columns});
+    require_activation(residual, "residual");
+    require_shape(residual, "residual", residual.dtype, {hidden, streams, columns});
+    require_activation(block_output, "block_output");
+    require_shape(block_output, "block_output", block_output.dtype, {hidden, columns});
     require_shape(injection, "injection", DType::FP32, {streams, columns});
-    require_shape(updated_residual, "updated_residual", DType::BF16, {hidden, streams, columns});
+    require_activation(updated_residual, "updated_residual");
+    require_shape(updated_residual, "updated_residual", updated_residual.dtype,
+                  {hidden, streams, columns});
+    if (block_output.dtype != residual.dtype || updated_residual.dtype != residual.dtype) {
+        throw std::invalid_argument("gated_residual: activation dtypes must agree");
+    }
     if (!same_storage(updated_residual, residual) && overlaps(updated_residual, residual)) {
         throw std::invalid_argument(
             "gated_residual: updated_residual must alias residual exactly or be disjoint");
@@ -180,12 +212,21 @@ void hc_combine_norm(const Tensor& residual, const Tensor& block_output, const T
     const std::int32_t hidden  = residual.ne[0];
     const std::int32_t streams = residual.ne[1];
     const std::int32_t columns = residual.ne[2];
-    require_shape(residual, "residual", DType::BF16, {hidden, streams, columns});
-    require_shape(block_output, "block_output", DType::BF16, {hidden, columns});
+    require_activation(residual, "residual");
+    require_shape(residual, "residual", residual.dtype, {hidden, streams, columns});
+    require_activation(block_output, "block_output");
+    require_shape(block_output, "block_output", block_output.dtype, {hidden, columns});
     require_shape(injection, "injection", DType::FP32, {streams, columns});
     require_shape(next_norm_weight, "next_norm_weight", DType::BF16, {hidden, streams});
-    require_shape(updated_residual, "updated_residual", DType::BF16, {hidden, streams, columns});
-    require_shape(normalized, "normalized", DType::BF16, {hidden, streams, columns});
+    require_activation(updated_residual, "updated_residual");
+    require_shape(updated_residual, "updated_residual", updated_residual.dtype,
+                  {hidden, streams, columns});
+    require_activation(normalized, "normalized");
+    require_shape(normalized, "normalized", normalized.dtype, {hidden, streams, columns});
+    if (block_output.dtype != residual.dtype || updated_residual.dtype != residual.dtype ||
+        normalized.dtype != residual.dtype) {
+        throw std::invalid_argument("gated_residual: activation dtypes must agree");
+    }
     if (!same_storage(updated_residual, residual) && overlaps(updated_residual, residual)) {
         throw std::invalid_argument(
             "gated_residual: updated_residual must alias residual exactly or be disjoint");
@@ -210,18 +251,24 @@ void hc_mix(const Tensor& normalized, const HcMixWeights& weights, WorkspaceAren
     const std::int32_t columns  = normalized.ne[2];
     const std::int32_t rank     = weights.up.k;
     const std::int32_t channels = hidden * streams;
-    require_shape(normalized, "normalized", DType::BF16, {hidden, streams, columns});
-    require_shape(block_input, "block_input", DType::BF16, {hidden, columns});
+    require_activation(normalized, "normalized");
+    require_shape(normalized, "normalized", normalized.dtype, {hidden, streams, columns});
+    require_activation(block_input, "block_input");
+    require_shape(block_input, "block_input", block_input.dtype, {hidden, columns});
     require_shape(injection, "injection", DType::FP32, {streams, columns});
-    require_bf16_weight(weights.down_injection, "down_injection", rank + streams, channels);
-    require_bf16_weight(weights.up, "up", channels, rank);
+    if (block_input.dtype != normalized.dtype) {
+        throw std::invalid_argument("gated_residual: activation dtypes must agree");
+    }
+    require_control_weight(weights.down_injection, "down_injection", rank + streams, channels,
+                           normalized.dtype);
+    require_control_weight(weights.up, "up", channels, rank, normalized.dtype);
     require_disjoint(block_input, normalized, "block_input");
     require_disjoint(block_input, injection, "block_input");
     require_disjoint(injection, normalized, "injection");
 
     const auto scope = workspace.scope();
-    Tensor low        = workspace.alloc(DType::BF16, {rank, columns});
-    Tensor gates      = workspace.alloc(DType::BF16, {channels, columns});
+    Tensor low        = workspace.alloc(normalized.dtype, {rank, columns});
+    Tensor gates      = workspace.alloc(normalized.dtype, {channels, columns});
     const Tensor flattened = normalized.view({channels, columns});
 
     Weight down          = weights.down_injection;
@@ -230,7 +277,7 @@ void hc_mix(const Tensor& normalized, const HcMixWeights& weights, WorkspaceAren
     down.padded_shape[0] = rank;
     down.payload_bytes   = static_cast<std::uint64_t>(rank) * channels * 2;
 
-    if (columns == 1) {
+    if (columns == 1 && normalized.dtype == DType::BF16) {
         detail::hc_project_gemv_launch(down.qdata, rank, channels, flattened.data, low, stream);
         detail::hc_mix_silu_launch(low, streams, stream);
         detail::hc_project_gemv_launch(weights.up.qdata, channels, rank, low.data, gates, stream);
@@ -243,7 +290,10 @@ void hc_mix(const Tensor& normalized, const HcMixWeights& weights, WorkspaceAren
 
     const auto* injection_rows = static_cast<const std::uint8_t*>(weights.down_injection.qdata) +
                                   static_cast<std::size_t>(rank) * channels * 2;
-    detail::hc_mix_injection_launch(injection_rows, flattened, channels, streams, injection, stream);
+    detail::hc_mix_injection_launch(injection_rows,
+                                    weights.down_injection.qtype == QType::FP16_CTRL ? DType::FP16
+                                                                                     : DType::BF16,
+                                    flattened, channels, streams, injection, stream);
 }
 
 void hc_final_mix(const Tensor& normalized, const HcFinalMixWeights& weights,
@@ -253,18 +303,23 @@ void hc_final_mix(const Tensor& normalized, const HcFinalMixWeights& weights,
     const std::int32_t columns  = normalized.ne[2];
     const std::int32_t rank     = weights.down.n;
     const std::int32_t channels = hidden * streams;
-    require_shape(normalized, "normalized", DType::BF16, {hidden, streams, columns});
-    require_shape(sample_hidden, "sample_hidden", DType::BF16, {hidden, columns});
-    require_bf16_weight(weights.down, "down", rank, channels);
-    require_bf16_weight(weights.up, "up", channels, rank);
+    require_activation(normalized, "normalized");
+    require_shape(normalized, "normalized", normalized.dtype, {hidden, streams, columns});
+    require_activation(sample_hidden, "sample_hidden");
+    require_shape(sample_hidden, "sample_hidden", sample_hidden.dtype, {hidden, columns});
+    if (sample_hidden.dtype != normalized.dtype) {
+        throw std::invalid_argument("gated_residual: activation dtypes must agree");
+    }
+    require_control_weight(weights.down, "down", rank, channels, normalized.dtype);
+    require_control_weight(weights.up, "up", channels, rank, normalized.dtype);
     require_disjoint(sample_hidden, normalized, "sample_hidden");
 
     const auto scope = workspace.scope();
-    Tensor low        = workspace.alloc(DType::BF16, {rank, columns});
-    Tensor gates      = workspace.alloc(DType::BF16, {channels, columns});
+    Tensor low        = workspace.alloc(normalized.dtype, {rank, columns});
+    Tensor gates      = workspace.alloc(normalized.dtype, {channels, columns});
     const Tensor flattened = normalized.view({channels, columns});
 
-    if (columns == 1) {
+    if (columns == 1 && normalized.dtype == DType::BF16) {
         detail::hc_project_gemv_launch(weights.down.qdata, rank, channels, flattened.data, low,
                                         stream);
         detail::hc_mix_silu_launch(low, streams, stream);
@@ -286,8 +341,8 @@ std::size_t hc_mix_workspace_capacity_bytes(const HcMixWeights& weights, std::in
     if (rank <= 0 || channels <= 0 || streams <= 0) {
         throw std::invalid_argument("gated_residual: invalid mixing weight geometry");
     }
-    require_bf16_geometry(weights.down_injection, "down_injection", rank + streams, channels);
-    require_bf16_geometry(weights.up, "up", channels, rank);
+    require_control_geometry(weights.down_injection, "down_injection", rank + streams, channels);
+    require_control_geometry(weights.up, "up", channels, rank);
     return workspace_bytes(rank, channels, max_tokens);
 }
 
@@ -300,8 +355,8 @@ std::size_t hc_final_mix_workspace_capacity_bytes(const HcFinalMixWeights& weigh
     if (rank <= 0 || channels <= 0) {
         throw std::invalid_argument("gated_residual: invalid mixing weight geometry");
     }
-    require_bf16_geometry(weights.down, "down", rank, channels);
-    require_bf16_geometry(weights.up, "up", channels, rank);
+    require_control_geometry(weights.down, "down", rank, channels);
+    require_control_geometry(weights.up, "up", channels, rank);
     return workspace_bytes(rank, channels, max_tokens);
 }
 

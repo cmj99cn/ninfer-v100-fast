@@ -25,8 +25,8 @@ void hc_project_gemv_launch(const void* weight, std::int32_t rows, std::int32_t 
 void hc_mix_gate_launch(const Tensor& gates, const Tensor& normalized, Tensor& block_input,
                         std::int32_t hidden, std::int32_t streams, cudaStream_t stream);
 
-void hc_mix_injection_launch(const void* injection_rows, const Tensor& flattened,
-                             std::int32_t channels, std::int32_t streams, Tensor& injection,
-                             cudaStream_t stream);
+void hc_mix_injection_launch(const void* injection_rows, DType weight_dtype,
+                             const Tensor& flattened, std::int32_t channels, std::int32_t streams,
+                             Tensor& injection, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

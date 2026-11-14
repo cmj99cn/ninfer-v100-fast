@@ -4,6 +4,8 @@
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
 
+#include "ops/gated_residual/act.h"
+
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -14,13 +16,13 @@ namespace {
 constexpr int kBlock = 256;
 constexpr int kGemvWarpsPerBlock = 8;
 
-__global__ void hc_mix_silu_kernel(__nv_bfloat16* values, std::int32_t streams,
-                                   std::int64_t count) {
+template <class A>
+__global__ void hc_mix_silu_kernel(A* values, std::int32_t streams, std::int64_t count) {
     const std::int64_t index =
         static_cast<std::int64_t>(blockIdx.x) * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     if (index >= count) { return; }
-    const float value = __bfloat162float(values[index]);
-    values[index]     = __float2bfloat16_rn(silu(value / static_cast<float>(streams)));
+    const float value = HcAct<A>::to_float(values[index]);
+    values[index]     = HcAct<A>::from_float(silu(value / static_cast<float>(streams)));
 }
 
 __device__ __forceinline__ void unpack_bf16x8(const uint4& value, float* out) {
@@ -77,8 +79,10 @@ __global__ __launch_bounds__(kGemvWarpsPerBlock * kWarpSize) void hc_project_gem
     }
 }
 
-__global__ __launch_bounds__(kBlock) void hc_mix_gate_kernel(    const __nv_bfloat16* gates, const __nv_bfloat16* normalized, __nv_bfloat16* block_input,
-    std::int32_t hidden, std::int32_t streams) {
+template <class A>
+__global__ __launch_bounds__(kBlock) void hc_mix_gate_kernel(
+    const A* gates, const A* normalized, A* block_input, std::int32_t hidden,
+    std::int32_t streams) {
     const std::int32_t m = static_cast<std::int32_t>(blockIdx.x);
     const std::int32_t d = static_cast<std::int32_t>(blockIdx.y) * kBlock +
                            static_cast<std::int32_t>(threadIdx.x);
@@ -88,23 +92,24 @@ __global__ __launch_bounds__(kBlock) void hc_mix_gate_kernel(    const __nv_bflo
     for (std::int32_t s = 0; s < streams; ++s) {
         const std::int64_t index = static_cast<std::int64_t>(s) * hidden + d +
                                    static_cast<std::int64_t>(m) * hidden * streams;
-        total += sigmoid(__bfloat162float(gates[index])) * __bfloat162float(normalized[index]);
+        total += sigmoid(HcAct<A>::to_float(gates[index])) * HcAct<A>::to_float(normalized[index]);
     }
     block_input[static_cast<std::int64_t>(m) * hidden + d] =
-        __float2bfloat16_rn(total / static_cast<float>(streams));
+        HcAct<A>::from_float(total / static_cast<float>(streams));
 }
 
+template <class W, class A>
 __global__ __launch_bounds__(kBlock) void hc_mix_injection_kernel(
-    const __nv_bfloat16* injection_rows, const __nv_bfloat16* flattened, float* injection,
-    std::int32_t channels, std::int32_t streams) {
+    const W* injection_rows, const A* flattened, float* injection, std::int32_t channels,
+    std::int32_t streams) {
     const std::int32_t m        = static_cast<std::int32_t>(blockIdx.x);
     const std::int32_t s        = static_cast<std::int32_t>(blockIdx.y);
-    const __nv_bfloat16* row     = injection_rows + static_cast<std::int64_t>(s) * channels;
-    const __nv_bfloat16* column  = flattened + static_cast<std::int64_t>(m) * channels;
+    const W* row     = injection_rows + static_cast<std::int64_t>(s) * channels;
+    const A* column  = flattened + static_cast<std::int64_t>(m) * channels;
 
     float sum = 0.0F;
     for (std::int32_t c = static_cast<std::int32_t>(threadIdx.x); c < channels; c += kBlock) {
-        sum += __bfloat162float(row[c]) * __bfloat162float(column[c]);
+        sum += HcAct<W>::to_float(row[c]) * HcAct<A>::to_float(column[c]);
     }
     __shared__ float scratch[kBlock / kWarpSize];
     const float total = block_reduce_sum<kBlock>(sum, scratch);
@@ -135,8 +140,13 @@ void hc_project_gemv_launch(const void* weight, std::int32_t rows, std::int32_t 
 void hc_mix_silu_launch(Tensor& values, std::int32_t streams, cudaStream_t stream) {
     const std::int64_t count = values.numel();
     const auto blocks = static_cast<unsigned int>((count + kBlock - 1) / kBlock);
-    hc_mix_silu_kernel<<<blocks, kBlock, 0, stream>>>(static_cast<__nv_bfloat16*>(values.data),
-                                                      streams, count);
+    if (values.dtype == DType::FP16) {
+        hc_mix_silu_kernel<__half><<<blocks, kBlock, 0, stream>>>(
+            static_cast<__half*>(values.data), streams, count);
+    } else {
+        hc_mix_silu_kernel<__nv_bfloat16><<<blocks, kBlock, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(values.data), streams, count);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -145,22 +155,35 @@ void hc_mix_gate_launch(const Tensor& gates, const Tensor& normalized, Tensor& b
     const std::int32_t columns = normalized.ne[2];
     const dim3 blocks(static_cast<unsigned int>(columns),
                       static_cast<unsigned int>((hidden + kBlock - 1) / kBlock));
-    hc_mix_gate_kernel<<<blocks, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(gates.data),
-        static_cast<const __nv_bfloat16*>(normalized.data),
-        static_cast<__nv_bfloat16*>(block_input.data), hidden, streams);
+    if (gates.dtype == DType::FP16) {
+        hc_mix_gate_kernel<__half><<<blocks, kBlock, 0, stream>>>(
+            static_cast<const __half*>(gates.data), static_cast<const __half*>(normalized.data),
+            static_cast<__half*>(block_input.data), hidden, streams);
+    } else {
+        hc_mix_gate_kernel<__nv_bfloat16><<<blocks, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(gates.data),
+            static_cast<const __nv_bfloat16*>(normalized.data),
+            static_cast<__nv_bfloat16*>(block_input.data), hidden, streams);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
-void hc_mix_injection_launch(const void* injection_rows, const Tensor& flattened,
-                             std::int32_t channels, std::int32_t streams, Tensor& injection,
-                             cudaStream_t stream) {
+void hc_mix_injection_launch(const void* injection_rows, DType weight_dtype,
+                             const Tensor& flattened, std::int32_t channels, std::int32_t streams,
+                             Tensor& injection, cudaStream_t stream) {
     const std::int32_t columns = flattened.ne[1];
     const dim3 blocks(static_cast<unsigned int>(columns), static_cast<unsigned int>(streams));
-    hc_mix_injection_kernel<<<blocks, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(injection_rows),
-        static_cast<const __nv_bfloat16*>(flattened.data), static_cast<float*>(injection.data),
-        channels, streams);
+    if (flattened.dtype == DType::FP16 && weight_dtype == DType::FP16) {
+        hc_mix_injection_kernel<__half, __half><<<blocks, kBlock, 0, stream>>>(
+            static_cast<const __half*>(injection_rows),
+            static_cast<const __half*>(flattened.data), static_cast<float*>(injection.data),
+            channels, streams);
+    } else {
+        hc_mix_injection_kernel<__nv_bfloat16, __nv_bfloat16><<<blocks, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(injection_rows),
+            static_cast<const __nv_bfloat16*>(flattened.data),
+            static_cast<float*>(injection.data), channels, streams);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

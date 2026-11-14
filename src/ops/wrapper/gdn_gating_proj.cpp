@@ -5,6 +5,7 @@
 #include "ops/common/split_launch.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
+#include "core/weight.h"
 #include "ops/launcher/gdn_gating.h"
 #include "ops/linear/ggml_k/ggml_k.h"
 
@@ -179,7 +180,10 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
     constexpr const char* op                = "gdn_gating_proj";
     const std::int32_t tokens               = x.ne[1];
     const GdnControlParentGeometry geometry = require_control_parent(ab_weight);
-    require_sequence_tensor(x, DType::BF16, geometry.input_rows, tokens, op, "x");
+    if (x.dtype != DType::BF16 && x.dtype != DType::FP16) {
+        throw std::invalid_argument(std::string(op) + ": x must be BF16 or FP16");
+    }
+    require_sequence_tensor(x, x.dtype, geometry.input_rows, tokens, op, "x");
     require_vector_tensor(A_log, DType::FP32, geometry.heads, op, "A_log");
     require_vector_tensor(dt_bias, DType::FP32, geometry.heads, op, "dt_bias");
     require_sequence_tensor(g, DType::FP32, geometry.heads, tokens, op, "g");
@@ -193,6 +197,11 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
     }
     const Weight a_weight = control_row_view(ab_weight, 0, geometry.heads);
     const Weight b_weight = control_row_view(ab_weight, geometry.heads, geometry.heads);
+    if (x.dtype == DType::FP16) {
+        gdn_gating_proj_f16(x, as_dense(a_weight), as_dense(b_weight), A_log, dt_bias, g, beta,
+                            stream);
+        return;
+    }
     detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
 

@@ -50,9 +50,9 @@ RowSplitPlanes row_split_planes(const Weight& w) {
 
 void validate_parent(const Tensor& x, const Weight& w, std::span<const Tensor> outputs,
                      std::span<const LinearSplitSegment> segments) {
-    if (x.dtype != DType::BF16 || !x.is_contiguous() || x.ne[0] != w.k || x.ne[1] <= 0 ||
-        x.ne[2] != 1 || x.ne[3] != 1) {
-        throw std::invalid_argument("linear_split: x must be contiguous BF16 [K,T]");
+    if ((x.dtype != DType::BF16 && x.dtype != DType::FP16) || !x.is_contiguous() ||
+        x.ne[0] != w.k || x.ne[1] <= 0 || x.ne[2] != 1 || x.ne[3] != 1) {
+        throw std::invalid_argument("linear_split: x must be contiguous BF16 or FP16 [K,T]");
     }
     if (outputs.size() != segments.size() || segments.empty()) {
         throw std::invalid_argument("linear_split: outputs and segments must align and be non-empty");
@@ -61,15 +61,22 @@ void validate_parent(const Tensor& x, const Weight& w, std::span<const Tensor> o
         throw std::invalid_argument("linear_split: parent weight is incomplete");
     }
 
-    const bool contiguous_bf16 =
-        w.qtype == QType::BF16_CTRL && w.layout == QuantLayout::Contiguous;
+    const bool contiguous_control =
+        (w.qtype == QType::BF16_CTRL || w.qtype == QType::FP16_CTRL) &&
+        w.layout == QuantLayout::Contiguous;
     const bool row_split =
         w.layout == QuantLayout::RowSplit &&
         (w.qtype == QType::Q4G64_F16S || w.qtype == QType::Q5G64_F16S ||
          w.qtype == QType::Q6G64_F16S || w.qtype == QType::W8G32_F16S);
-    if (!contiguous_bf16 && !row_split) {
+    if (!contiguous_control && !row_split) {
         throw std::invalid_argument(
-            "linear_split: supports only BF16 contiguous or Q4/Q5/Q6/W8 row-split parents");
+            "linear_split: supports only BF16/FP16 contiguous or Q4/Q5/Q6/W8 row-split parents");
+    }
+    const DType weight_dtype = contiguous_control && w.qtype == QType::FP16_CTRL
+                                   ? DType::FP16
+                                   : (contiguous_control ? DType::BF16 : x.dtype);
+    if (x.dtype != weight_dtype) {
+        throw std::invalid_argument("linear_split: activation dtype does not match the parent");
     }
     if (row_split) { (void)row_split_planes(w); }
 
@@ -80,7 +87,7 @@ void validate_parent(const Tensor& x, const Weight& w, std::span<const Tensor> o
             segment.row_begin > w.n - segment.row_count) {
             throw std::invalid_argument("linear_split: segment rows out of range");
         }
-        if (out.dtype != DType::BF16 || !out.is_contiguous() ||
+        if (out.dtype != x.dtype || !out.is_contiguous() ||
             out.ne[0] != segment.row_count || out.ne[1] != x.ne[1] || out.ne[2] != 1 ||
             out.ne[3] != 1 || out.data == nullptr) {
             throw std::invalid_argument(
@@ -131,7 +138,7 @@ std::size_t linear_split_workspace_capacity_bytes(
     }
     if (qtype != QType::Q4G64_F16S && qtype != QType::Q5G64_F16S &&
         qtype != QType::Q6G64_F16S && qtype != QType::W8G32_F16S &&
-        qtype != QType::BF16_CTRL) {
+        qtype != QType::BF16_CTRL && qtype != QType::FP16_CTRL) {
         throw std::invalid_argument("linear_split workspace: unsupported weight format");
     }
     std::size_t capacity = 0;
