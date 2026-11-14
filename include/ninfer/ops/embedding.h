@@ -14,11 +14,11 @@ namespace ninfer::ops {
  * `ids` is contiguous I32 [T], `out` is contiguous BF16 or FP16 [D,T], and every id is in
  * [0,vocab). `table` has logical shape [vocab,D] and is contiguous BF16_CTRL, FP16_CTRL, GGML_K
  * `ggml-k256-v1`, Q6G64_F16S RowSplit, W8G32_F16S RowSplit, or FP8_E4M3FN_ROW_BF16S RowScale.
- * A BF16 output is supported by every table route; an FP16 output is supported by BF16_CTRL,
- * FP16_CTRL, and FP8_E4M3FN_ROW_BF16S, and requires the output dtype to match the route's
- * activation representation. Dense values are copied bit-exactly when source and output dtypes
- * agree. For quantized tables, the oracle independently decodes each code and multiplies it by
- * the exact stored scale in FP64; the activation output is promoted and compared directly with
+ * A BF16 output is supported by BF16_CTRL, GGML_K, Q6G64_F16S, W8G32_F16S, and
+ * FP8_E4M3FN_ROW_BF16S; FP16_CTRL requires an FP16 output. An FP16 output is supported by
+ * BF16_CTRL, FP16_CTRL, and FP8_E4M3FN_ROW_BF16S. Dense values are copied bit-exactly when
+ * source and output dtypes agree. For quantized tables, the oracle independently decodes each
+ * code and multiplies it by the exact stored scale in FP64; the activation output is promoted and compared directly with
  * that ideal. Final output storage rounding belongs to the quantized embedding criterion, not the
  * oracle. The registered domains are Q6 `[248320,5120]`, W8 `[248320,2048]` or
  * `[248320,5120]`, and FP8 `[248320,5120]`. Q6/W8 scales are FP16; FP8 has one BF16 multiplier per

@@ -39,8 +39,9 @@
 // The all-reduce is a plain in-place ncclAllReduce(ncclSum) on every rank on the fallback path and
 // is NOT guaranteed bitwise-identical across ranks there (NCCL may associate the reduction
 // differently per rank). The mailbox fast path is bitwise-identical on every rank. Both are
-// consistent with the Op oracle (an FP64 sum rounded once to BF16) and with the reference
-// tensor-parallel implementations; rank-to-rank lockstep is preserved because every token decision
+// consistent with the Op oracle (an FP64 sum evaluated from the represented activation words and
+// compared under the activation dtype's rounding bound) and with the reference tensor-parallel
+// implementations; rank-to-rank lockstep is preserved because every token decision
 // is taken on rank 0 and published to the peers with broadcast_rank0.
 //
 // POST-CONDITION. On return each rank's stream is ordered after the collective; an unbounded

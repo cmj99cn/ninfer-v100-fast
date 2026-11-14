@@ -34,14 +34,12 @@ namespace ninfer::ops {
  *   g[h,t]    = -exp(A_log[h]) * softplus(a[h,t] + dt_bias[h])
  *   beta[h,t] = sigmoid(b[h,t]).
  *
- * `x` is contiguous BF16 or FP16 [5120,T]; both weights are contiguous BF16_CTRL [48,5120]
- * (the FP16 activation path reads the BF16 control words directly); A_log and
+ * `x` is contiguous BF16 [5120,T]; both weights are contiguous BF16_CTRL [48,5120]; A_log and
  * dt_bias are contiguous FP32 [48]; g and beta are distinct contiguous FP32 [48,T]. The numerical
  * contract accepts every positive T. The oracle evaluates the logical formula naively in FP64
- * from the represented inputs. Projection staging, accumulator precision, and the private
- * BF16-to-FP16 operand conversion of the FP16 path are implementation choices. The FP32 outputs
- * are promoted and compared directly with that oracle under the Op's named criterion. All inputs
- * and outputs are non-overlapping.
+ * from the represented inputs. Projection staging and accumulator precision are implementation
+ * choices. The FP32 outputs are promoted and compared directly with that oracle under the Op's
+ * named criterion. All inputs and outputs are non-overlapping.
  * `ws` provides the transient capacity reported above and is scoped to the call; there is no
  * persistent state side effect.
  * The 27B GGML_K form preserves Q4_K/Q6_K [48,5120] rows and stored scales. It evaluates a
@@ -59,9 +57,11 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
  * - Qwen3.8-27B: GGML_K GgmlK256 `ab_weight [96,5120]`, in the same A/B row order.
  * - Qwen3.8-Flash-Next: BF16_CTRL `ab_weight [96,2560]`, with A in rows [0,48) and B in [48,96).
  *
- * The complete immutable parent is the public weight. Its halves are consumed as zero-copy views
- * and produce FP32 g/beta `[heads,T]` under the same logical formula and oracle. All other effects
- * and non-overlap requirements match the two-weight form.
+ * `x` is contiguous BF16 or FP16 [input_rows,T]; the parent weight is BF16_CTRL or GGML_K. The
+ * complete immutable parent is the public weight. Its halves are consumed as zero-copy views and
+ * produce FP32 g/beta `[heads,T]` under the same logical formula and oracle. A BF16 activation
+ * uses the control path; an FP16 activation converts the BF16 control operands privately. All
+ * other effects and non-overlap requirements match the two-weight form.
  * Its TP2 GGML_K form has 24 heads and [48,5120] parent rows per device, with FP32 projection
  * and output storage and no additional workspace.
  */
@@ -79,11 +79,12 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
  *   g[r,t]    = -exp(A_log[r]) * softplus(a[r,t] + dt_bias[r])
  *   beta[r,t] = sigmoid(b[r,t]).
  *
- * `h` is the explicit BF16 output consumed by the other GDN projections. Its BF16 values are
- * promoted and compared directly with `h_ideal`; final storage rounding is not reproduced inside
- * the oracle. The control branch is evaluated directly from `n` and is not required to round
- * through h. Private tensor-core operand staging remains an implementation choice. The tensor and
- * weight domains otherwise match the two-weight gdn_gating_proj form. The implementation may fuse
+ * `h` is the explicit activation-dtype output consumed by the other GDN projections. Its stored
+ * values are promoted and compared directly with `h_ideal`; final storage rounding is not
+ * reproduced inside the oracle. The control branch is evaluated directly from `n` and is not
+ * required to round through h. Private tensor-core operand staging remains an implementation
+ * choice. `x` and `h` share one dtype, BF16 or FP16; `norm_weight` is BF16; the control weights
+ * are BF16_CTRL or GGML_K as in the two-weight gdn_gating_proj form. The implementation may fuse
  * or compose its internal kernels for any positive T; that route is not observable at this
  * boundary.
  */
@@ -92,7 +93,10 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
                           Tensor& beta, cudaStream_t stream);
 
-/** The Qwen3.8-27B and Qwen3.6-35B-A3B contiguous-parent storage forms described above. */
+/**
+ * The Qwen3.8-27B and Qwen3.6-35B-A3B contiguous-parent storage forms described above: `x` and
+ * `h` share BF16 or FP16, `norm_weight` is BF16, and `ab_weight` is BF16_CTRL or GGML_K.
+ */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,

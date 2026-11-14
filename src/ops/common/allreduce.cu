@@ -201,7 +201,6 @@ void allreduce_sum(const std::array<Tensor, kMaximumDevices>& buffer,
     if (elems == 0) return;
     comms.note_allreduce();
 
-    // Small 16-bit messages take the probed mailbox transport; larger messages stay on NCCL.
     if (comms.mailbox_allreduce_16bit(buffer, buffer[0].dtype, ec)) { return; }
 
     const CurrentDeviceGuard guard;
