@@ -106,7 +106,11 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     qwen4_exp::FrontendResourcePlan resources = qwen4_exp::bind_frontend_resources(binder);
 
     for (const auto& object : bindings.objects) {
-        binder.materialize_on_device(object.handle);
+        if (detail::is_fp16_control_object(bindings, object)) {
+            binder.validate_only(object.handle);
+        } else {
+            binder.materialize_on_device(object.handle);
+        }
     }
     binder.validate_unconsumed_matching("text/");
     binder.validate_unconsumed_matching("resource/text/");

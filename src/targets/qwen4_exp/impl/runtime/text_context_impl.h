@@ -16,6 +16,7 @@
 #include "ninfer/ops/ple.h"
 #include "ninfer/ops/qsa.h"
 #include "ninfer/ops/scatter.h"
+#include "targets/qwen4_exp/impl/runtime/activation_dtype.h"
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 
 #include <algorithm>
@@ -213,7 +214,7 @@ inline std::int32_t TextState::base_position() const {
 inline Tensor TextState::gdn_conv_state(std::size_t gdn_index) const {
     const std::size_t layer = gdn_layers_.at(gdn_index);
     return Tensor(conv_states_.p + layer * static_cast<std::size_t>(conv_channels_) * 3 * 2,
-                  DType::BF16, {3, conv_channels_});
+                  kTextActivationDtype, {3, conv_channels_});
 }
 
 inline Tensor TextState::gdn_conv_kernel(std::size_t layer) const {
@@ -278,7 +279,7 @@ inline ops::QsaRawRecordWriteView TextState::records(std::size_t entries) const 
 }
 
 inline Tensor TextState::ple_history() const {
-    return Tensor(ple_history_.p, DType::BF16,
+    return Tensor(ple_history_.p, kTextActivationDtype,
                   {kChannels, static_cast<std::int32_t>(ops::kPleConvWindow), kBatch});
 }
 
@@ -373,17 +374,17 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
         const std::int32_t value_width = state.gdn_value_heads() * TextConfig::gdn_head_dim;
         const std::int32_t conv_channels = state.conv_channels();
 
-        Tensor q    = activations_[slot]->alloc(DType::BF16, {key_width, T});
-        Tensor k    = activations_[slot]->alloc(DType::BF16, {key_width, T});
-        Tensor v    = activations_[slot]->alloc(DType::BF16, {value_width, T});
-        Tensor z    = activations_[slot]->alloc(DType::BF16, {value_width, T});
+        Tensor q    = activations_[slot]->alloc(kTextActivationDtype, {key_width, T});
+        Tensor k    = activations_[slot]->alloc(kTextActivationDtype, {key_width, T});
+        Tensor v    = activations_[slot]->alloc(kTextActivationDtype, {value_width, T});
+        Tensor z    = activations_[slot]->alloc(kTextActivationDtype, {value_width, T});
         Tensor g    = activations_[slot]->alloc(DType::FP32, {TextConfig::gdn_value_heads, T});
         Tensor beta = activations_[slot]->alloc(DType::FP32, {TextConfig::gdn_value_heads, T});
         Variant::gdn_projection_control(block_input[slot], weights, q, k, v, z, g, beta, workspace_,
                                         stream_for(rank));
 
-        Tensor conv_in  = activations_[slot]->alloc(DType::BF16, {conv_channels, T});
-        Tensor conv_out = activations_[slot]->alloc(DType::BF16, {conv_channels, T});
+        Tensor conv_in  = activations_[slot]->alloc(kTextActivationDtype, {conv_channels, T});
+        Tensor conv_out = activations_[slot]->alloc(kTextActivationDtype, {conv_channels, T});
         const auto copy_segment = [&](const Tensor& source, std::int32_t column) {
             CUDA_CHECK(cudaMemcpy2DAsync(
                 static_cast<std::byte*>(conv_in.data) +
@@ -409,8 +410,8 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
         ops::extract_bf16_columns(conv_out, key_width, k, stream_for(rank));
         ops::extract_bf16_columns(conv_out, 2 * key_width, v, stream_for(rank));
 
-        Tensor o  = activations_[slot]->alloc(DType::BF16, {value_width, T});
-        Tensor on = activations_[slot]->alloc(DType::BF16, {value_width, T});
+        Tensor o  = activations_[slot]->alloc(kTextActivationDtype, {value_width, T});
+        Tensor on = activations_[slot]->alloc(kTextActivationDtype, {value_width, T});
         Tensor q_recurrent = q.view({128, state.gdn_key_heads(), T});
         Tensor k_recurrent = k.view({128, state.gdn_key_heads(), T});
         Tensor v_recurrent = v.view({128, state.gdn_value_heads(), T});
@@ -467,14 +468,14 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
         const std::int32_t query_width = query_heads * TextConfig::head_dim;
         const std::int32_t kv_width    = kv_heads * TextConfig::head_dim;
 
-        Tensor query_flat       = activations_[slot]->alloc(DType::BF16, {query_width, T});
-        Tensor output_gate_flat = activations_[slot]->alloc(DType::BF16, {query_width, T});
-        Tensor key_flat         = activations_[slot]->alloc(DType::BF16, {kv_width, T});
-        Tensor value_flat       = activations_[slot]->alloc(DType::BF16, {kv_width, T});
+        Tensor query_flat       = activations_[slot]->alloc(kTextActivationDtype, {query_width, T});
+        Tensor output_gate_flat = activations_[slot]->alloc(kTextActivationDtype, {query_width, T});
+        Tensor key_flat         = activations_[slot]->alloc(kTextActivationDtype, {kv_width, T});
+        Tensor value_flat       = activations_[slot]->alloc(kTextActivationDtype, {kv_width, T});
         Tensor index_query_flat =
-            activations_[slot]->alloc(DType::BF16, {index_dim * TextConfig::index_heads, T});
+            activations_[slot]->alloc(kTextActivationDtype, {index_dim * TextConfig::index_heads, T});
         Tensor index_key_flat =
-            activations_[slot]->alloc(DType::BF16, {index_dim * TextConfig::index_kv_heads, T});
+            activations_[slot]->alloc(kTextActivationDtype, {index_dim * TextConfig::index_kv_heads, T});
         Tensor query       = query_flat.view({kHeadDim, query_heads, T, kBatch});
         Tensor output_gate = output_gate_flat.view({kHeadDim, query_heads, T, kBatch});
         Tensor key         = key_flat.view({kHeadDim, kv_heads, T, kBatch});
@@ -486,9 +487,9 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
                                       workspace_, stream_for(rank));
 
         Tensor rotated_query =
-            activations_[slot]->alloc(DType::BF16, {kHeadDim, query_heads, T, kBatch});
+            activations_[slot]->alloc(kTextActivationDtype, {kHeadDim, query_heads, T, kBatch});
         Tensor rotated_index_query =
-            activations_[slot]->alloc(DType::BF16, {index_dim, TextConfig::index_heads, T, kBatch});
+            activations_[slot]->alloc(kTextActivationDtype, {index_dim, TextConfig::index_heads, T, kBatch});
 
         const ops::QsaPrepareParameters parameters{
             .query_norm        = weights.query_norm,
@@ -523,7 +524,7 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
 #endif
 
         Tensor attention =
-            activations_[slot]->alloc(DType::BF16, {kHeadDim, query_heads, T, kBatch});
+            activations_[slot]->alloc(kTextActivationDtype, {kHeadDim, query_heads, T, kBatch});
         ops::qsa_sparse_gqa(rotated_query, output_gate, cache, batch, selected,
                             static_cast<std::uint32_t>(T), workspace_, attention, stream_for(rank));
 
@@ -551,21 +552,21 @@ inline void TextTrunk::run_ple(std::int32_t T,
         TextState& state = *states_[slot];
         const std::int32_t entries = static_cast<std::int32_t>(ops::kPleHeads) * T * kBatch;
 
-        Tensor embedding = activations_[slot]->alloc(DType::BF16,
+        Tensor embedding = activations_[slot]->alloc(kTextActivationDtype,
                                                      {TextConfig::ple_embed_dim, T, kBatch});
         ops::ple_lookup_rows(state.ple_table(), state.ple_rows(),
                              static_cast<std::size_t>(entries), state.ple_staged_rows(), embedding,
                              stream_for(rank));
 
-        Tensor projected_key   = activations_[slot]->alloc(DType::BF16, {kChannels, T, kBatch});
-        Tensor projected_value = activations_[slot]->alloc(DType::BF16, {kHidden, T, kBatch});
+        Tensor projected_key   = activations_[slot]->alloc(kTextActivationDtype, {kChannels, T, kBatch});
+        Tensor projected_value = activations_[slot]->alloc(kTextActivationDtype, {kHidden, T, kBatch});
         ops::linear(embedding, ple.key, projected_key, ops::LinearPolicy::A16Only, workspace_,
                     stream_for(rank));
         ops::linear(embedding, ple.value, projected_value, ops::LinearPolicy::A16Only, workspace_,
                     stream_for(rank));
 
-        Tensor gated_value     = activations_[slot]->alloc(DType::BF16, {kChannels, T, kBatch});
-        Tensor normalized_conv = activations_[slot]->alloc(DType::BF16, {kChannels, T, kBatch});
+        Tensor gated_value     = activations_[slot]->alloc(kTextActivationDtype, {kChannels, T, kBatch});
+        Tensor normalized_conv = activations_[slot]->alloc(kTextActivationDtype, {kChannels, T, kBatch});
         Tensor offsets         = activations_[slot]->alloc(DType::I32, {kBatch});
         Tensor counts          = activations_[slot]->alloc(DType::I32, {kBatch});
         const std::int32_t live         = T;
@@ -586,7 +587,7 @@ inline void TextTrunk::run_ple(std::int32_t T,
                                updated[slot], normalized[slot], stream_for(rank));
 
         Tensor after_history = activations_[slot]->alloc(
-            DType::BF16, {kChannels, static_cast<std::int32_t>(ops::kPleConvWindow), kBatch});
+            kTextActivationDtype, {kChannels, static_cast<std::int32_t>(ops::kPleConvWindow), kBatch});
         ops::ple_state_extract(state.ple_history(), normalized_conv, counts, after_history,
                                stream_for(rank));
         CUDA_CHECK(cudaMemcpyAsync(
@@ -640,25 +641,25 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
         ids[slot] = activations_[slot]->alloc(DType::I32, {T});
         CUDA_CHECK(cudaMemcpyAsync(ids[slot].data, tokens.data(), static_cast<std::size_t>(T) * 4,
                                    cudaMemcpyHostToDevice, stream));
-        embedding_out[slot] = activations_[slot]->alloc(DType::BF16, {kHidden, T});
+        embedding_out[slot] = activations_[slot]->alloc(kTextActivationDtype, {kHidden, T});
         ops::embedding(ids[slot], models_[slot]->embedding, embedding_out[slot], stream);
 
-        residual[slot]    = activations_[slot]->alloc(DType::BF16, {kHidden, kStreams, T, kBatch});
-        normalized[slot]  = activations_[slot]->alloc(DType::BF16, {kHidden, kStreams, T, kBatch});
-        stage[slot]       = activations_[slot]->alloc(DType::BF16, {kHidden, kStreams, T, kBatch});
-        block_input[slot] = activations_[slot]->alloc(DType::BF16, {kHidden, T});
+        residual[slot]    = activations_[slot]->alloc(kTextActivationDtype, {kHidden, kStreams, T, kBatch});
+        normalized[slot]  = activations_[slot]->alloc(kTextActivationDtype, {kHidden, kStreams, T, kBatch});
+        stage[slot]       = activations_[slot]->alloc(kTextActivationDtype, {kHidden, kStreams, T, kBatch});
+        block_input[slot] = activations_[slot]->alloc(kTextActivationDtype, {kHidden, T});
         injection[slot]   = activations_[slot]->alloc(DType::FP32, {kStreams, T});
-        mixer_out[slot]   = activations_[slot]->alloc(DType::BF16, {kHidden, T});
-        moe_out[slot]     = activations_[slot]->alloc(DType::BF16, {kHidden, T});
-        sample[slot]      = activations_[slot]->alloc(DType::BF16, {kHidden, T});
-        logits_part[slot] = activations_[slot]->alloc(DType::BF16, {TextConfig::vocab / tp_, T});
+        mixer_out[slot]   = activations_[slot]->alloc(kTextActivationDtype, {kHidden, T});
+        moe_out[slot]     = activations_[slot]->alloc(kTextActivationDtype, {kHidden, T});
+        sample[slot]      = activations_[slot]->alloc(kTextActivationDtype, {kHidden, T});
+        logits_part[slot] = activations_[slot]->alloc(kTextActivationDtype, {TextConfig::vocab / tp_, T});
         logits[slot]      = tp_ > 1
-                                ? activations_[slot]->alloc(DType::BF16, {TextConfig::vocab, T})
+                                ? activations_[slot]->alloc(kTextActivationDtype, {TextConfig::vocab, T})
                                 : logits_part[slot];
         positions[slot]     = activations_[slot]->alloc(DType::I32, {T, 1, kBatch});
         valid_columns[slot] = activations_[slot]->alloc(DType::I32, {kBatch});
         table_rows[slot]    = activations_[slot]->alloc(DType::I32, {kBatch});
-        staging[slot]       = workspaces_[slot]->alloc(DType::BF16, {kHidden, T});
+        staging[slot]       = workspaces_[slot]->alloc(kTextActivationDtype, {kHidden, T});
         CUDA_CHECK(cudaMemcpyAsync(positions[slot].data, host_positions.data(),
                                    static_cast<std::size_t>(T) * 4, cudaMemcpyHostToDevice,
                                    stream));
@@ -694,7 +695,7 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
             ops::hc_mix(normalized[slot],
                         ops::HcMixWeights{attention_hc.down_injection, attention_hc.up},
                         *workspaces_[slot], block_input[slot], injection[slot], stream_for(rank));
-        });
+            });
 #ifdef NINFER_QWEN4EXP_LAYER_DUMP
         NINFER_QWEN4EXP_LAYER_DUMP("attention_block", layer, block_input[0]);
         NINFER_QWEN4EXP_LAYER_DUMP("attention_injection", layer, injection[0]);
@@ -802,11 +803,11 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
                 destination_token[slot] = Tensor(
                     static_cast<std::byte*>(logits[slot].data) +
                         static_cast<std::size_t>(token) * vocab * 2,
-                    DType::BF16, {1, vocab});
+                    kTextActivationDtype, {1, vocab});
                 part_token[slot] = Tensor(
                     static_cast<std::byte*>(logits_part[slot].data) +
                         static_cast<std::size_t>(token) * (vocab / tp_) * 2,
-                    DType::BF16, {1, vocab / tp_});
+                    kTextActivationDtype, {1, vocab / tp_});
             }
             ops::allgather_rows(destination_token, part_token, *execution_, *comms_);
         }

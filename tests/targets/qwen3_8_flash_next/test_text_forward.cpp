@@ -10,6 +10,9 @@
 #include "targets/qwen3_8_flash_next/impl/load/bindings.h"
 
 #include <algorithm>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -26,8 +29,8 @@ struct QsaDumpEntry {
 };
 
 std::vector<QsaDumpEntry> g_qsa_entries;
-std::vector<std::uint16_t> g_index_query;
-std::vector<std::uint16_t> g_index_keys;
+std::vector<float> g_index_query;
+std::vector<float> g_index_keys;
 std::int32_t g_index_tokens = 0;
 std::int32_t g_index_pages  = 0;
 bool g_qsa_recording = false;
@@ -49,12 +52,28 @@ void flash_next_record_qsa(const ninfer::ops::QsaBatchView& batch,
                           cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(selection.data(), selected.selection.data, selection.size() * 4,
                           cudaMemcpyDeviceToHost));
-    g_index_query.resize(index_query.bytes() / 2);
-    g_index_keys.resize(cache.index_k_pages.bytes() / 2);
-    CUDA_CHECK(cudaMemcpy(g_index_query.data(), index_query.data, index_query.bytes(),
-                          cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(g_index_keys.data(), cache.index_k_pages.data, cache.index_k_pages.bytes(),
-                          cudaMemcpyDeviceToHost));
+    const auto widen = [](const ninfer::Tensor& tensor) {
+        std::vector<std::uint16_t> words(tensor.bytes() / 2);
+        if (!words.empty()) {
+            CUDA_CHECK(cudaMemcpy(words.data(), tensor.data, tensor.bytes(),
+                                  cudaMemcpyDeviceToHost));
+        }
+        std::vector<float> values(words.size());
+        for (std::size_t index = 0; index < words.size(); ++index) {
+            if (tensor.dtype == ninfer::DType::FP16) {
+                __half value;
+                std::memcpy(&value, &words[index], sizeof(value));
+                values[index] = __half2float(value);
+            } else {
+                __nv_bfloat16 value;
+                std::memcpy(&value, &words[index], sizeof(value));
+                values[index] = __bfloat162float(value);
+            }
+        }
+        return values;
+    };
+    g_index_query = widen(index_query);
+    g_index_keys  = widen(cache.index_k_pages);
     g_index_tokens = tokens;
     g_index_pages  = cache.index_k_pages.ne[3];
     for (std::int32_t b = 0; b < rows; ++b) {
@@ -174,10 +193,10 @@ void write_parity_dump(const char* path, const rt::TextState& state,
     std::fwrite(&query_words, sizeof(query_words), 1, index_file);
     std::fwrite(&key_words, sizeof(key_words), 1, index_file);
     if (!g_index_query.empty()) {
-        std::fwrite(g_index_query.data(), sizeof(std::uint16_t), g_index_query.size(), index_file);
+        std::fwrite(g_index_query.data(), sizeof(float), g_index_query.size(), index_file);
     }
     if (!g_index_keys.empty()) {
-        std::fwrite(g_index_keys.data(), sizeof(std::uint16_t), g_index_keys.size(), index_file);
+        std::fwrite(g_index_keys.data(), sizeof(float), g_index_keys.size(), index_file);
     }
     std::fclose(index_file);
 }

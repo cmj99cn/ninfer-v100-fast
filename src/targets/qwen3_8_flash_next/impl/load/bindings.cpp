@@ -1,5 +1,11 @@
 #include "targets/qwen3_8_flash_next/impl/load/bindings.h"
 
+#include "targets/qwen4_exp/impl/runtime/activation_dtype.h"
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cstring>
+
 #include "artifact/typed_binding.h"
 
 #include <cstddef>
@@ -634,6 +640,37 @@ BindingPlan bind_artifact(artifact::Binder& binder, WeightsProfile profile, int 
 }
 
 
+bool is_fp16_control_object(const BindingPlan& plan, const BoundObject& object) {
+    bool found = false;
+    for (const auto* parameter : plan.parameters()) {
+        for (const auto& part : parameter->parts) {
+            if (plan.objects.at(part.object).name != object.name) { continue; }
+            found = true;
+            switch (parameter->role) {
+            case roles::Role::OutputHead:
+            case roles::Role::FinalHcDown:
+            case roles::Role::FinalHcUp:
+            case roles::Role::AttentionHcDown:
+            case roles::Role::AttentionHcInject:
+            case roles::Role::AttentionHcUp:
+            case roles::Role::MoeHcDown:
+            case roles::Role::MoeHcInject:
+            case roles::Role::MoeHcUp:
+            case roles::Role::PleKey:
+            case roles::Role::PleValue:
+            case roles::Role::QsaKey:
+            case roles::Role::QsaValue:
+            case roles::Role::QsaIndexQuery:
+            case roles::Role::QsaIndexKey:
+                break;
+            default:
+                return false;
+            }
+        }
+    }
+    return found;
+}
+
 namespace {
 
 std::int64_t align_up_256(std::int64_t value) noexcept {
@@ -1128,6 +1165,136 @@ RankViews shard_views(const BindingPlan& plan, const artifact::MaterializedArtif
     return views;
 }
 
+namespace {
+
+class BoundDevice {
+public:
+    explicit BoundDevice(int device) {
+        CUDA_CHECK(cudaGetDevice(&previous_));
+        if (previous_ != device) { CUDA_CHECK(cudaSetDevice(device)); }
+    }
+    ~BoundDevice() { (void)cudaSetDevice(previous_); }
+    BoundDevice(const BoundDevice&)            = delete;
+    BoundDevice& operator=(const BoundDevice&) = delete;
+
+private:
+    int previous_ = 0;
+};
+
+std::vector<std::byte> read_object_bytes(artifact::Reader& reader, const std::string& name) {
+    const auto* descriptor = reader.find(name);
+    if (descriptor == nullptr) {
+        throw std::runtime_error("the artifact has no object " + name);
+    }
+    if (std::holds_alternative<artifact::ResourceDescriptor>(*descriptor)) {
+        throw std::runtime_error("the object " + name + " is a resource, not a tensor");
+    }
+    const std::uint64_t bytes = artifact::object_bytes(*descriptor);
+    const std::uint64_t absolute = reader.payload_offset() + artifact::object_offset(*descriptor);
+    std::vector<std::byte> out(bytes);
+    std::size_t copied = 0;
+    for (const auto& view : reader.payload_views(absolute, bytes)) {
+        std::copy(view.data.begin(), view.data.end(),
+                  out.begin() + static_cast<std::ptrdiff_t>(copied));
+        copied += view.data.size();
+    }
+    if (copied != bytes) {
+        throw std::runtime_error("the object " + name + " was read short");
+    }
+    return out;
+}
+
+Weight fp16_host_weight(const BindingPlan& plan, artifact::Reader& reader,
+                        const ShardPlanByName& shards,
+                        const std::vector<ObjectShardPlan>& byte_plan,
+                        const BoundParameter& parameter, std::int32_t rows, std::int32_t columns,
+                        int rank, int device, std::vector<DeviceBuffer>& buffers,
+                        std::map<std::pair<std::string, int>, std::size_t>& cache) {
+    const std::string& object_name = plan.objects.at(parameter.parts.front().object).name;
+    const auto key = std::make_pair(object_name, rank);
+    auto found = cache.find(key);
+    if (found == cache.end()) {
+        const auto& entry = object_entry(byte_plan, object_name);
+        std::vector<std::byte> shard(
+            entry.encoded_bytes[static_cast<std::size_t>(rank)], std::byte{0});
+        const auto parent = read_object_bytes(reader, object_name);
+        for (const auto& copy : entry.copies[static_cast<std::size_t>(rank)]) {
+            if (copy.source_offset + copy.bytes > parent.size() ||
+                copy.dest_offset + copy.bytes > shard.size()) {
+                throw std::runtime_error("the shard copy of " + object_name +
+                                         " is outside its payload");
+            }
+            std::memcpy(shard.data() + copy.dest_offset, parent.data() + copy.source_offset,
+                        static_cast<std::size_t>(copy.bytes));
+        }
+        const auto& prefix = entry.prefix[static_cast<std::size_t>(rank)];
+        if (!prefix.empty()) {
+            if (prefix.size() > shard.size()) {
+                throw std::runtime_error("the shard prefix of " + object_name + " is too large");
+            }
+            std::memcpy(shard.data(), prefix.data(), prefix.size());
+        }
+        float max_abs = 0.0F;
+        const std::string label = roles::parameter_name(parameter.role, parameter.layer);
+        for (std::size_t word = 0; word + 1 < shard.size(); word += 2) {
+            std::uint16_t bits = 0;
+            std::memcpy(&bits, shard.data() + word, sizeof(bits));
+            __nv_bfloat16 raw;
+            std::memcpy(&raw, &bits, sizeof(raw));
+            const float value = __bfloat162float(raw);
+            const float magnitude = std::abs(value);
+            if (magnitude > max_abs) { max_abs = magnitude; }
+            if (!(magnitude <= 65504.0F)) {
+                throw std::runtime_error("the fp16 materialization of " + label +
+                                         " exceeds the FP16 range; max |value| = " +
+                                         std::to_string(max_abs));
+            }
+            const __half converted = __float2half_rn(value);
+            std::memcpy(shard.data() + word, &converted, sizeof(converted));
+        }
+        const BoundDevice bound(device);
+        DeviceBuffer buffer(shard.size());
+        buffer.copy_from_host(shard.data(), shard.size());
+        buffers.push_back(std::move(buffer));
+        found = cache.emplace(key, buffers.size() - 1).first;
+    }
+    const auto geometry = role_geometry(parameter.role);
+    const auto mapping = shard_of(shards, roles::role_name(parameter.role));
+    const auto extent = rank_extent(shards, parameter.role, rank);
+    std::int32_t entry_rows = rows;
+    std::int32_t entry_columns = columns;
+    const auto& entry = object_entry(byte_plan, object_name);
+    if (extent >= 0) {
+        if (mapping.split == sharding::SplitAxis::Output) {
+            entry_rows = rows == static_cast<std::int32_t>(geometry.row_count)
+                ? static_cast<std::int32_t>(extent)
+                : static_cast<std::int32_t>(range_total(entry.ranges[static_cast<std::size_t>(rank)]));
+        } else if (mapping.split == sharding::SplitAxis::Input) {
+            entry_columns = columns == static_cast<std::int32_t>(geometry.column_count)
+                ? static_cast<std::int32_t>(extent)
+                : static_cast<std::int32_t>(range_total(entry.ranges[static_cast<std::size_t>(rank)]));
+        }
+    }
+    const auto& block = role_block(entry, parameter.role, rank);
+    Weight weight;
+    const auto* base = static_cast<const std::byte*>(buffers[found->second].p) + block.offset;
+    weight.payload = base;
+    weight.qdata = base;
+    weight.payload_bytes = static_cast<std::uint64_t>(entry_rows) * entry_columns * 2;
+    weight.qtype = QType::FP16_CTRL;
+    weight.layout = QuantLayout::Contiguous;
+    weight.n = entry_rows;
+    weight.k = entry_columns;
+    weight.shape[0] = entry_rows;
+    weight.shape[1] = entry_columns;
+    weight.padded_shape[0] = entry_rows;
+    weight.padded_shape[1] = entry_columns;
+    weight.ndim = 2;
+    return weight;
+}
+
+} // namespace
+
 LoadedModelData::LoadedModelData(const BindingPlan& plan,
                                  const artifact::MaterializedArtifact& materialized,
                                  std::size_t loaded_layers, int tp,
@@ -1136,6 +1303,60 @@ LoadedModelData::LoadedModelData(const BindingPlan& plan,
 
     const auto shards = shard_plan_by_name(tp);
     views_ = shard_views(plan, materialized, shards, tp, TextConfig::layers);
+
+    if constexpr (qwen4_exp::detail::kTextActivationDtype == DType::FP16) {
+        const auto probe_handle =
+            plan.objects.at(plan.token_embedding.parts.front().object).handle;
+        if (materialized.is_materialized(probe_handle, 0)) {
+            artifact::Reader reader(artifact_path);
+            const auto byte_plan = shard_byte_plan(plan, shards, tp);
+            std::map<std::pair<std::string, int>, std::size_t> cache;
+            for (int rank = 0; rank < tp; ++rank) {
+                int device = 0;
+                {
+                    const void* pointer = materialized.device_data(probe_handle, rank);
+                    cudaPointerAttributes attributes{};
+                    CUDA_CHECK(cudaPointerGetAttributes(&attributes, pointer));
+                    device = attributes.device;
+                }
+                auto& view = views_.views[static_cast<std::size_t>(rank)];
+                const auto build = [&](const BoundParameter& parameter, std::int32_t rows,
+                                       std::int32_t columns) {
+                    return fp16_host_weight(plan, reader, shards, byte_plan, parameter, rows, columns,
+                                            rank, device, fp16_control_, cache);
+                };
+                view.output_head = build(plan.output_head, TextConfig::vocab, TextConfig::hidden);
+                view.final_hc.down_injection =
+                    build(plan.final_hc.down, TextConfig::hc_lowrank, TextConfig::residual_width);
+                view.final_hc.up =
+                    build(plan.final_hc.up, TextConfig::residual_width, TextConfig::hc_lowrank);
+                view.ple.key =
+                    build(plan.ple.key, TextConfig::residual_width, TextConfig::hidden);
+                view.ple.value = build(plan.ple.value, TextConfig::hidden, TextConfig::hidden);
+                for (std::size_t layer = 0; layer < loaded_layers; ++layer) {
+                    const LayerPlan& source = plan.layers[layer];
+                    view.layers[layer].attention_hc.down_injection =
+                        build(source.attention_hc.down, TextConfig::hc_lowrank + TextConfig::hc_streams,
+                              TextConfig::residual_width);
+                    view.layers[layer].attention_hc.up =
+                        build(source.attention_hc.up, TextConfig::residual_width, TextConfig::hc_lowrank);
+                    view.layers[layer].moe_hc.down_injection =
+                        build(source.moe_hc.down, TextConfig::hc_lowrank + TextConfig::hc_streams,
+                              TextConfig::residual_width);
+                    view.layers[layer].moe_hc.up =
+                        build(source.moe_hc.up, TextConfig::residual_width, TextConfig::hc_lowrank);
+                    if (TextConfig::is_qsa_layer(static_cast<int>(layer))) {
+                        const QsaPlan& qsa = std::get<QsaPlan>(source.mixer);
+                        view.layers[layer].attention_projection.key_value =
+                            build(qsa.key,
+                                  2 * TextConfig::kv_width + TextConfig::index_query_width +
+                                      TextConfig::index_key_width,
+                                  TextConfig::hidden);
+                    }
+                }
+            }
+        }
+    }
 
     for (int rank = 0; rank < tp; ++rank) {
         auto& view = views_.views[static_cast<std::size_t>(rank)];

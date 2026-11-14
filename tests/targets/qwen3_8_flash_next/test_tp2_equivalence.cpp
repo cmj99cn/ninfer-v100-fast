@@ -12,7 +12,9 @@
 #include "targets/qwen3_8_flash_next/impl/load/roles.h"
 
 #include <ninfer/targets/qwen4_exp/frontend.h>
+#include "targets/qwen4_exp/impl/runtime/activation_dtype.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -38,11 +40,13 @@ constexpr std::size_t kLoadedLayers = 4;
 constexpr std::uint32_t kKvCapacityTokens = 64;
 constexpr std::size_t kPromptTokens = 8;
 constexpr std::array<std::int32_t, kPromptTokens> kPrompt{1024, 7, 98140, 33, 4097, 512, 100, 2048};
-// R44: allreduce_sum is a BF16-in/BF16-out join with one rounding (include/ninfer/ops/allreduce.h),
-// so each row-parallel layer adds one BF16 rounding to the residual chain. Allow 2 * sqrt(L) of
-// the 2^-8 BF16 unit roundoff across the loaded layers instead of a hand-measured constant.
+// allreduce_sum rounds its join to the activation dtype (include/ninfer/ops/allreduce.h), so each
+// row-parallel layer adds one unit roundoff to the residual chain. Allow 2 * sqrt(L) of the 2^-8
+// BF16 or 2^-10 FP16 unit roundoff across the loaded layers instead of a hand-measured constant.
 [[nodiscard]] double relative_l2_bound(std::size_t layers) {
-    return 2.0 * std::sqrt(static_cast<double>(layers)) * std::ldexp(1.0, -8);
+    constexpr int kMantissaBits =
+        qwen4_exp::detail::kTextActivationDtype == DType::FP16 ? 10 : 8;
+    return 2.0 * std::sqrt(static_cast<double>(layers)) * std::ldexp(1.0, -kMantissaBits);
 }
 constexpr double kMinCosine = 0.9999;
 constexpr std::uint64_t kAllReducePerLayer = 2;
@@ -78,7 +82,10 @@ int current_device() {
     return device;
 }
 
-float bf16_to_float(std::uint16_t word) {
+float word_to_float(std::uint16_t word) {
+    if (qwen4_exp::detail::kTextActivationDtype == DType::FP16) {
+        return __half2float(*reinterpret_cast<const __half*>(&word));
+    }
     const std::uint32_t bits = static_cast<std::uint32_t>(word) << 16;
     float value = 0.0F;
     std::memcpy(&value, &bits, sizeof(value));
@@ -335,8 +342,8 @@ double relative_l2(const std::vector<std::uint16_t>& reference,
     double numerator = 0.0;
     double denominator = 0.0;
     for (std::size_t index = 0; index < reference.size(); ++index) {
-        const double expected = bf16_to_float(reference[index]);
-        const double actual   = bf16_to_float(candidate[index]);
+        const double expected = word_to_float(reference[index]);
+        const double actual   = word_to_float(candidate[index]);
         const double delta    = actual - expected;
         numerator += delta * delta;
         denominator += expected * expected;
@@ -352,8 +359,8 @@ double cosine_of(const std::vector<std::uint16_t>& reference,
     double reference_norm = 0.0;
     double candidate_norm = 0.0;
     for (std::size_t index = 0; index < reference.size(); ++index) {
-        const double expected = bf16_to_float(reference[index]);
-        const double actual   = bf16_to_float(candidate[index]);
+        const double expected = word_to_float(reference[index]);
+        const double actual   = word_to_float(candidate[index]);
         dot += expected * actual;
         reference_norm += expected * expected;
         candidate_norm += actual * actual;
@@ -366,9 +373,9 @@ double cosine_of(const std::vector<std::uint16_t>& reference,
 
 TokenId argmax_of(const std::vector<std::uint16_t>& words) {
     std::size_t best = 0;
-    float best_value = bf16_to_float(words[0]);
+    float best_value = word_to_float(words[0]);
     for (std::size_t index = 1; index < words.size(); ++index) {
-        const float value = bf16_to_float(words[index]);
+        const float value = word_to_float(words[index]);
         if (value > best_value) {
             best_value = value;
             best = index;

@@ -142,6 +142,8 @@ struct BindingPlan {
 
 [[nodiscard]] BindingPlan bind_artifact(artifact::Binder& binder, WeightsProfile profile, int tp);
 
+[[nodiscard]] bool is_fp16_control_object(const BindingPlan& plan, const BoundObject& object);
+
 // The shard map of every text role at one tensor-parallel width, keyed by role name.
 using ShardPlanByName = std::map<std::string, sharding::ShardMapping, std::less<>>;
 
@@ -221,6 +223,7 @@ public:
 private:
     std::unique_ptr<PleTableSource> ple_source_;
     RankViews views_;
+    std::vector<DeviceBuffer> fp16_control_;
 };
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 
-from tools.reference.qwen3_8_flash_next.ops import bf16_from_u16, qsa_indexer, run_self_tests
+from tools.reference.qwen3_8_flash_next.ops import qsa_indexer, run_self_tests
 
 PROMPT = [1024, 7, 98140, 33, 4097, 512, 100, 2048]
 LONG_TOKENS = 2052
@@ -65,10 +65,10 @@ def load_index_dump(path, tokens):
         stored_tokens, pages, query_words, key_words = struct.unpack("<iiQQ", handle.read(24))
         if stored_tokens != tokens:
             raise ValueError("the index dump token count does not match")
-        query = np.frombuffer(handle.read(query_words * 2), dtype="<u2")
-        keys = np.frombuffer(handle.read(key_words * 2), dtype="<u2")
-    query = bf16_from_u16(query).reshape(tokens, 4, 128)
-    keys = bf16_from_u16(keys).reshape(pages, 1, 16, 128)
+        query = np.frombuffer(handle.read(query_words * 4), dtype="<f4")
+        keys = np.frombuffer(handle.read(key_words * 4), dtype="<f4")
+    query = query.reshape(tokens, 4, 128)
+    keys = keys.reshape(pages, 1, 16, 128)
     blocks = np.stack([keys[block // 16, 0, block % 16, :] for block in range(tokens // 4)], axis=0)
     return query, blocks
 
