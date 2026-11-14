@@ -6,9 +6,11 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "ninfer/ops/ple.h"
+#include "ninfer/ops/qsa.h"
 #include "targets/qwen3_8_flash_next/impl/load/bindings.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <optional>
 #include <variant>
@@ -18,11 +20,60 @@
 #include <string>
 #include <vector>
 
+struct QsaDumpEntry {
+    std::int32_t position = 0;
+    std::vector<std::int32_t> blocks;
+};
+
+std::vector<QsaDumpEntry> g_qsa_entries;
+bool g_qsa_recording = false;
+
+void flash_next_record_qsa(const ninfer::ops::QsaBatchView& batch,
+                           const ninfer::ops::QsaBlockSelection& selected, cudaStream_t stream) {
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::int32_t tokens = batch.positions.ne[0];
+    const std::int32_t axes   = batch.positions.ne[1];
+    const std::int32_t rows   = batch.positions.ne[2];
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens) * axes * rows);
+    std::vector<std::int32_t> counts(static_cast<std::size_t>(tokens) * rows);
+    std::vector<std::int32_t> selection(static_cast<std::size_t>(512) * tokens * rows);
+    CUDA_CHECK(cudaMemcpy(positions.data(), batch.positions.data, positions.size() * 4,
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(counts.data(), selected.counts.data, counts.size() * 4,
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(selection.data(), selected.selection.data, selection.size() * 4,
+                          cudaMemcpyDeviceToHost));
+    for (std::int32_t b = 0; b < rows; ++b) {
+        for (std::int32_t t = 0; t < tokens; ++t) {
+            QsaDumpEntry entry;
+            entry.position = positions[static_cast<std::size_t>(t * axes) * rows + b];
+            const std::int32_t count = counts[static_cast<std::size_t>(t) + tokens * b];
+            const auto begin = selection.begin() + static_cast<std::ptrdiff_t>(512) * (t + tokens * b);
+            entry.blocks.assign(begin, begin + count);
+            g_qsa_entries.push_back(std::move(entry));
+        }
+    }
+}
+
+namespace ninfer::ops {
+inline void ninfer_flash_next_dump_qsa_indexer(const Tensor& index_query,
+                                               const ConstQsaIndexCacheView& cache,
+                                               const QsaBatchView& batch,
+                                               std::uint32_t max_visible_tokens,
+                                               WorkspaceArena& workspace,
+                                               QsaBlockSelection& selected, cudaStream_t stream) {
+    qsa_indexer(index_query, cache, batch, max_visible_tokens, workspace, selected, stream);
+    if (g_qsa_recording) { flash_next_record_qsa(batch, selected, stream); }
+}
+} // namespace ninfer::ops
+
+#define qsa_indexer ninfer_flash_next_dump_qsa_indexer
 #define NINFER_QWEN4EXP_VARIANT ::ninfer::targets::qwen3_8_flash_next::detail::Variant
 #define NINFER_QWEN4EXP_RUNTIME_NS flash_next_text_test_runtime
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 #include "targets/qwen4_exp/impl/runtime/text_context_impl.h"
 #include "targets/qwen4_exp/impl/runtime/workspace_recipe.h"
+#undef qsa_indexer
 
 namespace {
 
@@ -41,6 +92,36 @@ constexpr std::array<std::int32_t, kPromptTokens> kPrompt{1024, 7, 98140, 33, 40
 
 void require(bool condition, const std::string& message) {
     if (!condition) { throw std::runtime_error(message); }
+}
+
+bool g_dump_written = false;
+
+void write_parity_dump(const char* path, const rt::TextState& state,
+                       std::span<const TokenId> prompt) {
+    const std::size_t tokens = prompt.size();
+    const std::size_t heads  = 16;
+    std::vector<std::uint32_t> rows(heads * tokens);
+    CUDA_CHECK(cudaMemcpy(rows.data(), state.ple_rows(), rows.size() * 4, cudaMemcpyDeviceToHost));
+    std::FILE* file = std::fopen(path, "w");
+    if (file == nullptr) { throw std::runtime_error("cannot open the parity dump path"); }
+    std::fprintf(file, "flash-next-dump v1\n");
+    std::fprintf(file, "prompt %zu", tokens);
+    for (const TokenId token : prompt) { std::fprintf(file, " %d", static_cast<int>(token)); }
+    std::fprintf(file, "\nple %zu\n", tokens);
+    for (std::size_t t = 0; t < tokens; ++t) {
+        std::fprintf(file, "%zu", t);
+        for (std::size_t head = 0; head < heads; ++head) {
+            std::fprintf(file, " %u", rows[head + heads * t]);
+        }
+        std::fprintf(file, "\n");
+    }
+    std::fprintf(file, "qsa %zu\n", g_qsa_entries.size());
+    for (const QsaDumpEntry& entry : g_qsa_entries) {
+        std::fprintf(file, "%d %zu", static_cast<int>(entry.position), entry.blocks.size());
+        for (const std::int32_t block : entry.blocks) { std::fprintf(file, " %d", block); }
+        std::fprintf(file, "\n");
+    }
+    std::fclose(file);
 }
 
 void place_reduced(const detail::BindingPlan& plan, artifact::Binder& binder) {
@@ -136,7 +217,18 @@ RunOutcome run_prompt(DeviceContext& device, const detail::Variant::ModelView& v
     rt::TextTrunk trunk(view, state, activations, workspace, device.stream);
 
     const std::span<const TokenId> prompt{kPrompt.data(), kPrompt.size()};
+    const char* dump_path = std::getenv("NINFER_FLASH_NEXT_DUMP");
+    const bool dump_here  = dump_path != nullptr && !g_dump_written;
+    if (dump_here) {
+        g_qsa_entries.clear();
+        g_qsa_recording = true;
+    }
     const TokenId first = trunk.prefill(prompt);
+    if (dump_here) {
+        g_qsa_recording = false;
+        write_parity_dump(dump_path, state, prompt);
+        g_dump_written = true;
+    }
 
     RunOutcome outcome;
     outcome.token = first;

@@ -1,0 +1,2 @@
+# Qwen3.8-Flash-Next artifact-native Python reference dependencies.
+numpy>=1.24

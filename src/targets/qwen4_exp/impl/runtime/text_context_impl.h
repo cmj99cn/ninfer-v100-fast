@@ -384,8 +384,9 @@ inline void TextTrunk::run_ple(std::int32_t T, const Tensor& residual, Tensor& u
     Tensor normalized_conv = activations_.alloc(DType::BF16, {kChannels, T, kBatch});
     Tensor offsets         = activations_.alloc(DType::I32, {kBatch});
     Tensor counts          = activations_.alloc(DType::I32, {kBatch});
-    const std::int32_t live = T;
-    CUDA_CHECK(cudaMemcpyAsync(offsets.data, &live, 4, cudaMemcpyHostToDevice, stream_));
+    const std::int32_t live         = T;
+    const std::int32_t column_start = 0;
+    CUDA_CHECK(cudaMemcpyAsync(offsets.data, &column_start, 4, cudaMemcpyHostToDevice, stream_));
     CUDA_CHECK(cudaMemcpyAsync(counts.data, &live, 4, cudaMemcpyHostToDevice, stream_));
 
     ops::ple_gate(projected_key, projected_value, residual, ple.norm_key, ple.norm_query,
