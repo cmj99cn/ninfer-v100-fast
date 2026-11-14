@@ -19,7 +19,8 @@ inline constexpr std::int32_t kQsaIndexCompress       = 4;
 inline constexpr std::int32_t kQsaSelectionCapacity   = 512;
 
 /**
- * The five projected QSA tensors. All are contiguous BF16, dimension 0 fastest.
+ * The five projected QSA tensors. All are contiguous and share one activation dtype (BF16 or
+ * FP16), dimension 0 fastest.
  *
  *   query       [head_dim, q_heads, T, B]
  *   key         [head_dim, kv_heads, T, B]
@@ -171,7 +172,8 @@ struct QsaBlockSelection {
  *   tensors follow their view structs.
  *
  * Supported domain:
- *   BF16 inputs and outputs, FP16 value cache, BF16 key/index-key cache. q_heads%kv_heads == 0,
+ *   BF16 or FP16 activation inputs and outputs, BF16 key/index-key cache, FP16 value cache, and
+ *   BF16 tail/record state. q_heads%kv_heads == 0,
  *   index_kv_heads == 1, rotary_dim == 64 and rotary_dim <= head_dim and <= index_head_dim,
  *   rms_epsilon positive and finite, A in {1,3}. Every written token/block/page must be in range.
  *
@@ -179,9 +181,9 @@ struct QsaBlockSelection {
  *   Normalization statistics accumulate in FP32; the gain 1 + FP32(w) is not rounded to BF16.
  *   The mean that forms u is rounded to BF16 before normalization, which is an observable
  *   boundary. The oracle evaluates the complete formula in FP64 from the represented inputs and
- *   reproduces that BF16 u rounding; the BF16 outputs and BF16 key cache are promoted and compared
- *   against it. The FP16 value cache stores the FP16_RNE representation of v, and its comparison
- *   decodes that stored word.
+ *   reproduces that BF16 u rounding; the activation outputs and BF16 key cache are promoted and
+ *   compared against it. The FP16 value cache stores the FP16_RNE representation of v, and its
+ *   comparison decodes that stored word.
  *
  * Effects:
  *   Writes query, index_query, the addressed K/V/index-K cache rows, and every valid record
@@ -211,11 +213,13 @@ void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters&
  *   table.
  *
  * Logical shapes:
- *   index_query BF16 [index_head_dim, index_heads, T, B]; selection I32 [512,T,B]; counts I32 [T,B].
+ *   index_query BF16 or FP16 [index_head_dim, index_heads, T, B]; selection I32 [512,T,B];
+ *   counts I32 [T,B].
  *   The cache follows ConstQsaIndexCacheView. index_heads is four and index_head_dim 128.
  *
  * Supported domain:
- *   BF16 index_query and index keys, I32 page table, index_kv_heads == 1, index_head_dim == 128.
+ *   BF16 or FP16 index_query, BF16 index keys, I32 page table, index_kv_heads == 1,
+ *   index_head_dim == 128.
  *   max_visible_tokens is a host launch-resource promise and does not alter any row's C.
  *
  * Numeric:
@@ -251,17 +255,18 @@ void qsa_indexer(const Tensor& index_query, const ConstQsaIndexCacheView& cache,
  *   row j%64. An empty J writes exact BF16 +0.
  *
  * Logical shapes:
- *   query/output_gate/out BF16 [head_dim, q_heads, T, B]; selection I32 [512,T,B]; counts I32 [T,B].
+ *   query/output_gate/out activation dtype (BF16 or FP16, matching) [head_dim, q_heads, T, B];
+ *   selection I32 [512,T,B]; counts I32 [T,B].
  *   The cache follows QsaCacheView.
  *
  * Supported domain:
- *   BF16 query, gate and output, BF16 K cache, FP16 V cache, head_dim == 256, q_heads%kv_heads == 0.
- *   Invalid token columns write exact BF16 zero.
+ *   BF16 or FP16 query, gate and output (matching), BF16 K cache, FP16 V cache, head_dim == 256,
+ *   q_heads%kv_heads == 0. Invalid token columns write exact zero in the activation dtype.
  *
  * Numeric:
  *   Scores accumulate in FP32 and softmax is evaluated in FP32 with a max subtraction. The value
- *   reduction accumulates in FP32. The BF16 output is promoted and compared with an FP64 oracle
- *   that consumes the represented BF16 query/gate and the stored BF16/FP16 cache words.
+ *   reduction accumulates in FP32. The activation output is promoted and compared with an FP64
+ *   oracle that consumes the represented query/gate and the stored BF16/FP16 cache words.
  *
  * Effects:
  *   Writes all of out. Cache, selection, counts, query and output_gate are read-only.

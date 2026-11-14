@@ -28,6 +28,31 @@ inline bool qsa_has_valid_columns(const Tensor& valid_columns) {
     return valid_columns.data != nullptr;
 }
 
+inline bool qsa_is_activation(DType dtype) {
+    return dtype == DType::BF16 || dtype == DType::FP16;
+}
+
+template <class A>
+struct QsaAct;
+
+template <>
+struct QsaAct<__nv_bfloat16> {
+    __device__ __forceinline__ static float to_float(__nv_bfloat16 value) {
+        return __bfloat162float(value);
+    }
+    __device__ __forceinline__ static __nv_bfloat16 from_float(float value) {
+        return __float2bfloat16_rn(value);
+    }
+};
+
+template <>
+struct QsaAct<__half> {
+    __device__ __forceinline__ static float to_float(__half value) { return __half2float(value); }
+    __device__ __forceinline__ static __half from_float(float value) {
+        return __float2half_rn(value);
+    }
+};
+
 __device__ __forceinline__ float qsa_rope_dim(const float* z, int d, int rotary_dim, float theta,
                                               int rho0, int rho1, int rho2) {
     if (d >= rotary_dim) { return z[d]; }

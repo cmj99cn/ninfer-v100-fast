@@ -4,6 +4,7 @@
 #include "ops/qsa/qsa_common.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 #include <limits>
@@ -13,6 +14,8 @@
 namespace ninfer::ops {
 namespace {
 
+using detail::QsaAct;
+using detail::qsa_is_activation;
 using detail::qsa_row_position;
 
 __device__ __forceinline__ bool candidate_better(float score_a, int block_a, float score_b,
@@ -56,7 +59,8 @@ __device__ __forceinline__ void heap_sift_down(float* scores, int* blocks, int s
     }
 }
 
-__global__ void indexer_kernel(const __nv_bfloat16* index_query, const int* positions,
+template <class A>
+__global__ void indexer_kernel(const A* index_query, const int* positions,
                                const int* valid_columns, int tokens, int batch, int axes,
                                const int* table_rows, int index_dim, int index_heads,
                                const int* page_table, int logical_pages,
@@ -107,7 +111,7 @@ __global__ void indexer_kernel(const __nv_bfloat16* index_query, const int* posi
                                              (t + static_cast<std::int64_t>(tokens) * b));
                     float dot = 0.0F;
                     for (int d = 0; d < index_dim; ++d) {
-                        dot += __bfloat162float(index_query[query_base + d]) *
+                        dot += QsaAct<A>::to_float(index_query[query_base + d]) *
                                __bfloat162float(index_pages[key_base + d]);
                     }
                     score += fmaxf(0.0F, dot);
@@ -164,7 +168,8 @@ void qsa_indexer(const Tensor& index_query, const ConstQsaIndexCacheView& cache,
     using detail::qsa_require_contiguous;
     using detail::qsa_require_dtype;
 
-    qsa_require_dtype(index_query, DType::BF16, "index_query must be BF16");
+    qsa_require(qsa_is_activation(index_query.dtype),
+                "index_query must be BF16 or FP16");
     qsa_require_contiguous(index_query, "index_query must be contiguous");
     qsa_require_dtype(cache.index_k_pages, DType::BF16, "index key cache must be BF16");
     qsa_require_contiguous(cache.index_k_pages, "index key cache must be contiguous");
@@ -212,17 +217,26 @@ void qsa_indexer(const Tensor& index_query, const ConstQsaIndexCacheView& cache,
         throw std::overflow_error("qsa_indexer: grid exceeds int range");
     }
 
-    indexer_kernel<<<static_cast<unsigned>(grid), 128, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(index_query.data),
-        static_cast<const int*>(batch.positions.data),
-        detail::qsa_has_valid_columns(batch.valid_columns)
-            ? static_cast<const int*>(batch.valid_columns.data)
-            : nullptr,
-        tokens, batch_sz, batch.positions.ne[1], static_cast<const int*>(batch.table_rows.data),
-        index_dim, heads, static_cast<const int*>(cache.page_table.data), cache.page_table.ne[0],
-        static_cast<const __nv_bfloat16*>(cache.index_k_pages.data),
-        static_cast<int*>(selected.selection.data), static_cast<int*>(selected.counts.data),
-        kQsaSelectionCapacity);
+    const auto* positions = static_cast<const int*>(batch.positions.data);
+    const auto* valid_columns = detail::qsa_has_valid_columns(batch.valid_columns)
+                                    ? static_cast<const int*>(batch.valid_columns.data)
+                                    : nullptr;
+    const auto* table_rows = static_cast<const int*>(batch.table_rows.data);
+    const auto* page_table = static_cast<const int*>(cache.page_table.data);
+    const auto* index_pages = static_cast<const __nv_bfloat16*>(cache.index_k_pages.data);
+    auto* selection = static_cast<int*>(selected.selection.data);
+    auto* counts = static_cast<int*>(selected.counts.data);
+    if (index_query.dtype == DType::FP16) {
+        indexer_kernel<__half><<<static_cast<unsigned>(grid), 128, 0, stream>>>(
+            static_cast<const __half*>(index_query.data), positions, valid_columns, tokens,
+            batch_sz, batch.positions.ne[1], table_rows, index_dim, heads, page_table,
+            cache.page_table.ne[0], index_pages, selection, counts, kQsaSelectionCapacity);
+    } else {
+        indexer_kernel<__nv_bfloat16><<<static_cast<unsigned>(grid), 128, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(index_query.data), positions, valid_columns, tokens,
+            batch_sz, batch.positions.ne[1], table_rows, index_dim, heads, page_table,
+            cache.page_table.ne[0], index_pages, selection, counts, kQsaSelectionCapacity);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

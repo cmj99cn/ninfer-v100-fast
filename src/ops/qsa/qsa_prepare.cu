@@ -14,6 +14,7 @@
 namespace ninfer::ops {
 namespace {
 
+using detail::QsaAct;
 using detail::qsa_position_axis;
 using detail::qsa_rope_dim;
 using detail::qsa_row_position;
@@ -28,10 +29,11 @@ __device__ float block_sum(float* scratch, float value, int threads) {
     return scratch[0];
 }
 
+template <class A>
 __global__ void prepare_query_kernel(
-    const __nv_bfloat16* projected, const __nv_bfloat16* weight, const int* positions,
+    const A* projected, const __nv_bfloat16* weight, const int* positions,
     const int* valid_columns, int tokens, int batch, int axes, int head_dim, int heads,
-    float epsilon, int rotary_dim, float theta, __nv_bfloat16* out) {
+    float epsilon, int rotary_dim, float theta, A* out) {
     extern __shared__ float shared[];
     float* values = shared;
     float* sums   = shared + head_dim;
@@ -47,7 +49,7 @@ __global__ void prepare_query_kernel(
         static_cast<std::int64_t>(head_dim) * (h + static_cast<std::int64_t>(heads) *
                                                       (t + static_cast<std::int64_t>(tokens) * b));
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        values[d] = __bfloat162float(projected[input_base + d]);
+        values[d] = QsaAct<A>::to_float(projected[input_base + d]);
     }
     __syncthreads();
 
@@ -65,16 +67,16 @@ __global__ void prepare_query_kernel(
     const int rho2 = qsa_position_axis(positions, t, b, batch, axes, 2);
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         out[input_base + d] =
-            __float2bfloat16_rn(qsa_rope_dim(values, d, rotary_dim, theta, rho0, rho1, rho2));
+            QsaAct<A>::from_float(qsa_rope_dim(values, d, rotary_dim, theta, rho0, rho1, rho2));
     }
 }
 
+template <class A>
 __global__ void prepare_key_value_kernel(
-    const __nv_bfloat16* projected_key, const __nv_bfloat16* projected_value,
-    const __nv_bfloat16* weight, const int* positions, const int* valid_columns,
-    const int* table_rows, int tokens, int batch, int axes, int head_dim, int kv_heads,
-    float epsilon, int rotary_dim, float theta, const int* page_table,
-    int logical_pages, __nv_bfloat16* k_pages, __half* v_pages) {
+    const A* projected_key, const A* projected_value, const __nv_bfloat16* weight,
+    const int* positions, const int* valid_columns, const int* table_rows, int tokens, int batch,
+    int axes, int head_dim, int kv_heads, float epsilon, int rotary_dim, float theta,
+    const int* page_table, int logical_pages, __nv_bfloat16* k_pages, __half* v_pages) {
     extern __shared__ float shared[];
     float* values = shared;
     float* sums   = shared + head_dim;
@@ -102,8 +104,9 @@ __global__ void prepare_key_value_kernel(
                                          static_cast<std::int64_t>(kv_heads) * physical));
 
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        values[d] = __bfloat162float(projected_key[input_base + d]);
-        v_pages[cache_base + d] = __float2half_rn(__bfloat162float(projected_value[input_base + d]));
+        values[d] = QsaAct<A>::to_float(projected_key[input_base + d]);
+        v_pages[cache_base + d] =
+            __float2half_rn(QsaAct<A>::to_float(projected_value[input_base + d]));
     }
     __syncthreads();
 
@@ -125,7 +128,8 @@ __global__ void prepare_key_value_kernel(
     }
 }
 
-__global__ void prepare_records_kernel(const __nv_bfloat16* index_key, const int* positions,
+template <class A>
+__global__ void prepare_records_kernel(const A* index_key, const int* positions,
                                        const int* valid_columns, int tokens, int batch, int axes,
                                        int index_dim, int record_width,
                                        __nv_bfloat16* record_keys, int* record_positions,
@@ -138,8 +142,9 @@ __global__ void prepare_records_kernel(const __nv_bfloat16* index_key, const int
     for (int d = threadIdx.x; d < index_dim; d += blockDim.x) {
         record_keys[d + static_cast<std::int64_t>(index_dim) *
                             (t + static_cast<std::int64_t>(record_width) * b)] =
-            index_key[d + static_cast<std::int64_t>(index_dim) *
-                              (t + static_cast<std::int64_t>(tokens) * b)];
+            __float2bfloat16_rn(QsaAct<A>::to_float(
+                index_key[d + static_cast<std::int64_t>(index_dim) *
+                                  (t + static_cast<std::int64_t>(tokens) * b)]));
     }
     for (int axis = threadIdx.x; axis < 3; axis += blockDim.x) {
         record_positions[axis + 3 * (t + static_cast<std::int64_t>(record_width) * b)] =
@@ -148,8 +153,9 @@ __global__ void prepare_records_kernel(const __nv_bfloat16* index_key, const int
     if (threadIdx.x == 0 && t == 0) { base_positions[b] = qsa_row_position(positions, 0, b, batch, axes); }
 }
 
+template <class A>
 __global__ void prepare_index_blocks_kernel(
-    const __nv_bfloat16* index_key, const __nv_bfloat16* index_key_norm,
+    const A* index_key, const __nv_bfloat16* index_key_norm,
     const int* positions, const int* valid_columns, const int* table_rows,
     const __nv_bfloat16* tail_keys, const int* tail_rope, int tokens, int batch, int axes,
     int index_dim, int rotary_dim, float theta, float epsilon,
@@ -179,7 +185,7 @@ __global__ void prepare_index_blocks_kernel(
                                                          (column + 4 * b)]);
             } else {
                 const int local = token - first;
-                value = __bfloat162float(index_key[d + static_cast<std::int64_t>(index_dim) *
+                value = QsaAct<A>::to_float(index_key[d + static_cast<std::int64_t>(index_dim) *
                                                            (local + static_cast<std::int64_t>(tokens) * b)]);
             }
             sum += value;
@@ -241,13 +247,16 @@ void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters&
     using detail::qsa_require_contiguous;
     using detail::qsa_require_dtype;
 
-    qsa_require_dtype(projected.query, DType::BF16, "query projection must be BF16");
-    qsa_require_dtype(projected.key, DType::BF16, "key projection must be BF16");
-    qsa_require_dtype(projected.value, DType::BF16, "value projection must be BF16");
-    qsa_require_dtype(projected.index_query, DType::BF16, "index query projection must be BF16");
-    qsa_require_dtype(projected.index_key, DType::BF16, "index key projection must be BF16");
-    qsa_require_dtype(query, DType::BF16, "query output must be BF16");
-    qsa_require_dtype(index_query, DType::BF16, "index query output must be BF16");
+    const DType activation = projected.query.dtype;
+    qsa_require(detail::qsa_is_activation(activation),
+                "query projection must be BF16 or FP16");
+    qsa_require(projected.key.dtype == activation && projected.value.dtype == activation &&
+                    projected.index_query.dtype == activation &&
+                    projected.index_key.dtype == activation,
+                "projection dtypes must agree");
+    qsa_require(query.dtype == activation, "query output dtype must match the activation");
+    qsa_require(index_query.dtype == activation,
+                "index query output dtype must match the activation");
     qsa_require_dtype(cache.k_pages, DType::BF16, "key cache must be BF16");
     qsa_require_dtype(cache.v_pages, DType::FP16, "value cache must be FP16");
     qsa_require_dtype(cache.index_k_pages, DType::BF16, "index key cache must be BF16");
@@ -370,12 +379,6 @@ void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters&
 
     const int logical_pages = cache.page_table.ne[0];
 
-    const auto* projected_query = static_cast<const __nv_bfloat16*>(projected.query.data);
-    const auto* projected_key = static_cast<const __nv_bfloat16*>(projected.key.data);
-    const auto* projected_value = static_cast<const __nv_bfloat16*>(projected.value.data);
-    const auto* projected_index_query =
-        static_cast<const __nv_bfloat16*>(projected.index_query.data);
-    const auto* projected_index_key = static_cast<const __nv_bfloat16*>(projected.index_key.data);
     const auto* query_norm = static_cast<const __nv_bfloat16*>(parameters.query_norm.data);
     const auto* key_norm = static_cast<const __nv_bfloat16*>(parameters.key_norm.data);
     const auto* index_query_norm = static_cast<const __nv_bfloat16*>(parameters.index_query_norm.data);
@@ -399,40 +402,84 @@ void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters&
         positive_grid(static_cast<std::int64_t>(tokens) * batch_sz * kv_heads, "key/value grid");
     const std::int64_t block_columns = positive_grid((tokens + 3) / 4 + 1, "index block grid");
 
-    prepare_query_kernel<<<static_cast<unsigned>(query_blocks), 256,
-                           2 * head_dim * sizeof(float), stream>>>(
-        projected_query, query_norm, positions, valid_columns, tokens, batch_sz, axes, head_dim,
-        q_heads, parameters.rms_epsilon, parameters.rotary_dim, parameters.theta,
-        static_cast<__nv_bfloat16*>(query.data));
+    auto* k_pages = static_cast<__nv_bfloat16*>(cache.k_pages.data);
+    auto* v_pages = static_cast<__half*>(cache.v_pages.data);
+    auto* record_keys = static_cast<__nv_bfloat16*>(records.raw_keys.data);
+    auto* record_rope = static_cast<int*>(records.rope_positions.data);
+    auto* base_positions = static_cast<int*>(records.base_positions.data);
+    auto* index_pages = static_cast<__nv_bfloat16*>(cache.index_k_pages.data);
 
-    prepare_query_kernel<<<static_cast<unsigned>(index_query_blocks), 128,
-                           2 * index_dim * sizeof(float), stream>>>(
-        projected_index_query, index_query_norm, positions, valid_columns, tokens, batch_sz, axes,
-        index_dim, index_heads, parameters.rms_epsilon, parameters.rotary_dim, parameters.theta,
-        static_cast<__nv_bfloat16*>(index_query.data));
-
-    prepare_key_value_kernel<<<static_cast<unsigned>(kv_blocks), 256,
-                               2 * head_dim * sizeof(float), stream>>>(
-        projected_key, projected_value, key_norm, positions, valid_columns, table_rows, tokens,
-        batch_sz, axes, head_dim, kv_heads, parameters.rms_epsilon, parameters.rotary_dim,
-        parameters.theta, page_table, logical_pages,
-        static_cast<__nv_bfloat16*>(cache.k_pages.data),
-        static_cast<__half*>(cache.v_pages.data));
-
-    prepare_records_kernel<<<dim3(static_cast<unsigned>(tokens), static_cast<unsigned>(batch_sz)),
-                             128, 0, stream>>>(
-        projected_index_key, positions, valid_columns, tokens, batch_sz, axes, index_dim,
-        record_width, static_cast<__nv_bfloat16*>(records.raw_keys.data),
-        static_cast<int*>(records.rope_positions.data),
-        static_cast<int*>(records.base_positions.data));
-
-    prepare_index_blocks_kernel<<<dim3(static_cast<unsigned>(block_columns),
-                                       static_cast<unsigned>(batch_sz)),
-                                  128, 2 * index_dim * sizeof(float), stream>>>(
-        projected_index_key, index_key_norm, positions, valid_columns, table_rows, tail_keys,
-        tail_rope, tokens, batch_sz, axes, index_dim, parameters.rotary_dim,
-        parameters.theta, parameters.rms_epsilon, page_table, logical_pages,
-        kQsaIndexCompress, static_cast<__nv_bfloat16*>(cache.index_k_pages.data));
+    if (activation == DType::FP16) {
+        const auto* projected_query = static_cast<const __half*>(projected.query.data);
+        const auto* projected_key = static_cast<const __half*>(projected.key.data);
+        const auto* projected_value = static_cast<const __half*>(projected.value.data);
+        const auto* projected_index_query =
+            static_cast<const __half*>(projected.index_query.data);
+        const auto* projected_index_key = static_cast<const __half*>(projected.index_key.data);
+        prepare_query_kernel<__half><<<static_cast<unsigned>(query_blocks), 256,
+                                       2 * head_dim * sizeof(float), stream>>>(
+            projected_query, query_norm, positions, valid_columns, tokens, batch_sz, axes,
+            head_dim, q_heads, parameters.rms_epsilon, parameters.rotary_dim, parameters.theta,
+            static_cast<__half*>(query.data));
+        prepare_query_kernel<__half><<<static_cast<unsigned>(index_query_blocks), 128,
+                                       2 * index_dim * sizeof(float), stream>>>(
+            projected_index_query, index_query_norm, positions, valid_columns, tokens, batch_sz,
+            axes, index_dim, index_heads, parameters.rms_epsilon, parameters.rotary_dim,
+            parameters.theta, static_cast<__half*>(index_query.data));
+        prepare_key_value_kernel<__half><<<static_cast<unsigned>(kv_blocks), 256,
+                                           2 * head_dim * sizeof(float), stream>>>(
+            projected_key, projected_value, key_norm, positions, valid_columns, table_rows,
+            tokens, batch_sz, axes, head_dim, kv_heads, parameters.rms_epsilon,
+            parameters.rotary_dim, parameters.theta, page_table, logical_pages, k_pages, v_pages);
+        prepare_records_kernel<__half><<<dim3(static_cast<unsigned>(tokens),
+                                              static_cast<unsigned>(batch_sz)),
+                                         128, 0, stream>>>(
+            projected_index_key, positions, valid_columns, tokens, batch_sz, axes, index_dim,
+            record_width, record_keys, record_rope, base_positions);
+        prepare_index_blocks_kernel<__half><<<dim3(static_cast<unsigned>(block_columns),
+                                                   static_cast<unsigned>(batch_sz)),
+                                              128, 2 * index_dim * sizeof(float), stream>>>(
+            projected_index_key, index_key_norm, positions, valid_columns, table_rows, tail_keys,
+            tail_rope, tokens, batch_sz, axes, index_dim, parameters.rotary_dim,
+            parameters.theta, parameters.rms_epsilon, page_table, logical_pages,
+            kQsaIndexCompress, index_pages);
+    } else {
+        const auto* projected_query =
+            static_cast<const __nv_bfloat16*>(projected.query.data);
+        const auto* projected_key = static_cast<const __nv_bfloat16*>(projected.key.data);
+        const auto* projected_value = static_cast<const __nv_bfloat16*>(projected.value.data);
+        const auto* projected_index_query =
+            static_cast<const __nv_bfloat16*>(projected.index_query.data);
+        const auto* projected_index_key =
+            static_cast<const __nv_bfloat16*>(projected.index_key.data);
+        prepare_query_kernel<__nv_bfloat16><<<static_cast<unsigned>(query_blocks), 256,
+                                              2 * head_dim * sizeof(float), stream>>>(
+            projected_query, query_norm, positions, valid_columns, tokens, batch_sz, axes,
+            head_dim, q_heads, parameters.rms_epsilon, parameters.rotary_dim, parameters.theta,
+            static_cast<__nv_bfloat16*>(query.data));
+        prepare_query_kernel<__nv_bfloat16><<<static_cast<unsigned>(index_query_blocks), 128,
+                                              2 * index_dim * sizeof(float), stream>>>(
+            projected_index_query, index_query_norm, positions, valid_columns, tokens, batch_sz,
+            axes, index_dim, index_heads, parameters.rms_epsilon, parameters.rotary_dim,
+            parameters.theta, static_cast<__nv_bfloat16*>(index_query.data));
+        prepare_key_value_kernel<__nv_bfloat16><<<static_cast<unsigned>(kv_blocks), 256,
+                                                  2 * head_dim * sizeof(float), stream>>>(
+            projected_key, projected_value, key_norm, positions, valid_columns, table_rows,
+            tokens, batch_sz, axes, head_dim, kv_heads, parameters.rms_epsilon,
+            parameters.rotary_dim, parameters.theta, page_table, logical_pages, k_pages, v_pages);
+        prepare_records_kernel<__nv_bfloat16><<<dim3(static_cast<unsigned>(tokens),
+                                                     static_cast<unsigned>(batch_sz)),
+                                                128, 0, stream>>>(
+            projected_index_key, positions, valid_columns, tokens, batch_sz, axes, index_dim,
+            record_width, record_keys, record_rope, base_positions);
+        prepare_index_blocks_kernel<__nv_bfloat16><<<dim3(static_cast<unsigned>(block_columns),
+                                                          static_cast<unsigned>(batch_sz)),
+                                                     128, 2 * index_dim * sizeof(float), stream>>>(
+            projected_index_key, index_key_norm, positions, valid_columns, table_rows, tail_keys,
+            tail_rope, tokens, batch_sz, axes, index_dim, parameters.rotary_dim,
+            parameters.theta, parameters.rms_epsilon, page_table, logical_pages,
+            kQsaIndexCompress, index_pages);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

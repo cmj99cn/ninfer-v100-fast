@@ -37,6 +37,23 @@ double fp16_double(std::uint16_t bits) { return double(f16_to_f32(bits)); }
 std::uint16_t double_bf16(double value) { return f32_to_bf16(static_cast<float>(value)); }
 std::uint16_t double_fp16(double value) { return f32_to_f16(static_cast<float>(value)); }
 
+double act_double(std::uint16_t bits, DType dtype) {
+    return dtype == DType::FP16 ? fp16_double(bits) : bf16_double(bits);
+}
+std::uint16_t act_bits(double value, DType dtype) {
+    return dtype == DType::FP16 ? double_fp16(value) : double_bf16(value);
+}
+std::vector<std::uint16_t> to_activation(std::vector<std::uint16_t> bits, DType dtype) {
+    if (dtype == DType::FP16) {
+        for (std::uint16_t& value : bits) { value = f32_to_f16(bf16_to_f32(value)); }
+    }
+    return bits;
+}
+std::vector<double> read_activation(const void* device, std::size_t count, DType dtype) {
+    return dtype == DType::FP16 ? from_device_f16(device, count)
+                                : from_device_bf16(device, count);
+}
+
 std::vector<std::uint16_t> bf16_inputs(std::size_t count, std::uint32_t seed, float lo, float hi) {
     std::vector<float> values(count);
     fill_uniform(values, seed, lo, hi);
@@ -113,6 +130,7 @@ std::size_t d2i(std::int32_t d, std::int32_t h, std::int32_t t, std::int32_t b, 
 
 struct PrepareCase {
     std::string label;
+    DType activation = DType::BF16;
     std::int32_t T;
     std::int32_t B;
     std::int32_t axes;
@@ -146,8 +164,9 @@ int run_prepare(const PrepareCase& c, cudaStream_t stream, WorkspaceArena& arena
         static_cast<std::size_t>(kIndexDim) * kQsaIndexBlockPageSize * c.index_pages;
     const std::size_t record_count = static_cast<std::size_t>(kIndexDim) * c.record_width * c.B;
 
-    std::vector<double> ref_query(query_count, bf16_double(kSentinelBf16));
-    std::vector<double> ref_index_query(index_query_count, bf16_double(kSentinelBf16));
+    std::vector<double> ref_query(query_count, act_double(kSentinelBf16, c.activation));
+    std::vector<double> ref_index_query(index_query_count,
+                                      act_double(kSentinelBf16, c.activation));
     std::vector<double> ref_k(k_count, bf16_double(kSentinelBf16));
     std::vector<std::uint16_t> ref_v(k_count, kSentinelBf16);
     std::vector<double> ref_index(index_count, bf16_double(kSentinelBf16));
@@ -171,40 +190,48 @@ int run_prepare(const PrepareCase& c, cudaStream_t stream, WorkspaceArena& arena
                 std::vector<double> head(static_cast<std::size_t>(kHeadDim));
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
                     head[static_cast<std::size_t>(d)] =
-                        bf16_double(c.proj_query[static_cast<std::size_t>(
-                            d + static_cast<std::size_t>(kHeadDim) *
-                                (h + static_cast<std::size_t>(kQHeads) * (t + c.T * b)))]);
+                        act_double(c.proj_query[static_cast<std::size_t>(
+                                       d + static_cast<std::size_t>(kHeadDim) *
+                                               (h + static_cast<std::size_t>(kQHeads) *
+                                                        (t + c.T * b)))],
+                                   c.activation);
                 }
                 const std::vector<double> rotated =
                     rotate(rmsnorm(head, gain_vector(c.norm_query), kHeadDim), rho, kHeadDim);
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
                     ref_query[static_cast<std::size_t>(d2i(d, h, t, b, kHeadDim, kQHeads, c.T, c.B))] =
-                        bf16_double(double_bf16(rotated[static_cast<std::size_t>(d)]));
+                        act_double(act_bits(rotated[static_cast<std::size_t>(d)], c.activation),
+                                   c.activation);
                 }
             }
             for (std::int32_t h = 0; h < kIndexHeads; ++h) {
                 std::vector<double> head(static_cast<std::size_t>(kIndexDim));
                 for (std::int32_t d = 0; d < kIndexDim; ++d) {
                     head[static_cast<std::size_t>(d)] =
-                        bf16_double(c.proj_index_query[static_cast<std::size_t>(
-                            d + static_cast<std::size_t>(kIndexDim) *
-                                (h + static_cast<std::size_t>(kIndexHeads) * (t + c.T * b)))]);
+                        act_double(c.proj_index_query[static_cast<std::size_t>(
+                                       d + static_cast<std::size_t>(kIndexDim) *
+                                               (h + static_cast<std::size_t>(kIndexHeads) *
+                                                        (t + c.T * b)))],
+                                   c.activation);
                 }
                 const std::vector<double> rotated = rotate(
                     rmsnorm(head, gain_vector(c.norm_index_query), kIndexDim), rho, kIndexDim);
                 for (std::int32_t d = 0; d < kIndexDim; ++d) {
                     ref_index_query[static_cast<std::size_t>(
                         d2i(d, h, t, b, kIndexDim, kIndexHeads, c.T, c.B))] =
-                        bf16_double(double_bf16(rotated[static_cast<std::size_t>(d)]));
+                        act_double(act_bits(rotated[static_cast<std::size_t>(d)], c.activation),
+                                   c.activation);
                 }
             }
             for (std::int32_t h = 0; h < kKvHeads; ++h) {
                 std::vector<double> head(static_cast<std::size_t>(kHeadDim));
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
                     head[static_cast<std::size_t>(d)] =
-                        bf16_double(c.proj_key[static_cast<std::size_t>(
-                            d + static_cast<std::size_t>(kHeadDim) *
-                                (h + static_cast<std::size_t>(kKvHeads) * (t + c.T * b)))]);
+                        act_double(c.proj_key[static_cast<std::size_t>(
+                                       d + static_cast<std::size_t>(kHeadDim) *
+                                               (h + static_cast<std::size_t>(kKvHeads) *
+                                                        (t + c.T * b)))],
+                                   c.activation);
                 }
                 const std::vector<double> rotated =
                     rotate(rmsnorm(head, gain_vector(c.norm_key), kHeadDim), rho, kHeadDim);
@@ -225,16 +252,18 @@ int run_prepare(const PrepareCase& c, cudaStream_t stream, WorkspaceArena& arena
                     const std::uint16_t value_bits = c.proj_value[static_cast<std::size_t>(
                         d + static_cast<std::size_t>(kHeadDim) *
                             (h + static_cast<std::size_t>(kKvHeads) * (t + c.T * b)))];
-                    ref_v[cache_base] = double_fp16(bf16_double(value_bits));
+                    ref_v[cache_base] = double_fp16(act_double(value_bits, c.activation));
                 }
             }
             for (std::int32_t d = 0; d < kIndexDim; ++d) {
                 ref_records[static_cast<std::size_t>(
                     d + static_cast<std::size_t>(kIndexDim) * (static_cast<std::size_t>(t) +
                                                                 static_cast<std::size_t>(c.record_width) * b))] =
-                    c.proj_index_key[static_cast<std::size_t>(
-                        d + static_cast<std::size_t>(kIndexDim) *
-                            (static_cast<std::size_t>(t) + static_cast<std::size_t>(c.T) * b))];
+                    double_bf16(act_double(
+                        c.proj_index_key[static_cast<std::size_t>(
+                            d + static_cast<std::size_t>(kIndexDim) *
+                                (static_cast<std::size_t>(t) + static_cast<std::size_t>(c.T) * b))],
+                        c.activation));
             }
             for (std::int32_t axis = 0; axis < 3; ++axis) {
                 const std::int32_t a = c.axes == 1 ? 0 : axis;
@@ -261,9 +290,10 @@ int run_prepare(const PrepareCase& c, cudaStream_t stream, WorkspaceArena& arena
                                 (static_cast<std::size_t>(column) + 4 * b))]);
                     } else {
                         const std::int32_t local = token - F;
-                        sum += bf16_double(c.proj_index_key[static_cast<std::size_t>(
+                        sum += act_double(c.proj_index_key[static_cast<std::size_t>(
                             d + static_cast<std::size_t>(kIndexDim) *
-                                (static_cast<std::size_t>(local) + static_cast<std::size_t>(c.T) * b))]);
+                                (static_cast<std::size_t>(local) + static_cast<std::size_t>(c.T) * b))],
+                            c.activation);
                     }
                 }
                 u[static_cast<std::size_t>(d)] = bf16_double(double_bf16(sum / 4.0));
@@ -333,11 +363,11 @@ int run_prepare(const PrepareCase& c, cudaStream_t stream, WorkspaceArena& arena
     d_index.copy_from_host(std::vector<std::uint16_t>(index_count, kSentinelBf16).data(), index_count * 2);
 
     QsaProjectionView projected{
-        tensor(d_proj_query.p, DType::BF16, {kHeadDim, kQHeads, c.T, c.B}),
-        tensor(d_proj_key.p, DType::BF16, {kHeadDim, kKvHeads, c.T, c.B}),
-        tensor(d_proj_value.p, DType::BF16, {kHeadDim, kKvHeads, c.T, c.B}),
-        tensor(d_proj_index_query.p, DType::BF16, {kIndexDim, kIndexHeads, c.T, c.B}),
-        tensor(d_proj_index_key.p, DType::BF16, {kIndexDim, 1, c.T, c.B})};
+        tensor(d_proj_query.p, c.activation, {kHeadDim, kQHeads, c.T, c.B}),
+        tensor(d_proj_key.p, c.activation, {kHeadDim, kKvHeads, c.T, c.B}),
+        tensor(d_proj_value.p, c.activation, {kHeadDim, kKvHeads, c.T, c.B}),
+        tensor(d_proj_index_query.p, c.activation, {kIndexDim, kIndexHeads, c.T, c.B}),
+        tensor(d_proj_index_key.p, c.activation, {kIndexDim, 1, c.T, c.B})};
     QsaPrepareParameters parameters{
         tensor(d_norm_query.p, DType::BF16, {kHeadDim}),
         tensor(d_norm_key.p, DType::BF16, {kHeadDim}),
@@ -360,17 +390,19 @@ int run_prepare(const PrepareCase& c, cudaStream_t stream, WorkspaceArena& arena
         tensor(d_records.p, DType::BF16, {kIndexDim, c.record_width, c.B}),
         tensor(d_rope.p, DType::I32, {3, c.record_width, c.B}),
         tensor(d_base.p, DType::I32, {c.B})};
-    Tensor query = tensor(d_query.p, DType::BF16, {kHeadDim, kQHeads, c.T, c.B});
-    Tensor index_query = tensor(d_index_query.p, DType::BF16, {kIndexDim, kIndexHeads, c.T, c.B});
+    Tensor query = tensor(d_query.p, c.activation, {kHeadDim, kQHeads, c.T, c.B});
+    Tensor index_query = tensor(d_index_query.p, c.activation, {kIndexDim, kIndexHeads, c.T, c.B});
 
     ops::qsa_prepare(projected, parameters, batch, before, cache, arena, records, query, index_query,
                      stream);
     cuda_synchronize(stream);
 
     int failures = 0;
-    failures += verify_pointwise(c.label + " query", from_device_bf16(d_query.p, query_count),
-                                 ref_query, kCriterion);
-    failures += verify_pointwise(c.label + " index_query", from_device_bf16(d_index_query.p, index_query_count),
+    failures += verify_pointwise(c.label + " query",
+                                 read_activation(d_query.p, query_count, c.activation), ref_query,
+                                 kCriterion);
+    failures += verify_pointwise(c.label + " index_query",
+                                 read_activation(d_index_query.p, index_query_count, c.activation),
                                  ref_index_query, kCriterion);
     failures += verify_pointwise(c.label + " key cache", from_device_bf16(d_k.p, k_count), ref_k,
                                  kCriterion);
@@ -388,6 +420,7 @@ int run_prepare(const PrepareCase& c, cudaStream_t stream, WorkspaceArena& arena
 
 struct IndexerCase {
     std::string label;
+    DType activation = DType::BF16;
     std::int32_t T;
     std::int32_t B;
     std::int32_t axes;
@@ -432,7 +465,7 @@ int run_indexer(const IndexerCase& c, cudaStream_t stream, WorkspaceArena& arena
                 for (std::int32_t h = 0; h < kIndexHeads; ++h) {
                     double dot = 0.0;
                     for (std::int32_t d = 0; d < kIndexDim; ++d) {
-                        dot += bf16_double(c.index_query[static_cast<std::size_t>(d2i(d, h, t, b, kIndexDim, kIndexHeads, c.T, c.B))]) *
+                        dot += act_double(c.index_query[static_cast<std::size_t>(d2i(d, h, t, b, kIndexDim, kIndexHeads, c.T, c.B))], c.activation) *
                                bf16_double(c.index_keys[static_cast<std::size_t>(
                                    d + static_cast<std::size_t>(kIndexDim) *
                                        (static_cast<std::size_t>(row) +
@@ -482,7 +515,7 @@ int run_indexer(const IndexerCase& c, cudaStream_t stream, WorkspaceArena& arena
         tensor(d_selection.p, DType::I32, {kCapacity, c.T, c.B}),
         tensor(d_counts.p, DType::I32, {c.T, c.B})};
 
-    ops::qsa_indexer(tensor(d_index_query.p, DType::BF16, {kIndexDim, kIndexHeads, c.T, c.B}), cache,
+    ops::qsa_indexer(tensor(d_index_query.p, c.activation, {kIndexDim, kIndexHeads, c.T, c.B}), cache,
                      batch, 4096, arena, selected, stream);
     cuda_synchronize(stream);
 
@@ -496,6 +529,7 @@ int run_indexer(const IndexerCase& c, cudaStream_t stream, WorkspaceArena& arena
 
 struct GqaCase {
     std::string label;
+    DType activation = DType::BF16;
     std::int32_t T;
     std::int32_t B;
     std::int32_t axes;
@@ -544,7 +578,7 @@ int run_sparse_gqa(const GqaCase& c, cudaStream_t stream, WorkspaceArena& arena)
                     const std::int32_t row = token % kQsaTokenPageSize;
                     double dot = 0.0;
                     for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                        dot += bf16_double(c.query[static_cast<std::size_t>(d2i(d, h, t, b, kHeadDim, kQHeads, c.T, c.B))]) *
+                        dot += act_double(c.query[static_cast<std::size_t>(d2i(d, h, t, b, kHeadDim, kQHeads, c.T, c.B))], c.activation) *
                                bf16_double(c.k_pages[static_cast<std::size_t>(
                                    d + static_cast<std::size_t>(kHeadDim) *
                                        (static_cast<std::size_t>(row) +
@@ -581,9 +615,11 @@ int run_sparse_gqa(const GqaCase& c, cudaStream_t stream, WorkspaceArena& arena)
                                                    static_cast<std::size_t>(kKvHeads) *
                                             static_cast<std::size_t>(physical))))]);
                     }
-                    const double gate = bf16_double(c.gate[static_cast<std::size_t>(d2i(d, h, t, b, kHeadDim, kQHeads, c.T, c.B))]);
+                    const double gate = act_double(c.gate[static_cast<std::size_t>(d2i(d, h, t, b, kHeadDim, kQHeads, c.T, c.B))], c.activation);
                     ref[static_cast<std::size_t>(d2i(d, h, t, b, kHeadDim, kQHeads, c.T, c.B))] =
-                        bf16_double(double_bf16(attention * (1.0 / (1.0 + std::exp(-gate)))));
+                        act_double(act_bits(attention * (1.0 / (1.0 + std::exp(-gate))),
+                                            c.activation),
+                                   c.activation);
                 }
             }
         }
@@ -616,14 +652,15 @@ int run_sparse_gqa(const GqaCase& c, cudaStream_t stream, WorkspaceArena& arena)
     QsaBlockSelection selected{
         tensor(d_selection.p, DType::I32, {kCapacity, c.T, c.B}),
         tensor(d_counts.p, DType::I32, {c.T, c.B})};
-    Tensor out = tensor(d_out.p, DType::BF16, {kHeadDim, kQHeads, c.T, c.B});
+    Tensor out = tensor(d_out.p, c.activation, {kHeadDim, kQHeads, c.T, c.B});
 
-    ops::qsa_sparse_gqa(tensor(d_query.p, DType::BF16, {kHeadDim, kQHeads, c.T, c.B}),
-                        tensor(d_gate.p, DType::BF16, {kHeadDim, kQHeads, c.T, c.B}), cache, batch,
+    ops::qsa_sparse_gqa(tensor(d_query.p, c.activation, {kHeadDim, kQHeads, c.T, c.B}),
+                        tensor(d_gate.p, c.activation, {kHeadDim, kQHeads, c.T, c.B}), cache, batch,
                         selected, 4096, arena, out, stream);
     cuda_synchronize(stream);
 
-    return verify_pointwise(c.label, from_device_bf16(d_out.p, out_count), ref, kCriterion);
+    return verify_pointwise(c.label, read_activation(d_out.p, out_count, c.activation), ref,
+                            kCriterion);
 }
 
 struct TailCase {
@@ -677,6 +714,32 @@ int run_tail_extract(const TailCase& c, cudaStream_t stream) {
     return failures;
 }
 
+PrepareCase fp16_prepare(PrepareCase c) {
+    c.activation = DType::FP16;
+    c.label += " (f16)";
+    c.proj_query = to_activation(std::move(c.proj_query), DType::FP16);
+    c.proj_key = to_activation(std::move(c.proj_key), DType::FP16);
+    c.proj_value = to_activation(std::move(c.proj_value), DType::FP16);
+    c.proj_index_query = to_activation(std::move(c.proj_index_query), DType::FP16);
+    c.proj_index_key = to_activation(std::move(c.proj_index_key), DType::FP16);
+    return c;
+}
+
+IndexerCase fp16_indexer(IndexerCase c) {
+    c.activation = DType::FP16;
+    c.label += " (f16)";
+    c.index_query = to_activation(std::move(c.index_query), DType::FP16);
+    return c;
+}
+
+GqaCase fp16_gqa(GqaCase c) {
+    c.activation = DType::FP16;
+    c.label += " (f16)";
+    c.query = to_activation(std::move(c.query), DType::FP16);
+    c.gate = to_activation(std::move(c.gate), DType::FP16);
+    return c;
+}
+
 int run_prepare_cases(cudaStream_t stream, WorkspaceArena& arena) {
     int failures = 0;
     const std::int32_t logical_pages = 64;
@@ -722,6 +785,7 @@ int run_prepare_cases(cudaStream_t stream, WorkspaceArena& arena) {
     }
     p1.tail_rope = {0, 0, 0, 1, 2, 3};
     failures += run_prepare(p1, stream, arena);
+    failures += run_prepare(fp16_prepare(p1), stream, arena);
 
     PrepareCase p2;
     p2.label = "qsa_prepare block boundary";
@@ -754,6 +818,7 @@ int run_prepare_cases(cudaStream_t stream, WorkspaceArena& arena) {
     }
     p2.tail_rope = {1, 2, 3};
     failures += run_prepare(p2, stream, arena);
+    failures += run_prepare(fp16_prepare(p2), stream, arena);
 
     return failures;
 }
@@ -776,6 +841,7 @@ int run_indexer_cases(cudaStream_t stream, WorkspaceArena& arena) {
     i1.index_query = integer_inputs(static_cast<std::size_t>(kIndexDim) * kIndexHeads * 2, 31U);
     i1.index_keys = integer_inputs(static_cast<std::size_t>(kIndexDim) * kQsaIndexBlockPageSize * 64, 32U);
     failures += run_indexer(i1, stream, arena);
+    failures += run_indexer(fp16_indexer(i1), stream, arena);
 
     IndexerCase i2;
     i2.label = "qsa_indexer top-512";
@@ -792,6 +858,7 @@ int run_indexer_cases(cudaStream_t stream, WorkspaceArena& arena) {
     i2.index_query = integer_inputs(static_cast<std::size_t>(kIndexDim) * kIndexHeads, 41U);
     i2.index_keys = integer_inputs(static_cast<std::size_t>(kIndexDim) * kQsaIndexBlockPageSize * 64, 42U);
     failures += run_indexer(i2, stream, arena);
+    failures += run_indexer(fp16_indexer(i2), stream, arena);
 
     IndexerCase i3;
     i3.label = "qsa_indexer tie rule";
@@ -810,6 +877,7 @@ int run_indexer_cases(cudaStream_t stream, WorkspaceArena& arena) {
     i3.index_keys[static_cast<std::size_t>(0 + kIndexDim * (4 + kQsaIndexBlockPageSize * 31))] = double_bf16(1.0);
     i3.index_keys[static_cast<std::size_t>(0 + kIndexDim * (0 + kQsaIndexBlockPageSize * 32))] = double_bf16(1.0);
     failures += run_indexer(i3, stream, arena);
+    failures += run_indexer(fp16_indexer(i3), stream, arena);
 
     IndexerCase i5;
     i5.label = "qsa_indexer distinct scores";
@@ -833,6 +901,7 @@ int run_indexer_cases(cudaStream_t stream, WorkspaceArena& arena) {
         i5.index_keys[static_cast<std::size_t>(g) * kIndexDim] = double_bf16(value);
     }
     failures += run_indexer(i5, stream, arena);
+    failures += run_indexer(fp16_indexer(i5), stream, arena);
 
     IndexerCase i4;
     i4.label = "qsa_indexer invalid row";
@@ -849,6 +918,7 @@ int run_indexer_cases(cudaStream_t stream, WorkspaceArena& arena) {
     i4.index_query = integer_inputs(static_cast<std::size_t>(kIndexDim) * kIndexHeads * 2, 51U);
     i4.index_keys = integer_inputs(static_cast<std::size_t>(kIndexDim) * kQsaIndexBlockPageSize * 64, 52U);
     failures += run_indexer(i4, stream, arena);
+    failures += run_indexer(fp16_indexer(i4), stream, arena);
 
     return failures;
 }
@@ -882,6 +952,7 @@ int run_gqa_cases(cudaStream_t stream, WorkspaceArena& arena) {
         }
     }
     failures += run_sparse_gqa(g1, stream, arena);
+    failures += run_sparse_gqa(fp16_gqa(g1), stream, arena);
 
     GqaCase g2;
     g2.label = "qsa_sparse_gqa partial selection";
@@ -905,6 +976,7 @@ int run_gqa_cases(cudaStream_t stream, WorkspaceArena& arena) {
     g2.selection[2] = 7;
     g2.counts = {3};
     failures += run_sparse_gqa(g2, stream, arena);
+    failures += run_sparse_gqa(fp16_gqa(g2), stream, arena);
 
     GqaCase g3;
     g3.label = "qsa_sparse_gqa empty set";
@@ -925,6 +997,7 @@ int run_gqa_cases(cudaStream_t stream, WorkspaceArena& arena) {
     g3.selection.assign(static_cast<std::size_t>(kCapacity) * 2, kSentinelI32);
     g3.counts = {0, 0};
     failures += run_sparse_gqa(g3, stream, arena);
+    failures += run_sparse_gqa(fp16_gqa(g3), stream, arena);
 
     return failures;
 }

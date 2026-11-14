@@ -14,6 +14,8 @@
 namespace ninfer::ops {
 namespace {
 
+using detail::QsaAct;
+using detail::qsa_is_activation;
 using detail::qsa_row_position;
 
 __device__ float block_reduce_sum(float* scratch, float value) {
@@ -38,14 +40,14 @@ __device__ float block_reduce_max(float* scratch, float value) {
     return scratch[0];
 }
 
-__global__ void sparse_gqa_kernel(const __nv_bfloat16* query, const __nv_bfloat16* output_gate,
+template <class A>
+__global__ void sparse_gqa_kernel(const A* query, const A* output_gate,
                                   const int* positions, const int* valid_columns,
                                   const int* table_rows, int tokens, int batch, int axes,
                                   int head_dim, int q_heads, int kv_heads, const int* page_table,
                                   int logical_pages,
                                   const __nv_bfloat16* k_pages, const __half* v_pages,
-                                  const int* selection, const int* counts,
-                                  __nv_bfloat16* out) {
+                                  const int* selection, const int* counts, A* out) {
     __shared__ float reduce[256];
     __shared__ float probabilities[4 * kQsaSelectionCapacity + 3];
 
@@ -60,7 +62,7 @@ __global__ void sparse_gqa_kernel(const __nv_bfloat16* query, const __nv_bfloat1
 
     if (t >= columns) {
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-            out[output_base + d] = __float2bfloat16_rn(0.0F);
+            out[output_base + d] = QsaAct<A>::from_float(0.0F);
         }
         return;
     }
@@ -78,7 +80,7 @@ __global__ void sparse_gqa_kernel(const __nv_bfloat16* query, const __nv_bfloat1
 
     if (count_j == 0) {
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-            out[output_base + d] = __float2bfloat16_rn(0.0F);
+            out[output_base + d] = QsaAct<A>::from_float(0.0F);
         }
         return;
     }
@@ -104,7 +106,7 @@ __global__ void sparse_gqa_kernel(const __nv_bfloat16* query, const __nv_bfloat1
         const std::int64_t cache_base = key_offset(token);
         float dot = 0.0F;
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-            dot += __bfloat162float(query[output_base + d]) *
+            dot += QsaAct<A>::to_float(query[output_base + d]) *
                    __bfloat162float(k_pages[cache_base + d]);
         }
         const float total = block_reduce_sum(reduce, dot);
@@ -135,9 +137,9 @@ __global__ void sparse_gqa_kernel(const __nv_bfloat16* query, const __nv_bfloat1
             const std::int64_t cache_base = key_offset(token);
             attention += probabilities[j] * __half2float(v_pages[cache_base + d]);
         }
-        const float gate = __bfloat162float(output_gate[output_base + d]);
+        const float gate = QsaAct<A>::to_float(output_gate[output_base + d]);
         const float sigmoid = 1.0F / (1.0F + expf(-gate));
-        out[output_base + d] = __float2bfloat16_rn(attention * sigmoid);
+        out[output_base + d] = QsaAct<A>::from_float(attention * sigmoid);
     }
 }
 
@@ -153,9 +155,9 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate, const QsaCac
     using detail::qsa_require_contiguous;
     using detail::qsa_require_dtype;
 
-    qsa_require_dtype(query, DType::BF16, "query must be BF16");
-    qsa_require_dtype(output_gate, DType::BF16, "output_gate must be BF16");
-    qsa_require_dtype(out, DType::BF16, "out must be BF16");
+    qsa_require(qsa_is_activation(query.dtype), "query must be BF16 or FP16");
+    qsa_require(output_gate.dtype == query.dtype, "output_gate dtype must match query");
+    qsa_require(out.dtype == query.dtype, "out dtype must match query");
     qsa_require_dtype(cache.k_pages, DType::BF16, "key cache must be BF16");
     qsa_require_dtype(cache.v_pages, DType::FP16, "value cache must be FP16");
     qsa_require_dtype(cache.page_table, DType::I32, "page table must be I32");
@@ -217,20 +219,31 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate, const QsaCac
         throw std::overflow_error("qsa_sparse_gqa: grid exceeds int range");
     }
 
-    sparse_gqa_kernel<<<static_cast<unsigned>(grid), 256, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(query.data),
-        static_cast<const __nv_bfloat16*>(output_gate.data),
-        static_cast<const int*>(batch.positions.data),
-        detail::qsa_has_valid_columns(batch.valid_columns)
-            ? static_cast<const int*>(batch.valid_columns.data)
-            : nullptr,
-        static_cast<const int*>(batch.table_rows.data), tokens, batch_sz,
-        batch.positions.ne[1], head_dim, q_heads, kv_heads,
-        static_cast<const int*>(cache.page_table.data), cache.page_table.ne[0],
-        static_cast<const __nv_bfloat16*>(cache.k_pages.data),
-        static_cast<const __half*>(cache.v_pages.data),
-        static_cast<const int*>(selected.selection.data),
-        static_cast<const int*>(selected.counts.data), static_cast<__nv_bfloat16*>(out.data));
+    const auto* positions = static_cast<const int*>(batch.positions.data);
+    const auto* valid_columns = detail::qsa_has_valid_columns(batch.valid_columns)
+                                    ? static_cast<const int*>(batch.valid_columns.data)
+                                    : nullptr;
+    const auto* table_rows = static_cast<const int*>(batch.table_rows.data);
+    const auto* page_table = static_cast<const int*>(cache.page_table.data);
+    const auto* k_pages = static_cast<const __nv_bfloat16*>(cache.k_pages.data);
+    const auto* v_pages = static_cast<const __half*>(cache.v_pages.data);
+    const auto* selection = static_cast<const int*>(selected.selection.data);
+    const auto* count_values = static_cast<const int*>(selected.counts.data);
+    if (query.dtype == DType::FP16) {
+        sparse_gqa_kernel<__half><<<static_cast<unsigned>(grid), 256, 0, stream>>>(
+            static_cast<const __half*>(query.data),
+            static_cast<const __half*>(output_gate.data), positions, valid_columns, table_rows,
+            tokens, batch_sz, batch.positions.ne[1], head_dim, q_heads, kv_heads, page_table,
+            cache.page_table.ne[0], k_pages, v_pages, selection, count_values,
+            static_cast<__half*>(out.data));
+    } else {
+        sparse_gqa_kernel<__nv_bfloat16><<<static_cast<unsigned>(grid), 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(query.data),
+            static_cast<const __nv_bfloat16*>(output_gate.data), positions, valid_columns,
+            table_rows, tokens, batch_sz, batch.positions.ne[1], head_dim, q_heads, kv_heads,
+            page_table, cache.page_table.ne[0], k_pages, v_pages, selection, count_values,
+            static_cast<__nv_bfloat16*>(out.data));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
