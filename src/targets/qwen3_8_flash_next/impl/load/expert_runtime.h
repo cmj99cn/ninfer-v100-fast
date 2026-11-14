@@ -8,8 +8,10 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <vector>
 
 namespace ninfer::targets::qwen3_8_flash_next::detail {
@@ -24,6 +26,7 @@ public:
     ExpertRuntime& operator=(const ExpertRuntime&) = delete;
     ExpertRuntime(ExpertRuntime&&)                 = delete;
     ExpertRuntime& operator=(ExpertRuntime&&)      = delete;
+    ~ExpertRuntime();
 
     void routed(std::uint32_t layer, const Tensor& x, const ops::MoeNvfp4RouteView& route,
                 Tensor& destination, cudaStream_t stream);
@@ -33,18 +36,24 @@ public:
         return static_cast<std::uint64_t>(slab_.bytes + lookup_.bytes + divisors_.bytes);
     }
     [[nodiscard]] std::uint64_t host_bytes() const noexcept {
-        return static_cast<std::uint64_t>(staging_.size());
+        return static_cast<std::uint64_t>(kCopyStages) * kPairBytes;
     }
 
 private:
-    void pull(std::uint32_t layer, std::uint32_t expert, std::uint32_t slot, cudaStream_t stream);
+    static constexpr std::uint32_t kCopyStages = 3;
+
+    void launch_pull(std::uint32_t layer, std::uint32_t expert, std::uint32_t slot);
 
     int device_                              = 0;
     std::uint32_t expert_begin_              = 0;
     qwen4_exp::TextResidentStats* stats_     = nullptr;
     HostPairSource source_;
     ExpertCache cache_;
-    PinnedHostBuffer staging_;
+    std::array<std::unique_ptr<PinnedHostBuffer>, kCopyStages> staging_;
+    std::array<cudaEvent_t, kCopyStages> stage_ready_{};
+    std::uint32_t stage_cursor_              = 0;
+    cudaStream_t copy_stream_                = nullptr;
+    cudaEvent_t copy_done_                   = nullptr;
     DeviceBuffer slab_;
     DeviceBuffer lookup_;
     DeviceBuffer divisors_;

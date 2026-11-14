@@ -127,6 +127,12 @@ ninfer_add_test(ninfer_flash_next_full_model_test
 target_link_libraries(ninfer_flash_next_full_model_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_flash_next_full_model_test PROPERTIES SKIP_RETURN_CODE 77)
 
+ninfer_add_test(ninfer_flash_next_ple_prefetch_test
+  SOURCES targets/qwen3_8_flash_next/test_ple_prefetch.cpp
+  LIBRARIES ninfer_flash_next_package)
+target_link_libraries(ninfer_flash_next_ple_prefetch_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_flash_next_ple_prefetch_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_flash_next_program_lifecycle_test
   SOURCES targets/qwen3_8_flash_next/test_program_lifecycle.cpp
   LIBRARIES ninfer_flash_next_package)

@@ -4,6 +4,7 @@
 #include "targets/qwen3_8_flash_next/impl/config.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -68,6 +69,8 @@ public:
     void read_divisors(std::uint32_t layer, std::uint32_t expert, float (&out)[3]) const;
 
     [[nodiscard]] std::uint64_t pair_bytes() const noexcept { return pair_bytes_; }
+    [[nodiscard]] std::uint64_t reads_started() const noexcept { return reads_started_; }
+    [[nodiscard]] std::uint64_t reads_finished() const noexcept { return reads_finished_; }
 
 private:
     struct PairGeometry {
@@ -85,6 +88,8 @@ private:
     artifact::Reader reader_;
     std::uint64_t pair_bytes_;
     std::vector<std::array<PairGeometry, 3>> geometry_;
+    mutable std::atomic<std::uint64_t> reads_started_{0};
+    mutable std::atomic<std::uint64_t> reads_finished_{0};
 };
 class ExpertCache {
 public:
@@ -101,6 +106,7 @@ public:
     [[nodiscard]] std::uint32_t slots() const noexcept;
     [[nodiscard]] const ExpertCachePlan& plan() const noexcept { return plan_; }
     [[nodiscard]] HostPairSource& source() noexcept { return source_; }
+    [[nodiscard]] const HostPairSource& source() const noexcept { return source_; }
     [[nodiscard]] CacheStats stats() const noexcept { return stats_; }
 
 private:

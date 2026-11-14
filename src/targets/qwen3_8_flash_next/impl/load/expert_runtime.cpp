@@ -35,13 +35,20 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
     : device_(device), expert_begin_(expert_begin), stats_(stats),
       source_(artifact_path, kPairBytes),
       cache_(options, kPairBytes, available_bytes, source_),
-      staging_(static_cast<std::size_t>(kPairBytes)),
       host_lookup_(static_cast<std::size_t>(TextConfig::experts), -1),
       host_divisors_(static_cast<std::size_t>(cache_.slots()) * 3, 0.0F) {
     const ScopedDevice scope(device_);
     slab_    = DeviceBuffer(static_cast<std::size_t>(cache_.plan().bytes));
     lookup_  = DeviceBuffer(static_cast<std::size_t>(TextConfig::experts) * 4);
     divisors_ = DeviceBuffer(static_cast<std::size_t>(cache_.slots()) * 3 * 4);
+    for (auto& staging : staging_) {
+        staging = std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(kPairBytes));
+    }
+    for (auto& event : stage_ready_) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventCreateWithFlags(&copy_done_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
     if (stats_ != nullptr) {
         stats_->expert_cache_bytes = device_bytes();
         stats_->expert_cache_pairs = cache_.plan().pairs;
@@ -49,20 +56,33 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
     }
 }
 
-void ExpertRuntime::pull(std::uint32_t layer, std::uint32_t expert, std::uint32_t slot,
-                         cudaStream_t stream) {
+ExpertRuntime::~ExpertRuntime() {
+    const ScopedDevice scope(device_);
+    if (copy_stream_ != nullptr) { (void)cudaStreamDestroy(copy_stream_); }
+    if (copy_done_ != nullptr) { (void)cudaEventDestroy(copy_done_); }
+    for (cudaEvent_t& event : stage_ready_) {
+        if (event != nullptr) { (void)cudaEventDestroy(event); }
+    }
+}
+
+void ExpertRuntime::launch_pull(std::uint32_t layer, std::uint32_t expert, std::uint32_t slot) {
+    const std::uint32_t stage = stage_cursor_;
+    stage_cursor_ = (stage_cursor_ + 1) % kCopyStages;
+    CUDA_CHECK(cudaEventSynchronize(stage_ready_[stage]));
+    PinnedHostBuffer& staging = *staging_[stage];
     const std::uint32_t global = expert_begin_ + expert;
     source_.read(layer, global,
-                 std::span<std::byte>(static_cast<std::byte*>(staging_.data()), kPairBytes));
+                 std::span<std::byte>(static_cast<std::byte*>(staging.data()), kPairBytes));
     CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(slab_.p) + slot * kPairBytes,
-                               staging_.data(), kPairBytes, cudaMemcpyHostToDevice, stream));
+                               staging.data(), kPairBytes, cudaMemcpyHostToDevice, copy_stream_));
     float divisors[3]{};
     source_.read_divisors(layer, global, divisors);
     std::memcpy(host_divisors_.data() + static_cast<std::size_t>(slot) * 3, divisors,
                 sizeof(divisors));
     CUDA_CHECK(cudaMemcpyAsync(static_cast<float*>(divisors_.p) + static_cast<std::size_t>(slot) * 3,
-                               divisors, sizeof(divisors), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+                               divisors, sizeof(divisors), cudaMemcpyHostToDevice, copy_stream_));
+    CUDA_CHECK(cudaEventRecord(stage_ready_[stage], copy_stream_));
+    CUDA_CHECK(cudaEventRecord(copy_done_, copy_stream_));
 }
 
 void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
@@ -109,16 +129,19 @@ void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
     cache_.reserve(missing, protected_pairs);
 
     std::fill(host_lookup_.begin(), host_lookup_.end(), -1);
+    bool copied = false;
     for (const auto& [local, global] : needed) {
         std::int32_t slot = cache_.resident_slot(layer, local);
         if (slot < 0) {
             slot = static_cast<std::int32_t>(cache_.load(layer, local));
-            pull(layer, local, static_cast<std::uint32_t>(slot), stream);
+            launch_pull(layer, local, static_cast<std::uint32_t>(slot));
+            copied = true;
         } else {
             (void)cache_.find(layer, local);
         }
         host_lookup_[static_cast<std::size_t>(global)] = slot;
     }
+    if (copied) { CUDA_CHECK(cudaStreamWaitEvent(stream, copy_done_, 0)); }
     CUDA_CHECK(cudaMemcpyAsync(lookup_.p, host_lookup_.data(), host_lookup_.size() * 4,
                                cudaMemcpyHostToDevice, stream));
     const ops::MoeNvfp4ExpertSlots bank{

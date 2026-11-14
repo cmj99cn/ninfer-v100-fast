@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/host_worker_pool.h"
 #include "core/tensor.h"
 #include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/ple.h"
@@ -12,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <future>
 #include <memory>
 #include <cstddef>
 #include <cstdint>
@@ -37,9 +39,11 @@ public:
               std::uint32_t forward_tokens);
     TextState(DeviceContext& device, const ModelView& model, std::uint32_t kv_capacity_tokens,
               std::uint32_t forward_tokens, int tp, int rank);
+    ~TextState();
 
     void reset();
     void prepare_ple_rows(std::span<const TokenId> tokens);
+    void await_ple_rows();
     [[nodiscard]] std::int32_t base_position() const;
 
     [[nodiscard]] Tensor gdn_conv_state(std::size_t gdn_index) const;
@@ -111,6 +115,10 @@ private:
     std::vector<std::optional<std::size_t>> gdn_index_;
     std::unique_ptr<PinnedHostBuffer> ple_rows_host_;
     std::unique_ptr<PinnedHostBuffer> ple_staged_host_;
+    cudaStream_t ple_stream_ = nullptr;
+    cudaEvent_t ple_ready_   = nullptr;
+    std::unique_ptr<HostWorkerPool> ple_workers_;
+    std::future<void> ple_prefetch_;
     std::uint32_t next_position_ = 0;
     std::uint64_t ple_tail_[2]   = {0, 0};
     ops::PleHashControls ple_controls_{};

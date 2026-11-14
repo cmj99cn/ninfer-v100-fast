@@ -124,6 +124,7 @@ void HostPairSource::read(std::uint32_t layer, std::uint32_t expert,
                                     std::to_string(destination.size()));
     }
 
+    ++reads_started_;
     std::size_t cursor = 0;
     for (const auto& geometry : geometry_[layer]) {
         const auto code_start = expert * geometry.matrix_code + geometry.row_begin * geometry.row_bytes;
@@ -135,6 +136,7 @@ void HostPairSource::read(std::uint32_t layer, std::uint32_t expert,
         const auto scale_bytes = (geometry.row_count / kRowTile) * geometry.tile_bytes;
         copy_range(reader_, geometry.base + scale_start, scale_bytes, destination, cursor);
     }
+    ++reads_finished_;
 }
 
 void HostPairSource::read_divisors(std::uint32_t layer, std::uint32_t expert,

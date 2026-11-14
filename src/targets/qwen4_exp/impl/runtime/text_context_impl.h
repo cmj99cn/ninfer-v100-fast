@@ -31,6 +31,30 @@
 #define NINFER_QWEN4EXP_LAST_STAGE(sample, logits)
 #endif
 
+#ifndef NINFER_QWEN4EXP_PLE_PREFETCH_LAUNCH
+#define NINFER_QWEN4EXP_PLE_PREFETCH_LAUNCH()
+#endif
+
+#ifndef NINFER_QWEN4EXP_PLE_FETCH_BEGIN
+#define NINFER_QWEN4EXP_PLE_FETCH_BEGIN(count)
+#endif
+
+#ifndef NINFER_QWEN4EXP_PLE_FETCH_END
+#define NINFER_QWEN4EXP_PLE_FETCH_END()
+#endif
+
+#ifndef NINFER_QWEN4EXP_PLE_PREFETCH_AWAIT
+#define NINFER_QWEN4EXP_PLE_PREFETCH_AWAIT()
+#endif
+
+#ifndef NINFER_QWEN4EXP_EXPERT_READ_BEGIN
+#define NINFER_QWEN4EXP_EXPERT_READ_BEGIN(layer)
+#endif
+
+#ifndef NINFER_QWEN4EXP_EXPERT_READ_END
+#define NINFER_QWEN4EXP_EXPERT_READ_END(layer)
+#endif
+
 namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
 
 inline constexpr std::int32_t kHidden   = TextConfig::hidden;
@@ -155,11 +179,23 @@ inline TextState::TextState(DeviceContext& device, const ModelView& model,
         table[page] = static_cast<std::int32_t>(page);
     }
     page_table_.copy_from_host(table.data(), pages_ * 4);
+    CUDA_CHECK(cudaStreamCreateWithFlags(&ple_stream_, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ple_ready_, cudaEventDisableTiming));
+    ple_workers_ = std::make_unique<HostWorkerPool>(1, 2);
     reset();
+}
+
+inline TextState::~TextState() {
+    DeviceScope scope(device_);
+    if (ple_prefetch_.valid()) { ple_prefetch_.wait(); }
+    if (ple_ready_ != nullptr) { (void)cudaEventDestroy(ple_ready_); }
+    if (ple_stream_ != nullptr) { (void)cudaStreamDestroy(ple_stream_); }
 }
 
 inline void TextState::reset() {
     DeviceScope scope(device_);
+    if (ple_prefetch_.valid()) { ple_prefetch_.wait(); }
+    if (ple_ready_ != nullptr) { (void)cudaEventSynchronize(ple_ready_); }
     conv_states_.fill(0);
     recurrent_states_.fill(0);
     k_pages_.fill(0);
@@ -210,14 +246,31 @@ inline void TextState::prepare_ple_rows(std::span<const TokenId> tokens) {
     if (staged_bytes > ple_staged_host_->size() || rows.size() * 4 > ple_rows_host_->size()) {
         throw std::runtime_error("the PLE row round exceeds its pinned staging capacity");
     }
-    ple_source_.fetch(ple_source_.context, addresses.data(), addresses.size(),
-                      static_cast<std::byte*>(ple_staged_host_->data()));
-    std::memcpy(ple_rows_host_->data(), rows.data(), rows.size() * 4);
-    CUDA_CHECK(cudaMemcpyAsync(ple_rows_.p, ple_rows_host_->data(), rows.size() * 4,
-                               cudaMemcpyHostToDevice, stream_));
-    CUDA_CHECK(cudaMemcpyAsync(ple_staged_rows_.p, ple_staged_host_->data(), staged_bytes,
-                               cudaMemcpyHostToDevice, stream_));
     for (const TokenId token : tokens) { advance_ple_tail(token); }
+    if (ple_prefetch_.valid()) { ple_prefetch_.get(); }
+    NINFER_QWEN4EXP_PLE_PREFETCH_LAUNCH();
+    ple_prefetch_ = ple_workers_->submit(
+        [this, rows = std::move(rows), addresses = std::move(addresses), staged_bytes] {
+            CUDA_CHECK(cudaSetDevice(device_));
+            CUDA_CHECK(cudaEventSynchronize(ple_ready_));
+            NINFER_QWEN4EXP_PLE_FETCH_BEGIN(addresses.size());
+            ple_source_.fetch(ple_source_.context, addresses.data(), addresses.size(),
+                              static_cast<std::byte*>(ple_staged_host_->data()));
+            NINFER_QWEN4EXP_PLE_FETCH_END();
+            std::memcpy(ple_rows_host_->data(), rows.data(), rows.size() * 4);
+            CUDA_CHECK(cudaMemcpyAsync(ple_rows_.p, ple_rows_host_->data(), rows.size() * 4,
+                                       cudaMemcpyHostToDevice, ple_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(ple_staged_rows_.p, ple_staged_host_->data(), staged_bytes,
+                                       cudaMemcpyHostToDevice, ple_stream_));
+            CUDA_CHECK(cudaEventRecord(ple_ready_, ple_stream_));
+        });
+}
+
+inline void TextState::await_ple_rows() {
+    DeviceScope scope(device_);
+    if (ple_prefetch_.valid()) { ple_prefetch_.get(); }
+    CUDA_CHECK(cudaStreamWaitEvent(stream_, ple_ready_, 0));
+    NINFER_QWEN4EXP_PLE_PREFETCH_AWAIT();
 }
 
 inline std::int32_t TextState::base_position() const {
@@ -770,9 +823,11 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
             ops::moe_nvfp4_route(block_input[slot], models_[slot]->layers[layer].post_mixer,
                                  route_ids, route_coefficients, route_gate, stream_for(rank));
             routes[slot] = ops::MoeNvfp4RouteView{route_ids, route_coefficients, route_gate};
+            NINFER_QWEN4EXP_EXPERT_READ_BEGIN(layer);
             Variant::post_mixer_routed(block_input[slot],
                                        models_[slot]->layers[layer].post_mixer, routes[slot],
                                        moe_out[slot], stream_for(rank));
+            NINFER_QWEN4EXP_EXPERT_READ_END(layer);
         });
         reduce_rows(moe_out, staging);
         for_each_rank([&](int rank) {
@@ -786,6 +841,9 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
 #endif
 
         if (layer + 1 == static_cast<std::size_t>(TextConfig::ple_layer)) {
+            for_each_rank([&](int rank) {
+                states_[static_cast<std::size_t>(rank)]->await_ple_rows();
+            });
             for_each_rank([&](int rank) {
                 const auto slot = static_cast<std::size_t>(rank);
                 ops::hc_combine(stage[slot], moe_out[slot], injection[slot], residual[slot],
