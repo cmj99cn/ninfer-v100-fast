@@ -761,7 +761,7 @@ int main() {
     failures += shared_gate_buffer.verify_guards("moe_nvfp4 shared gate guard");
     failures += destination_buffer.verify_guards("moe_nvfp4 destination guard");
 
-    constexpr float kF16ExpertDivisorScale = 4096.0F;
+    constexpr float kF16ExpertDivisorScale = 1024.0F;
     BatchedFixture gate_up_f16 =
         make_batched(kGateUpRows, kHidden, 0x9abcU, active, kF16ExpertDivisorScale);
     BatchedFixture down_f16 =
@@ -801,6 +801,7 @@ int main() {
     Tensor shared_gate16{shared_gate_f16.data(), DType::FP32,
                          {static_cast<std::int32_t>(kTokens)}};
     ops::moe_nvfp4_route(x16, weights_f16, ids16, coefficients16, shared_gate16, 0);
+    const MoeNvfp4RouteView route16{ids16, coefficients16, shared_gate16};
 
     GuardedDeviceBuffer destination_f16(kTokens * kHidden * sizeof(std::uint16_t));
     destination_f16.copy_from_host(residual_f16_bits.data(),
@@ -819,8 +820,17 @@ int main() {
     const std::vector<double> got_destination_f16 =
         from_device_f16(destination_f16.data(), kTokens * kHidden);
 
+    GuardedDeviceBuffer partial_f16(kTokens * kHidden * sizeof(std::uint16_t));
+    partial_f16.fill(0);
+    Tensor partial16{partial_f16.data(), DType::FP16, {kHidden, static_cast<std::int32_t>(kTokens)}};
+    ops::moe_routed_nvfp4_partial(x16, weights_f16, route16, partial16, 0);
+    cuda_synchronize();
+    const std::vector<double> got_partial_f16 =
+        from_device_f16(partial_f16.data(), kTokens * kHidden);
+
     std::vector<double> expected_destination_f16(kTokens * kHidden, 0.0);
-    bool routed_effect_f16 = false;
+    std::vector<double> expected_partial_f16(kTokens * kHidden, 0.0);
+    double max_routed_f16 = 0.0;
     for (std::size_t t = 0; t < kTokens; ++t) {
         std::vector<float> activation(activation_f16.begin() + static_cast<std::ptrdiff_t>(t * kHidden),
                                       activation_f16.begin() + static_cast<std::ptrdiff_t>((t + 1) * kHidden));
@@ -843,16 +853,14 @@ int main() {
                                     oracle.coefficients[static_cast<std::size_t>(rank)]);
             for (std::size_t i = 0; i < kHidden; ++i) {
                 expected_destination_f16[t * kHidden + i] += contribution[i];
+                expected_partial_f16[t * kHidden + i] += contribution[i];
+                max_routed_f16 = std::max(max_routed_f16, std::abs(contribution[i]));
             }
         }
         const std::vector<double> shared =
             shared_contribution(inputs.parent, inputs.shared_down, activation, oracle.shared_gate);
         for (std::size_t i = 0; i < kHidden; ++i) {
             expected_destination_f16[t * kHidden + i] += shared[i];
-            if (std::abs(expected_destination_f16[t * kHidden + i] -
-                         f16_to_f32(residual_f16_bits[t * kHidden + i])) > 1.0e-3) {
-                routed_effect_f16 = true;
-            }
         }
         failures += verify_pointwise("moe_nvfp4 f16 token " + std::to_string(t) + " coefficients",
                                      std::vector<double>(got_coefficients_f16.begin() +
@@ -867,10 +875,21 @@ int main() {
                                      std::vector<double>{oracle.shared_gate},
                                      kRouteCoefficientCriterion);
     }
-    if (!routed_effect_f16) {
-        std::cerr << "moe_nvfp4 f16 destination: the routed experts contribute nothing\n";
+    if (!(max_routed_f16 > 1.0)) {
+        std::cerr << "moe_nvfp4 f16 routed fixture is too weak: max |contribution| = "
+                  << max_routed_f16 << "\n";
         ++failures;
     }
+    for (const double value : expected_partial_f16) {
+        if (!std::isfinite(value) || std::abs(value) > 65504.0) {
+            std::cerr << "moe_nvfp4 f16 routed-only fixture is not FP16-representable\n";
+            ++failures;
+            break;
+        }
+    }
+    failures += verify_reduction("moe_nvfp4 f16 routed-only destination", got_partial_f16,
+                                 expected_partial_f16, kF16DestinationCriterion);
+    failures += partial_f16.verify_guards("moe_nvfp4 f16 routed-only guard");
     for (const double value : expected_destination_f16) {
         if (!std::isfinite(value) || std::abs(value) > 65504.0) {
             std::cerr << "moe_nvfp4 f16 destination: the fixture is not FP16-representable\n";
