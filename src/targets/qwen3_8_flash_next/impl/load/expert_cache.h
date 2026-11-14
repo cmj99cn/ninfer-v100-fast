@@ -9,7 +9,6 @@
 #include <filesystem>
 #include <optional>
 #include <span>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -71,7 +70,6 @@ public:
 
 private:
     struct PairGeometry {
-        std::string object;
         std::uint64_t base         = 0;
         std::uint64_t matrix_code  = 0;
         std::uint64_t matrix_scale = 0;

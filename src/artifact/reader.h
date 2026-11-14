@@ -392,6 +392,9 @@ public:
     // The volume-contiguous pieces of a logical payload range, in order. A range that spans
     // volumes is split at the volume boundaries; a range inside one volume is one piece.
     std::vector<PayloadSegment> payload_segments(std::uint64_t offset, std::uint64_t bytes) const;
+    // The zero-copy views of a logical payload range, in order, one per volume piece; a range that
+    // spans volumes yields several views rather than an error.
+    std::vector<PayloadSpan> payload_views(std::uint64_t offset, std::uint64_t bytes) const;
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const;
 
 private:

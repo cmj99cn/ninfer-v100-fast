@@ -1027,6 +1027,22 @@ public:
         return result;
     }
 
+    std::vector<PayloadSpan> payload_views(std::uint64_t offset, std::uint64_t bytes) const {
+        std::vector<PayloadSpan> result;
+        for (const auto& piece : segments(offset, bytes)) {
+            const auto& volume = volumes_[piece.volume];
+            if (piece.file_offset + piece.bytes > volume.file->size()) {
+                throw ArtifactError("read range exceeds the volume file");
+            }
+            result.push_back(
+                PayloadSpan{piece.logical_offset,
+                            std::span<const std::byte>(
+                                volume.file->data() + piece.file_offset,
+                                static_cast<std::size_t>(piece.bytes))});
+        }
+        return result;
+    }
+
     std::size_t read_direct(std::uint64_t logical_offset, std::span<std::byte> destination) const {
         std::size_t copied = 0;
         for (const auto& piece : segments(logical_offset, destination.size())) {
@@ -1536,6 +1552,17 @@ std::vector<PayloadSegment> Reader::payload_segments(std::uint64_t offset,
     if (end > impl_->file.size()) { throw ArtifactError("read range exceeds the file"); }
     if (bytes == 0) { return {}; }
     return {PayloadSegment{offset, bytes}};
+}
+
+std::vector<PayloadSpan> Reader::payload_views(std::uint64_t offset,
+                                               std::uint64_t bytes) const {
+    if (impl_->multipart) { return impl_->multipart->payload_views(offset, bytes); }
+    const auto end = checked_add(offset, bytes, "payload range");
+    if (end > impl_->file.size()) { throw ArtifactError("read range exceeds the file"); }
+    if (bytes == 0) { return {}; }
+    return {PayloadSpan{offset,
+                        std::span<const std::byte>(impl_->file.data() + offset,
+                                                   static_cast<std::size_t>(bytes))}};
 }
 
 std::size_t Reader::read_direct(std::uint64_t absolute_offset,

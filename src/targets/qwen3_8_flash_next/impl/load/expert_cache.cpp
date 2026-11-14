@@ -20,6 +20,22 @@ constexpr std::uint64_t kTileBytes  = 512;
 std::uint64_t align_up(std::uint64_t value, std::uint64_t unit) {
     return (value + unit - 1) / unit * unit;
 }
+
+void copy_range(const artifact::Reader& reader, std::uint64_t object_offset, std::uint64_t bytes,
+                std::span<std::byte> destination, std::size_t& cursor) {
+    const auto absolute = reader.payload_offset() + object_offset;
+    std::uint64_t copied = 0;
+    for (const auto& view : reader.payload_views(absolute, bytes)) {
+        std::copy(view.data.begin(), view.data.end(),
+                  destination.begin() + static_cast<std::ptrdiff_t>(cursor + copied));
+        copied += view.data.size();
+    }
+    if (copied != bytes) {
+        throw artifact::ArtifactError("the payload range is shorter than the pair requests");
+    }
+    cursor += static_cast<std::size_t>(bytes);
+}
+
 const std::array<CoveragePoint, 5> kCurve = {{
     {0, 0.0},
     {5247, 0.990},
@@ -84,7 +100,6 @@ HostPairSource::HostPairSource(const std::filesystem::path& path, std::uint64_t 
                                                                      part.end - part.begin);
             const auto geometry = artifact::batched_block_scale_geometry(tensor.format, tensor.shape);
             row[index] = PairGeometry{
-                .object        = part.object,
                 .base          = artifact::object_offset(*object),
                 .matrix_code   = geometry.code_plane_bytes,
                 .matrix_scale  = geometry.scale_plane_bytes,
@@ -109,24 +124,14 @@ void HostPairSource::read(std::uint32_t layer, std::uint32_t expert,
 
     std::size_t cursor = 0;
     for (const auto& geometry : geometry_[layer]) {
-        const auto span = reader_.payload(geometry.object);
+        const auto code_start = expert * geometry.matrix_code + geometry.row_begin * geometry.row_bytes;
+        const auto code_bytes = geometry.row_count * geometry.row_bytes;
+        copy_range(reader_, geometry.base + code_start, code_bytes, destination, cursor);
 
-        const auto code_start = static_cast<std::size_t>(
-            expert * geometry.matrix_code + geometry.row_begin * geometry.row_bytes);
-        const auto code_bytes = static_cast<std::size_t>(geometry.row_count * geometry.row_bytes);
-        std::copy(span.data.begin() + static_cast<std::ptrdiff_t>(code_start),
-                  span.data.begin() + static_cast<std::ptrdiff_t>(code_start + code_bytes),
-                  destination.begin() + static_cast<std::ptrdiff_t>(cursor));
-        cursor += code_bytes;
-
-        const auto scale_start = static_cast<std::size_t>(
-            geometry.scale_plane + expert * geometry.matrix_scale +
-            (geometry.row_begin / kRowTile) * geometry.tile_bytes);
-        const auto scale_bytes = static_cast<std::size_t>((geometry.row_count / kRowTile) * geometry.tile_bytes);
-        std::copy(span.data.begin() + static_cast<std::ptrdiff_t>(scale_start),
-                  span.data.begin() + static_cast<std::ptrdiff_t>(scale_start + scale_bytes),
-                  destination.begin() + static_cast<std::ptrdiff_t>(cursor));
-        cursor += scale_bytes;
+        const auto scale_start = geometry.scale_plane + expert * geometry.matrix_scale +
+                                 (geometry.row_begin / kRowTile) * geometry.tile_bytes;
+        const auto scale_bytes = (geometry.row_count / kRowTile) * geometry.tile_bytes;
+        copy_range(reader_, geometry.base + scale_start, scale_bytes, destination, cursor);
     }
 }
 

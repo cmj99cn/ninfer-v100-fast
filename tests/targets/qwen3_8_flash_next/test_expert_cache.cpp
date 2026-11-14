@@ -463,40 +463,73 @@ void test_empty_profile(const char* path, const std::filesystem::path& profile) 
         std::to_string(expert.stats().residency) + " after the first load past an empty profile");
 }
 
+std::vector<std::byte> direct_pair(const artifact::Reader& reader, std::uint32_t layer,
+                                   std::uint32_t expert) {
+    std::vector<std::byte> direct(static_cast<std::size_t>(cache::kPairBytes));
+    std::size_t cursor = 0;
+    for (const auto& segment : oracle_pair(reader, layer, expert)) {
+        if (reader.find(segment.object) == nullptr) {
+            throw std::runtime_error("no object " + segment.object);
+        }
+        for (const auto& view : reader.payload_views(
+                 reader.payload_offset() + segment.offset, segment.bytes)) {
+            std::copy(view.data.begin(), view.data.end(),
+                      direct.begin() + static_cast<std::ptrdiff_t>(cursor));
+            cursor += view.data.size();
+        }
+    }
+    require(cursor == cache::kPairBytes, "the artifact pair at layer " + std::to_string(layer) +
+        " expert " + std::to_string(expert) + " sums to " + std::to_string(cursor) + " bytes");
+    return direct;
+}
+
+bool pair_spans_volumes(const artifact::Reader& reader, std::uint32_t layer, std::uint32_t expert) {
+    for (const auto& segment : oracle_pair(reader, layer, expert)) {
+        if (reader.payload_segments(reader.payload_offset() + segment.offset, segment.bytes).size() > 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::pair<std::uint32_t, std::uint32_t> find_spanning_pair(const artifact::Reader& reader) {
+    for (std::uint32_t layer = 0; layer < cache::kTextLayers; ++layer) {
+        for (std::uint32_t expert = 0; expert < cache::kRankExperts; ++expert) {
+            if (pair_spans_volumes(reader, layer, expert)) { return {layer, expert}; }
+        }
+    }
+    throw std::runtime_error("the artifact has no pair whose bytes span volumes");
+}
+
 void test_host_pair_source(const char* path) {
     const artifact::Reader reader(path);
     cache::HostPairSource source(path, cache::kPairBytes);
 
     std::vector<std::byte> buffer(cache::kPairBytes);
-    std::vector<std::byte> direct(cache::kPairBytes);
     for (const std::uint32_t layer : {0U, 17U, 47U}) {
         for (const std::uint32_t expert : {0U, 128U, 255U}) {
             source.read(layer, expert, buffer);
-            const auto segments = oracle_pair(reader, layer, expert);
-            std::size_t total = 0;
-            std::size_t cursor = 0;
-            for (const auto& segment : segments) {
-                const auto* object = reader.find(segment.object);
-                if (object == nullptr) { throw std::runtime_error("no object " + segment.object); }
-                const auto span = reader.payload(*object);
-                const std::size_t local =
-                    static_cast<std::size_t>(segment.offset - artifact::object_offset(*object));
-                std::copy(span.data.begin() + static_cast<std::ptrdiff_t>(local),
-                          span.data.begin() + static_cast<std::ptrdiff_t>(local + segment.bytes),
-                          direct.begin() + static_cast<std::ptrdiff_t>(cursor));
-                cursor += segment.bytes;
-                total += segment.bytes;
-            }
-            require(total == cache::kPairBytes, "the oracle pair at layer " +
-                std::to_string(layer) + " expert " + std::to_string(expert) + " sums to " +
-                std::to_string(total) + " bytes");
-            require(hash_of(buffer) == hash_of(direct),
+            require(hash_of(buffer) == hash_of(direct_pair(reader, layer, expert)),
                 "the host pair source read a different pair than the artifact holds at layer " +
                     std::to_string(layer) + " expert " + std::to_string(expert));
         }
     }
     std::cout << "flash-next expert cache: the host pair source reads " << cache::kPairBytes
               << " bytes per pair and matches the artifact byte for byte\n";
+}
+
+void test_cross_volume_pair(const char* path) {
+    const artifact::Reader reader(path);
+    cache::HostPairSource source(path, cache::kPairBytes);
+
+    const auto spanning = find_spanning_pair(reader);
+    std::vector<std::byte> buffer(cache::kPairBytes);
+    source.read(spanning.first, spanning.second, buffer);
+    require(hash_of(buffer) == hash_of(direct_pair(reader, spanning.first, spanning.second)),
+        "the host pair source misreads the pair that spans volumes at layer " +
+            std::to_string(spanning.first) + " expert " + std::to_string(spanning.second));
+    std::cout << "flash-next expert cache: the spanning pair at layer " << spanning.first
+              << " expert " << spanning.second << " reads across volumes\n";
 }
 
 // The device layer: a fixed device slab whose slot addresses stay put, and the miss path landing
@@ -557,20 +590,7 @@ int test_device_slots(const char* path) {
             throw std::runtime_error("the device slot could not be read back");
         }
 
-        std::vector<std::byte> direct(static_cast<std::size_t>(cache::kPairBytes));
-        std::size_t cursor = 0;
-        for (const auto& segment : oracle_pair(reader, layer, expert_index)) {
-            const auto* object = reader.find(segment.object);
-            if (object == nullptr) { throw std::runtime_error("no object " + segment.object); }
-            const auto span = reader.payload(*object);
-            const std::size_t local =
-                static_cast<std::size_t>(segment.offset - artifact::object_offset(*object));
-            std::copy(span.data.begin() + static_cast<std::ptrdiff_t>(local),
-                      span.data.begin() + static_cast<std::ptrdiff_t>(local + segment.bytes),
-                      direct.begin() + static_cast<std::ptrdiff_t>(cursor));
-            cursor += segment.bytes;
-        }
-        check(hash_of(readback) == hash_of(direct),
+        check(hash_of(readback) == hash_of(direct_pair(reader, layer, expert_index)),
               "the device slot holds bytes the artifact does not have for pair (" +
                   std::to_string(layer) + "," + std::to_string(expert_index) + ")");
     }
@@ -582,12 +602,27 @@ int test_device_slots(const char* path) {
         std::to_string(expert.stats().miss_count) + " misses over " + std::to_string(slots) +
         " placements");
 
-    const std::pair<std::uint32_t, std::uint32_t> newcomer = {10, 200};
-    const auto evicted_slot = expert.load(newcomer.first, newcomer.second);
+    const auto spanning = find_spanning_pair(reader);
+    const auto evicted_slot = expert.load(spanning.first, spanning.second);
     check(expert.stats().evictions == 1, "the load after a full slab evicted " +
         std::to_string(expert.stats().evictions) + " pair; a full-cache miss evicts one");
-    check(expert.find(newcomer.first, newcomer.second) == evicted_slot,
+    check(expert.find(spanning.first, spanning.second) == evicted_slot,
           "the pair that caused the eviction is not in the slot load returned");
+
+    source.read(spanning.first, spanning.second, staging);
+    std::byte* evicted_address = slab + static_cast<std::size_t>(expert.slot_offset(evicted_slot));
+    if (cudaMemcpy(evicted_address, staging.data(), staging.size(), cudaMemcpyHostToDevice) !=
+        cudaSuccess) {
+        throw std::runtime_error("the spanning pair could not be copied to its device slot");
+    }
+    execution.primary().synchronize();
+    if (cudaMemcpy(readback.data(), evicted_address, readback.size(), cudaMemcpyDeviceToHost) !=
+        cudaSuccess) {
+        throw std::runtime_error("the spanning pair could not be read back from the device");
+    }
+    check(hash_of(readback) == hash_of(direct_pair(reader, spanning.first, spanning.second)),
+          "the device slot does not hold the bytes of the pair that spans volumes");
+
     for (std::uint32_t slot = 0; slot < slots; ++slot) {
         check(slab + static_cast<std::size_t>(expert.slot_offset(slot)) == slot_address[slot],
               "slot " + std::to_string(slot) + " moved to a different device address after an eviction");
@@ -633,6 +668,7 @@ int main(int argc, char** argv) {
             std::ofstream out(empty_profile);
         }
         test_empty_profile(artifact, empty_profile);
+        test_cross_volume_pair(artifact);
 
         if (device_mode) { return test_device_slots(artifact); }
         test_host_pair_source(artifact);
