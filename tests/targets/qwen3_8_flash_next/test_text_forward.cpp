@@ -69,6 +69,33 @@ void flash_next_record_qsa(const ninfer::ops::QsaBatchView& batch,
     }
 }
 
+void flash_next_layer_dump(const char* name, std::size_t layer, const ninfer::Tensor& tensor,
+                           cudaStream_t stream) {
+    static std::string directory;
+    if (directory.empty()) {
+        const char* configured = std::getenv("NINFER_FLASH_NEXT_LAYER_DUMP");
+        if (configured == nullptr || configured[0] == '\0') { return; }
+        directory = configured;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<std::byte> host(tensor.bytes());
+    if (!host.empty()) {
+        CUDA_CHECK(cudaMemcpy(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost));
+    }
+    const std::string stem =
+        directory + "/L" + std::to_string(layer) + "_" + name;
+    std::FILE* data_file = std::fopen(stem.c_str(), "wb");
+    if (data_file == nullptr) { throw std::runtime_error("cannot open the layer dump path"); }
+    if (!host.empty()) { std::fwrite(host.data(), 1, host.size(), data_file); }
+    std::fclose(data_file);
+    std::FILE* manifest = std::fopen((directory + "/manifest.txt").c_str(), "a");
+    if (manifest == nullptr) { throw std::runtime_error("cannot open the layer dump manifest"); }
+    std::fprintf(manifest, "%zu %s %d 4 %d %d %d %d %zu\n", layer, name,
+                 static_cast<int>(tensor.dtype), tensor.ne[0], tensor.ne[1], tensor.ne[2],
+                 tensor.ne[3], host.size());
+    std::fclose(manifest);
+}
+
 namespace ninfer::ops {
 inline void ninfer_flash_next_dump_qsa_indexer(const Tensor& index_query,
                                                const ConstQsaIndexCacheView& cache,
@@ -84,6 +111,7 @@ inline void ninfer_flash_next_dump_qsa_indexer(const Tensor& index_query,
 #define qsa_indexer ninfer_flash_next_dump_qsa_indexer
 #define NINFER_QWEN4EXP_VARIANT ::ninfer::targets::qwen3_8_flash_next::detail::Variant
 #define NINFER_QWEN4EXP_RUNTIME_NS flash_next_text_test_runtime
+#define NINFER_QWEN4EXP_LAYER_DUMP(name, layer, tensor) ::flash_next_layer_dump((name), (layer), (tensor), stream_)
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 #include "targets/qwen4_exp/impl/runtime/text_context_impl.h"
 #include "targets/qwen4_exp/impl/runtime/workspace_recipe.h"

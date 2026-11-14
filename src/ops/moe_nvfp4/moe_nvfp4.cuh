@@ -22,7 +22,8 @@ inline constexpr int kMoeIntermediate = 640;
 __device__ __forceinline__ std::size_t batched_nvfp4_scale_offset(std::int32_t row,
                                                                    std::int32_t group,
                                                                    std::int32_t columns) {
-    return static_cast<std::size_t>(row / 128) * (columns / 64) * 512U +
+    return (static_cast<std::size_t>(row / 128) * (columns / 64) +
+            static_cast<std::size_t>(group / 4)) * 512U +
            static_cast<std::size_t>(row % 32) * 16U +
            static_cast<std::size_t>((row % 128) / 32) * 4U + static_cast<std::size_t>(group % 4);
 }

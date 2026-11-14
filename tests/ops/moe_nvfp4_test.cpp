@@ -163,7 +163,8 @@ double exact_decode(const BatchedFixture& fixture, std::int32_t matrix, std::int
     const std::int32_t row_global = matrix * fixture.rows + row;
     const std::size_t scale_offset =
         fixture.scale_plane_offset +
-        static_cast<std::size_t>(row_global / 128) * (fixture.columns / 64) * 512U +
+        (static_cast<std::size_t>(row_global / 128) * (fixture.columns / 64) +
+         static_cast<std::size_t>(group / 4)) * 512U +
         static_cast<std::size_t>(row_global % 32) * 16U +
         static_cast<std::size_t>((row_global % 128) / 32) * 4U + static_cast<std::size_t>(group % 4);
     const double scale = quantized_weight::detail::decode_e4m3fn(fixture.payload[scale_offset]);
@@ -223,7 +224,8 @@ int verify_view_planes(const BatchedFixture& fixture) {
                 const std::size_t row_global = static_cast<std::size_t>(matrix) * fixture.rows + row;
                 const std::size_t absolute =
                     fixture.scale_plane_offset +
-                    static_cast<std::size_t>(row_global / 128) * (fixture.columns / 64) * 512U +
+                    (static_cast<std::size_t>(row_global / 128) * (fixture.columns / 64) +
+                     static_cast<std::size_t>(group / 4)) * 512U +
                     static_cast<std::size_t>(row_global % 32) * 16U +
                     static_cast<std::size_t>((row_global % 128) / 32) * 4U +
                     static_cast<std::size_t>(group % 4);

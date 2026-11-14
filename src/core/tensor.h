@@ -105,7 +105,8 @@ struct BatchedNvfp4Weight {
     [[nodiscard]] float divisor_for(std::int32_t matrix) const { return divisors[matrix]; }
 
     [[nodiscard]] std::size_t scale_offset(std::int32_t row, std::int32_t group) const {
-        return static_cast<std::size_t>(row / 128) * (columns / 64) * 512U +
+        return (static_cast<std::size_t>(row / 128) * (columns / 64) +
+                static_cast<std::size_t>(group / 4)) * 512U +
                static_cast<std::size_t>(row % 32) * 16U +
                static_cast<std::size_t>((row % 128) / 32) * 4U +
                static_cast<std::size_t>(group % 4);

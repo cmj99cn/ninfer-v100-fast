@@ -197,7 +197,7 @@ class RefModel:
         normalized = gated_rmsnorm(out, weights["norm"], z_view, CFG.rms_epsilon)
         return dense(normalized.reshape(tokens, CFG.gdn_value_width), weights["out"])
 
-    def _qsa(self, layer, hidden, weights):
+    def _qsa(self, layer, hidden, weights, tensor_capture=None):
         tokens = hidden.shape[0]
         query = dense(hidden, weights["query"]).reshape(tokens, CFG.q_heads, CFG.head_dim)
         gate = dense(hidden, weights["gate"]).reshape(tokens, CFG.q_heads, CFG.head_dim)
@@ -223,6 +223,9 @@ class RefModel:
             index_blocks[block] = qsa_index_block(
                 raw, weights["index_key_norm"], start, CFG.rms_epsilon, CFG.rope_theta, CFG.rotary_dim
             )
+        if tensor_capture is not None:
+            tensor_capture["index_query"] = index_query
+            tensor_capture["index_keys"] = index_blocks
         selections = qsa_indexer(index_query, index_blocks, positions, CFG.index_block_budget)
         attention = qsa_sparse_gqa(
             query, gate, key, value_cache, selections, positions, CFG.index_compress, CFG.head_dim
@@ -298,7 +301,7 @@ class RefModel:
             tokens, CFG.hc_streams, CFG.hidden
         )
 
-    def forward(self, ids, capture=False):
+    def forward(self, ids, capture=False, capture_tensors=False):
         tokens = list(ids)
         state = ModelState.fresh()
         embedding = self._embedding_rows(tokens)
@@ -306,21 +309,44 @@ class RefModel:
             embedding, self._hc(0, "attention_hc")["norm"], CFG.rms_epsilon
         )
         captured = {"ple_rows": self.ple_rows(tokens), "qsa": {}}
+        tensors = {} if capture_tensors else None
         for layer in range(CFG.layers):
+            if tensors is not None:
+                tensors[(layer, "residual_in")] = residual
+                tensors[(layer, "normalized_in")] = normalized
             attention_hc = self._hc(layer, "attention_hc")
             block_input, injection = hc_mix(normalized, attention_hc["down"], attention_hc["up"])
+            if tensors is not None:
+                tensors[(layer, "attention_block")] = block_input
+                tensors[(layer, "attention_injection")] = injection
             if CFG.is_qsa_layer(layer):
-                mixer, selections = self._qsa(layer, block_input, self._qsa_weights(layer))
+                layer_tensors = {} if tensors is not None else None
+                mixer, selections = self._qsa(
+                    layer, block_input, self._qsa_weights(layer), layer_tensors
+                )
+                if tensors is not None:
+                    tensors[(layer, "index_query")] = layer_tensors["index_query"]
+                    tensors[(layer, "index_keys")] = layer_tensors["index_keys"]
                 if capture:
                     captured["qsa"][layer] = selections
             else:
                 mixer = self._gdn(layer, block_input, self._gdn_weights(layer), state.gdn[layer])
+            if tensors is not None:
+                tensors[(layer, "mixer")] = mixer
             moe_hc = self._hc(layer, "moe_hc")
             stage, normalized = hc_combine_norm(
                 residual, mixer, injection, moe_hc["norm"], CFG.rms_epsilon
             )
+            if tensors is not None:
+                tensors[(layer, "stage")] = stage
+                tensors[(layer, "normalized_moe")] = normalized
             block_input, injection = hc_mix(normalized, moe_hc["down"], moe_hc["up"])
+            if tensors is not None:
+                tensors[(layer, "moe_block")] = block_input
+                tensors[(layer, "moe_injection")] = injection
             moe_out = self._moe(layer, block_input, self._moe_weights(layer))
+            if tensors is not None:
+                tensors[(layer, "moe")] = moe_out
             if layer + 1 == CFG.ple_layer:
                 residual = hc_combine(stage, moe_out, injection)
                 residual, normalized = self._ple(residual, self._ple_weights(), captured["ple_rows"], state.ple)
@@ -333,11 +359,16 @@ class RefModel:
                 residual, normalized = hc_combine_norm(
                     stage, moe_out, injection, next_norm, CFG.rms_epsilon
                 )
+            if tensors is not None:
+                tensors[(layer, "residual_out")] = residual
+                tensors[(layer, "normalized_out")] = normalized
         final_hc = self._final_hc()
         sample = hc_final_mix(normalized[-1:], final_hc["down"], final_hc["up"])[0]
         logits = self._logits(sample)
         captured["sample"] = sample
         captured["logits"] = logits
+        if tensors is not None:
+            captured["tensors"] = tensors
         return captured
 
     def next_token(self, ids):

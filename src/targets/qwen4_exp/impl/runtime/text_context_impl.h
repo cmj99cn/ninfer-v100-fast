@@ -352,6 +352,10 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T, const Tensor& 
     ops::qsa_indexer(rotated_index_query, ops::ConstQsaIndexCacheView{cache.index_k_pages,
                                                                       cache.page_table},
                      batch, static_cast<std::uint32_t>(T), workspace_, selected, stream_);
+#ifdef NINFER_QWEN4EXP_LAYER_DUMP
+    NINFER_QWEN4EXP_LAYER_DUMP("index_query", layer, rotated_index_query);
+    NINFER_QWEN4EXP_LAYER_DUMP("index_keys", layer, cache.index_k_pages);
+#endif
 
     Tensor attention = activations_.alloc(DType::BF16, {kHeadDim, TextConfig::query_heads, T, kBatch});
     ops::qsa_sparse_gqa(rotated_query, output_gate, cache, batch, selected,
@@ -451,24 +455,46 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
     for (std::size_t layer = 0; layer < model_.loaded_layers; ++layer) {
         const auto layer_scope = activations_.scope();
         const auto& attention_hc = model_.layers[layer].attention_hc;
+#ifdef NINFER_QWEN4EXP_LAYER_DUMP
+        NINFER_QWEN4EXP_LAYER_DUMP("residual_in", layer, residual);
+        NINFER_QWEN4EXP_LAYER_DUMP("normalized_in", layer, normalized);
+#endif
         ops::hc_mix(normalized, ops::HcMixWeights{attention_hc.down_injection, attention_hc.up},
                     workspace_, block_input, injection, stream_);
+#ifdef NINFER_QWEN4EXP_LAYER_DUMP
+        NINFER_QWEN4EXP_LAYER_DUMP("attention_block", layer, block_input);
+        NINFER_QWEN4EXP_LAYER_DUMP("attention_injection", layer, injection);
+#endif
 
         if (TextConfig::is_qsa_layer(static_cast<int>(layer))) {
             run_qsa(layer, T, block_input, positions, valid_columns, table_rows, mixer_out);
         } else {
             run_gdn(layer, T, block_input, mixer_out);
         }
+#ifdef NINFER_QWEN4EXP_LAYER_DUMP
+        NINFER_QWEN4EXP_LAYER_DUMP("mixer", layer, mixer_out);
+#endif
 
         const auto& moe_hc = model_.layers[layer].moe_hc;
         ops::hc_combine_norm(residual, mixer_out, injection, moe_hc.norm, TextConfig::rms_epsilon,
                              stage, normalized, stream_);
+#ifdef NINFER_QWEN4EXP_LAYER_DUMP
+        NINFER_QWEN4EXP_LAYER_DUMP("stage", layer, stage);
+        NINFER_QWEN4EXP_LAYER_DUMP("normalized_moe", layer, normalized);
+#endif
 
         ops::hc_mix(normalized, ops::HcMixWeights{moe_hc.down_injection, moe_hc.up}, workspace_,
                     block_input, injection, stream_);
+#ifdef NINFER_QWEN4EXP_LAYER_DUMP
+        NINFER_QWEN4EXP_LAYER_DUMP("moe_block", layer, block_input);
+        NINFER_QWEN4EXP_LAYER_DUMP("moe_injection", layer, injection);
+#endif
 
         CUDA_CHECK(cudaMemsetAsync(moe_out.data, 0, moe_out.bytes(), stream_));
         Variant::post_mixer(block_input, model_.layers[layer].post_mixer, moe_out, workspace_, stream_);
+#ifdef NINFER_QWEN4EXP_LAYER_DUMP
+        NINFER_QWEN4EXP_LAYER_DUMP("moe", layer, moe_out);
+#endif
 
         if (layer + 1 == static_cast<std::size_t>(TextConfig::ple_layer)) {
             ops::hc_combine(stage, moe_out, injection, residual, stream_);
@@ -481,6 +507,10 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
             ops::hc_combine_norm(stage, moe_out, injection, next_norm, TextConfig::rms_epsilon,
                                  residual, normalized, stream_);
         }
+#ifdef NINFER_QWEN4EXP_LAYER_DUMP
+        NINFER_QWEN4EXP_LAYER_DUMP("residual_out", layer, residual);
+        NINFER_QWEN4EXP_LAYER_DUMP("normalized_out", layer, normalized);
+#endif
     }
 
     ops::hc_final_mix(normalized,
