@@ -1,2 +1,5 @@
 # Qwen3.8-Flash-Next artifact-native Python reference dependencies.
+# torch is required indirectly: tools/reference/qwen3_8_flash_next/bindings.py imports
+# tools.artifact.layouts, which imports torch at module level.
 numpy>=1.24
+torch>=2.0

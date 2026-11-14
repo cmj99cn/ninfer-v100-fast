@@ -118,6 +118,14 @@ def main():
         short_order = np.argsort(-short["logits"], kind="stable")[:2]
         short_token = int(short_order[0])
         short_margin = float(short["logits"][short_order[0]] - short["logits"][short_order[1]])
+        if short_margin < 1.0e-2:
+            if short_margin < 1.0e-3:
+                print("FAIL: the short top two logits are nearly tied (margin "
+                      + format(short_margin, ".9g") + " < 1e-3)")
+            else:
+                print("FAIL: the short top two logits margin " + format(short_margin, ".9g")
+                      + " is below the 1e-2 acceptance bound")
+            return 1
         short_rows = short["ple_rows"]
         short_qsa = short["qsa"]
         if len(short_qsa) != 1:
@@ -136,6 +144,7 @@ def main():
             print("FAIL: expected one QSA layer in the long reduced stack")
             return 1
         long_blocks = next(iter(long_qsa.values()))
+        budget_rows = model.ple_rows(BUDGET_PROMPT)
 
     short_handle = tempfile.NamedTemporaryFile(prefix="flash_next_short_", suffix=".txt", delete=False)
     short_dump = short_handle.name
@@ -184,7 +193,7 @@ def main():
             print(long_run.stderr)
             print("FAIL: the C++ long parity binary exited " + str(long_run.returncode))
             return 1
-        long_prompt, _, long_entries = parse_dump(long_dump)
+        long_prompt, long_dump_rows, long_entries = parse_dump(long_dump)
         long_index_query, long_index_keys = load_index_dump(long_dump + ".index", LONG_TOKENS)
 
         budget_run_start = time.perf_counter()
@@ -203,7 +212,7 @@ def main():
             print(budget_run.stderr)
             print("FAIL: the C++ budget parity binary exited " + str(budget_run.returncode))
             return 1
-        budget_prompt, _, budget_entries = parse_dump(budget_dump)
+        budget_prompt, budget_dump_rows, budget_entries = parse_dump(budget_dump)
         budget_index_query, budget_index_keys = load_index_dump(budget_dump + ".index", BUDGET_TOKENS)
     finally:
         for path in (short_dump, short_dump + ".index", long_dump, long_dump + ".index", budget_dump,
@@ -228,6 +237,16 @@ def main():
         expected = [int(value) for value in short_rows[index]]
         if short_dump_rows.get(index) != expected:
             row_mismatches.append(index)
+    long_row_mismatches = []
+    for index in range(len(LONG_PROMPT)):
+        expected = [int(value) for value in long["ple_rows"][index]]
+        if long_dump_rows.get(index) != expected:
+            long_row_mismatches.append(index)
+    budget_row_mismatches = []
+    for index in range(len(BUDGET_PROMPT)):
+        expected = [int(value) for value in budget_rows[index]]
+        if budget_dump_rows.get(index) != expected:
+            budget_row_mismatches.append(index)
     short_block_mismatches = compare_blocks(short_blocks, short_entries, len(PROMPT))
     model_long_mismatches = compare_blocks(long_blocks, long_entries, LONG_TOKENS)
     indexed_blocks = qsa_indexer(
@@ -258,17 +277,18 @@ def main():
     print("long pruned " + ("yes" if pruned else "no"))
     print("long qsa block parity " + ("OK" if not long_block_mismatches else "FAIL " + str(long_block_mismatches[:3])))
     print("long model-level qsa block parity " + ("OK" if not model_long_mismatches else "FAIL " + str(model_long_mismatches[:3])))
+    print("long ple row parity " + ("OK" if not long_row_mismatches else "FAIL " + str(long_row_mismatches[:3]) + " of " + str(len(long_row_mismatches))))
     print("budget c++ time " + format(budget_run_time, ".3f") + " s")
     print("budget block size max " + str(max(budget_sizes)) + " of C=" + str(budget_complete))
     print("budget pruned " + ("yes" if budget_pruned else "no"))
     print("budget qsa block parity " + ("OK" if not budget_mismatches else "FAIL " + str(budget_mismatches[:3])))
-    if short_margin < 1.0e-3:
-        print("WARNING: the short top two logits are nearly tied (margin < 1e-3)")
+    print("budget ple row parity " + ("OK" if not budget_row_mismatches else "FAIL " + str(budget_row_mismatches[:3]) + " of " + str(len(budget_row_mismatches))))
     if long_margin < 1.0e-3:
         print("WARNING: the long top two logits are nearly tied (margin < 1e-3)")
 
-    if (row_mismatches or short_block_mismatches or long_block_mismatches
-            or model_long_mismatches or not pruned or budget_mismatches or not budget_pruned):
+    if (row_mismatches or long_row_mismatches or budget_row_mismatches or short_block_mismatches
+            or long_block_mismatches or model_long_mismatches or not pruned or budget_mismatches
+            or not budget_pruned):
         return 1
     return 0
 

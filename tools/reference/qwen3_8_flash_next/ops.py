@@ -279,14 +279,15 @@ def swiglu(x, gate_up):
 
 
 def ple_hash_rows(ids, tail, multipliers, vocab_sizes, offsets, eos):
+    mask = (1 << 64) - 1
     older_tail = int(tail[0])
     previous_tail = int(tail[1])
     rows = []
     for raw in ids:
         token = int(raw)
         older = eos if previous_tail == eos else older_tail
-        pair = (token * int(multipliers[0])) ^ (previous_tail * int(multipliers[1]))
-        triple = pair ^ (older * int(multipliers[2]))
+        pair = ((token * int(multipliers[0])) ^ (previous_tail * int(multipliers[1]))) & mask
+        triple = (pair ^ (older * int(multipliers[2]))) & mask
         token_rows = []
         for head in range(16):
             word = pair if head < 8 else triple
@@ -543,6 +544,13 @@ def run_self_tests(verbose=False):
     check("ple_hash_rows", hashed, np.array([[2 + 7 * head for head in range(16)]], dtype=np.uint64))
     negative = ple_hash_rows([1 << 63], (0, 0), *controls, 0)
     check("ple_hash_rows.negative", negative, np.array([[6 + 7 * head for head in range(16)]], dtype=np.uint64))
+    wrap_controls = (
+        np.array([1 << 63, 1, 1], dtype=np.uint64),
+        np.array([7] * 16, dtype=np.uint64),
+        np.array([7 * head for head in range(16)], dtype=np.uint64),
+    )
+    wrapped = ple_hash_rows([1 << 63], (0, 0), *wrap_controls, 0)
+    check("ple_hash_rows.wrap", wrapped, np.array([[7 * head for head in range(16)]], dtype=np.uint64))
 
     row = bytearray(90)
     for index in range(80):

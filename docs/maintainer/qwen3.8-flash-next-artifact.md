@@ -918,7 +918,6 @@ Engine route always loads the full 48 layers.
     amplifies a one-ulp difference when a per-stream RMS is near zero; the smallest measured
     layer-0 per-stream RMS is `1.6761e-3` (stream 0, token 98). The production kernel's FP32
     accumulation and BF16 outputs therefore do not reproduce the reference FP64 evaluation
-    bit-for-bit, and the QSA top-512 boundary is discontinuous. The production kernel's FP32
-    accumulation and BF16 outputs are implementation-profile differences, not semantic
-    differences.
+    bit-for-bit, and the QSA top-512 boundary is discontinuous; these are implementation-profile
+    differences, not semantic differences.
 - The tokenizer is outside M2: the test feeds token ids directly.
