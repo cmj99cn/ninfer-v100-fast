@@ -34,9 +34,9 @@ namespace ninfer::ops {
  *   g[h,t]    = -exp(A_log[h]) * softplus(a[h,t] + dt_bias[h])
  *   beta[h,t] = sigmoid(b[h,t]).
  *
- * `x` is contiguous BF16 [5120,T]; both weights are contiguous BF16_CTRL [48,5120]; A_log and
- * dt_bias are contiguous FP32 [48]; g and beta are distinct contiguous FP32 [48,T]. The numerical
- * contract accepts every positive T. The oracle evaluates the logical formula naively in FP64
+ * `x` is contiguous BF16 [5120,T]; both weights are contiguous BF16_CTRL or GGML_K [48,5120];
+ * A_log and dt_bias are contiguous FP32 [48]; g and beta are distinct contiguous FP32 [48,T].
+ * The numerical contract accepts every positive T. The oracle evaluates the logical formula naively in FP64
  * from the represented inputs. Projection staging and accumulator precision are implementation
  * choices. The FP32 outputs are promoted and compared directly with that oracle under the Op's
  * named criterion. All inputs and outputs are non-overlapping.
@@ -57,11 +57,12 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
  * - Qwen3.8-27B: GGML_K GgmlK256 `ab_weight [96,5120]`, in the same A/B row order.
  * - Qwen3.8-Flash-Next: BF16_CTRL `ab_weight [96,2560]`, with A in rows [0,48) and B in [48,96).
  *
- * `x` is contiguous BF16 or FP16 [input_rows,T]; the parent weight is BF16_CTRL or GGML_K. The
- * complete immutable parent is the public weight. Its halves are consumed as zero-copy views and
- * produce FP32 g/beta `[heads,T]` under the same logical formula and oracle. A BF16 activation
- * uses the control path; an FP16 activation converts the BF16 control operands privately. All
- * other effects and non-overlap requirements match the two-weight form.
+ * `x` is contiguous BF16 [input_rows,T] with a BF16_CTRL or GGML_K parent, or FP16
+ * [input_rows,T] with a BF16_CTRL parent. The complete immutable parent is the public weight. Its
+ * halves are consumed as zero-copy views and produce FP32 g/beta `[heads,T]` under the same
+ * logical formula and oracle. A BF16 activation uses the control path; an FP16 activation
+ * converts the BF16_CTRL operands privately. All other effects and non-overlap requirements match
+ * the two-weight form.
  * Its TP2 GGML_K form has 24 heads and [48,5120] parent rows per device, with FP32 projection
  * and output storage and no additional workspace.
  */
@@ -83,10 +84,10 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
  * values are promoted and compared directly with `h_ideal`; final storage rounding is not
  * reproduced inside the oracle. The control branch is evaluated directly from `n` and is not
  * required to round through h. Private tensor-core operand staging remains an implementation
- * choice. `x` and `h` share one dtype, BF16 or FP16; `norm_weight` is BF16; the control weights
- * are BF16_CTRL or GGML_K as in the two-weight gdn_gating_proj form. The implementation may fuse
- * or compose its internal kernels for any positive T; that route is not observable at this
- * boundary.
+ * choice. `x` and `h` share one dtype. A BF16 activation accepts BF16_CTRL or GGML_K control
+ * weights; an FP16 activation accepts only BF16_CTRL. `norm_weight` is BF16. The implementation
+ * may fuse or compose its internal kernels for any positive T; that route is not observable at
+ * this boundary.
  */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
@@ -94,8 +95,9 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           Tensor& beta, cudaStream_t stream);
 
 /**
- * The Qwen3.8-27B and Qwen3.6-35B-A3B contiguous-parent storage forms described above: `x` and
- * `h` share BF16 or FP16, `norm_weight` is BF16, and `ab_weight` is BF16_CTRL or GGML_K.
+ * The Qwen3.8-27B and Qwen3.6-35B-A3B contiguous-parent storage forms described above. `x` and
+ * `h` share BF16 or FP16. A BF16 activation accepts a BF16_CTRL or GGML_K parent; an FP16
+ * activation accepts only a BF16_CTRL parent. `norm_weight` is BF16.
  */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
