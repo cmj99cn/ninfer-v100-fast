@@ -18,18 +18,29 @@
 #include <vector>
 
 namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
+namespace {
+
+class ScopedDevice {
+public:
+    explicit ScopedDevice(int device) {
+        CUDA_CHECK(cudaGetDevice(&previous_));
+        if (previous_ != device) { CUDA_CHECK(cudaSetDevice(device)); }
+    }
+    ~ScopedDevice() { (void)cudaSetDevice(previous_); }
+    ScopedDevice(const ScopedDevice&)            = delete;
+    ScopedDevice& operator=(const ScopedDevice&) = delete;
+
+private:
+    int previous_ = 0;
+};
+
+} // namespace
 
 ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevices>& models,
                                  WeightsProfile weights_profile, std::unique_ptr<SequencePlanImpl> plan,
                                  ExecutionContext& execution, const EngineOptions& options)
     : weights_profile_(weights_profile), models_(models), execution_(execution), options_(options),
-      plan_(std::move(plan)),
-      state_(execution_.primary(), *models_[0],
-             std::max<std::uint32_t>(plan_->kv_capacity, plan_->capacity),
-             std::max<std::uint32_t>(plan_->prefill_chunk, 1)),
-      activations_(std::max<std::size_t>(plan_->activation_capacity_bytes, 1)),
-      workspace_(std::max<std::size_t>(plan_->workspace_capacity_bytes, 1)),
-      trunk_(*models_[0], state_, activations_, workspace_, execution_.primary().stream) {
+      plan_(std::move(plan)) {
     if (plan_ == nullptr) { throw std::logic_error("qwen4_exp program received an empty sequence plan"); }
     if (execution_.tp != plan_->tp) {
         throw std::invalid_argument("qwen4_exp program execution width does not match the sequence plan");
@@ -42,6 +53,27 @@ ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevi
             throw std::invalid_argument("qwen4_exp program model view is missing for an active rank");
         }
     }
+
+    for (int rank = 0; rank < execution_.tp; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        const ScopedDevice scope(execution_.dev[slot]->device);
+        states_[slot] = std::make_unique<TextState>(
+            *execution_.dev[slot], *models_[slot],
+            std::max<std::uint32_t>(plan_->kv_capacity, plan_->capacity),
+            std::max<std::uint32_t>(plan_->prefill_chunk, 1), execution_.tp, rank);
+        activation_arenas_[slot] =
+            std::make_unique<WorkspaceArena>(std::max<std::size_t>(plan_->activation_capacity_bytes, 1));
+        work_arenas_[slot] =
+            std::make_unique<WorkspaceArena>(std::max<std::size_t>(plan_->workspace_capacity_bytes, 1));
+        view_ptrs_[slot]       = models_[slot];
+        state_ptrs_[slot]      = states_[slot].get();
+        activation_ptrs_[slot] = activation_arenas_[slot].get();
+        workspace_ptrs_[slot]  = work_arenas_[slot].get();
+    }
+    comms_ = std::make_unique<ops::CollectiveComms>(execution_);
+    trunk_ = std::make_unique<TextTrunk>(view_ptrs_, state_ptrs_, activation_ptrs_,
+                                         workspace_ptrs_, execution_, *comms_);
+    CUDA_CHECK(cudaSetDevice(execution_.dev[0]->device));
 }
 
 runtime::RequestPlanSummary ProgramImplCore::make_summary(std::uint32_t prompt_tokens,
@@ -70,7 +102,7 @@ void ProgramImplCore::clear_lane(std::uint32_t lane) noexcept {
 
 void ProgramImplCore::prefill_chunk(LaneState& state, std::uint32_t begin, std::uint32_t count) {
     const std::span<const TokenId> chunk{state.context.prompt_tokens.data() + begin, count};
-    const TokenId sampled = trunk_.prefill(chunk);
+    const TokenId sampled = trunk_->prefill(chunk);
     if (begin + count == state.context.prompt_tokens.size()) {
         state.context.next_input = sampled;
     }
@@ -152,11 +184,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         }
     }
 
-    state_.reset();
+    for (int rank = 0; rank < execution_.tp; ++rank) {
+        states_[static_cast<std::size_t>(rank)]->reset();
+    }
     std::vector<TokenId>& tokens = data.token_ids;
     const std::uint32_t chunk = std::min(plan_->prefill_chunk,
                                          static_cast<std::uint32_t>(tokens.size()));
-    const TokenId sampled = trunk_.prefill(std::span<const TokenId>{tokens.data(), chunk});
+    const TokenId sampled = trunk_->prefill(std::span<const TokenId>{tokens.data(), chunk});
 
     LaneState& state = lanes_[lane];
     state.active    = true;
@@ -222,7 +256,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
     round_row_counts_.clear();
     for (const std::uint32_t lane : lanes) {
         const LaneState& state = lanes_[lane];
-        round_tokens_.push_back(trunk_.decode(state.context.next_input));
+        round_tokens_.push_back(trunk_->decode(state.context.next_input));
         round_row_counts_.push_back(1);
     }
 

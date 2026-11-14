@@ -85,6 +85,7 @@ struct BatchedNvfp4Weight {
     std::uint32_t group_size       = 16;
 
     std::int32_t matrices  = 0;
+    std::int32_t expert_begin = 0;
     std::int32_t rows      = 0;
     std::int32_t columns   = 0;
 

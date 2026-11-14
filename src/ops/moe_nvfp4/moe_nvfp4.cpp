@@ -110,16 +110,18 @@ void require_shared_down(const Weight& shared_down, std::vector<AddressRange>& r
 void require_batched(const BatchedNvfp4Weight& weight, std::int32_t rows, std::int32_t columns,
                      const char* name, std::vector<AddressRange>& ranges) {
     if (weight.qtype != QType::NVFP4 || weight.layout != QuantLayout::BatchedBlockScaleK16M128x4 ||
-        weight.group_size != 16U || weight.matrices != kExperts || weight.rows != rows ||
-        weight.columns != columns || (rows % 128) != 0 || (columns % 64) != 0 ||
-        weight.payload == nullptr || weight.codes == nullptr || weight.scales == nullptr ||
-        weight.divisors == nullptr) {
+        weight.group_size != 16U || weight.matrices < 1 || weight.matrices > kExperts ||
+        weight.expert_begin < 0 || weight.expert_begin > kExperts - weight.matrices ||
+        weight.rows != rows || weight.columns != columns || (rows % 128) != 0 ||
+        (columns % 64) != 0 || weight.payload == nullptr || weight.codes == nullptr ||
+        weight.scales == nullptr || weight.divisors == nullptr) {
         throw std::invalid_argument(std::string("moe_nvfp4: invalid batched NVFP4 ") + name);
     }
-    const std::size_t code_bytes  = static_cast<std::size_t>(kExperts) * rows * columns / 2U;
-    const std::size_t scale_bytes = static_cast<std::size_t>(kExperts) * rows * columns / 16U;
+    const std::size_t matrices = static_cast<std::size_t>(weight.matrices);
+    const std::size_t code_bytes  = matrices * rows * columns / 2U;
+    const std::size_t scale_bytes = matrices * rows * columns / 16U;
     const std::size_t scale_offset = align_up_256(code_bytes);
-    if (weight.payload_bytes < scale_offset + scale_bytes + 4U * kExperts) {
+    if (weight.payload_bytes < scale_offset + scale_bytes + 4U * matrices) {
         throw std::invalid_argument(std::string("moe_nvfp4: invalid payload size for ") + name);
     }
     const auto* payload = static_cast<const std::uint8_t*>(weight.payload);
@@ -136,14 +138,42 @@ void require_batched(const BatchedNvfp4Weight& weight, std::int32_t rows, std::i
     }
     ranges.push_back(address_range(weight.codes, code_bytes, std::string(name) + " code"));
     ranges.push_back(address_range(weight.scales, scale_bytes, std::string(name) + " scales"));
-    ranges.push_back(address_range(weight.divisors, 4U * kExperts, std::string(name) + " divisors"));
+    ranges.push_back(address_range(weight.divisors, 4U * matrices, std::string(name) + " divisors"));
 }
 
-void validate_weights(const MoeNvfp4Weights& weights, std::vector<AddressRange>& ranges) {
+const BatchedNvfp4Weight& require_expert_bank(const MoeNvfp4Weights& weights,
+                                              std::vector<AddressRange>& ranges) {
     require_parent(weights.router_shared, ranges);
     require_shared_down(weights.shared_down, ranges);
     require_batched(weights.routed_gate_up, 2 * kIntermediate, kHidden, "routed_gate_up", ranges);
     require_batched(weights.routed_down, kHidden, kIntermediate, "routed_down", ranges);
+    if (weights.routed_gate_up.expert_begin != weights.routed_down.expert_begin ||
+        weights.routed_gate_up.matrices != weights.routed_down.matrices) {
+        throw std::invalid_argument("moe_nvfp4: the routed expert banks disagree on their range");
+    }
+    return weights.routed_gate_up;
+}
+
+void validate_weights(const MoeNvfp4Weights& weights, std::vector<AddressRange>& ranges) {
+    (void)require_expert_bank(weights, ranges);
+}
+
+void require_route(const MoeNvfp4RouteView& route, std::int32_t tokens,
+                   std::vector<AddressRange>& ranges) {
+    require_output(route.expert_ids, DType::I32, kTopK, tokens, "expert_ids");
+    require_output(route.coefficients, DType::FP32, kTopK, tokens, "coefficients");
+    require_vector(route.shared_gate, DType::FP32, tokens, "shared_gate");
+    ranges.push_back(address_range(route.expert_ids.data, route.expert_ids.bytes(), "expert_ids"));
+    ranges.push_back(address_range(route.coefficients.data, route.coefficients.bytes(),
+                                   "coefficients"));
+    ranges.push_back(address_range(route.shared_gate.data, route.shared_gate.bytes(),
+                                   "shared_gate"));
+}
+
+detail::MoeNvfp4RouteOutputs route_outputs(const MoeNvfp4RouteView& route) {
+    return {static_cast<std::int32_t*>(route.expert_ids.data),
+            static_cast<float*>(route.coefficients.data),
+            static_cast<float*>(route.shared_gate.data)};
 }
 
 detail::MoeNvfp4BatchedPlanes planes_of(const BatchedNvfp4Weight& weight) {
@@ -222,7 +252,51 @@ void moe_routed_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& d
 
     detail::moe_nvfp4_route_launch(x, weights.router_shared.qdata, outputs, stream);
     detail::moe_nvfp4_grouped_launch(x, planes_of(weights.routed_gate_up),
-                                     planes_of(weights.routed_down), outputs, destination, stream);
+                                     planes_of(weights.routed_down), outputs,
+                                     weights.routed_gate_up.expert_begin,
+                                     weights.routed_gate_up.matrices, destination, stream);
+    detail::moe_nvfp4_shared_launch(x, weights.router_shared.qdata, weights.shared_down.qdata,
+                                    outputs, destination, stream);
+}
+
+void moe_routed_nvfp4_partial(const Tensor& x, const MoeNvfp4Weights& weights,
+                              const MoeNvfp4RouteView& route, Tensor& destination,
+                              cudaStream_t stream) {
+    const std::int32_t tokens = require_tokens(x, "x");
+    if (require_tokens(destination, "destination") != tokens) {
+        throw std::invalid_argument("moe_nvfp4: x and destination token counts must match");
+    }
+
+    std::vector<AddressRange> ranges;
+    ranges.reserve(12);
+    ranges.push_back(address_range(x.data, x.bytes(), "x"));
+    ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
+    require_route(route, tokens, ranges);
+    const BatchedNvfp4Weight& bank = require_expert_bank(weights, ranges);
+    require_disjoint(ranges);
+
+    const detail::MoeNvfp4RouteOutputs outputs = route_outputs(route);
+    detail::moe_nvfp4_grouped_launch(x, planes_of(weights.routed_gate_up),
+                                     planes_of(weights.routed_down), outputs, bank.expert_begin,
+                                     bank.matrices, destination, stream);
+}
+
+void moe_shared_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights,
+                      const MoeNvfp4RouteView& route, Tensor& destination, cudaStream_t stream) {
+    const std::int32_t tokens = require_tokens(x, "x");
+    if (require_tokens(destination, "destination") != tokens) {
+        throw std::invalid_argument("moe_nvfp4: x and destination token counts must match");
+    }
+
+    std::vector<AddressRange> ranges;
+    ranges.reserve(12);
+    ranges.push_back(address_range(x.data, x.bytes(), "x"));
+    ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
+    require_route(route, tokens, ranges);
+    (void)require_expert_bank(weights, ranges);
+    require_disjoint(ranges);
+
+    const detail::MoeNvfp4RouteOutputs outputs = route_outputs(route);
     detail::moe_nvfp4_shared_launch(x, weights.router_shared.qdata, weights.shared_down.qdata,
                                     outputs, destination, stream);
 }

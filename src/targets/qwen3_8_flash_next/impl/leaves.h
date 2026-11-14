@@ -55,6 +55,13 @@ struct PostMixerLeaf {
     static void mix(const Tensor& hidden, const MoeWeights& weights, Tensor& destination,
                     WorkspaceArena& workspace, cudaStream_t stream);
 
+    static void routed(const Tensor& hidden, const MoeWeights& weights,
+                       const ops::MoeNvfp4RouteView& route, Tensor& destination,
+                       cudaStream_t stream);
+    static void shared(const Tensor& hidden, const MoeWeights& weights,
+                       const ops::MoeNvfp4RouteView& route, Tensor& destination,
+                       cudaStream_t stream);
+
     [[nodiscard]] static std::size_t workspace_capacity_bytes(std::int32_t tokens);
 };
 

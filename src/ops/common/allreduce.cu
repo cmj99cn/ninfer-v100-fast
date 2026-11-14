@@ -196,6 +196,7 @@ void allreduce_sum(const std::array<Tensor, kMaximumDevices>& buffer,
 
     const std::size_t elems = element_count(buffer[0]);
     if (elems == 0) return;
+    comms.note_allreduce();
 
     // Small BF16 messages take the probed mailbox transport; FP16 and larger messages stay on
     // NCCL.

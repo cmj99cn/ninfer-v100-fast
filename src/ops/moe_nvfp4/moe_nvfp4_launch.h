@@ -25,6 +25,7 @@ void moe_nvfp4_route_launch(const Tensor& x, const void* control, MoeNvfp4RouteO
 
 void moe_nvfp4_grouped_launch(const Tensor& x, MoeNvfp4BatchedPlanes gate_up,
                               MoeNvfp4BatchedPlanes down, const MoeNvfp4RouteOutputs& route,
+                              std::int32_t expert_begin, std::int32_t experts,
                               Tensor& destination, cudaStream_t stream);
 
 void moe_nvfp4_shared_launch(const Tensor& x, const void* control, const void* shared_down,

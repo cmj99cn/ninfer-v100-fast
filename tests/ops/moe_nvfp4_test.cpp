@@ -444,6 +444,63 @@ std::vector<double> shared_contribution(const direct_bf16_weight::HostWeight& pa
     return contribution;
 }
 
+struct LocalBank {
+    std::vector<std::uint8_t> payload;
+    std::vector<float> divisors;
+    std::int32_t rows    = 0;
+    std::int32_t columns = 0;
+    std::int32_t begin   = 0;
+    std::int32_t count   = 0;
+    std::size_t scale_offset = 0;
+
+    BatchedNvfp4Weight view(const void* device_payload) const {
+        BatchedNvfp4Weight weight;
+        weight.payload       = device_payload;
+        weight.payload_bytes = payload.size();
+        weight.matrices      = count;
+        weight.expert_begin  = begin;
+        weight.rows          = rows;
+        weight.columns       = columns;
+        weight.codes         = device_payload;
+        weight.scales        = static_cast<const std::uint8_t*>(device_payload) + scale_offset;
+        weight.divisors      = reinterpret_cast<const float*>(
+            static_cast<const std::uint8_t*>(device_payload) + scale_offset +
+            static_cast<std::size_t>(count) * rows * columns / 16U);
+        return weight;
+    }
+};
+
+LocalBank local_bank(const BatchedFixture& full, std::int32_t begin, std::int32_t count) {
+    LocalBank bank;
+    bank.rows    = full.rows;
+    bank.columns = full.columns;
+    bank.begin   = begin;
+    bank.count   = count;
+    const std::size_t matrix_code  = static_cast<std::size_t>(full.rows) * full.columns / 2U;
+    const std::size_t matrix_scale = static_cast<std::size_t>(full.rows) * full.columns / 16U;
+    const std::size_t code_bytes   = static_cast<std::size_t>(count) * matrix_code;
+    bank.scale_offset              = align_up_256(code_bytes);
+    const std::size_t scale_bytes  = static_cast<std::size_t>(count) * matrix_scale;
+    const std::size_t divisor_offset = bank.scale_offset + scale_bytes;
+    bank.payload.assign(divisor_offset + 4U * static_cast<std::size_t>(count), 0);
+    bank.divisors.resize(static_cast<std::size_t>(count));
+    for (std::int32_t local = 0; local < count; ++local) {
+        const std::int32_t global = begin + local;
+        const auto code_source = static_cast<std::size_t>(global) * matrix_code;
+        std::copy_n(full.payload.begin() + static_cast<std::ptrdiff_t>(code_source), matrix_code,
+                    bank.payload.begin() + static_cast<std::ptrdiff_t>(local * matrix_code));
+        const auto scale_source = full.scale_plane_offset + static_cast<std::size_t>(global) * matrix_scale;
+        std::copy_n(full.payload.begin() + static_cast<std::ptrdiff_t>(scale_source), matrix_scale,
+                    bank.payload.begin() +
+                        static_cast<std::ptrdiff_t>(bank.scale_offset + local * matrix_scale));
+        bank.divisors[static_cast<std::size_t>(local)] = full.divisors[static_cast<std::size_t>(global)];
+        quantized_weight::detail::store_u32_le(
+            bank.payload, divisor_offset + static_cast<std::size_t>(local) * 4U,
+            quantized_weight::detail::float_bits(bank.divisors[static_cast<std::size_t>(local)]));
+    }
+    return bank;
+}
+
 struct Case {
     direct_bf16_weight::HostWeight parent;
     direct_bf16_weight::HostWeight shared_down;
@@ -699,6 +756,68 @@ int main() {
     failures += coefficients_buffer.verify_guards("moe_nvfp4 coefficients guard");
     failures += shared_gate_buffer.verify_guards("moe_nvfp4 shared gate guard");
     failures += destination_buffer.verify_guards("moe_nvfp4 destination guard");
+
+    const std::int32_t local_begin = 256;
+    const std::int32_t local_count = 256;
+    LocalBank local_gate_up = local_bank(inputs.gate_up, local_begin, local_count);
+    LocalBank local_down    = local_bank(inputs.down, local_begin, local_count);
+    DeviceBuffer local_gate_up_device = to_device(local_gate_up.payload);
+    DeviceBuffer local_down_device    = to_device(local_down.payload);
+
+    MoeNvfp4Weights local_weights;
+    local_weights.router_shared  = weights.router_shared;
+    local_weights.shared_down    = weights.shared_down;
+    local_weights.routed_gate_up = local_gate_up.view(local_gate_up_device.p);
+    local_weights.routed_down    = local_down.view(local_down_device.p);
+    const MoeNvfp4RouteView route{ids, coefficients, shared_gate};
+
+    bool low_selected  = false;
+    bool high_selected = false;
+    for (const std::int32_t id : got_ids) {
+        if (id < local_begin) { low_selected = true; }
+        if (id >= local_begin && id < local_begin + local_count) { high_selected = true; }
+    }
+    if (!low_selected || !high_selected) {
+        std::cerr << "moe_nvfp4 local subset: the routing does not straddle the local expert range\n";
+        ++failures;
+    }
+
+    GuardedDeviceBuffer local_destination_buffer(kTokens * kHidden * sizeof(std::uint16_t));
+    local_destination_buffer.copy_from_host(residual_words.data(),
+                                            kTokens * kHidden * sizeof(std::uint16_t));
+    Tensor local_destination{local_destination_buffer.data(), DType::BF16,
+                             {kHidden, static_cast<std::int32_t>(kTokens)}};
+    ops::moe_routed_nvfp4_partial(x, local_weights, route, local_destination, 0);
+    ops::moe_shared_nvfp4(x, local_weights, route, local_destination, 0);
+    cuda_synchronize();
+    const std::vector<double> got_local =
+        from_device_bf16(local_destination_buffer.data(), kTokens * kHidden);
+
+    std::vector<double> expected_local(kTokens * kHidden, 0.0);
+    for (std::size_t t = 0; t < kTokens; ++t) {
+        const RouteOracle& oracle = inputs.oracle[t];
+        for (std::size_t i = 0; i < kHidden; ++i) {
+            expected_local[t * kHidden + i] = bf16_to_f32(residual_words[t * kHidden + i]);
+        }
+        for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+            const std::int32_t expert = oracle.ids[static_cast<std::size_t>(rank)];
+            if (expert < local_begin || expert >= local_begin + local_count) { continue; }
+            const std::vector<double> contribution =
+                expert_contribution(inputs.gate_up, inputs.down, expert, inputs.activation[t],
+                                    oracle.coefficients[static_cast<std::size_t>(rank)]);
+            for (std::size_t i = 0; i < kHidden; ++i) {
+                expected_local[t * kHidden + i] += contribution[i];
+            }
+        }
+        const std::vector<double> shared = shared_contribution(
+            inputs.parent, inputs.shared_down, inputs.activation[t], oracle.shared_gate);
+        for (std::size_t i = 0; i < kHidden; ++i) {
+            expected_local[t * kHidden + i] += shared[i];
+        }
+    }
+    failures += verify_reduction("moe_nvfp4 local subset", got_local, expected_local,
+                                 kDestinationCriterion);
+    failures += local_destination_buffer.verify_guards("moe_nvfp4 local destination guard");
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " moe_nvfp4 correctness\n";
     return failures == 0 ? 0 : 1;

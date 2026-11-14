@@ -76,6 +76,10 @@ namespace detail {
 class TpMailboxPlan;
 } // namespace detail
 
+struct CollectiveStats {
+    std::uint64_t allreduce_calls = 0;
+};
+
 // Owns one NCCL communicator per rank for an ExecutionContext with `tp` in {1,2,4}. Construction
 // is a one-time startup cost (ncclCommInitAll over the device ids); the collectives below only
 // issue stream work. At tp == 1 no communicator is created and every collective is a
@@ -114,6 +118,10 @@ public:
         return true;
     }
 
+    [[nodiscard]] CollectiveStats stats() const noexcept { return stats_; }
+    void reset_stats() noexcept { stats_ = {}; }
+    void note_allreduce() const noexcept { ++stats_.allreduce_calls; }
+
     // Small-message fast-path dispatch for the free collective ops. Both return false when the
     // probed mailbox cannot carry the call (no plan, transport NCCL, wrong dtype, capacity), in
     // which case the caller runs the grouped NCCL route.
@@ -128,6 +136,7 @@ private:
     std::array<ncclComm_t, kMaximumDevices> comms_{};
     // Probed small-message transport; null when tp == 1, disabled, or nothing beat NCCL.
     std::unique_ptr<detail::TpMailboxPlan> mailbox_;
+    mutable CollectiveStats stats_{};
 };
 
 /**

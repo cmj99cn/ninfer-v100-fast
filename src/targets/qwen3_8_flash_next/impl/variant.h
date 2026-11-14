@@ -47,12 +47,25 @@ struct Variant {
                                        Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                        Tensor& g, Tensor& beta, WorkspaceArena& workspace,
                                        cudaStream_t stream) {
-        GdnProjectionLeaf::project(hidden, weights, query, key, value, z, g, beta, workspace, stream);
+        GdnProjectionLeaf::project(hidden, weights, query, key, value, z, g, beta, workspace,
+                                   stream);
     }
 
     static void post_mixer(const Tensor& hidden, const MoeWeights& weights, Tensor& destination,
                            WorkspaceArena& workspace, cudaStream_t stream) {
         PostMixerLeaf::mix(hidden, weights, destination, workspace, stream);
+    }
+
+    static void post_mixer_routed(const Tensor& hidden, const MoeWeights& weights,
+                                  const ops::MoeNvfp4RouteView& route, Tensor& destination,
+                                  cudaStream_t stream) {
+        PostMixerLeaf::routed(hidden, weights, route, destination, stream);
+    }
+
+    static void post_mixer_shared(const Tensor& hidden, const MoeWeights& weights,
+                                  const ops::MoeNvfp4RouteView& route, Tensor& destination,
+                                  cudaStream_t stream) {
+        PostMixerLeaf::shared(hidden, weights, route, destination, stream);
     }
 };
 

@@ -133,6 +133,46 @@ void moe_routed_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& d
                       WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
+ * The routing control produced by moe_nvfp4_route, consumed by the sharded expert entries below.
+ * All three are contiguous outputs of one moe_nvfp4_route call on the same activation:
+ *   expert_ids   I32  [K, T]
+ *   coefficients FP32 [K, T]
+ *   shared_gate  FP32 [T]
+ */
+struct MoeNvfp4RouteView {
+    Tensor expert_ids;
+    Tensor coefficients;
+    Tensor shared_gate;
+};
+
+/**
+ * Op: the routed top-K contribution of ONE rank's expert subset, added into `destination`.
+ *
+ * The routing is the same global top-K selection moe_nvfp4_route publishes. Each batched weight
+ * carries `expert_begin` (the global id of its first matrix) and `matrices` (the local count), so
+ * a route slot whose global id falls outside [expert_begin, expert_begin + matrices) contributes
+ * exactly zero on this rank. The whole rank group covers [0, 512); the caller combines the ranks
+ * with one all-reduce. The shared expert is NOT part of this entry (see moe_shared_nvfp4), so an
+ * all-reduce over the routed partials never counts it twice.
+ *
+ * Shapes, formats and effects match moe_routed_nvfp4 above. `route` must be the output of
+ * moe_nvfp4_route for this same `x`; it is read-only. No workspace is required.
+ */
+void moe_routed_nvfp4_partial(const Tensor& x, const MoeNvfp4Weights& weights,
+                              const MoeNvfp4RouteView& route, Tensor& destination,
+                              cudaStream_t stream);
+
+/**
+ * Op: the sigmoid-gated shared-expert contribution, added into `destination`.
+ *
+ * This is the replicated half of the MoE: every rank carries the same shared weights and the same
+ * routing control, so every rank adds the identical contribution exactly once after the routed
+ * partials have been reduced. The routed experts are not part of this entry.
+ */
+void moe_shared_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights,
+                      const MoeNvfp4RouteView& route, Tensor& destination, cudaStream_t stream);
+
+/**
  * Minimum call-local workspace capacity for every T in the inclusive
  * [min_tokens, max_tokens] interval. The Op takes one contiguous block aligned to 256 bytes at
  * the arena cursor holding the route ids, coefficients, and shared gate in that order; each

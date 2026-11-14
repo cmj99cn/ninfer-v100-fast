@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/ple.h"
 #include "ninfer/ops/qsa.h"
 #include "runtime/contract/types.h"
@@ -10,6 +11,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -25,12 +27,15 @@ struct TextLaneContext {
     bool decode_ready = false;
 };
 
-// The persistent text state of one lane: the per-layer GDN convolution and recurrent state pools,
-// the QSA cache planes with its canonical tail and call records, and the PLE convolution history.
+// The persistent text state of one lane on one rank: the per-layer GDN convolution and recurrent
+// state pools, the QSA cache planes with its canonical tail and call records, and the PLE
+// convolution history. A tensor-parallel rank holds only its own heads.
 class TextState {
 public:
     TextState(DeviceContext& device, const ModelView& model, std::uint32_t kv_capacity_tokens,
               std::uint32_t forward_tokens);
+    TextState(DeviceContext& device, const ModelView& model, std::uint32_t kv_capacity_tokens,
+              std::uint32_t forward_tokens, int tp, int rank);
 
     void reset();
     void prepare_ple_rows(std::span<const TokenId> tokens);
@@ -40,6 +45,11 @@ public:
     [[nodiscard]] Tensor gdn_recurrent_state(std::size_t gdn_index) const;
     [[nodiscard]] std::optional<std::size_t> gdn_state_index(std::size_t layer) const;
     [[nodiscard]] std::size_t gdn_state_entries() const noexcept;
+
+    [[nodiscard]] std::int32_t kv_heads() const noexcept { return kv_heads_; }
+    [[nodiscard]] std::int32_t gdn_key_heads() const noexcept { return gdn_key_heads_; }
+    [[nodiscard]] std::int32_t gdn_value_heads() const noexcept { return gdn_value_heads_; }
+    [[nodiscard]] std::int32_t conv_channels() const noexcept { return conv_channels_; }
 
     [[nodiscard]] ops::QsaCacheView cache() const;
     [[nodiscard]] ops::QsaTailStateView tail() const;
@@ -78,10 +88,15 @@ private:
 
     DeviceScope device_scope_;
     const qwen4_exp::PleRowSource ple_source_;
+    int device_                  = 0;
     cudaStream_t stream_         = nullptr;
     std::size_t layers_          = 0;
     std::size_t forward_tokens_  = 0;
     std::size_t pages_           = 0;
+    std::int32_t kv_heads_       = 0;
+    std::int32_t gdn_key_heads_  = 0;
+    std::int32_t gdn_value_heads_ = 0;
+    std::int32_t conv_channels_  = 0;
     std::vector<std::size_t> gdn_layers_;
     std::vector<std::optional<std::size_t>> gdn_index_;
     std::vector<std::byte> ple_staged_host_;
@@ -111,28 +126,72 @@ private:
 
 // The text trunk: the embedding stem, the per-layer four-stream mixer and post-mixer, and the main
 // head. It runs the fixed order of the artifact authority and calls the package's three execution
-// leaves.
+// leaves. The tensor-parallel form issues the same schedule on every rank and joins the two
+// row-parallel projections with `allreduce_sum`.
 class TextTrunk {
 public:
     TextTrunk(const ModelView& model, TextState& state, WorkspaceArena& activations,
-             WorkspaceArena& workspace, cudaStream_t stream);
+              WorkspaceArena& workspace, cudaStream_t stream);
+    TextTrunk(const std::array<const ModelView*, kMaximumDevices>& models,
+              const std::array<TextState*, kMaximumDevices>& states,
+              const std::array<WorkspaceArena*, kMaximumDevices>& activations,
+              const std::array<WorkspaceArena*, kMaximumDevices>& workspaces,
+              ExecutionContext& execution, const ops::CollectiveComms& comms);
 
     TokenId prefill(std::span<const TokenId> tokens);
     TokenId decode(TokenId token);
 
 private:
     TokenId forward(std::span<const TokenId> tokens);
-    void run_gdn(std::size_t layer, std::int32_t tokens, const Tensor& block_input, Tensor& mixer_out);
+    TokenId forward_single(std::span<const TokenId> tokens);
+    TokenId forward_parallel(std::span<const TokenId> tokens);
+
+    void run_gdn(std::size_t layer, std::int32_t tokens, const Tensor& block_input,
+                 Tensor& mixer_out);
     void run_qsa(std::size_t layer, std::int32_t tokens, const Tensor& block_input,
                  const Tensor& positions, const Tensor& valid_columns, const Tensor& table_rows,
                  Tensor& mixer_out);
     void run_ple(std::int32_t tokens, const Tensor& residual, Tensor& updated, Tensor& normalized);
 
-    const ModelView& model_;
-    TextState& state_;
-    WorkspaceArena& activations_;
-    WorkspaceArena& workspace_;
-    cudaStream_t stream_;
+    void run_gdn_parallel(std::size_t layer, std::int32_t tokens,
+                          const std::array<Tensor, kMaximumDevices>& block_input,
+                          std::array<Tensor, kMaximumDevices>& mixer_out,
+                          const std::array<Tensor, kMaximumDevices>& staging);
+    void run_qsa_parallel(std::size_t layer, std::int32_t tokens,
+                          const std::array<Tensor, kMaximumDevices>& block_input,
+                          const std::array<Tensor, kMaximumDevices>& positions,
+                          const std::array<Tensor, kMaximumDevices>& valid_columns,
+                          const std::array<Tensor, kMaximumDevices>& table_rows,
+                          std::array<Tensor, kMaximumDevices>& mixer_out,
+                          const std::array<Tensor, kMaximumDevices>& staging);
+    void run_ple_parallel(std::int32_t tokens,
+                          std::array<Tensor, kMaximumDevices>& residual,
+                          std::array<Tensor, kMaximumDevices>& updated,
+                          std::array<Tensor, kMaximumDevices>& normalized);
+
+    template <class Body>
+    void for_each_rank(Body&& body) {
+        int previous = 0;
+        CUDA_CHECK(cudaGetDevice(&previous));
+        for (int rank = 0; rank < tp_; ++rank) {
+            CUDA_CHECK(cudaSetDevice(execution_->dev[static_cast<std::size_t>(rank)]->device));
+            body(rank);
+        }
+        CUDA_CHECK(cudaSetDevice(previous));
+    }
+
+    [[nodiscard]] cudaStream_t stream_for(int rank) const noexcept {
+        return execution_->dev[static_cast<std::size_t>(rank)]->stream;
+    }
+
+    std::array<const ModelView*, kMaximumDevices> models_{};
+    std::array<TextState*, kMaximumDevices> states_{};
+    std::array<WorkspaceArena*, kMaximumDevices> activations_{};
+    std::array<WorkspaceArena*, kMaximumDevices> workspaces_{};
+    ExecutionContext* execution_       = nullptr;
+    const ops::CollectiveComms* comms_ = nullptr;
+    int tp_                            = 1;
+    cudaStream_t stream_               = nullptr;
 };
 
 } // namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS

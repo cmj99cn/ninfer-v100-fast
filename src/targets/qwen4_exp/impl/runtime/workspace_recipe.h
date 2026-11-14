@@ -39,7 +39,11 @@ struct WorkspaceRecipe {
 
 [[nodiscard]] inline WorkspaceRecipe text_workspace_recipe(std::uint32_t prefill_chunk,
                                                            std::uint32_t max_concurrency) {
-    const std::size_t lane = align_up(text_op_scratch_bytes(prefill_chunk), 256);
+    const std::size_t lane = align_up(
+        text_op_scratch_bytes(prefill_chunk) +
+            static_cast<std::size_t>(TextConfig::hidden) * (prefill_chunk == 0 ? 1 : prefill_chunk) *
+                kBf16Bytes,
+        256);
     const std::size_t ple = align_up(
         static_cast<std::size_t>(TextConfig::ple_heads) * TextConfig::ple_head_width *
             TextConfig::ple_conv_kernel * kBf16Bytes,
@@ -57,8 +61,9 @@ struct WorkspaceRecipe {
     const std::size_t streams  = TextConfig::hc_streams;
 
     const std::size_t trunk_per_token =
-        (17 * hidden + static_cast<std::size_t>(TextConfig::vocab)) * kBf16Bytes +
-        (streams + 3) * sizeof(std::uint32_t);
+        (17 * hidden + 2 * static_cast<std::size_t>(TextConfig::vocab)) * kBf16Bytes +
+        (streams + 3 + 2 * static_cast<std::size_t>(TextConfig::experts_per_token) + 1) *
+            sizeof(std::uint32_t);
 
     const std::size_t qsa_per_token =
         (4 * static_cast<std::size_t>(TextConfig::query_width) +

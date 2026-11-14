@@ -74,7 +74,7 @@ constexpr std::array<ShardSpec, roles::kRoleCount> kShardSpecs{{
     {Role::QsaQuery, Axis::Head, Split::Output, 0, kQuery, kHead},
     {Role::QsaKey, Axis::Head, Split::Output, 0, kKv, kHead},
     {Role::QsaValue, Axis::Head, Split::Output, kKv, kKv, kHead},
-    {Role::QsaIndexQuery, Axis::Head, Split::Output, 2 * kKv, kIndexQuery, kIndexHead},
+    {Role::QsaIndexQuery, Axis::Replicated, Split::Output, 2 * kKv, kIndexQuery, kIndexHead},
     {Role::QsaIndexKey, Axis::Replicated, Split::Output, 0, kIndexKey, 1},
     {Role::QsaOutput, Axis::Head, Split::Input, 0, kQuery, kHead},
     {Role::QsaOutputGate, Axis::Head, Split::Output, kQuery, kQuery, kHead},

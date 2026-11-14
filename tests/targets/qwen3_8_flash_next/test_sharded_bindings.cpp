@@ -360,7 +360,7 @@ constexpr ExpectedRoleRanges kExpectedRanges[] = {
     {roles::Role::QsaQuery, {{{0, 3072}, {3072, 3072}}}},
     {roles::Role::QsaKey, {{{0, 256}, {256, 256}}}},
     {roles::Role::QsaValue, {{{512, 256}, {768, 256}}}},
-    {roles::Role::QsaIndexQuery, {{{1024, 256}, {1280, 256}}}},
+    {roles::Role::QsaIndexQuery, {{{1024, 512}, {1024, 512}}}},
     {roles::Role::QsaIndexKey, {{{1536, 128}, {1536, 128}}}},
     {roles::Role::QsaOutput, {{{0, 3072}, {3072, 3072}}}},
     {roles::Role::QsaOutputGate, {{{6144, 3072}, {9216, 3072}}}},
@@ -450,8 +450,8 @@ void test_partition(const flash::ShardPlanByName& shards) {
                     std::string(name) + " rank covers part of a 128-row band");
         }
     }
-    require(checked == 15, "the shard map names " + std::to_string(checked) +
-                               " split roles; the expected table gives 15");
+    require(checked == 14, "the shard map names " + std::to_string(checked) +
+                               " split roles; the expected table gives 14");
 }
 
 void test_expert_subsets(const flash::ShardPlanByName& shards) {

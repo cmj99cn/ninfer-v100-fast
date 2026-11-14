@@ -925,6 +925,9 @@ BatchedNvfp4Weight part_library(const BindingPlan& plan, const artifact::Materia
     weight.layout        = QuantLayout::BatchedBlockScaleK16M128x4;
     weight.group_size    = 16U;
     weight.matrices      = static_cast<std::int32_t>(range_total(ranges));
+    const auto& mapping = shard_of(shards, roles::role_name(parameter.role));
+    weight.expert_begin = static_cast<std::int32_t>(
+        mapping.ranks.empty() ? 0 : mapping.ranks[static_cast<std::size_t>(rank)].begin);
     weight.rows          = static_cast<std::int32_t>(library.rows);
     weight.columns       = static_cast<std::int32_t>(library.columns);
     weight.codes         = payload;

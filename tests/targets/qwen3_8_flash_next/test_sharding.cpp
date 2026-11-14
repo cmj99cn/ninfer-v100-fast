@@ -71,7 +71,7 @@ constexpr ExpectedMapping kExpectedMappings[] = {
     {Role::QsaQuery,           Axis::Head,       Split::Output, 0,     6144,    256},
     {Role::QsaKey,             Axis::Head,       Split::Output, 0,     512,     256},
     {Role::QsaValue,           Axis::Head,       Split::Output, 512,   512,     256},
-    {Role::QsaIndexQuery,      Axis::Head,       Split::Output, 1024,  512,     128},
+    {Role::QsaIndexQuery,      Axis::Replicated, Split::Output, 1024,  512,     128},
     {Role::QsaIndexKey,        Axis::Replicated, Split::Output, 0,     128,     1},
     {Role::QsaOutput,          Axis::Head,       Split::Input,  0,     6144,    256},
     {Role::QsaOutputGate,      Axis::Head,       Split::Output, 6144,  6144,    256},
@@ -154,7 +154,7 @@ void test_head_roles_partition_by_head_width() {
     }
     const std::set<Role> expected_head = {
         Role::GdnQuery,   Role::GdnKey,    Role::GdnValue,   Role::GdnZ,      Role::GdnOutput,
-        Role::QsaQuery,   Role::QsaKey,    Role::QsaValue,   Role::QsaIndexQuery,
+        Role::QsaQuery,   Role::QsaKey,    Role::QsaValue,
         Role::QsaOutput,  Role::QsaOutputGate,
     };
     require(head_roles == expected_head, "the head-axis set is not the head-axis set");
@@ -227,7 +227,8 @@ void test_replicated_set_is_exact() {
         Role::MoeHcInject,        Role::MoeHcUp,           Role::GdnNorm,
         Role::GdnAProjection,     Role::GdnBProjection,    Role::GdnALog,
         Role::GdnDtBias,          Role::GdnConvolution,    Role::QsaIndexKey,
-        Role::QsaIndexKeyNorm,    Role::QsaIndexQueryNorm, Role::QsaKeyNorm,
+        Role::QsaIndexQuery,      Role::QsaIndexKeyNorm,    Role::QsaIndexQueryNorm,
+        Role::QsaKeyNorm,
         Role::QsaQueryNorm,       Role::MoeRouter,         Role::MoeSharedScore,
         Role::MoeSharedGate,      Role::MoeSharedUp,       Role::MoeSharedDown,
         Role::PleTable,           Role::PleKey,            Role::PleValue,
@@ -261,7 +262,7 @@ void test_tp1_yields_the_whole_range() {
 
 void test_illegal_boundary_names_the_role() {
     const std::vector<Role> indivisible = {
-        Role::GdnKey,         Role::QsaKey,        Role::QsaIndexQuery,
+        Role::GdnKey,         Role::QsaKey,
         Role::MoeRoutedGate,  Role::MoeRoutedDown, Role::OutputHead,
     };
     for (const auto role : indivisible) {
