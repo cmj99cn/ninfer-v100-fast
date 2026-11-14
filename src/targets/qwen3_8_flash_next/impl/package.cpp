@@ -3,6 +3,7 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "targets/qwen3_8_flash_next/impl/load/bindings.h"
+#include "targets/qwen4_exp/impl/runtime/activation_dtype.h"
 #include "targets/qwen3_8_flash_next/impl/variant.h"
 
 #include <ninfer/targets/qwen4_exp/frontend.h>
@@ -105,10 +106,16 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     detail::BindingPlan bindings = detail::bind_artifact(binder, weights_profile, options.tp);
     qwen4_exp::FrontendResourcePlan resources = qwen4_exp::bind_frontend_resources(binder);
 
-    for (const auto& object : bindings.objects) {
-        if (detail::is_fp16_control_object(bindings, object)) {
-            binder.validate_only(object.handle);
-        } else {
+    if constexpr (qwen4_exp::detail::kTextActivationDtype == DType::FP16) {
+        for (const auto& object : bindings.objects) {
+            if (detail::is_fp16_control_object(bindings, object)) {
+                binder.validate_only(object.handle);
+            } else {
+                binder.materialize_on_device(object.handle);
+            }
+        }
+    } else {
+        for (const auto& object : bindings.objects) {
             binder.materialize_on_device(object.handle);
         }
     }

@@ -1307,7 +1307,11 @@ LoadedModelData::LoadedModelData(const BindingPlan& plan,
     if constexpr (qwen4_exp::detail::kTextActivationDtype == DType::FP16) {
         const auto probe_handle =
             plan.objects.at(plan.token_embedding.parts.front().object).handle;
-        if (materialized.is_materialized(probe_handle, 0)) {
+        if (materialized.stats().tensor_count != 0) {
+            if (!materialized.is_materialized(probe_handle, 0)) {
+                throw std::runtime_error(
+                    "the fp16 control materialization probe object is not resident");
+            }
             artifact::Reader reader(artifact_path);
             const auto byte_plan = shard_byte_plan(plan, shards, tp);
             std::map<std::pair<std::string, int>, std::size_t> cache;

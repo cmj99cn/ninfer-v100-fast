@@ -8,8 +8,12 @@
 #include "ninfer/ops/ple.h"
 #include "ninfer/ops/qsa.h"
 #include "targets/qwen3_8_flash_next/impl/load/bindings.h"
+#include "targets/qwen4_exp/impl/runtime/activation_dtype.h"
+
+#include <ninfer/targets/qwen3_8_flash_next/package.h>
 
 #include <algorithm>
+#include <array>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cstring>
@@ -201,7 +205,7 @@ void write_parity_dump(const char* path, const rt::TextState& state,
     std::fclose(index_file);
 }
 
-void place_reduced(const detail::BindingPlan& plan, artifact::Binder& binder) {
+std::vector<bool> reduced_object_mask(const detail::BindingPlan& plan) {
     std::size_t object_slots = 0;
     for (const auto& object : plan.objects) {
         object_slots = std::max(object_slots, object.handle.index + 1);
@@ -220,15 +224,44 @@ void place_reduced(const detail::BindingPlan& plan, artifact::Binder& binder) {
             reduced[parameter->library->handle.index] = true;
         }
     }
+    return reduced;
+}
+
+void place_reduced(const detail::BindingPlan& plan, artifact::Binder& binder) {
+    const std::vector<bool> reduced = reduced_object_mask(plan);
     for (const auto& object : plan.objects) {
         const auto handle = object.handle;
-        if (reduced[static_cast<std::size_t>(handle.index)] &&
+        if (static_cast<std::size_t>(handle.index) < reduced.size() &&
+            reduced[static_cast<std::size_t>(handle.index)] &&
             std::holds_alternative<artifact::TensorDescriptor>(binder.descriptor(handle))) {
             binder.materialize_on_device(handle);
         } else {
             binder.validate_only(handle);
         }
     }
+}
+
+artifact::MaterializationPlan reduce_plan(const artifact::MaterializationPlan& plan,
+                                          const std::vector<bool>& keep) {
+    artifact::MaterializationPlan reduced;
+    reduced.object_count = plan.object_count;
+    reduced.device_count = plan.device_count;
+    std::array<std::uint64_t, artifact::kMaximumDevices> cursor{};
+    for (const auto& placement : plan.device_objects) {
+        if (static_cast<std::size_t>(placement.object.index) >= keep.size() ||
+            !keep[static_cast<std::size_t>(placement.object.index)]) {
+            continue;
+        }
+        const auto device = static_cast<std::size_t>(placement.device);
+        const std::uint64_t alignment = placement.alignment == 0 ? 1 : placement.alignment;
+        const std::uint64_t aligned = (cursor[device] + alignment - 1) / alignment * alignment;
+        artifact::DeviceMaterialization narrowed = placement;
+        narrowed.offset = aligned;
+        cursor[device] = aligned + placement.bytes;
+        reduced.device_objects.push_back(std::move(narrowed));
+    }
+    reduced.device_capacity_bytes = cursor;
+    return reduced;
 }
 
 std::size_t gdn_state_signature(const rt::TextState& state) {
@@ -355,6 +388,53 @@ TokenId run_long_prompt(DeviceContext& device, const detail::Variant::ModelView&
     return token;
 }
 
+int run_plan_load(DeviceContext& device, const char* path, std::optional<TokenId> reference) {
+    artifact::Reader reader(path);
+    artifact::Binder binder(reader, 1);
+    ninfer::EngineOptions options;
+    options.device        = device.device;
+    options.tp            = 1;
+    options.max_context   = kKvCapacityTokens;
+    options.max_concurrency = 1;
+    options.artifact_path = path;
+    auto load_plan = ninfer::targets::qwen3_8_flash_next::Package::plan_load(
+        binder, options, detail::WeightsProfile::Nvfp4);
+
+    const detail::BindingPlan& bindings = load_plan.bindings();
+    const artifact::MaterializationPlan& plan = load_plan.materialization();
+
+    std::vector<bool> placed(plan.object_count, false);
+    for (const auto& placement : plan.device_objects) {
+        placed[static_cast<std::size_t>(placement.object.index)] = true;
+    }
+    const bool expect_resident =
+        ninfer::targets::qwen4_exp::detail::kTextActivationDtype == DType::BF16;
+    for (const auto& object : bindings.objects) {
+        if (!detail::is_fp16_control_object(bindings, object)) { continue; }
+        const bool resident = placed[static_cast<std::size_t>(object.handle.index)];
+        require(resident == expect_resident,
+                "the fp16 control object " + object.name +
+                    " residency does not match the build activation dtype");
+    }
+
+    const std::vector<bool> keep = reduced_object_mask(bindings);
+    const artifact::MaterializationPlan reduced = reduce_plan(plan, keep);
+    const artifact::MaterializedArtifact materialized =
+        artifact::materialize(reader, reduced, device);
+    const detail::LoadedModelData data(bindings, materialized, kLoadedLayers, 1,
+                                       std::filesystem::path(path));
+    const RunOutcome outcome = run_prompt(device, data.view(0));
+    require(outcome.token >= 0 && outcome.token < static_cast<TokenId>(detail::TextConfig::vocab),
+            "the plan-load greedy token is outside the vocabulary");
+    if (reference.has_value()) {
+        require(outcome.token == *reference,
+                "the plan-load token " + std::to_string(outcome.token) +
+                    " does not match the reference token " + std::to_string(*reference));
+    }
+    std::cout << "OK flash-next plan-load forward: token " << outcome.token << "\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -376,6 +456,9 @@ int main() {
                                   : std::nullopt;
 
     DeviceContext device(0);
+    if (std::getenv("NINFER_FLASH_NEXT_PLAN_LOAD") != nullptr) {
+        return run_plan_load(device, path, reference);
+    }
     artifact::Reader reader(path);
     artifact::Binder binder(reader, 1);
 
