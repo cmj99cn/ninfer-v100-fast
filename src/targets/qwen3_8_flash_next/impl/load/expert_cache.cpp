@@ -20,10 +20,6 @@ constexpr std::uint64_t kTileBytes  = 512;
 std::uint64_t align_up(std::uint64_t value, std::uint64_t unit) {
     return (value + unit - 1) / unit * unit;
 }
-
-// The measured routing skew, as pair counts inside one rank's 12288 pairs: 42.7%, 47.7% and
-// 51.7% of the pairs cover 99.0%, 99.5% and 99.9% of the routed mass. Full residency covers all
-// of it.
 const std::array<CoveragePoint, 5> kCurve = {{
     {0, 0.0},
     {5247, 0.990},
@@ -54,7 +50,7 @@ ExpertCachePlan ExpertCachePlan::auto_sized(std::uint64_t available_bytes, std::
     ExpertCachePlan plan;
     plan.budget_pairs   = available_bytes / pair_bytes;
     plan.target_pairs   = pairs_for_coverage(kCoverageTarget);
-    plan.pairs          = std::min(plan.budget_pairs, kRankPairs);
+    plan.pairs          = std::min(plan.target_pairs, plan.budget_pairs);
     plan.bytes          = plan.pairs * pair_bytes;
     plan.coverage_mass  = curve_coverage(plan.pairs);
     plan.budget_exhausted      = plan.pairs == plan.budget_pairs;

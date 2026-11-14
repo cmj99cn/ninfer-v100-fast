@@ -13,14 +13,7 @@
 #include <utility>
 #include <vector>
 
-// The per-rank expert residency cache. One cache owns one rank's own expert set: at tp 2 that is
-// 256 whole matrices per layer, because the swizzled scale plane stores each matrix in whole
-// 128-row bands. Every byte count in this module is per rank.
 namespace ninfer::targets::qwen3_8_flash_next::detail {
-
-// One pair is the gate, up and down matrix of one expert in one layer exactly as the artifact
-// stores them: each matrix's code plane followed by its swizzled scale plane, without the
-// per-matrix weight divisor.
 inline constexpr std::uint64_t kPairCode  = static_cast<std::uint64_t>(TextConfig::expert_intermediate) *
                                             static_cast<std::uint64_t>(TextConfig::hidden) / 2;
 inline constexpr std::uint64_t kPairScale = static_cast<std::uint64_t>(TextConfig::expert_intermediate) *
@@ -32,9 +25,6 @@ inline constexpr std::uint32_t kTextLayers  = static_cast<std::uint32_t>(TextCon
 inline constexpr std::uint32_t kTp          = 2;
 inline constexpr std::uint32_t kRankExperts = static_cast<std::uint32_t>(TextConfig::experts) / kTp;
 inline constexpr std::uint64_t kRankPairs   = static_cast<std::uint64_t>(kTextLayers) * kRankExperts;
-
-// Routing skew measured on the registered artifact (4 layers x 512 tokens, 20480 routings): the
-// share of the routed mass that lands on the hottest pairs of one rank's expert set.
 struct CoveragePoint {
     std::uint64_t pairs;
     double mass;
@@ -53,10 +43,6 @@ struct ExpertCachePlan {
     double coverage_mass       = 0.0;
     bool budget_exhausted      = false;
     bool coverage_target_met   = false;
-
-    // The pair count the cache holds when no explicit capacity is given: the budget decides when
-    // the measured curve already reaches the coverage target at a smaller count, and the coverage
-    // target is still reported so the caller can see which of the two governs.
     [[nodiscard]] static ExpertCachePlan auto_sized(std::uint64_t available_bytes,
                                                      std::uint64_t pair_bytes);
 };
@@ -64,7 +50,6 @@ struct ExpertCachePlan {
 struct ExpertCacheOptions {
     std::optional<std::uint64_t> capacity_bytes;   // nullopt selects the auto plan
     std::uint64_t vram_reserve_bytes               = 0;
-    // layer, expert, count per line. The counts order the initial fill; the clock then governs.
     std::optional<std::filesystem::path> profile;
 };
 
@@ -76,10 +61,6 @@ struct CacheStats {
     std::uint64_t evictions  = 0;
     std::uint32_t residency  = 0;
 };
-
-// The byte source for a pair the cache does not hold: the artifact's own stored planes through the
-// mmap'd reader. The destination receives the pair in the slot layout, gate, up and down in that
-// order, each matrix's code plane followed by its scale plane.
 class HostPairSource {
 public:
     HostPairSource(const std::filesystem::path& path, std::uint64_t pair_bytes);
@@ -105,11 +86,6 @@ private:
     std::uint64_t pair_bytes_;
     std::vector<std::array<PairGeometry, 3>> geometry_;
 };
-
-// The slot table of one rank. Slots are a fixed number of slab ranges; the device address of slot
-// `s` is the slab base plus `slot_offset(s)` and never moves. Replacement is a clock over one
-// reference bit per slot. `find` and `load` each record one lookup; `load` additionally records
-// the placement. The profile decides only the initial fill order.
 class ExpertCache {
 public:
     ExpertCache(const ExpertCacheOptions& options, std::uint64_t pair_bytes,

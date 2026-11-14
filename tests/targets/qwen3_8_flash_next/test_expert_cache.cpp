@@ -174,9 +174,9 @@ void test_auto_sized(const char* path) {
     const std::uint64_t full_budget     = (cache::kRankPairs + 4) * pair_bytes;
 
     const Case cases[] = {
-        {measured_budget, measured_budget / pair_bytes, 0.999, true},
+        {measured_budget, curve_pairs(0.477), 0.995, false},
         {short_budget, curve_pairs(0.427), 0.990, true},
-        {full_budget, cache::kRankPairs, 1.0, false},
+        {full_budget, curve_pairs(0.477), 0.995, false},
     };
 
     for (const auto& case_ : cases) {
@@ -197,6 +197,11 @@ void test_auto_sized(const char* path) {
                     std::to_string(plan.coverage_mass) + " mass; the curve gives " +
                     std::to_string(case_.expected_mass));
 
+        require(plan.target_pairs == cache::pairs_for_coverage(cache::kCoverageTarget),
+                "auto sizing reports target pairs " + std::to_string(plan.target_pairs) +
+                    "; the coverage target needs " +
+                    std::to_string(cache::pairs_for_coverage(cache::kCoverageTarget)));
+
         require(plan.coverage_target_met || plan.budget_exhausted,
                 "auto sizing at " + std::to_string(case_.available) + " bytes satisfies neither "
                 "the coverage target nor the budget");
@@ -204,6 +209,28 @@ void test_auto_sized(const char* path) {
                 "auto sizing at " + std::to_string(case_.available) + " bytes reports governed_by " +
                     (plan.budget_exhausted ? "budget" : "coverage target") + "; the case expects " +
                     (case_.budget_governs ? "budget" : "coverage target"));
+
+        if (case_.budget_governs) {
+            require(plan.budget_pairs < plan.target_pairs,
+                    "the case calls the budget governing at " + std::to_string(case_.available) +
+                        " bytes, where the budget holds " + std::to_string(plan.budget_pairs) +
+                        " pairs and the coverage target needs " + std::to_string(plan.target_pairs));
+            require(plan.pairs == plan.budget_pairs,
+                    "a governing budget at " + std::to_string(case_.available) + " bytes plans " +
+                        std::to_string(plan.pairs) + " pairs; it holds " +
+                        std::to_string(plan.budget_pairs));
+        } else {
+            require(plan.budget_pairs > plan.target_pairs,
+                    "the case calls the coverage target governing at " +
+                        std::to_string(case_.available) + " bytes, where the budget holds " +
+                        std::to_string(plan.budget_pairs) + " pairs and the target needs " +
+                        std::to_string(plan.target_pairs));
+            require(plan.pairs == plan.target_pairs,
+                    "a governing coverage target plans " + std::to_string(plan.pairs) +
+                        " pairs at " + std::to_string(case_.available) + " bytes; it needs " +
+                        std::to_string(plan.target_pairs) + " and the budget would hold " +
+                        std::to_string(plan.budget_pairs));
+        }
 
         std::cout << "flash-next expert cache: " << std::to_string(plan.pairs) << " pairs ("
                   << std::to_string(plan.bytes) << " B) at " << std::to_string(case_.available)
@@ -246,8 +273,18 @@ void test_explicit_capacity_over_budget(const char* path) {
     options.capacity_bytes = std::nullopt;
     options.vram_reserve_bytes = 0;
     cache::ExpertCache automatic(options, cache::kPairBytes, available, source);
-    require(automatic.plan().pairs == available / cache::kPairBytes,
-            "auto capacity ignores the available budget: " + std::to_string(automatic.plan().pairs));
+    require(automatic.plan().pairs == cache::pairs_for_coverage(cache::kCoverageTarget),
+            "auto capacity at " + std::to_string(available) + " bytes plans " +
+                std::to_string(automatic.plan().pairs) + " pairs; the coverage target needs " +
+                std::to_string(cache::pairs_for_coverage(cache::kCoverageTarget)) +
+                " and the budget would hold " + std::to_string(available / cache::kPairBytes));
+    require(!automatic.plan().budget_exhausted && automatic.plan().coverage_target_met,
+            "auto capacity at " + std::to_string(available) + " bytes reports itself governed by " +
+                (automatic.plan().budget_exhausted ? "the budget" : "the coverage target"));
+    require(automatic.plan().bytes < available,
+            "auto capacity at " + std::to_string(available) + " bytes plans " +
+                std::to_string(automatic.plan().bytes) + " bytes, leaving nothing for the resident KV "
+                "and the MTP proposal head");
 }
 
 // find and load each record one lookup; load additionally records the placement.
@@ -403,6 +440,29 @@ void test_profile_seeds_the_fill_order(const char* path, const std::filesystem::
     require(expert.find(12, 201) == slot, "the loaded pair is not in the slot load returned");
 }
 
+void test_empty_profile(const char* path, const std::filesystem::path& profile) {
+    cache::ExpertCacheOptions options;
+    options.capacity_bytes = 3 * cache::kPairBytes;
+    options.profile = profile;
+    cache::HostPairSource source(path, cache::kPairBytes);
+    cache::ExpertCache expert(options, cache::kPairBytes, 3 * cache::kPairBytes, source);
+
+    require(expert.stats().residency == 0, "an empty profile seeded " +
+        std::to_string(expert.stats().residency) + " slots; it seeds none");
+    require(expert.stats().insertions == 0, "an empty profile recorded " +
+        std::to_string(expert.stats().insertions) + " insertions; it inserts nothing");
+
+    const auto slot = expert.load(20, 200);
+    require(slot == 0, "the first load after an empty profile took slot " +
+        std::to_string(slot) + "; the clock takes the first free slot");
+    require(expert.stats().evictions == 0, "the first load after an empty profile evicted " +
+        std::to_string(expert.stats().evictions) + " pairs; the cache was not full");
+    require(expert.stats().insertions == 1, "the first load after an empty profile recorded " +
+        std::to_string(expert.stats().insertions) + " insertions");
+    require(expert.stats().residency == 1, "residency is " +
+        std::to_string(expert.stats().residency) + " after the first load past an empty profile");
+}
+
 void test_host_pair_source(const char* path) {
     const artifact::Reader reader(path);
     cache::HostPairSource source(path, cache::kPairBytes);
@@ -470,6 +530,7 @@ int test_device_slots(const char* path) {
 
     std::vector<std::byte> staging(static_cast<std::size_t>(cache::kPairBytes));
     std::vector<std::byte> readback(static_cast<std::size_t>(cache::kPairBytes));
+    std::vector<std::byte*> slot_address(static_cast<std::size_t>(slots), nullptr);
 
     for (std::uint32_t step = 0; step < slots; ++step) {
         const std::uint32_t layer        = step % cache::kTextLayers;
@@ -478,19 +539,21 @@ int test_device_slots(const char* path) {
         check(slot < slots, "load returned slot " + std::to_string(slot) +
             " outside the " + std::to_string(slots) + " device slots");
 
-        std::byte* first  = slab + static_cast<std::size_t>(expert.slot_offset(slot));
-        std::byte* second = slab + static_cast<std::size_t>(expert.slot_offset(slot));
-        check(first == second, "the device address of slot " + std::to_string(slot) +
-            " moved between lookups");
+        const auto address = slab + static_cast<std::size_t>(expert.slot_offset(slot));
+        if (slot_address[slot] != nullptr) {
+            check(address == slot_address[slot], "slot " + std::to_string(slot) +
+                " changed its device address between placements");
+        }
+        slot_address[slot] = address;
         check(expert.slot_offset(slot) + cache::kPairBytes <= slab_bytes,
               "slot " + std::to_string(slot) + " runs past the end of the slab");
 
         source.read(layer, expert_index, staging);
-        if (cudaMemcpy(first, staging.data(), staging.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (cudaMemcpy(address, staging.data(), staging.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
             throw std::runtime_error("the miss path could not fill slot " + std::to_string(slot));
         }
         execution.primary().synchronize();
-        if (cudaMemcpy(readback.data(), first, readback.size(), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        if (cudaMemcpy(readback.data(), address, readback.size(), cudaMemcpyDeviceToHost) != cudaSuccess) {
             throw std::runtime_error("the device slot could not be read back");
         }
 
@@ -518,6 +581,17 @@ int test_device_slots(const char* path) {
     check(expert.stats().miss_count == slots, "the device slab counted " +
         std::to_string(expert.stats().miss_count) + " misses over " + std::to_string(slots) +
         " placements");
+
+    const std::pair<std::uint32_t, std::uint32_t> newcomer = {10, 200};
+    const auto evicted_slot = expert.load(newcomer.first, newcomer.second);
+    check(expert.stats().evictions == 1, "the load after a full slab evicted " +
+        std::to_string(expert.stats().evictions) + " pair; a full-cache miss evicts one");
+    check(expert.find(newcomer.first, newcomer.second) == evicted_slot,
+          "the pair that caused the eviction is not in the slot load returned");
+    for (std::uint32_t slot = 0; slot < slots; ++slot) {
+        check(slab + static_cast<std::size_t>(expert.slot_offset(slot)) == slot_address[slot],
+              "slot " + std::to_string(slot) + " moved to a different device address after an eviction");
+    }
 
     cudaFree(slab);
     if (failures == 0) {
@@ -552,6 +626,13 @@ int main(int argc, char** argv) {
             out << "12 200 512\n3 100 310\n40 7 90\n12 201 12\n";
         }
         test_profile_seeds_the_fill_order(artifact, profile);
+
+        const auto empty_profile =
+            std::filesystem::temp_directory_path() / "ninfer_expert_cache_empty_profile.txt";
+        {
+            std::ofstream out(empty_profile);
+        }
+        test_empty_profile(artifact, empty_profile);
 
         if (device_mode) { return test_device_slots(artifact); }
         test_host_pair_source(artifact);
