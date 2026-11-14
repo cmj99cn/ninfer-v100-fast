@@ -35,7 +35,9 @@ std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
 } // namespace
 
 void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream) {
-    if (logits.dtype != DType::BF16) { throw std::invalid_argument("argmax: logits must be BF16"); }
+    if (logits.dtype != DType::BF16 && logits.dtype != DType::FP16) {
+        throw std::invalid_argument("argmax: logits must be BF16 or FP16");
+    }
     if (out.dtype != DType::I32) { throw std::invalid_argument("argmax: out must be I32"); }
 
     const std::int64_t logits_n = numel_allow_zero(logits, "logits");
@@ -71,7 +73,8 @@ void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStre
 void argmax_with_value(const Tensor& logits, Tensor& values, Tensor& indices,
                        std::int32_t valid_rows, cudaStream_t stream) {
     constexpr const char* op = "argmax_with_value";
-    if (logits.dtype != DType::BF16 || !logits.is_contiguous() || logits.ne[0] <= 0 ||
+    if ((logits.dtype != DType::BF16 && logits.dtype != DType::FP16) ||
+        !logits.is_contiguous() || logits.ne[0] <= 0 ||
         logits.ne[1] <= 0 || logits.ne[2] != 1 || logits.ne[3] != 1 || values.dtype != DType::FP32 ||
         indices.dtype != DType::I32 || values.ne[0] != logits.ne[1] || values.ne[1] != 1 ||
         values.ne[2] != 1 || values.ne[3] != 1 || indices.ne[0] != logits.ne[1] ||
