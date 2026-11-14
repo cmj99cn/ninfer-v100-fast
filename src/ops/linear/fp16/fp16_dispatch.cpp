@@ -27,8 +27,14 @@ Fp16Launch select_fp16_launch(std::int32_t n, std::int32_t k, std::int32_t t, Li
 
 void fp16_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                    cudaStream_t stream) {
-    const Fp16Launch launch = select_fp16_launch(w.n, w.k, x.ne[1], policy);
-    launch(x, w, out, stream);
+    (void)select_fp16_launch(w.n, w.k, x.ne[1], policy);
+#ifdef NINFER_VOLTA_BUILD
+    if (x.dtype == DType::FP16) {
+        launch_fp16_volta_mma_f16(x, w, out, stream);
+    } else {
+        launch_fp16_volta_mma(x, w, out, stream);
+    }
+#endif
 }
 
 } // namespace ninfer::ops::detail

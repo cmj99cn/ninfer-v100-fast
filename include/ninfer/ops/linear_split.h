@@ -46,20 +46,23 @@ struct LinearSplitSegment {
  *   projection over the same activation; nothing is summed across segments.
  *
  * Logical shapes:
- *   x is contiguous BF16 [K,T], out_s is contiguous BF16 [n_s,T], and the parent weight is
- *   logical [N,K]. T is positive. The outputs' row counts must equal the segment counts.
+ *   x is contiguous BF16 or FP16 [K,T], out_s is contiguous [n_s,T] with the same dtype as x,
+ *   and the parent weight is logical [N,K]. T is positive. The outputs' row counts must equal the
+ *   segment counts.
  *
  * Supported domain:
  *   RowSplit K128 parents Q4G64_F16S, Q5G64_F16S, Q6G64_F16S and W8G32_F16S, plus contiguous
- *   BF16_CTRL parents. Every segment must itself resolve as a registered linear problem of the
- *   parent's format; an unsupported format, layout or segment shape throws before any launch.
+ *   BF16_CTRL or FP16_CTRL parents. Every segment must itself resolve as a registered linear
+ *   problem of the parent's format; an unsupported format, layout or segment shape throws before
+ *   any launch.
  *   Batched NVFP4, row-scaled FP8 and every other layout are rejected explicitly.
  *
  * Numeric:
  *   Each segment has the same numerical contract as ops::linear. The governing oracle is an
  *   independent naive FP64 evaluation of the logical formula from the represented public inputs,
  *   decoding every packed code with the exact stored scale over the segment's own row interval,
- *   compared with a criterion appropriate to BF16 output rounding. Equality with an ops::linear()
+ *   compared with a criterion appropriate to the activation dtype's output rounding. Equality
+ *   with an ops::linear()
  *   invocation on an equivalent standalone weight is supplementary evidence rather than the
  *   criterion, because the accumulation grouping depends on the row extent and bit-identical
  *   results are not guaranteed.

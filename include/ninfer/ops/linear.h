@@ -16,8 +16,8 @@ namespace ninfer::ops {
  * @brief Permitted private activation-compute profiles for a linear projection.
  *
  * The policy constrains private route selection; it does not select a kernel or prescribe a
- * particular MMA instruction. The public activation and output tensors remain BF16 for every
- * policy.
+ * particular MMA instruction. The public activation and output tensors are BF16, or FP16 for the
+ * registered FP16 activation profile; the two carry the same dtype.
  */
 enum class LinearPolicy : std::uint8_t {
     A16Only, ///< Admit only A16 compute profiles.
@@ -47,20 +47,23 @@ enum class LinearPolicy : std::uint8_t {
  *     \mathrm{FP32Dequant}(w)_{n,k}\,\mathrm{FP32}(x_{k,t}).
  * @f]
  *
- * `out` stores a BF16 approximation of this ideal result under the named numerical criterion for
- * the selected private activation-compute path.
+ * `out` stores a BF16 or FP16 approximation of this ideal result under the named numerical
+ * criterion for the selected private activation-compute path.
  *
  * @par Logical tensors and layout
- * `x` is contiguous, non-null, 16-byte-aligned BF16 `[K,T]`, `w` has logical shape `[N,K]`, and
- * `out` is contiguous, non-null, 16-byte-aligned BF16 `[N,T]`. Every logical extent is positive;
+ * `x` is contiguous, non-null, 16-byte-aligned BF16 or FP16 `[K,T]`, `w` has logical shape
+ * `[N,K]`, and `out` is contiguous, non-null, 16-byte-aligned BF16 or FP16 `[N,T]` with the same
+ * dtype as `x`. Every logical extent is positive;
  * in particular, `T=0` is invalid rather than a no-op. Dimension zero is stored fastest. The Op has
  * no bias, activation, residual addition, or transpose mode.
  *
  * @par Supported execution domain
  * Registered execution uses GGML_K `ggml-k256-v1`, RowSplit Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, or W8G32_F16S weights
  * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16S weights, plus
- * registered contiguous BF16_CTRL problems. Each format owns a finite registry of exact physical
- * weight problems and selects its kernel internally; a valid encoding and alignment do not imply
+ * registered contiguous BF16_CTRL and FP16_CTRL problems. A BF16 activation pairs with BF16_CTRL,
+ * and an FP16 activation pairs with FP16_CTRL or a quantized format whose A16 route admits it.
+ * Each format owns a finite registry of exact physical weight problems and selects its kernel
+ * internally; a valid encoding and alignment do not imply
  * arbitrary N/K support. FP8 currently registers `[N,K]` in `{[14336,5120], [16384,5120],
  * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4
  * problems register the five non-vocabulary FP8 geometries and accept every positive T. Text and
@@ -70,9 +73,9 @@ enum class LinearPolicy : std::uint8_t {
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
- * The one Linear oracle accepts that matrix and the FP32 values represented by the BF16 activation,
- * evaluates every complete dot product with naive FP64 accumulation, and retains the FP64 result.
- * The BF16 output is promoted and compared against that result. Output representation,
+ * The one Linear oracle accepts that matrix and the FP32 values represented by the represented
+ * activation words, evaluates every complete dot product with naive FP64 accumulation, and retains
+ * the FP64 result. The output is promoted and compared against that result. Output representation,
  * accumulator precision, activation quantization, staging, reduction order, and kernel schedule
  * are private implementation effects covered by the named tolerance for the selected
  * activation-compute path; none is copied into the oracle. Kernel, schedule, template instance,
@@ -81,7 +84,7 @@ enum class LinearPolicy : std::uint8_t {
  * @par Compute policy
  * `policy` specifies the permitted private activation-compute set. A permission does not require a
  * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
- * choice. BF16_CTRL and GGML_K admit only LinearPolicy::A16Only. Registered Q4/Q5/Q6/W8 formats admit
+ * choice. BF16_CTRL, FP16_CTRL and GGML_K admit only LinearPolicy::A16Only. Registered Q4/Q5/Q6/W8 formats admit
  * LinearPolicy::A16Only and LinearPolicy::AllowA8. The five non-vocabulary FP8 problems admit the
  * same two policies at every positive T. AllowA8 resolves `[14336,5120]` to A16 through T=11 and
  * A8 from T=12; `[16384,5120]` to A16 through T=10 and A8 from T=11; `[34816,5120]` to A8 at T=1,
@@ -96,9 +99,9 @@ enum class LinearPolicy : std::uint8_t {
  * linear_workspace_capacity_bytes(). It must not overlap x, any weight plane, or out. Linear does
  * not allocate device memory internally.
  *
- * @param[in] x Contiguous, non-null, 16-byte-aligned BF16 input matrix `[K,T]`.
+ * @param[in] x Contiguous, non-null, 16-byte-aligned BF16 or FP16 input matrix `[K,T]`.
  * @param[in] w Logical weight matrix `[N,K]` in a registered persistent format and layout.
- * @param[out] out Contiguous, non-null, 16-byte-aligned BF16 output matrix `[N,T]`. It must not
+ * @param[out] out Contiguous, non-null, 16-byte-aligned output matrix `[N,T]` matching `x`. It must not
  * overlap `x` or any weight plane.
  * @param[in] policy Permitted private activation-compute profiles.
  * @param[in,out] workspace Caller-owned transient arena.

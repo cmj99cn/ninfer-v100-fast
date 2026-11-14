@@ -122,6 +122,70 @@ int run_fp16_linear_case(DeviceWeight& weight, std::int32_t tokens) {
     return failures;
 }
 
+int run_fp16_activation_case(DeviceWeight& weight, std::int32_t tokens) {
+    const std::int32_t rows   = weight.host.n;
+    const std::int32_t hidden = weight.host.k;
+    std::vector<std::uint16_t> activation_bits(static_cast<std::size_t>(hidden) * tokens);
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        for (std::int32_t column = 0; column < hidden; ++column) {
+            const int centered = ((column * 29 + token * 71 + 17) & 0xff) - 128;
+            activation_bits[static_cast<std::size_t>(token) * hidden + column] =
+                f32_to_f16(static_cast<float>(centered) * (1.0F / 512.0F));
+        }
+    }
+    std::vector<float> activation(activation_bits.size());
+    for (std::size_t index = 0; index < activation_bits.size(); ++index) {
+        activation[index] = fp16_bits_to_f32(activation_bits[index]);
+    }
+
+    DeviceBuffer device_activation = to_device(activation_bits);
+    GuardedDeviceBuffer guarded_output(
+        static_cast<std::size_t>(rows) * tokens * sizeof(std::uint16_t));
+    guarded_output.fill(0xff);
+    Tensor x(device_activation.p, DType::FP16, {hidden, tokens});
+    Tensor output(guarded_output.data(), DType::FP16, {rows, tokens});
+    DeviceArena workspace(256);
+    ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, workspace, nullptr);
+    cuda_synchronize();
+
+    const std::string suffix = " FP16 activation T=" + std::to_string(tokens);
+    int failures             = guarded_output.verify_guards("FP16_CTRL Linear" + suffix);
+    const std::vector<std::uint16_t> output_bits =
+        from_device<std::uint16_t>(guarded_output.data(), static_cast<std::size_t>(rows) * tokens);
+    for (const std::uint16_t bits : output_bits) {
+        if (!std::isfinite(fp16_bits_to_f32(bits))) {
+            std::cerr << "FP16_CTRL Linear" << suffix << " produced a non-finite output\n";
+            ++failures;
+            break;
+        }
+    }
+    const std::vector<std::int32_t> sampled       = sampled_rows(rows);
+    const std::vector<std::int32_t> token_samples = sampled_tokens(tokens);
+    std::vector<double> actual;
+    std::vector<double> expected;
+    for (const std::int32_t row : sampled) {
+        for (const std::int32_t token : token_samples) {
+            actual.push_back(
+                fp16_bits_to_f32(output_bits[static_cast<std::size_t>(token) * rows + row]));
+            expected.push_back(dot_fp64(
+                weight.host, row,
+                std::span<const float>(
+                    activation.data() + static_cast<std::size_t>(token) * hidden, hidden)));
+        }
+    }
+    failures += verify_reduction("FP16_CTRL Linear [" + std::to_string(rows) + "," +
+                                     std::to_string(hidden) + "]" + suffix,
+                                 actual, expected, kA16Tolerance);
+    const std::vector<std::uint16_t> activation_after =
+        from_device<std::uint16_t>(device_activation, activation_bits.size());
+    if (activation_after != activation_bits) {
+        std::cerr << "FP16_CTRL Linear" << suffix << " modified its activation\n";
+        ++failures;
+    }
+    failures += weight.verify_preserved("FP16_CTRL Linear weight" + suffix);
+    return failures;
+}
+
 int run_fp16_linear() {
     int failures = 0;
 #ifdef NINFER_VOLTA_BUILD
@@ -140,6 +204,16 @@ int run_fp16_linear() {
         DeviceWeight weight(make_patterned(shape.first, shape.second, 501U));
         for (const std::int32_t tokens : {1, 2, 4, 8, 32, 128, 1024}) {
             failures += run_fp16_linear_case(weight, tokens);
+        }
+    }
+    // The Flash-Next text profile uses native FP16 activations against these weights. The HC
+    // low-rank projection is [324,10240]; the output head is the vocabulary split.
+    {
+        DeviceWeight hc(make_patterned(324, 10240, 601U));
+        DeviceWeight head(make_patterned(124160, 2560, 603U));
+        for (const std::int32_t tokens : {1, 8}) {
+            failures += run_fp16_activation_case(hc, tokens);
+            failures += run_fp16_activation_case(head, tokens);
         }
     }
     // One tensor-parallel shard of each form: column-parallel halves N (merger/fc1 -> 2304),

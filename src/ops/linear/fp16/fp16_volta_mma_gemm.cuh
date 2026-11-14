@@ -18,6 +18,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -32,9 +33,10 @@ struct Fp16VoltaMmaSchedule {
     static constexpr int kThreads    = kWarps * 32;
 };
 
+template <class A>
 __global__ __launch_bounds__(Fp16VoltaMmaSchedule::kThreads, 8) void fp16_volta_mma_gemm_kernel(
-    const __half* __restrict__ w, const __nv_bfloat16* __restrict__ x,
-    __nv_bfloat16* __restrict__ out, int out_ld, int n, int k, int t) {
+    const __half* __restrict__ w, const A* __restrict__ x,
+    A* __restrict__ out, int out_ld, int n, int k, int t) {
     using S = Fp16VoltaMmaSchedule;
     constexpr int kVecs = S::kKStep / 8;  // uint4 (8 half) per row per tile
 
@@ -87,13 +89,17 @@ __global__ __launch_bounds__(Fp16VoltaMmaSchedule::kThreads, 8) void fp16_volta_
 
     auto commit = [&](const Carry& r, int buf) {
         if (r.xactive) {
-            const int idx   = static_cast<int>(threadIdx.x);
-            const auto* src = reinterpret_cast<const __nv_bfloat16*>(&r.xraw);
-            __half tmp[8];
+            const int idx = static_cast<int>(threadIdx.x);
+            if constexpr (std::is_same_v<A, __nv_bfloat16>) {
+                const auto* src = reinterpret_cast<const __nv_bfloat16*>(&r.xraw);
+                __half tmp[8];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) { tmp[j] = __float2half(__bfloat162float(src[j])); }
-            *reinterpret_cast<uint4*>(&x_sh[buf][idx / kVecs][(idx % kVecs) * 8]) =
-                *reinterpret_cast<const uint4*>(tmp);
+                for (int j = 0; j < 8; ++j) { tmp[j] = __float2half(__bfloat162float(src[j])); }
+                *reinterpret_cast<uint4*>(&x_sh[buf][idx / kVecs][(idx % kVecs) * 8]) =
+                    *reinterpret_cast<const uint4*>(tmp);
+            } else {
+                *reinterpret_cast<uint4*>(&x_sh[buf][idx / kVecs][(idx % kVecs) * 8]) = r.xraw;
+            }
         }
         if (r.wactive) {
             *reinterpret_cast<uint4*>(&w_sh[buf][warp][lane >> 2][(lane & 3) * 8]) =
@@ -135,7 +141,11 @@ __global__ __launch_bounds__(Fp16VoltaMmaSchedule::kThreads, 8) void fp16_volta_
         const int col_n = n0 + volta_d_get_j(l);
         if (row_t < tcnt && col_n < n) {
             const std::int64_t o = static_cast<std::int64_t>(t0 + row_t) * out_ld + col_n;
-            out[o] = __float2bfloat16(d[l]);
+            if constexpr (std::is_same_v<A, __nv_bfloat16>) {
+                out[o] = __float2bfloat16(d[l]);
+            } else {
+                out[o] = __float2half(d[l]);
+            }
         }
     }
 }
