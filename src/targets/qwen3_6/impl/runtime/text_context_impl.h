@@ -526,7 +526,7 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
     auto roots = workspace_recipe::mtp_stem<TextConfig>(work_, T, input_embeddings == nullptr);
     Tensor emb;
     if (input_embeddings != nullptr) {
-        if (input_embeddings->dtype != DType::BF16 || input_embeddings->ne[0] != kCfg.hidden ||
+        if (input_embeddings->dtype != kCfg.act || input_embeddings->ne[0] != kCfg.hidden ||
             input_embeddings->numel() != static_cast<std::int64_t>(kCfg.hidden) * T ||
             !input_embeddings->is_contiguous() || input_embeddings->data == nullptr) {
             throw std::invalid_argument("MTP input embeddings shape mismatch");
@@ -2032,7 +2032,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 Tensor mtp_input_embeddings;
                 const Tensor* mtp_input_embeddings_ptr = nullptr;
                 if (multimodal != nullptr) {
-                    mtp_input_embeddings = work_.alloc(DType::BF16, {kCfg.hidden, len});
+                    mtp_input_embeddings = work_.alloc(kCfg.act, {kCfg.hidden, len});
                     ops::embedding(mtp_ids, *embed_, mtp_input_embeddings, s);
                     if (vision_chunk.control != nullptr) {
                         const qwen3_6::MtpVisualOverlap overlap = qwen3_6::shifted_visual_overlap(
@@ -2040,9 +2040,21 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                         if (!overlap.empty()) {
                             Tensor shifted_indices = workspace_recipe::visual_scatter_indices(
                                 work_, static_cast<std::int32_t>(overlap.size()));
-                            qwen3_6::detail::scatter_shifted_visual_embeddings(
-                                mtp_input_embeddings, vision_chunk.embeddings, overlap,
-                                shifted_indices, s);
+                            if (vision_chunk.embeddings.dtype != mtp_input_embeddings.dtype) {
+                                Tensor staged = work_.alloc(
+                                    kCfg.act,
+                                    {kCfg.hidden, static_cast<std::int32_t>(overlap.size())});
+                                ops::cast_bf16_to_fp16(
+                                    vision_chunk.embeddings.slice(
+                                        1, overlap.source_begin,
+                                        static_cast<std::int32_t>(overlap.size())),
+                                    staged, s);
+                                ops::scatter(staged, shifted_indices, mtp_input_embeddings, s);
+                            } else {
+                                qwen3_6::detail::scatter_shifted_visual_embeddings(
+                                    mtp_input_embeddings, vision_chunk.embeddings, overlap,
+                                    shifted_indices, s);
+                            }
                         }
                     }
                     mtp_input_embeddings_ptr = &mtp_input_embeddings;
@@ -3905,7 +3917,7 @@ void TextContext::mtp_forward_stem_parallel(const Tensor& ids, const std::array<
     if (input_embeddings != nullptr) {
         for (int rank = 0; rank < emb_ranks; ++rank) {
             const Tensor& emb = (*input_embeddings)[static_cast<std::size_t>(rank)];
-            if (emb.dtype != DType::BF16 || emb.ne[0] != kCfg.hidden || emb.ne[1] != T ||
+            if (emb.dtype != kCfg.act || emb.ne[0] != kCfg.hidden || emb.ne[1] != T ||
                 emb.ne[2] != 1 || emb.ne[3] != 1 || !emb.is_contiguous() || emb.data == nullptr) {
                 throw std::invalid_argument("tensor-parallel MTP input embeddings shape mismatch");
             }

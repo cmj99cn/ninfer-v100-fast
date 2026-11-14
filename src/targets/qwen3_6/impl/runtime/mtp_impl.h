@@ -3,6 +3,7 @@
 
 #include "ninfer/ops/mtp_round.h"
 #include "ninfer/ops/scatter.h"
+#include "ninfer/ops/cast.h"
 #include "ninfer/ops/scalar.h"
 
 #include <cuda_runtime.h>
@@ -145,6 +146,22 @@ void mtp_bridge_parallel(PrefillContext& state, const Tensor& next_token,
         work[rank] = rank == 0 ? &state.execution.work : tp[rank]->work;
         io[rank]   = rank == 0 ? &state.execution.io : tp[rank]->io;
     }
+    // The Vision session hands over BF16 embeddings, but the MTP stem normalizes them into
+    // activation-dtype workspace buffers. In a non-BF16 text runtime the bridge must stage a
+    // cast first; the per-rank arenas were just reset above, so these allocations are live for
+    // the whole bridge call.
+    std::array<Tensor, kMaximumDevices> cast_embeddings{};
+    if (next_embeddings != nullptr &&
+        (*next_embeddings)[0].dtype != TextConfig::activation_dtype) {
+        for_each_rank(ec, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            cast_embeddings[r] =
+                work[r]->alloc(TextConfig::activation_dtype, {TextConfig::hidden, 1});
+            ops::cast_bf16_to_fp16((*next_embeddings)[r], cast_embeddings[r],
+                                   ec.dev[rank]->stream);
+        });
+        next_embeddings = &cast_embeddings;
+    }
     for_each_rank(ec, [&](int rank) {
         const auto r       = static_cast<std::size_t>(rank);
         const auto stream  = ec.dev[rank]->stream;
@@ -225,6 +242,13 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     }
     const Tensor* next_embedding = next_embeddings != nullptr ? &(*next_embeddings)[0] : nullptr;
     state.execution.work.reset();
+    Tensor cast_embedding;
+    if (next_embedding != nullptr && next_embedding->dtype != TextConfig::activation_dtype) {
+        cast_embedding = state.execution.work.alloc(TextConfig::activation_dtype,
+                                                    {TextConfig::hidden, 1});
+        ops::cast_bf16_to_fp16(*next_embedding, cast_embedding, state.execution.device.stream);
+        next_embedding = &cast_embedding;
+    }
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.execution.rope_frequency, state.text_kv,
                      state.execution.linear_attention, state.execution.io,
