@@ -1,5 +1,6 @@
 #include <ninfer/targets/qwen4_exp/frontend.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -28,24 +29,34 @@ PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
 runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
                                                 std::uint32_t budget_remaining,
                                                 FinishReason limit_reason) {
-    (void)tokens;
-    (void)budget_remaining;
-    (void)limit_reason;
-    throw std::logic_error("qwen4_exp family frontend does not detokenize generated tokens");
+    runtime::OutputDecision decision;
+    for (const TokenId token : tokens) {
+        if (decision.accepted_tokens == budget_remaining) {
+            decision.finish_reason = limit_reason;
+            return decision;
+        }
+        ++decision.accepted_tokens;
+        if (std::find(stop_token_ids_.begin(), stop_token_ids_.end(), token) !=
+            stop_token_ids_.end()) {
+            decision.finish_reason = FinishReason::StopToken;
+            return decision;
+        }
+    }
+    if (decision.accepted_tokens == budget_remaining) {
+        decision.finish_reason = limit_reason;
+    }
+    return decision;
 }
 
 runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
-    (void)reason;
-    throw std::logic_error("qwen4_exp family frontend does not finalize output");
+    runtime::OutputDecision decision;
+    decision.finish_reason = reason;
+    return decision;
 }
 
-std::vector<OutputDelta> OutputSession::commit_preview() {
-    throw std::logic_error("qwen4_exp family frontend does not commit output");
-}
+std::vector<OutputDelta> OutputSession::commit_preview() { return {}; }
 
-std::uint32_t OutputSession::reasoning_tokens() const {
-    throw std::logic_error("qwen4_exp family frontend does not count output reasoning");
-}
+std::uint32_t OutputSession::reasoning_tokens() const { return 0; }
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
     (void)input;
@@ -75,9 +86,10 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output) const {
     (void)prompt;
-    (void)caller_stop;
     (void)output;
-    return OutputSession{};
+    OutputSession session;
+    session.stop_token_ids_ = caller_stop.token_ids;
+    return session;
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept {

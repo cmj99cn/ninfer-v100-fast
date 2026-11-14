@@ -111,8 +111,9 @@ struct Package {
     // modes carry it.
     [[nodiscard]] static ModelSamplingDefaults sampling_defaults(std::string_view model);
 
-    // The binding and materialization plan of a load. `tp` is the tensor-parallel width; only one
-    // device is planned at this milestone.
+    // The binding and materialization plan of a load. `tp` is the tensor-parallel width; the
+    // full-model execution path plans two ranks, each holding its own shard, KV/state planes and
+    // expert cache.
     [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
                                             WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<LoadedModel>

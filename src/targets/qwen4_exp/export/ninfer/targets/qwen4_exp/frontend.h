@@ -84,6 +84,8 @@ public:
     [[nodiscard]] std::uint32_t reasoning_tokens() const;
 
 private:
+    std::vector<TokenId> stop_token_ids_;
+
     friend class Frontend;
 };
 

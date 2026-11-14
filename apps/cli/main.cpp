@@ -342,8 +342,9 @@ int main(int argc, char** argv) {
         engine_options.kv_cache       = cli.kv_cache;
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
-        engine_options.use_cuda_graph = cli.use_cuda_graph;
-        engine_options.load_progress  = load_progress.callback();
+        engine_options.use_cuda_graph    = cli.use_cuda_graph;
+        engine_options.expert_cache_mib  = cli.expert_cache_mib;
+        engine_options.load_progress     = load_progress.callback();
 
         // Wire the hybrid prefix cache: --prefix-cache enables it explicitly, and a positive
         // --host-cache-mib implies it as well (host tier sized in MiB; 0 = device-only).

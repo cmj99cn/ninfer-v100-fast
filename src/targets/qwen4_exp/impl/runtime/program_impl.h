@@ -9,6 +9,7 @@
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -85,11 +86,16 @@ runtime::RequestPlanSummary ProgramImplCore::make_summary(std::uint32_t prompt_t
     summary.reusable_prompt_tokens     = 0;
     summary.requested_output_tokens    = requested_output_tokens;
     summary.effective_output_tokens    = requested_output_tokens;
+    summary.effective_limit_reason     = FinishReason::OutputLimit;
     summary.transient_bytes            = transient_bytes;
     summary.transient_alignment        = 1;
     summary.admission.active_lanes     = 1;
     summary.admission.main_kv_pages    = page_groups_for(prompt_tokens);
-    summary.service_work_quanta        = 1;
+    const std::uint64_t prefill_units =
+        1ULL + (static_cast<std::uint64_t>(prompt_tokens) - 1ULL) / plan_->prefill_chunk;
+    const std::uint64_t decode_units =
+        requested_output_tokens == 0 ? 0ULL : requested_output_tokens - 1ULL;
+    summary.service_work_quanta = prefill_units + decode_units;
     return summary;
 }
 
@@ -156,11 +162,20 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
     return true;
 }
 
+bool ProgramImplCore::can_admit_lane_after_retained_eviction(
+    std::uint32_t lane, const RequestPlan& plan) const noexcept {
+    return can_admit_lane(lane, plan);
+}
+
 runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept {
     return runtime::AdmissionResources{
         .active_lanes  = plan_->max_concurrency,
         .main_kv_pages = plan_->main_page_groups,
     };
+}
+
+runtime::AdmissionResources ProgramImplCore::admission_cache_residue() const noexcept {
+    return {};
 }
 
 runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lane,
@@ -191,21 +206,31 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     std::vector<TokenId>& tokens = data.token_ids;
     const std::uint32_t chunk = std::min(plan_->prefill_chunk,
                                          static_cast<std::uint32_t>(tokens.size()));
+    const auto prefill_start = std::chrono::steady_clock::now();
     const TokenId sampled = trunk_->prefill(std::span<const TokenId>{tokens.data(), chunk});
+    const double prefill_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_start).count();
 
     LaneState& state = lanes_[lane];
     state.active    = true;
     state.transient = std::move(transient);
     state.context.prompt_tokens = std::move(tokens);
     state.context.processed_prompt_tokens = chunk;
+    state.timings.prefill_seconds += prefill_seconds;
     state.context.decode_ready = state.context.processed_prompt_tokens >=
                                  static_cast<std::uint32_t>(state.context.prompt_tokens.size());
-    if (state.context.decode_ready) { state.context.next_input = sampled; }
+    if (state.context.decode_ready) {
+        state.context.next_input   = sampled;
+        last_prefill_tokens_       = state.context.prompt_tokens.size();
+        last_prefill_seconds_      = state.timings.prefill_seconds;
+    }
 
     runtime::PrefillStepResult result;
     result.summary.prompt_tokens          = static_cast<std::uint32_t>(state.context.prompt_tokens.size());
     result.summary.reused_prompt_tokens   = 0;
-    result.round.tokens                   = std::span<const TokenId>{};
+    result.round.tokens = state.context.decode_ready
+                              ? std::span<const TokenId>{&state.context.next_input, 1}
+                              : std::span<const TokenId>{};
     result.processed_prompt_tokens        = chunk;
     result.complete                       = state.context.decode_ready;
     return result;
@@ -223,15 +248,24 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t l
     const std::uint32_t remaining =
         static_cast<std::uint32_t>(state.context.prompt_tokens.size()) - state.context.processed_prompt_tokens;
     const std::uint32_t chunk = std::min(plan_->prefill_chunk, remaining);
+    const auto prefill_start = std::chrono::steady_clock::now();
     prefill_chunk(state, state.context.processed_prompt_tokens, chunk);
+    state.timings.prefill_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_start).count();
     state.context.processed_prompt_tokens += chunk;
     state.context.decode_ready = state.context.processed_prompt_tokens >=
                                  static_cast<std::uint32_t>(state.context.prompt_tokens.size());
+    if (state.context.decode_ready) {
+        last_prefill_tokens_  = state.context.prompt_tokens.size();
+        last_prefill_seconds_ = state.timings.prefill_seconds;
+    }
 
     runtime::PrefillStepResult result;
     result.summary.prompt_tokens          = static_cast<std::uint32_t>(state.context.prompt_tokens.size());
     result.summary.reused_prompt_tokens   = 0;
-    result.round.tokens                   = std::span<const TokenId>{};
+    result.round.tokens = state.context.decode_ready
+                              ? std::span<const TokenId>{&state.context.next_input, 1}
+                              : std::span<const TokenId>{};
     result.processed_prompt_tokens        = chunk;
     result.complete                       = state.context.decode_ready;
     return result;
@@ -256,8 +290,11 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
     round_tokens_.clear();
     round_row_counts_.clear();
     for (const std::uint32_t lane : lanes) {
-        const LaneState& state = lanes_[lane];
+        LaneState& state         = lanes_[lane];
+        const auto decode_start  = std::chrono::steady_clock::now();
         round_tokens_.push_back(trunk_->decode(state.context.next_input));
+        state.timings.decode_seconds +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
         round_row_counts_.push_back(1);
     }
 
@@ -266,6 +303,24 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
     round.row_counts   = round_row_counts_;
     round.row_stride   = 1;
     return round;
+}
+
+runtime::MixedBatchResult
+ProgramImplCore::decode_mixed_batch(std::span<const std::uint32_t> lanes,
+                                    std::span<const runtime::RoundBudget> budgets,
+                                    std::uint32_t owner_lane) {
+    (void)lanes;
+    (void)budgets;
+    (void)owner_lane;
+    throw std::logic_error(
+        "qwen4_exp text state serves one request and does not plan a mixed decode unit");
+}
+
+bool ProgramImplCore::supports_mixed_unit() const noexcept { return false; }
+
+bool ProgramImplCore::mixed_owner_eligible(std::uint32_t lane) const noexcept {
+    (void)lane;
+    return false;
 }
 
 void ProgramImplCore::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
@@ -296,6 +351,24 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 
 void ProgramImplCore::abort_lane(std::uint32_t lane) noexcept {
     if (lane < plan_->max_concurrency) { clear_lane(lane); }
+}
+
+bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
+    (void)lane;
+    return false;
+}
+
+void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept { (void)lane; }
+
+GenerationTimings
+ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
+    return lane < plan_->max_concurrency ? lanes_[lane].timings : GenerationTimings{};
+}
+
+SpeculativeStats
+ProgramImplCore::speculative_stats_lane(std::uint32_t lane) const noexcept {
+    (void)lane;
+    return SpeculativeStats{};
 }
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {
@@ -343,11 +416,63 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
 }
 
 MetricsSnapshot ProgramImplCore::metrics() const noexcept {
-    return MetricsSnapshot{};
+    MetricsSnapshot out;
+    out.devices.reserve(static_cast<std::size_t>(execution_.tp));
+    for (int rank = 0; rank < execution_.tp; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        DeviceMemoryMetrics memory;
+        memory.device = execution_.dev[slot]->device;
+        {
+            const ScopedDevice scope(memory.device);
+            std::size_t free_bytes  = 0;
+            std::size_t total_bytes = 0;
+            if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+                memory.free_bytes  = free_bytes;
+                memory.total_bytes = total_bytes;
+                memory.used_bytes  = total_bytes - free_bytes;
+            }
+        }
+        out.devices.push_back(memory);
+    }
+
+    bool active = false;
+    for (const LaneState& lane : lanes_) { active = active || lane.active; }
+    const std::uint32_t pages = plan_->main_page_groups + 1;
+    out.main_kv.capacity_pages = pages;
+    out.main_kv.mapped_pages   = active ? pages : 0;
+    out.main_kv.free_pages     = pages - out.main_kv.mapped_pages;
+    out.main_kv.page_bytes     = Variant::bytes_per_main_page_group;
+    return out;
+}
+
+PrefixProbe ProgramImplCore::prefix_probe(std::span<const std::uint64_t> hashes) const {
+    (void)hashes;
+    PrefixProbe probe;
+    probe.block_tokens = 64;
+    return probe;
 }
 
 CapacitySnapshot ProgramImplCore::capacity_snapshot() const noexcept {
-    return CapacitySnapshot{};
+    CapacitySnapshot out;
+    bool active = false;
+    for (const LaneState& lane : lanes_) { active = active || lane.active; }
+    out.total_pages     = plan_->main_page_groups + 1;
+    out.free_pages      = active ? 0 : out.total_pages;
+    out.max_concurrency = plan_->max_concurrency;
+    out.max_context     = plan_->capacity;
+    out.prefill_chunk   = plan_->prefill_chunk;
+    out.recent_prefill_tps =
+        last_prefill_seconds_ > 0.0
+            ? static_cast<double>(last_prefill_tokens_) / last_prefill_seconds_
+            : 0.0;
+    return out;
+}
+
+void ProgramImplCore::enable_logits_capture(bool enabled) {
+    if (enabled) {
+        throw std::logic_error(
+            "qwen4_exp text state does not implement logits capture");
+    }
 }
 
 void ProgramImplCore::reset_memory_peaks() noexcept {}

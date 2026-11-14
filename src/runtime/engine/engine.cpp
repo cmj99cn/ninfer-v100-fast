@@ -287,8 +287,11 @@ class Engine::Impl {
 public:
     using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
     using Executor35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
-    using Executor =
-        std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
+    using ExecutorFlashNext =
+        runtime::ConcurrentExecutor<targets::Qwen3_8_FlashNextInstance>;
+    using Executor = std::variant<std::monostate, std::unique_ptr<Executor27>,
+                                  std::unique_ptr<Executor35>,
+                                  std::unique_ptr<ExecutorFlashNext>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)),
@@ -472,8 +475,10 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
+                using ExecutorType = typename Executor::element_type;
                 auto submission = executor->submit(
-                    std::get<targets::qwen3_6::PreparedPrompt>(std::move(prompt.impl_->value)),
+                    std::get<typename ExecutorType::Package::PreparedPrompt>(
+                        std::move(prompt.impl_->value)),
                     prompt_summary, prepare_seconds, std::move(resolved_options),
                     pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(

@@ -37,6 +37,7 @@ using RequestPlanImpl     = qwen4_exp::detail::RequestPlanImpl<Variant>;
 struct LaneState {
     TextLaneContext context;
     runtime::TransientRegion transient;
+    GenerationTimings timings;
     bool active = false;
 };
 
@@ -55,7 +56,11 @@ public:
                                                      const RequestBasePlan& base);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
                                       const RequestPlan& plan) const noexcept;
+    [[nodiscard]] bool
+    can_admit_lane_after_retained_eviction(std::uint32_t lane,
+                                           const RequestPlan& plan) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
+    [[nodiscard]] runtime::AdmissionResources admission_cache_residue() const noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                  PreparedPrompt&& prompt,
                                                                  RequestPlan&& plan,
@@ -64,18 +69,41 @@ public:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::MixedBatchResult
+    decode_mixed_batch(std::span<const std::uint32_t> lanes,
+                       std::span<const runtime::RoundBudget> budgets, std::uint32_t owner_lane);
+    [[nodiscard]] bool supports_mixed_unit() const noexcept;
+    [[nodiscard]] bool mixed_owner_eligible(std::uint32_t lane) const noexcept;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,
                                std::span<const std::uint8_t> terminal,
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
+    void evict_retained_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     [[nodiscard]] MetricsSnapshot metrics() const noexcept;
+    [[nodiscard]] PrefixProbe prefix_probe(std::span<const std::uint64_t> hashes) const;
     [[nodiscard]] CapacitySnapshot capacity_snapshot() const noexcept;
 
     void reset_memory_peaks() noexcept;
+
+    [[nodiscard]] std::span<const std::uint16_t> last_round_logits_bf16() const noexcept {
+        return {};
+    }
+    void enable_logits_capture(bool enabled);
+    void enable_peer_egress_check(bool enabled) noexcept { (void)enabled; }
+    [[nodiscard]] std::uint64_t peer_egress_check_rounds() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t peer_egress_check_mismatches() const noexcept { return 0; }
+
+    [[nodiscard]] std::shared_ptr<SharedHostTier> shared_host_tier() const noexcept {
+        return nullptr;
+    }
+    void set_shared_tier_owner(std::uint64_t owner) noexcept { (void)owner; }
 
 private:
     [[nodiscard]] runtime::RequestPlanSummary make_summary(std::uint32_t prompt_tokens,
@@ -102,6 +130,8 @@ private:
     std::unique_ptr<TextTrunk> trunk_;
     std::vector<TokenId> round_tokens_;
     std::vector<std::int32_t> round_row_counts_;
+    std::uint64_t last_prefill_tokens_ = 0;
+    double last_prefill_seconds_       = 0.0;
 };
 
 } // namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS

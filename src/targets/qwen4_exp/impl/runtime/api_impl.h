@@ -131,8 +131,19 @@ bool Program<Variant>::can_admit_lane(std::uint32_t lane, const RequestPlan<Vari
 }
 
 template <>
+bool Program<Variant>::can_admit_lane_after_retained_eviction(
+    std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept {
+    return impl_->can_admit_lane_after_retained_eviction(lane, plan);
+}
+
+template <>
 runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcept {
     return impl_->admission_capacity();
+}
+
+template <>
+runtime::AdmissionResources Program<Variant>::admission_cache_residue() const noexcept {
+    return impl_->admission_cache_residue();
 }
 
 template <>
@@ -154,6 +165,23 @@ runtime::BatchedGeneratedRound Program<Variant>::decode_batch(
 }
 
 template <>
+runtime::MixedBatchResult Program<Variant>::decode_mixed_batch(
+    std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
+    std::uint32_t owner_lane) {
+    return impl_->decode_mixed_batch(lanes, budgets, owner_lane);
+}
+
+template <>
+bool Program<Variant>::supports_mixed_unit() const noexcept {
+    return impl_->supports_mixed_unit();
+}
+
+template <>
+bool Program<Variant>::mixed_owner_eligible(std::uint32_t lane) const noexcept {
+    return impl_->mixed_owner_eligible(lane);
+}
+
+template <>
 void Program<Variant>::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
     impl_->resolve_prefill_lane(lane, terminal);
 }
@@ -171,6 +199,26 @@ void Program<Variant>::abort_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
+bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
+    return impl_->has_retained_lane(lane);
+}
+
+template <>
+void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
+    impl_->evict_retained_lane(lane);
+}
+
+template <>
+GenerationTimings Program<Variant>::generation_timings_lane(std::uint32_t lane) const noexcept {
+    return impl_->generation_timings_lane(lane);
+}
+
+template <>
+SpeculativeStats Program<Variant>::speculative_stats_lane(std::uint32_t lane) const noexcept {
+    return impl_->speculative_stats_lane(lane);
+}
+
+template <>
 MemorySummary Program<Variant>::memory_summary() const noexcept {
     return impl_->memory_summary();
 }
@@ -181,6 +229,11 @@ MetricsSnapshot Program<Variant>::metrics() const noexcept {
 }
 
 template <>
+PrefixProbe Program<Variant>::prefix_probe(std::span<const std::uint64_t> hashes) const {
+    return impl_->prefix_probe(hashes);
+}
+
+template <>
 CapacitySnapshot Program<Variant>::capacity_snapshot() const noexcept {
     return impl_->capacity_snapshot();
 }
@@ -188,6 +241,41 @@ CapacitySnapshot Program<Variant>::capacity_snapshot() const noexcept {
 template <>
 void Program<Variant>::reset_memory_peaks() noexcept {
     impl_->reset_memory_peaks();
+}
+
+template <>
+std::span<const std::uint16_t> Program<Variant>::last_round_logits_bf16() const noexcept {
+    return impl_->last_round_logits_bf16();
+}
+
+template <>
+void Program<Variant>::enable_logits_capture(bool enabled) {
+    impl_->enable_logits_capture(enabled);
+}
+
+template <>
+void Program<Variant>::enable_peer_egress_check(bool enabled) noexcept {
+    impl_->enable_peer_egress_check(enabled);
+}
+
+template <>
+std::uint64_t Program<Variant>::peer_egress_check_rounds() const noexcept {
+    return impl_->peer_egress_check_rounds();
+}
+
+template <>
+std::uint64_t Program<Variant>::peer_egress_check_mismatches() const noexcept {
+    return impl_->peer_egress_check_mismatches();
+}
+
+template <>
+std::shared_ptr<SharedHostTier> Program<Variant>::shared_host_tier() const noexcept {
+    return impl_->shared_host_tier();
+}
+
+template <>
+void Program<Variant>::set_shared_tier_owner(std::uint64_t owner) noexcept {
+    impl_->set_shared_tier_owner(owner);
 }
 
 template <>

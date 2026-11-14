@@ -43,6 +43,8 @@ struct Options {
     bool prefix_cache  = false;
     // M2: pinned host RAM for the hybrid prefix cache (MiB). 0 = device-only (M1).
     std::uint32_t host_cache_mib = 0;
+    // Per-rank expert residency cache for the qwen3.8-flash-next package (MiB). 0 = auto.
+    std::uint32_t expert_cache_mib = 0;
 
     bool raw_output      = false;
     bool print_token_ids = false;

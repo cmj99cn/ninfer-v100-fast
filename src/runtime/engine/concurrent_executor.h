@@ -43,6 +43,8 @@ public:
     using Program  = typename Package::Program;
     using BasePlan = typename Package::RequestBasePlan;
     using Plan     = typename Package::RequestPlan;
+    using PreparedPrompt = typename Package::PreparedPrompt;
+    using OutputSession  = typename Package::OutputSession;
     using Clock    = std::chrono::steady_clock;
 
     ConcurrentExecutor(Instance& instance, const EngineOptions& options, const DeviceContext& device)
@@ -129,7 +131,7 @@ public:
         friend class ConcurrentExecutor;
     };
 
-    Submission submit(targets::qwen3_6::PreparedPrompt prompt, PromptSummary prompt_summary,
+    Submission submit(PreparedPrompt prompt, PromptSummary prompt_summary,
                       double prepare_seconds, ResolvedRequestOptions options,
                       Clock::time_point pending_deadline = {}) {
         const Clock::time_point submitted = Clock::now();
@@ -186,8 +188,12 @@ public:
         out.request_transient                  = instance_.request_memory.summary();
         const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
         out.kv_capacity_mode                   = resolution.mode;
-        out.kv_capacity_page_groups            = resolution.main_page_groups;
-        out.kv_capacity_max_page_groups        = resolution.maximum_main_page_groups;
+        if (out.kv_capacity_page_groups == 0) {
+            out.kv_capacity_page_groups = resolution.main_page_groups;
+        }
+        if (out.kv_capacity_max_page_groups == 0) {
+            out.kv_capacity_max_page_groups = resolution.maximum_main_page_groups;
+        }
         out.minimum_runtime_reservation_bytes  = resolution.minimum_runtime_reservation_bytes;
         out.kv_capacity_increment_bytes        = resolution.bytes_per_additional_main_page_group;
         out.runtime_reservation_bytes          = resolution.runtime_reservation_bytes;
@@ -374,8 +380,8 @@ private:
     }
 
     struct Request {
-        Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
-                targets::qwen3_6::OutputSession output_session, PromptSummary summary,
+        Request(std::uint64_t request_identity, PreparedPrompt input,
+                OutputSession output_session, PromptSummary summary,
                 double frontend_seconds, ResolvedRequestOptions request_options,
                 Clock::time_point limit, Clock::time_point submit_time)
             : id(request_identity), prompt(std::move(input)), output(std::move(output_session)),
@@ -383,8 +389,8 @@ private:
               options(std::move(request_options)), deadline(limit), submitted(submit_time) {}
 
         const std::uint64_t id;
-        targets::qwen3_6::PreparedPrompt prompt;
-        targets::qwen3_6::OutputSession output;
+        PreparedPrompt prompt;
+        OutputSession output;
         PromptSummary prompt_summary;
         double prepare_seconds = 0.0;
         ResolvedRequestOptions options;
@@ -454,8 +460,8 @@ private:
         bool evict_retained = false;
     };
 
-    void append_output(const std::shared_ptr<Request>& request,
-                       targets::qwen3_6::PublishedOutput output) {
+    template <class PublishedOutput>
+    void append_output(const std::shared_ptr<Request>& request, PublishedOutput output) {
         if (output.empty()) { return; }
         {
             std::lock_guard lock(request->mutex);
@@ -543,8 +549,14 @@ private:
             record.token_ids        = request->generated;
             record.reasoning        = request->reasoning;
             record.content          = request->content;
-            record.raw_text         = request->output.debug_raw_text(request->generated);
-            record.prompt_tail      = request->output.debug_prompt_tail();
+            if constexpr (requires(const OutputSession& session,
+                                   std::span<const TokenId> tokens) {
+                              session.debug_raw_text(tokens);
+                              session.debug_prompt_tail();
+                          }) {
+                record.raw_text    = request->output.debug_raw_text(request->generated);
+                record.prompt_tail = request->output.debug_prompt_tail();
+            }
             if (request->begin) {
                 record.reused_prompt_tokens = request->begin->reused_prompt_tokens;
                 record.prefix_reuse_path    = request->begin->prefix_reuse_path;

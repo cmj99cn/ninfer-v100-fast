@@ -556,7 +556,7 @@ std::string format_server_start_json(
           {"pending_timeout_ms", options.pending_timeout_ms},
           {"prefill_chunk", options.prefill_chunk},
           {"log_stats_interval_ms", options.log_stats_interval_ms},
-          {"kv_cache", kv_cache_name(options.kv_cache)},
+          {"kv_cache", kv_cache_name(memory.kv_cache)},
           {"vision", options.enable_vision},
           {"cuda_graph", options.use_cuda_graph},
           {"prefix_reuse", options.allow_prefix_reuse},

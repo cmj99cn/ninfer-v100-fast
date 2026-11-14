@@ -404,6 +404,8 @@ struct ScriptedPackage {
     using Program         = ScriptedProgram;
     using RequestBasePlan = ScriptedPlan;
     using RequestPlan     = ScriptedPlan;
+    using PreparedPrompt  = q36::PreparedPrompt;
+    using OutputSession   = q36::OutputSession;
 };
 
 struct ScriptedRequestMemory {

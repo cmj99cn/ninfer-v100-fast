@@ -133,7 +133,7 @@ std::string usage_text(const char* argv0) {
            "       [--top-logits N] [--no-thinking] [--preserve-thinking] [--ignore-eos]\n"
             "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
             "       [--cuda-graph|--no-cuda-graph]\n"
-            "       [--prefix-cache] [--host-cache-mib N]\n"
+            "       [--prefix-cache] [--host-cache-mib N] [--expert-cache-mib auto|N]\n"
             "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
@@ -168,7 +168,11 @@ std::string usage_text(const char* argv0) {
             "--prefix-cache enables the hybrid content-addressed prefix cache, which reuses KV "
             "blocks and state snapshots across requests that share a prompt prefix. "
             "--host-cache-mib N adds a pinned host-RAM tier (N MiB) so evicted blocks and "
-            "snapshots survive device pressure; 0 keeps the cache device-only.\n";
+            "snapshots survive device pressure; 0 keeps the cache device-only.\n"
+            "--expert-cache-mib auto|N sizes the per-rank expert residency cache of the "
+            "qwen3.8-flash-next package; auto uses the routing-coverage target or the memory left "
+            "after the other allocations, whichever is smaller, and an explicit N larger than that "
+            "budget is rejected at load.\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -254,6 +258,11 @@ Options parse_options(int argc, char** argv) {
             options.prefix_cache = true;
         } else if (arg == "--host-cache-mib") {
             options.host_cache_mib = parse_u32(value(arg), "host-cache-mib", true);
+        } else if (arg == "--expert-cache-mib") {
+            const char* text = value(arg);
+            options.expert_cache_mib = std::string_view(text) == "auto"
+                ? 0
+                : parse_u32(text, "expert-cache-mib", true);
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {
