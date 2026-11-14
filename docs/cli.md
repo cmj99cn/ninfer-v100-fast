@@ -264,7 +264,8 @@ selected.
 
 `--groups N` starts N independent Engines in one process. Every group must use the same artifact
 and the same `--tp` width, and no device may appear in two groups. `--group-devices` assigns ranks
-explicitly and infers `--tp` from the group width when it is omitted. The 8-card example below is
+explicitly and infers `--tp` from the group width when it is omitted. The 4-card `2×TP2` profile
+has passed third-party end-to-end validation; the single-pool 8-card example below is
 community/out-of-contract:
 
 ```bash

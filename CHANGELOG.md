@@ -11,7 +11,36 @@ the FP16 text runtime. `v0.2.2` (2026-11-11) fixes TP peer-access setup for
 device lists that do not start at device 0. `v0.2.3` (2026-11-12) fixes
 multi-instance routing against a warm home and surfaces host-cache diagnostics.
 `v0.2.4` (2026-11-13) removes the multi-instance admission stall behind a
-decoding instance.
+decoding instance. `v0.2.5` (2026-11-13) reports prefix-cache reuse in every
+serving usage payload and fixes the Vision MTP bridge under the FP16 text
+runtime.
+
+## [0.2.5] - 2026-11-13
+
+### Added
+
+- Chat Completions and Anthropic Messages report prefix-cache reuse. OpenAI responses
+  (non-streaming, tool-call, and the streaming usage chunk) carry
+  `usage.prompt_tokens_details.cached_tokens`; Anthropic messages carry
+  `cache_read_input_tokens` and `cache_creation_input_tokens` (`message_start` reports zero cache
+  counters and the final `message_delta` carries the real read count). Responses already reported
+  `input_tokens_details.cached_tokens`.
+
+### Fixed
+
+- The Vision MTP bridge crashed under the FP16 text runtime with
+  `rmsnorm: tensors must share BF16 ... [x=0 w=0 out=6]`. The bridge handed the Vision session's
+  BF16 embeddings to an MTP stem whose workspace is allocated at the activation dtype. Both the
+  tensor-parallel and single-device bridges now cast to the activation dtype first, the stem
+  validators accept the activation dtype, and the multimodal prefill MTP path allocates at the
+  activation dtype and casts the visual scatter source when it differs.
+
+### Docs
+
+- Record the third-party 8×V100-SXM2-32GB deployment validation: a 4-card 2×TP2 pool passed
+  end-to-end (Vision, MTP, prefix reuse, OpenAI/Anthropic serving, 8 concurrent requests), and the
+  same host ran two independent 4-card pools side by side. Single-pool 8-card profiles remain
+  unverified community paths.
 
 ## [0.2.4] - 2026-11-13
 

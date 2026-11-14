@@ -75,18 +75,18 @@ token 容量不同。以本机 NVFP4 27B、INT8 group-64、TP2 + MTP-3 为例，
   --prefix-cache --host-cache-mib 1024
 ```
 
-4 卡与 8 卡机在本任务窗口不可访问。下表给出完整 profile；除 `2xTP1` 外全部未验证。
+下表给出完整 profile。`2xTP1` 已通过真实集成测试；4 卡 `2xTP2` 与 8 卡机上的双池并存部署已由第三方实测通过（见 §7）；其余单池 profile 未验证。
 
 | profile | 卡数 | `--groups` | `--group-devices` | `--tp` | `--max-concurrency`（每实例） | `--kv-capacity`（每实例） | 状态 |
 |---|---:|---:|---|---:|---:|---:|---|
 | `2xTP1` | 2 | 2 | `0;1` | 1 | 1 | 262144 | **真实集成通过** |
 | `4xTP1` | 4 | 4 | `0;1;2;3` | 1 | 1 | 262144 | 未验证；需要 32GB 卡 |
-| `2xTP2` | 4 | 2 | `0,1;2,3` | 2 | 4 | 1048576 | 未验证 |
+| `2xTP2` | 4 | 2 | `0,1;2,3` | 2 | 4 | 1048576 | **第三方端到端验证通过**（32GB） |
 | `8xTP1` | 8 | 8 | `0;1;2;3;4;5;6;7` | 1 | 1 | 262144 | 社区/非契约；未验证；需要 32GB 卡 |
-| `4xTP2` | 8 | 4 | `0,1;2,3;4,5;6,7` | 2 | 4 | 1048576 | 社区/非契约；未验证 |
+| `4xTP2` | 8 | 4 | `0,1;2,3;4,5;6,7` | 2 | 4 | 1048576 | 社区/非契约；未验证（单池） |
 | `2xTP4` | 8 | 2 | `0,1,2,3;4,5,6,7` | 4 | 8 | 2097152 | 社区/非契约；未验证 |
 
-4/8 卡 profile 可按表设置变量后启动；8 卡 profile 是社区/非契约路径：
+4/8 卡 profile 可按表设置变量后启动；单池 8 卡 profile 是社区/非契约路径：
 
 ```bash
 ARTIFACT=/home/cmj/models/ninfer-artifacts-nvfp4attn/qwen3_8_27b_nvfp4.ninfer
@@ -309,36 +309,32 @@ Prometheus 输出不增加任何 instance 行，单组文本输出与之前一�
   `prefix_cache_hit_tokens=8128`、`block_snapshot`，cold/warm 与 before/after 文本一致；
   MTP 3 drafts 下 8K warm 也一致，acceptance 20/30、10 rounds。未覆盖采样质量与 Vision。
 
-4 卡与 8 卡多实例在本任务窗口不可访问，以下全部**未验证**：
+**第三方验证（2026-11-13，8×V100-SXM2-32GB，ninfer v0.2.3 + 本批修复）**：
 
-- 4 卡 `4×TP1`/`2×TP2` 的设备分配、共享 host tier、跨实例 manifest 与 MTP；没有吞吐或
-  显存测量。
-- 8 卡 `8×TP1` 的 8 份完整 27B 权重、每实例 KV、150 GiB host tier 与聚合吞吐。该 profile
-  需要 32GB 卡；16GB V100 放不下一份完整权重。它不使用 NCCL。
-- NCCL 多 communicator（每进程 4 个 TP2 或 2 个 TP4）在 8×V100 上的初始化、带宽与设备集合
-  互斥。
-- TP4 跨实例 host restore 的显存与正确性，包括恢复后的 MTP 与 Vision。
-- 8×TP1 的 8 路 50K token、4×TP2/2×TP4 的 16×50K token 聚合 committed decode tok/s，以及
-  实际 TTFT、queue wait 和 acceptance；由 `tools/v100/bench_multi_instance.py` 记录，尚无测量。
-- 4×TP2 在 `kv_capacity=1048576` 下的 32GB 显存余量；8×TP1 每实例 262144-token KV 的余量；
-  4×TP2/2×TP4 在 `1048576`/`2097152` capacity 下承载 180000 occupied tokens 的余量。
-- 153600 MiB（150 GiB）pinned host tier 在目标主机上的实际可分配性。
-- 多组 Vision：NVFP4 的 2×TP1/4×TP2/8×TP1 Vision prompt 未在本窗口验证。
-- 多组 MTP：2×TP1 已通过（见上）；4 卡 `4×TP1`/`2×TP2` 与 8 卡 `8×TP1`/`4×TP2`/`2×TP4`
-  的多组 MTP 未验证。
+- 4 卡 `2xTP2` 池（GPU 4-7）：2 实例 × TP2，每实例 `--max-concurrency 4`、
+  `--kv-capacity 1048576`、`--kv-dtype int8`、MTP-3、`--prefix-cache --host-cache-mib 98304`
+  （96 GiB）。端到端通过：图片问答；缓存命中图片叠加前缀恢复的视觉 MTP 流式请求（修复前
+  100% 崩溃，修复后两次均 200）；OpenAI chat 与 Anthropic 的 usage 缓存字段；8 并发 ×
+  256 token 聚合 341–382 tok/s（池接纳停摆修复前 124–152）；缓存恢复 TTFT 1.1–9 s
+  （冷预填约 114 s），`cache=174080`。
+- 8 卡机双池并存：GPU 0-3 运行冻结的 `2×2` 生产栈（端口 8000），GPU 4-7 运行上述新栈
+  （端口 8001），两池并存、端口隔离；重启须等旧进程完全退出再启动，否则权重加载显存不足。
+- 未覆盖：单池 8 卡 profile（8×TP1/4×TP2/2×TP4）的吞吐与显存；4×TP1；NCCL 多 communicator；
+  TP4 跨实例 host restore；150 GiB host tier；`kv_capacity=1048576` 下的 32GB 余量与
+  180000 occupied tokens 余量。这些仍未验证。
 
-8 卡启动与压测脚本已通过静态检查（`bash -n`、`py_compile`、三条 `--dry-run`），但未在 8 卡
-上执行；4 卡 profile 只有文档命令，未执行。2 卡 TP2 单组已做上述前后对比，但未覆盖 85K
+8 卡单池启动与压测脚本已通过静态检查（`bash -n`、`py_compile`、三条 `--dry-run`），但未在
+8 卡上执行；4 卡 `4×TP1` 只有文档命令，未执行。2 卡 TP2 单组已做上述前后对比，但未覆盖 85K
 occupied context、多实例吞吐或 LM Studio 对照；不得把静态检查、正确性测试、质量对比或这些
 单组数据当作多实例/验收性能证据。
 
-本仓库当前没有可引用的多实例吞吐测量；不得把单实例、短 prompt、draft 吞吐或上游数据当作
-多实例验收。4/8 卡验收通过前，`AGENTS.md` 的 4×16GB/Q4_K_M 单组路径仍是 legacy 回归门禁，
-不是当前 2×32GB NVFP4 发布验收。
+本仓库的验收测量仍是 2×32GB 单请求 profile；第三方 4 卡 `2xTP2` 的 8 并发数据是部署验证，
+不是发布验收口径，也不得把单实例、短 prompt、draft 吞吐或上游数据当作多实例验收。
+`AGENTS.md` 的 4×16GB/Q4_K_M 单组路径仍是 legacy 回归门禁，不是当前 2×32GB NVFP4 发布验收。
 
 ## 8. 社区测试请求（4 卡 / 8 卡）
 
-目前只有 `2xTP1` 通过真实集成。请在 8×V100-SXM2-32GB 上优先测试：
+`2xTP1` 与 4 卡 `2xTP2` 已通过；单池 8 卡 profile 仍待验证。请在 8×V100-SXM2-32GB 上优先测试：
 
 ```bash
 bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1
@@ -346,7 +342,7 @@ bash tools/v100/bench_multi_instance_8gpu.sh 4xTP2
 bash tools/v100/bench_multi_instance_8gpu.sh 2xTP4
 ```
 
-4 卡 `4xTP1`/`2xTP2` 按 §2 的 profile 表直接启动。每个结果请附启动命令、binary/artifact
+4 卡 `4xTP1` 按 §2 的 profile 表直接启动。每个结果请附启动命令、binary/artifact
 hash、`/metrics?format=json` 的 `instances` 数组、每实例 committed decode tok/s、TTFT/TPOT、
 MTP acceptance、queue wait、free KV pages、host tier 实际分配量，以及 32GB 卡的显存余量。
 `--dry-run`、静态检查或单实例数据不等于多实例验收；本项目不承诺修复周期或 SLA。

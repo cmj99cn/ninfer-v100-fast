@@ -16,7 +16,7 @@
 
 ## 发布版本
 
-当前版本：**v0.2.4（2026-11-13）**（首个公开版本 v0.1.0，2026-10-27）。版本说明与已知限制见 [`CHANGELOG.md`](CHANGELOG.md)。
+当前版本：**v0.2.5（2026-11-13）**（首个公开版本 v0.1.0，2026-10-27）。版本说明与已知限制见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ---
 
@@ -82,14 +82,16 @@ decode/prefill 性能回退（详见“速度”节）。
 
 ---
 
-## 当前进度（v0.2.4，截至 2026-11-13）
+## 当前进度（v0.2.5，截至 2026-11-13）
 
 本版本在 v0.1.0 之上完成 FP16 text runtime，修复 BFCL 多轮质量，消除 FP16 路径的
 decode/prefill 回退，修复 FP16 text runtime 下 Vision 请求的 scatter dtype 失败
 （TP1、TP2 与多实例均已实测），并修复 `--devices` 不从 0 开始时 TP mailbox 的
 P2P 使能崩溃。v0.2.3 修复多实例下温暖 home 被 reuse-blind gross 页账单挤出，补齐
 host tier 容量公式与分配失败指标；v0.2.4 消除多实例接纳被解码实例执行锁卡死——候选改为
-非阻塞读取，忙实例本轮跳过，请求留在全局 pending 队列。BFCL `multi_turn_base` 全量：**no-spec 86/200 = 43.0%、
+非阻塞读取，忙实例本轮跳过，请求留在全局 pending 队列；v0.2.5 在 OpenAI/Anthropic usage
+上报前缀缓存复用，并修复 FP16 文本运行时下视觉 MTP 桥接的 rmsnorm dtype 崩溃。第三方已在
+8×V100-SXM2-32GB 上完成 4 卡 `2×TP2` 池与 8 卡机双池并存的端到端验证。BFCL `multi_turn_base` 全量：**no-spec 86/200 = 43.0%、
 MTP-3 87/200 = 43.5%**。MTP-3 decode 四点
 （262144 上下文、INT8 KV、FP16-embedding 制品）：**104.7 / 98.9 / 109.6 / 98.1 tok/s**。
 
@@ -340,10 +342,17 @@ host prefix-KV tier；device 权重与 device KV 仍每实例私有。host tier 
 |---:|---|---|---|
 | 2 | 2×TP1 | `"0;1"` | **真实集成测试已通过** |
 | 4 | 4×TP1 | `"0;1;2;3"` | 未验证 |
-| 4 | 2×TP2 | `"0,1;2,3"` | 未验证 |
+| 4 | 2×TP2 | `"0,1;2,3"` | **第三方端到端验证通过**（32GB；Vision、MTP、前缀复用、8 并发） |
 | 8 | 8×TP1 | `"0;1;2;3;4;5;6;7"` | 社区/非契约；未验证 |
-| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | 社区/非契约；未验证 |
+| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | 社区/非契约；未验证（单池；8 卡机双池并存已验证） |
 | 8 | 2×TP4 | `"0,1,2,3;4,5,6,7"` | 社区/非契约；未验证 |
+
+**第三方验证（2026-11-13，8×V100-SXM2-32GB）**：4 卡 `2×TP2` 池（2 实例，每实例
+`--max-concurrency 4`、`--kv-capacity 1048576`、`--kv-dtype int8`、MTP-3、
+`--prefix-cache --host-cache-mib 98304`）完成端到端验证：图片问答；缓存命中图片叠加前缀恢复的
+视觉 MTP 流式请求；OpenAI/Anthropic usage 缓存字段；8 并发 × 256 token 聚合 341–382 tok/s
+（修复池接纳停摆前 124–152）；缓存恢复 TTFT 1.1–9 s（冷预填约 114 s）。同一 8 卡机的另一组
+GPU 0-3 运行冻结的 `2×2` 生产栈（端口 8000），两池并存、端口隔离。单池 8 卡 profile 仍未验证。
 
 多组建议用 `--group-devices` 明确分组；`--devices` 也可按组顺序列出全部 rank，但 `ninfer`
 CLI 最多接受 4 个 ID。多组模式不支持 `--spec dflash`。
@@ -368,17 +377,17 @@ CLI 最多接受 4 个 ID。多组模式不支持 `--spec dflash`。
   --prefix-cache --host-cache-mib 153600
 ```
 
-对应脚本 profile（社区/非契约）：`bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
+对应脚本 profile（单池 8 卡为社区/非契约）：`bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
 （加 `--dry-run` 只打印完整命令）。8 卡 4×TP2 / 2×TP4 以及 4 卡 4×TP1 / 2×TP2 的完整参数、
 路由和验证边界见 [`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md)。
-上述未验证 profile 没有吞吐或显存实测数据，不得引用为验收结果。
+上述单池未验证 profile 没有吞吐或显存实测数据，不得引用为验收结果。
 
-**社区测试请求（8 卡）：** 请在 8×V100-SXM2-32GB 上优先测试 8×TP1、4×TP2、2×TP4，并提交
-启动命令、binary/artifact hash、`/metrics?format=json` 的 `instances` 数组、每实例 committed
-decode tok/s、TTFT/TPOT、MTP acceptance、queue wait、free KV pages、host tier 实际分配量，以及
-4×TP2/2×TP4 的 32GB 显存余量。4×TP1 与 8×TP1 都需要 32GB 卡；16GB V100 放不下一份完整的 27B 权重。
-4 卡多实例（4×TP1/2×TP2）也未验证，欢迎一起提交。`--dry-run` 或静态检查不等于 8 卡验证；
-本项目不承诺修复周期或 SLA。
+**社区测试请求（单池 8 卡）：** 8×V100-SXM2-32GB 上的单池 8×TP1、4×TP2、2×TP4 仍未验证；
+欢迎提交启动命令、binary/artifact hash、`/metrics?format=json` 的 `instances` 数组、每实例
+committed decode tok/s、TTFT/TPOT、MTP acceptance、queue wait、free KV pages、host tier
+实际分配量，以及 4×TP2/2×TP4 的 32GB 显存余量。4×TP1 与 8×TP1 都需要 32GB 卡；16GB V100
+放不下一份完整的 27B 权重。4 卡 `4×TP1` 也未验证，欢迎一起提交。`--dry-run` 或静态检查不等于
+8 卡验证；本项目不承诺修复周期或 SLA。
 
 ### 关键参数
 
@@ -426,7 +435,7 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 ## 已知限制
 
 - **Vision**：当前自转换 NVFP4 制品包含 Vision；GGUF Q4_K_M 制品拒绝 `--vision`；多实例 Vision（2×TP1）与 TP2 Vision 均已通过真实集成测试。
-- 多实例只有 2×TP1 通过真实集成测试；4 卡（4×TP1/2×TP2）和 8 卡（8×TP1/4×TP2/2×TP4）未验证，8 卡为社区/非契约。4×TP1 与 8×TP1 需要 32GB 卡，16GB V100 放不下一份完整的 27B 权重。
+- 多实例：2×TP1 通过真实集成测试；4 卡 `2×TP2` 已由第三方在 8×V100-SXM2-32GB 上端到端验证（Vision、MTP、前缀复用、OpenAI/Anthropic、8 并发），8 卡机上两个独立 4 卡池并存也已验证；单池 8×TP1/4×TP2/2×TP4 与 4×TP1 仍未验证，8 卡单池为社区/非契约。4×TP1 与 8×TP1 需要 32GB 卡，16GB V100 放不下一份完整的 27B 权重。
 - KV 只有每实例 device KV 和进程共享的 pinned host prefix-KV 两级；没有磁盘 KV tier、KV offload 或全局活跃 KV 池。
 - prefix cache 修复后未做长时间浸泡测试；超高压并发下的缓存行为仍在观察。
 - **BFCL 全量 200 条：ninfer no-spec 43.0%（86/200）、MTP-3 43.5%（87/200）**。本轮修复了 tool-call 参数类型、NVFP4 QPN 除数、prefix-reuse 的 rewrite checkpoint 复用，以及 FP16 的 gating/prefill 性能与数值路径；同一 server 重跑已可复现（见“质量”节）。
@@ -471,7 +480,7 @@ A Tesla V100 inference engine based on NInfer: single-process TP2 (TP4 remains a
 
 ## Release
 
-Current release: **v0.2.4 (2026-11-13)** (first public release v0.1.0, 2026-10-27). See [`CHANGELOG.md`](CHANGELOG.md) for release notes and known limitations.
+Current release: **v0.2.5 (2026-11-13)** (first public release v0.1.0, 2026-10-27). See [`CHANGELOG.md`](CHANGELOG.md) for release notes and known limitations.
 
 ---
 
@@ -539,7 +548,7 @@ See [`TEMP_WORKAROUNDS.md`](TEMP_WORKAROUNDS.md) for all temporary changes and r
 
 ---
 
-## Current Status (v0.2.4, as of 2026-11-13)
+## Current Status (v0.2.5, as of 2026-11-13)
 
 This version adds the FP16 text runtime on top of v0.1.0, fixes BFCL multi-turn quality,
 removes the FP16 path's decode/prefill regression, fixes the Vision `scatter` dtype
@@ -548,7 +557,10 @@ the TP mailbox P2P setup that crashed when `--devices` did not start at 0. v0.2.
 warm-home routing against the reuse-blind gross page bill and adds the host-tier capacity
 formula and allocation-failure metrics; v0.2.4 removes the multi-instance admission stall
 behind a decoding instance by reading each candidate non-blockingly and skipping a busy
-instance for that round. BFCL `multi_turn_base`, full 200:
+instance for that round; v0.2.5 reports prefix-cache reuse in the OpenAI and Anthropic usage
+payloads and fixes the Vision MTP bridge rmsnorm dtype crash under the FP16 text runtime.
+Third-party validation completed a 4-card `2×TP2` pool and an 8-card host running two such pools
+side by side. BFCL `multi_turn_base`, full 200:
 **no-spec 86/200 = 43.0%, MTP-3 87/200 = 43.5%**. MTP-3 decode at four points (262144 context, INT8 KV, FP16-embedding artifact):
 **104.7 / 98.9 / 109.6 / 98.1 tok/s**.
 
@@ -823,10 +835,19 @@ with semicolons and `--tp` is inferred from the group width when omitted. `--max
 |---:|---|---|---|
 | 2 | 2×TP1 | `"0;1"` | **real integration test passed** |
 | 4 | 4×TP1 | `"0;1;2;3"` | unverified |
-| 4 | 2×TP2 | `"0,1;2,3"` | unverified |
+| 4 | 2×TP2 | `"0,1;2,3"` | **third-party end-to-end validation passed** (32GB; Vision, MTP, prefix reuse, 8 concurrent) |
 | 8 | 8×TP1 | `"0;1;2;3;4;5;6;7"` | community/out-of-contract; unverified |
-| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | community/out-of-contract; unverified |
+| 8 | 4×TP2 | `"0,1;2,3;4,5;6,7"` | community/out-of-contract; unverified (single pool; the 8-card dual-pool host is validated) |
 | 8 | 2×TP4 | `"0,1,2,3;4,5,6,7"` | community/out-of-contract; unverified |
+
+**Third-party validation (2026-11-13, 8×V100-SXM2-32GB):** a 4-card `2×TP2` pool (two instances,
+each `--max-concurrency 4`, `--kv-capacity 1048576`, `--kv-dtype int8`, MTP-3,
+`--prefix-cache --host-cache-mib 98304`) passed end-to-end: image question answering; a streaming
+vision MTP request whose cached images ride a prefix restore; OpenAI/Anthropic usage cache fields;
+8 concurrent × 256 tokens at 341–382 tok/s aggregate (124–152 before the pool-admission stall fix);
+cache-restore TTFT 1.1–9 s (cold prefill about 114 s). The other GPU pair on the same 8-card host
+ran a frozen `2×2` production stack (port 8000), and the two pools coexisted with port isolation.
+Single-pool 8-card profiles remain unverified.
 
 Prefer `--group-devices` for multi-group launches. `--devices` can also list all ranks in group
 order, but the `ninfer` CLI accepts at most four IDs. `--spec dflash` is rejected with multiple
@@ -852,19 +873,19 @@ Eight-card host (8xTP1; unverified, eight full instances, highest memory pressur
   --prefix-cache --host-cache-mib 153600
 ```
 
-Script profiles (community/out-of-contract): `bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
+Script profiles (single-pool 8-card is community/out-of-contract): `bash tools/v100/bench_multi_instance_8gpu.sh 8xTP1|4xTP2|2xTP4`
 (add `--dry-run` to print the full command). See
 [`docs/maintainer/multi-instance.md`](docs/maintainer/multi-instance.md) for the 8xTP1, 4xTP2,
-2xTP4, 4xTP1, and 2xTP2 parameters, routing, and validation boundaries. These unverified profiles
-have no measured throughput or memory result and are not acceptance evidence.
+2xTP4, 4xTP1, and 2xTP2 parameters, routing, and validation boundaries. These unverified
+single-pool profiles have no measured throughput or memory result and are not acceptance evidence.
 
-**Community request (8 cards):** on an 8×V100-SXM2-32GB host, please prioritize 8xTP1, 4xTP2, and
-2xTP4 and report the launch command, binary/artifact hashes, the `/metrics?format=json`
-`instances` array, per-instance committed decode tok/s, TTFT/TPOT, MTP acceptance, queue wait,
-free KV pages, actual host-tier allocation, and 32GB memory headroom for 4xTP2/2xTP4. 4xTP1 and
-8xTP1 need 32GB cards; a 16GB V100 cannot hold one full 27B copy. The 4-card profiles (4xTP1/2xTP2)
-are also unverified and welcome. `--dry-run` or static checks are not 8-card validation; no fix timeline or
-SLA is promised.
+**Community request (single-pool 8 cards):** on an 8×V100-SXM2-32GB host, single-pool 8xTP1, 4xTP2,
+and 2xTP4 are still unverified. Please report the launch command, binary/artifact hashes, the
+`/metrics?format=json` `instances` array, per-instance committed decode tok/s, TTFT/TPOT, MTP
+acceptance, queue wait, free KV pages, actual host-tier allocation, and 32GB memory headroom for
+4xTP2/2xTP4. 4xTP1 and 8xTP1 need 32GB cards; a 16GB V100 cannot hold one full 27B copy. The 4-card
+4xTP1 profile is also unverified and welcome. `--dry-run` or static checks are not 8-card
+validation; no fix timeline or SLA is promised.
 
 ### Key Flags
 
@@ -914,7 +935,7 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 ## Known Limitations
 
 - **Vision**: the current self-converted NVFP4 artifact includes Vision; the GGUF Q4_K_M artifact rejects `--vision`; multi-instance Vision (2×TP1) and TP2 Vision have both passed real integration tests.
-- Only 2×TP1 multi-instance has passed a real integration test; the 4-card (4×TP1/2×TP2) and 8-card (8×TP1/4×TP2/2×TP4) profiles are unverified, and the 8-card profiles are community/out-of-contract. 4×TP1 and 8×TP1 require 32GB cards; a 16GB V100 cannot hold one full 27B copy.
+- Multi-instance: 2×TP1 has passed a real integration test; the 4-card 2×TP2 profile passed third-party end-to-end validation on an 8×V100-SXM2-32GB host (Vision, MTP, prefix reuse, OpenAI/Anthropic, 8 concurrent), and the same host ran two independent 4-card pools side by side. Single-pool 8xTP1/4xTP2/2xTP4 and 4xTP1 remain unverified; the single-pool 8-card profiles are community/out-of-contract. 4×TP1 and 8×TP1 require 32GB cards; a 16GB V100 cannot hold one full 27B copy.
 - KV has two tiers only: per-instance device KV and the process-shared pinned host prefix-KV tier. There is no disk KV tier, KV offload, or global active-KV pool.
 - After the prefix-cache fix, no long soak test has been run; cache behavior under very high concurrency is still being observed.
 - **BFCL full 200: ninfer no-spec 43.0% (86/200), MTP-3 43.5% (87/200)**. This round fixed tool-call argument typing, the NVFP4 QPN divisor, the rewrite-checkpoint prefix reuse, and the FP16 gating/prefill performance and numerical paths; same-server reruns are now reproducible (see the “Quality” section).

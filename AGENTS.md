@@ -153,6 +153,11 @@ capacity with a 1024-token prefill chunk; it is not the 262144 MTP acceptance pr
 One Engine owns one resident model, with one device or TP2 on the current 2×32GB 27B package and
 a startup-fixed one to eight active requests. The V100X2 acceptance workload is one active request
 on two 32GB cards. TP4 on four 16GB cards remains a legacy regression path.
+Third-party validation on an 8×V100-SXM2-32GB host covers a 4-card 2×TP2 pool (Vision, MTP, prefix
+reuse, OpenAI/Anthropic serving, 8 concurrent requests) and the same host running two independent
+4-card pools side by side; single-pool 8-card profiles (8×TP1, 4×TP2, 2×TP4) remain unverified
+community paths, and the 4-card 2×TP2 result is deployment evidence, not a change of the
+single-request acceptance workload.
 The Engine forms one compact decode batch at every round boundary and uses bounded
 FIFO ingress with no request preemption. Large-scale or preemptive continuous batching, priority/QoS
 scheduling, additional checkpoint targets, and additional execution platforms beyond those named

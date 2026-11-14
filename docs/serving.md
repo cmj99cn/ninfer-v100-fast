@@ -80,8 +80,9 @@ after the permit is returned.
 
 See [`docs/maintainer/multi-instance.md`](maintainer/multi-instance.md) for grouping, routing,
 manifest lifecycle, and the current verification status. The 2×TP1 profile has passed real
-integration; 4- and 8-card profiles are unverified, and the 8-card profiles are
-community/out-of-contract.
+integration; the 4-card `2×TP2` profile passed third-party end-to-end validation on an
+8×V100-SXM2-32GB host, which also ran two independent 4-card pools side by side; single-pool
+8-card profiles are unverified community paths.
 
 Compatible-prefix reuse is enabled by default at every tensor-parallel width, including
 `--tp 2 --spec mtp` and `--tp 4 --spec mtp`.
@@ -261,6 +262,11 @@ switch directly.
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
 `choices` chunk contains completed usage.
+
+Chat-completion `usage` mirrors the Responses cache count: `prompt_tokens_details.cached_tokens`
+reports the resident prompt prefix the Engine reused, and `prompt_tokens` stays the full prompt
+count (reused prefix plus expanded media tokens), so `cached_tokens` never exceeds it. The
+non-streaming, tool-call, and streaming usage payloads carry the same field.
 
 ### Multimodal request
 
@@ -582,6 +588,12 @@ Anthropic `output_config.effort` accepts the protocol values `low`, `medium`, `h
 (`high` -> `medium`, `max` -> `xhigh`, anything else -> `low`); the registered effort-capable
 template exposes `low`, `medium`, and `xhigh`. An explicit `thinking.type: "disabled"` keeps
 thinking off and drops the effort.
+
+Anthropic `usage` reports `input_tokens` (the full prompt, including the reused prefix and expanded
+media tokens), `output_tokens`, `cache_read_input_tokens` (the resident prompt prefix the Engine
+reused, matching the OpenAI endpoints' `cached_tokens`), and `cache_creation_input_tokens` (always
+`0`: NInfer has no separate cache-write accounting). In SSE, `message_start` reports zero cache
+counters and the final `message_delta` carries the real `cache_read_input_tokens`.
 
 Anthropic's `model` field is treated as a response label and does not select the loaded artifact.
 
