@@ -47,7 +47,7 @@ struct ShardSpec {
 };
 
 constexpr std::array<ShardSpec, roles::kRoleCount> kShardSpecs{{
-    {Role::TokenEmbedding, Axis::Host, Split::Output, 0, kVocab, 1},
+    {Role::TokenEmbedding, Axis::Replicated, Split::Output, 0, kVocab, 1},
     {Role::OutputHead, Axis::Vocab, Split::Output, 0, kVocab, 1},
     {Role::FinalHcNorm, Axis::Replicated, Split::Output, 0, kResidual, 1},
     {Role::FinalHcDown, Axis::Replicated, Split::Output, 0, kHcLowrank, 1},
@@ -120,7 +120,7 @@ ShardMapping shard_mapping(roles::Role role, int tp) {
 
     const auto& spec = kShardSpecs[static_cast<std::size_t>(role)];
     ShardMapping mapping{spec.axis, spec.split, {}};
-    if (spec.axis == Axis::Replicated || spec.axis == Axis::Host) { return mapping; }
+    if (spec.axis == Axis::Replicated) { return mapping; }
 
     const std::string name = roles::parameter_name(role, 0);
     if (spec.extent % tp != 0) {

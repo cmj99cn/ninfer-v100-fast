@@ -137,6 +137,10 @@ std::string parameter_name(Role role, std::uint32_t layer) {
     return "text/layers/" + std::to_string(layer) + "/" + std::string(spec.suffix);
 }
 
+std::string_view role_name(Role role) noexcept {
+    return kRoleSpecs[static_cast<std::size_t>(role)].suffix;
+}
+
 std::optional<Role> role_of(std::string_view name) noexcept {
     const auto parsed = parse(name);
     if (!parsed) { return std::nullopt; }

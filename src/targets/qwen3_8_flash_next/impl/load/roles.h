@@ -103,6 +103,10 @@ inline constexpr std::uint32_t kPleLayer = 1;
 // roles ignore it.
 [[nodiscard]] std::string parameter_name(Role role, std::uint32_t layer = 0);
 
+// The role's own name: the artifact name pattern without the `text/` namespace and without the
+// layer index. A shard map describes one role, not one parameter, so it is keyed by this name.
+[[nodiscard]] std::string_view role_name(Role role) noexcept;
+
 // The role a parameter name denotes, or no role when the name is outside this target's
 // `text/*` namespace.
 [[nodiscard]] std::optional<Role> role_of(std::string_view name) noexcept;

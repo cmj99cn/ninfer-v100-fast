@@ -10,8 +10,7 @@
 // `ShardAxis::Head` splits a role by its head width, `Expert` by the expert set, and `Vocab` by the
 // vocabulary. An `Expert` range names whole matrices of the batched stack: no dimension inside one
 // matrix is split, because the swizzled scale plane stores each matrix in whole 128-row bands.
-// `Replicated` names a role whose whole object lives on every rank, and `Host` names a role that is
-// not a device shard at all and is read from the pinned host row source. An empty `ranks` is the
+// `Replicated` names a role whose whole object lives on every rank. An empty `ranks` is the
 // binder convention for a full copy on device 0.
 //
 // A `Shard` is a half-open range on the stored axis `SplitAxis` selects: the output-feature axis of
@@ -20,7 +19,7 @@
 // `begin + extent` and the ranks partition it.
 namespace ninfer::targets::qwen3_8_flash_next::detail::sharding {
 
-enum class ShardAxis { Replicated, Host, Vocab, Head, Expert };
+enum class ShardAxis { Replicated, Vocab, Head, Expert };
 
 enum class SplitAxis { Output, Input, Batch };
 

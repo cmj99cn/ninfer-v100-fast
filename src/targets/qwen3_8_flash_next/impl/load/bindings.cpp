@@ -10,8 +10,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -536,9 +538,9 @@ BindingPlan bind_artifact(artifact::Binder& binder, WeightsProfile profile, int 
     if (profile != WeightsProfile::Nvfp4) {
         throw std::invalid_argument("qwen3.8-flash-next binds the nvfp4 weights profile only");
     }
-    if (tp != 1) {
-        throw std::invalid_argument("qwen3.8-flash-next binds one device at this milestone; the "
-                                    "tensor-parallel plan belongs to the TP2 milestone");
+    if (tp < 1 || tp > static_cast<int>(kMaximumDevices)) {
+        throw std::invalid_argument("qwen3.8-flash-next binds between one and " +
+                                    std::to_string(kMaximumDevices) + " devices");
     }
     const artifact::V3Directory& directory = binder.directory();
     validate_text_config(directory);
@@ -616,6 +618,18 @@ BindingPlan bind_artifact(artifact::Binder& binder, WeightsProfile profile, int 
     collect_unclaimed(directory.part_bindings, builder.claimed(), plan.unclaimed);
     collect_unclaimed_objects(directory.bindings, builder.claimed(), plan.unclaimed);
     collect_unclaimed_part_objects(directory.part_bindings, builder.claimed(), plan.unclaimed);
+
+    if (tp > 1) {
+        const auto shards = shard_plan_by_name(tp);
+        auto placements = shard_placements(plan, shards, tp);
+        binder.set_shard_resolver([placements = std::move(placements)](std::string_view name) {
+            const auto found = placements.find(std::string(name));
+            if (found == placements.end()) {
+                throw std::invalid_argument("the shard map has no placement for object " + std::string(name));
+            }
+            return found->second;
+        });
+    }
     return plan;
 }
 
@@ -630,72 +644,274 @@ artifact::ObjectHandle object_handle(const BindingPlan& plan, const BoundParamet
     return plan.objects[static_cast<std::size_t>(parameter.parts.front().object)].handle;
 }
 
-Weight part_weight(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
-                   const BoundParameter& parameter, std::int32_t rows, std::int32_t columns) {
-    const auto handle = object_handle(plan, parameter);
-    if (!materialized.is_materialized(handle)) { return Weight{}; }
-    Weight weight = artifact::materialized_weight(
-        materialized, handle, role_geometry(parameter.role).format, rows, columns, 0);
-    const artifact::ElementIntervalView& view = parameter.parts.front().view;
-    if (view.matrix_row_begin == 0) { return weight; }
-    if (view.layout != artifact::StorageLayout::ContiguousLeV1 ||
-        view.matrix_row_count != static_cast<std::uint64_t>(rows)) {
-        throw std::runtime_error("part_weight requires a contiguous row interval of the bound rows");
+const sharding::ShardMapping& shard_of(const ShardPlanByName& shards, std::string_view role) {
+    const auto found = shards.find(role);
+    if (found == shards.end()) {
+        throw std::runtime_error("the shard map has no role " + std::string(role));
     }
-    const std::array<std::uint64_t, 2> one_row{1, static_cast<std::uint64_t>(columns)};
-    const std::uint64_t row_bytes = artifact::tensor_encoded_size(
-        artifact::StorageLayout::ContiguousLeV1, role_geometry(parameter.role).format, one_row);
-    const auto offset = static_cast<std::uint64_t>(view.matrix_row_begin) * row_bytes;
+    return found->second;
+}
+
+std::uint64_t range_total(const std::vector<artifact::SliceRange>& ranges) {
+    return std::accumulate(ranges.begin(), ranges.end(), std::uint64_t{0},
+                           [](std::uint64_t value, const artifact::SliceRange& range) {
+                               return value + range.count;
+                           });
+}
+
+std::vector<std::uint64_t> narrowed_object_shape(std::span<const std::uint64_t> shape,
+                                                 sharding::SplitAxis split, std::uint64_t selected) {
+    std::vector<std::uint64_t> out(shape.begin(), shape.end());
+    if (split == sharding::SplitAxis::Input) { out[1] = selected; } else { out[0] = selected; }
+    return out;
+}
+
+artifact::SliceRange role_range(const ShardPlanByName& shards, roles::Role role,
+                                sharding::SplitAxis split, int rank) {
+    const auto& mapping = shard_of(shards, roles::role_name(role));
+    const auto geometry = role_geometry(role);
+    if (!mapping.ranks.empty()) {
+        const auto& part = mapping.ranks[static_cast<std::size_t>(rank)];
+        return {static_cast<std::uint64_t>(part.begin),
+                static_cast<std::uint64_t>(part.end - part.begin)};
+    }
+    const auto begin = split == sharding::SplitAxis::Input ? geometry.column_begin : geometry.row_begin;
+    const auto count = split == sharding::SplitAxis::Input ? geometry.column_count : geometry.row_count;
+    return {begin, count};
+}
+
+std::int64_t rank_extent(const ShardPlanByName& shards, roles::Role role, int rank) {
+    const auto& mapping = shard_of(shards, roles::role_name(role));
+    if (mapping.ranks.empty()) { return -1; }
+    const auto& part = mapping.ranks[static_cast<std::size_t>(rank)];
+    return part.end - part.begin;
+}
+
+const ObjectShardPlan& object_entry(const std::vector<ObjectShardPlan>& byte_plan,
+                                    const std::string& name) {
+    for (const auto& entry : byte_plan) {
+        if (entry.object == name) { return entry; }
+    }
+    throw std::runtime_error("no shard byte plan for object " + name);
+}
+
+std::uint64_t block_offset(const ShardPlanByName& shards, const ObjectShardPlan& entry,
+                           roles::Role role, int rank) {
+    const std::vector<artifact::SliceRange> ranges{role_range(shards, role, entry.split, rank)};
+    const auto geometry = role_geometry(role);
+    const auto own = entry.split == sharding::SplitAxis::Input
+        ? artifact::tensor_column_slice(geometry.layout, geometry.format, geometry.object_shape(), ranges)
+        : artifact::tensor_row_slice(geometry.layout, geometry.format, geometry.object_shape(), ranges);
+    if (own.copies.empty()) { return 0; }
+    const auto source = own.copies.front().source_offset;
+    for (const auto& copy : entry.copies[static_cast<std::size_t>(rank)]) {
+        if (copy.source_offset == source) { return copy.dest_offset; }
+    }
+    throw std::runtime_error("the shard of " + entry.object + " on rank " + std::to_string(rank) +
+                             " does not hold the role block " + std::string(roles::role_name(role)));
+}
+
+} // namespace
+
+ShardPlanByName shard_plan_by_name(int tp) {
+    ShardPlanByName shards;
+    for (const auto role : roles::all_roles()) {
+        shards.emplace(std::string(roles::role_name(role)), sharding::shard_mapping(role, tp));
+    }
+    return shards;
+}
+
+std::vector<ObjectShardPlan> shard_byte_plan(const BindingPlan& plan, const ShardPlanByName& shards,
+                                             int tp) {
+    std::map<std::string, std::vector<const BoundParameter*>> owners;
+    for (const auto* parameter : plan.parameters()) {
+        for (const auto& part : parameter->parts) {
+            owners[plan.objects.at(part.object).name].push_back(parameter);
+        }
+    }
+
+    std::vector<ObjectShardPlan> byte_plan;
+    byte_plan.reserve(plan.objects.size());
+    for (const auto& object : plan.objects) {
+        if (object.shape.empty()) { continue; }
+        const auto owner = owners.find(object.name);
+        const std::vector<const BoundParameter*> none;
+        const auto& bound = owner == owners.end() ? none : owner->second;
+        ObjectShardPlan entry;
+        entry.object = object.name;
+        for (const auto* parameter : bound) { entry.roles.push_back(parameter->role); }
+        entry.split = bound.empty() ? sharding::SplitAxis::Output
+                                    : shard_of(shards, roles::role_name(entry.roles.front())).split;
+
+        for (int rank = 0; rank < tp; ++rank) {
+            std::vector<artifact::SliceRange> ranges;
+            if (bound.empty()) {
+                const auto extent = entry.split == sharding::SplitAxis::Input ? object.shape[1]
+                                                                             : object.shape[0];
+                ranges.push_back({0, extent});
+            }
+            for (const auto* parameter : bound) {
+                ranges.push_back(role_range(shards, parameter->role, entry.split, rank));
+            }
+            std::sort(ranges.begin(), ranges.end(), [](const artifact::SliceRange& left,
+                                                       const artifact::SliceRange& right) {
+                return left.begin < right.begin;
+            });
+            ranges.erase(std::unique(ranges.begin(), ranges.end(),
+                                     [](const artifact::SliceRange& left, const artifact::SliceRange& right) {
+                                         return left.begin == right.begin && left.count == right.count;
+                                     }), ranges.end());
+            entry.ranges[static_cast<std::size_t>(rank)] = ranges;
+
+            const auto shape = narrowed_object_shape(object.shape, entry.split, range_total(ranges));
+            entry.encoded_bytes[static_cast<std::size_t>(rank)] =
+                artifact::tensor_encoded_size(object.layout, object.format, shape);
+
+            const auto extent = entry.split == sharding::SplitAxis::Input ? object.shape[1]
+                                                                         : object.shape[0];
+            if (ranges.size() == 1 && ranges.front().begin == 0 && ranges.front().count == extent) {
+                entry.copies[static_cast<std::size_t>(rank)].push_back(
+                    {0, 0, entry.encoded_bytes[static_cast<std::size_t>(rank)]});
+            } else {
+                const auto slice = entry.split == sharding::SplitAxis::Input
+                    ? artifact::tensor_column_slice(object.layout, object.format, object.shape, ranges)
+                    : artifact::tensor_row_slice(object.layout, object.format, object.shape, ranges);
+                entry.copies[static_cast<std::size_t>(rank)] = slice.copies;
+                entry.prefix[static_cast<std::size_t>(rank)] = slice.prefix;
+            }
+
+            if (object.layout == StorageLayout::BatchedBlockScaleK16M128x4V1) {
+                const auto geometry = artifact::batched_block_scale_geometry(object.format, shape);
+                entry.scale_plane_offset[static_cast<std::size_t>(rank)] = geometry.scale_plane_offset;
+                entry.divisor_plane_offset[static_cast<std::size_t>(rank)] =
+                    geometry.weight_divisor_offset;
+            } else if (object.layout == StorageLayout::RowSplitK128V1) {
+                entry.scale_plane_offset[static_cast<std::size_t>(rank)] =
+                    artifact::row_split_geometry(object.format, shape).scale_plane_offset;
+            }
+        }
+        byte_plan.push_back(std::move(entry));
+    }
+    return byte_plan;
+}
+
+std::map<std::string, artifact::ShardPlacement> shard_placements(const BindingPlan& plan,
+                                                                  const ShardPlanByName& shards,
+                                                                  int tp) {
+    const auto byte_plan = shard_byte_plan(plan, shards, tp);
+    std::map<std::string, artifact::ShardPlacement> placements;
+    for (const auto& entry : byte_plan) {
+        if (entry.roles.empty()) {
+            artifact::ShardPlacement placement;
+            placement.axis = artifact::ShardAxis::Replicated;
+            placements.emplace(entry.object, placement);
+            continue;
+        }
+        const auto& mapping = shard_of(shards, roles::role_name(entry.roles.front()));
+        artifact::ShardPlacement placement;
+        if (mapping.axis == sharding::ShardAxis::Replicated) {
+            placement.axis = artifact::ShardAxis::Replicated;
+        } else {
+            placement.axis = mapping.split == sharding::SplitAxis::Input
+                ? artifact::ShardAxis::Columns
+                : artifact::ShardAxis::Rows;
+            for (int rank = 0; rank < tp; ++rank) {
+                for (const auto& range : entry.ranges[static_cast<std::size_t>(rank)]) {
+                    placement.device_ranges[static_cast<std::size_t>(rank)].push_back(range);
+                }
+            }
+        }
+        placements.emplace(entry.object, placement);
+    }
+    return placements;
+}
+
+namespace {
+
+Weight part_weight(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
+                   const ShardPlanByName& shards, const std::vector<ObjectShardPlan>& byte_plan,
+                   const BoundParameter& parameter, std::int32_t rows, std::int32_t columns,
+                   int rank) {
+    const auto handle = object_handle(plan, parameter);
+    if (!materialized.is_materialized(handle, rank)) { return Weight{}; }
+    const auto& mapping = shard_of(shards, roles::role_name(parameter.role));
+    const auto geometry = role_geometry(parameter.role);
+    const auto& entry = object_entry(byte_plan, plan.objects.at(parameter.parts.front().object).name);
+    const auto extent = rank_extent(shards, parameter.role, rank);
+    std::int32_t entry_rows = rows;
+    std::int32_t entry_columns = columns;
+    if (extent >= 0) {
+        if (mapping.split == sharding::SplitAxis::Output) {
+            entry_rows = rows == static_cast<std::int32_t>(geometry.row_count)
+                ? static_cast<std::int32_t>(extent)
+                : static_cast<std::int32_t>(range_total(entry.ranges[static_cast<std::size_t>(rank)]));
+        } else if (mapping.split == sharding::SplitAxis::Input) {
+            entry_columns = columns == static_cast<std::int32_t>(geometry.column_count)
+                ? static_cast<std::int32_t>(extent)
+                : static_cast<std::int32_t>(range_total(entry.ranges[static_cast<std::size_t>(rank)]));
+        }
+    }
+
+    Weight weight = artifact::materialized_weight(materialized, handle, geometry.format,
+                                                  entry_rows, entry_columns, rank);
+    const auto offset = block_offset(shards, entry, parameter.role, rank);
+    if (offset == 0) { return weight; }
+    const auto shape = narrowed_object_shape(geometry.object_shape(), mapping.split,
+                                            static_cast<std::uint64_t>(extent));
     const auto* base = static_cast<const std::byte*>(weight.payload) + offset;
     weight.payload = base;
     weight.qdata   = base;
+    weight.payload_bytes = artifact::tensor_encoded_size(geometry.layout, geometry.format, shape);
     return weight;
 }
 
 Tensor part_tensor(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
-                   const BoundParameter& parameter, std::initializer_list<std::int32_t> shape) {
+                   const ShardPlanByName& shards, const BoundParameter& parameter,
+                   std::initializer_list<std::int32_t> shape, int rank) {
     const auto handle = object_handle(plan, parameter);
-    if (!materialized.is_materialized(handle)) { return Tensor{}; }
+    if (!materialized.is_materialized(handle, rank)) { return Tensor{}; }
+    const auto& mapping = shard_of(shards, roles::role_name(parameter.role));
     return artifact::materialized_tensor(materialized, handle, role_geometry(parameter.role).format,
-                                         shape, 0);
+                                         shape, rank);
 }
 
 BatchedNvfp4Weight part_library(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
-                                const BoundParameter& parameter) {
+                                const ShardPlanByName& shards,
+                                const std::vector<ObjectShardPlan>& byte_plan,
+                                const BoundParameter& parameter, int rank) {
     const ExpertLibrary& library = parameter.library.value();
-    const auto library_handle = library.handle;
+    const auto handle = library.handle;
     BatchedNvfp4Weight weight;
-    if (!materialized.is_materialized(library_handle)) { return weight; }
-    weight.payload      = materialized.device_data(library_handle);
-    weight.payload_bytes = materialized.device_bytes(library_handle, 0);
-    weight.qtype        = QType::NVFP4;
-    weight.layout       = QuantLayout::BatchedBlockScaleK16M128x4;
-    weight.group_size   = 16U;
-    weight.matrices     = static_cast<std::int32_t>(library.matrices);
-    weight.rows         = static_cast<std::int32_t>(library.rows);
-    weight.columns      = static_cast<std::int32_t>(library.columns);
-    const std::int64_t code_bytes  = static_cast<std::int64_t>(library.matrices) * library.rows *
-                                     library.columns / 2;
-    const std::int64_t scale_bytes = static_cast<std::int64_t>(library.matrices) * library.rows *
-                                     library.columns / 16;
-    const std::int64_t scale_offset = align_up_256(code_bytes);
-    const auto* payload = static_cast<const std::uint8_t*>(weight.payload);
-    weight.codes    = payload;
-    weight.scales   = payload + scale_offset;
-    weight.divisors = reinterpret_cast<const float*>(payload + scale_offset + scale_bytes);
+    if (!materialized.is_materialized(handle, rank)) { return weight; }
+    const auto& entry = object_entry(byte_plan, library.object);
+    const auto& ranges = entry.ranges[static_cast<std::size_t>(rank)];
+    const auto* payload = static_cast<const std::uint8_t*>(materialized.device_data(handle, rank));
+    weight.payload       = payload;
+    weight.payload_bytes = entry.encoded_bytes[static_cast<std::size_t>(rank)];
+    weight.qtype         = QType::NVFP4;
+    weight.layout        = QuantLayout::BatchedBlockScaleK16M128x4;
+    weight.group_size    = 16U;
+    weight.matrices      = static_cast<std::int32_t>(range_total(ranges));
+    weight.rows          = static_cast<std::int32_t>(library.rows);
+    weight.columns       = static_cast<std::int32_t>(library.columns);
+    weight.codes         = payload;
+    weight.scales        = payload + entry.scale_plane_offset[static_cast<std::size_t>(rank)];
+    weight.divisors      = reinterpret_cast<const float*>(
+        payload + entry.divisor_plane_offset[static_cast<std::size_t>(rank)]);
     return weight;
 }
 
 qwen4_exp::HcWeights hc_view(const BindingPlan& bindings, const artifact::MaterializedArtifact& materialized,
-                  const HcPlan& plan, std::int32_t down_rows) {
+                             const ShardPlanByName& shards, const std::vector<ObjectShardPlan>& byte_plan,
+                             const HcPlan& plan, std::int32_t down_rows, int rank) {
     return qwen4_exp::HcWeights{
-        .down_injection = part_weight(bindings, materialized, plan.down, down_rows,
-                                      TextConfig::residual_width),
-        .up = part_weight(bindings, materialized, plan.up, TextConfig::residual_width,
-                          TextConfig::hc_lowrank),
-        .norm = part_tensor(bindings, materialized, plan.norm,
+        .down_injection = part_weight(bindings, materialized, shards, byte_plan, plan.down, down_rows,
+                                      TextConfig::residual_width, rank),
+        .up = part_weight(bindings, materialized, shards, byte_plan, plan.up, TextConfig::residual_width,
+                          TextConfig::hc_lowrank, rank),
+        .norm = part_tensor(bindings, materialized, shards, plan.norm,
                             {TextConfig::residual_width / TextConfig::hc_streams,
-                             TextConfig::hc_streams}),
+                             TextConfig::hc_streams}, rank),
     };
 }
 
@@ -768,95 +984,134 @@ void fetch_ple_rows(void* context, const ops::PleRowAddress* addresses, std::siz
     static_cast<PleTableSource*>(context)->fetch(addresses, count, destination);
 }
 
-LoadedModelData::LoadedModelData(const BindingPlan& plan,
-                                 const artifact::MaterializedArtifact& materialized,
-                                 std::size_t loaded_layers,
-                                 const std::filesystem::path& artifact_path) {
-    model_.tp = 1;
-    model_.loaded_layers = loaded_layers;
+namespace {
 
-    model_.embedding = part_weight(plan, materialized, plan.token_embedding, TextConfig::vocab,
-                                   TextConfig::hidden);
-    model_.output_head = part_weight(plan, materialized, plan.output_head, TextConfig::vocab,
-                                     TextConfig::hidden);
-    model_.final_hc = hc_view(plan, materialized, plan.final_hc, TextConfig::hc_lowrank);
-    const BoundParameter& tail_norm = loaded_layers < static_cast<std::size_t>(TextConfig::layers)
-                                          ? plan.layers[loaded_layers].attention_hc.norm
-                                          : plan.final_hc.norm;
-    model_.tail_norm = part_tensor(plan, materialized, tail_norm,
-                                   {TextConfig::residual_width / TextConfig::hc_streams,
-                                    TextConfig::hc_streams});
+Variant::ModelView build_rank_view(const BindingPlan& plan,
+                                   const artifact::MaterializedArtifact& materialized,
+                                   const ShardPlanByName& shards,
+                                   const std::vector<ObjectShardPlan>& byte_plan, int rank) {
+    Variant::ModelView view;
 
-    ple_source_ = std::make_unique<PleTableSource>(artifact_path, plan);
+    view.embedding = part_weight(plan, materialized, shards, byte_plan, plan.token_embedding,
+                                 TextConfig::vocab, TextConfig::hidden, rank);
+    view.output_head = part_weight(plan, materialized, shards, byte_plan, plan.output_head,
+                                   TextConfig::vocab, TextConfig::hidden, rank);
+    view.final_hc = hc_view(plan, materialized, shards, byte_plan, plan.final_hc,
+                            TextConfig::hc_lowrank, rank);
 
-    model_.ple = qwen4_exp::PleWeights{
-        .key        = part_weight(plan, materialized, plan.ple.key, TextConfig::residual_width,
-                                  TextConfig::hidden),
-        .value      = part_weight(plan, materialized, plan.ple.value, TextConfig::hidden,
-                                  TextConfig::hidden),
-        .norm_key   = part_tensor(plan, materialized, plan.ple.norm_key, {TextConfig::residual_width}),
-        .norm_query = part_tensor(plan, materialized, plan.ple.norm_query, {TextConfig::residual_width}),
-        .norm_conv  = part_tensor(plan, materialized, plan.ple.norm_conv, {TextConfig::residual_width}),
-        .kernel     = part_tensor(plan, materialized, plan.ple.convolution,
-                                  {TextConfig::ple_conv_kernel, TextConfig::residual_width}),
-        .controls   = ple_source_->controls(),
-        .rows       = qwen4_exp::PleRowSource{ple_source_.get(), &fetch_ple_rows,
-                                              ple_source_->divisors()},
+    view.ple = qwen4_exp::PleWeights{
+        .key        = part_weight(plan, materialized, shards, byte_plan, plan.ple.key,
+                                  TextConfig::residual_width, TextConfig::hidden, rank),
+        .value      = part_weight(plan, materialized, shards, byte_plan, plan.ple.value,
+                                  TextConfig::hidden, TextConfig::hidden, rank),
+        .norm_key   = part_tensor(plan, materialized, shards, plan.ple.norm_key,
+                                  {TextConfig::residual_width}, rank),
+        .norm_query = part_tensor(plan, materialized, shards, plan.ple.norm_query,
+                                  {TextConfig::residual_width}, rank),
+        .norm_conv  = part_tensor(plan, materialized, shards, plan.ple.norm_conv,
+                                  {TextConfig::residual_width}, rank),
+        .kernel     = part_tensor(plan, materialized, shards, plan.ple.convolution,
+                                  {TextConfig::ple_conv_kernel, TextConfig::residual_width}, rank),
     };
 
-    for (std::size_t layer = 0; layer < loaded_layers; ++layer) {
+    for (std::size_t layer = 0; layer < static_cast<std::size_t>(TextConfig::layers); ++layer) {
         const LayerPlan& source = plan.layers[layer];
-        auto& target = model_.layers[layer];
-        target.attention_hc = hc_view(plan, materialized, source.attention_hc,
-                                      TextConfig::hc_lowrank + TextConfig::hc_streams);
-        target.moe_hc = hc_view(plan, materialized, source.moe_hc,
-                                TextConfig::hc_lowrank + TextConfig::hc_streams);
+        auto& target = view.layers[layer];
+        target.attention_hc = hc_view(plan, materialized, shards, byte_plan, source.attention_hc,
+                                      TextConfig::hc_lowrank + TextConfig::hc_streams, rank);
+        target.moe_hc = hc_view(plan, materialized, shards, byte_plan, source.moe_hc,
+                                TextConfig::hc_lowrank + TextConfig::hc_streams, rank);
 
         if (TextConfig::is_qsa_layer(static_cast<int>(layer))) {
             const QsaPlan& qsa = std::get<QsaPlan>(source.mixer);
             target.attention_projection = AttentionProjectionWeights{
-                .query_gate        = part_weight(plan, materialized, qsa.query, 2 * TextConfig::query_width,
-                                                 TextConfig::hidden),
-                .key_value         = part_weight(plan, materialized, qsa.key, 2 * TextConfig::kv_width +
-                                                 TextConfig::index_query_width +
-                                                 TextConfig::index_key_width, TextConfig::hidden),
-                .query_norm        = part_tensor(plan, materialized, qsa.query_norm, {TextConfig::head_dim}),
-                .key_norm          = part_tensor(plan, materialized, qsa.key_norm, {TextConfig::head_dim}),
-                .index_query_norm  = part_tensor(plan, materialized, qsa.index_query_norm,
-                                                 {TextConfig::index_head_dim}),
-                .index_key_norm    = part_tensor(plan, materialized, qsa.index_key_norm,
-                                                 {TextConfig::index_head_dim}),
-                .output            = part_weight(plan, materialized, qsa.output, TextConfig::hidden,
-                                                 TextConfig::query_width),
+                .query_gate        = part_weight(plan, materialized, shards, byte_plan, qsa.query,
+                                                 2 * TextConfig::query_width, TextConfig::hidden, rank),
+                .key_value         = part_weight(plan, materialized, shards, byte_plan, qsa.key,
+                                                 2 * TextConfig::kv_width + TextConfig::index_query_width +
+                                                 TextConfig::index_key_width, TextConfig::hidden, rank),
+                .query_norm        = part_tensor(plan, materialized, shards, qsa.query_norm,
+                                                 {TextConfig::head_dim}, rank),
+                .key_norm          = part_tensor(plan, materialized, shards, qsa.key_norm,
+                                                 {TextConfig::head_dim}, rank),
+                .index_query_norm  = part_tensor(plan, materialized, shards, qsa.index_query_norm,
+                                                 {TextConfig::index_head_dim}, rank),
+                .index_key_norm    = part_tensor(plan, materialized, shards, qsa.index_key_norm,
+                                                 {TextConfig::index_head_dim}, rank),
+                .output            = part_weight(plan, materialized, shards, byte_plan, qsa.output,
+                                                 TextConfig::hidden, TextConfig::query_width, rank),
             };
         } else {
             const GdnPlan& gdn = std::get<GdnPlan>(source.mixer);
             target.gdn_projection = GdnProjectionWeights{
-                .qkvz       = part_weight(plan, materialized, gdn.query,
+                .qkvz       = part_weight(plan, materialized, shards, byte_plan, gdn.query,
                                           TextConfig::gdn_conv_channels + TextConfig::gdn_value_width,
-                                          TextConfig::hidden),
-                .control    = part_weight(plan, materialized, gdn.a_projection, 2 * TextConfig::gdn_value_heads,
-                                          TextConfig::hidden),
-                .a_log      = part_tensor(plan, materialized, gdn.a_log, {TextConfig::gdn_value_heads}),
-                .dt_bias    = part_tensor(plan, materialized, gdn.dt_bias, {TextConfig::gdn_value_heads}),
-                .convolution = part_tensor(plan, materialized, gdn.convolution,
-                                           {TextConfig::gdn_conv_kernel, TextConfig::gdn_conv_channels}),
-                .norm       = part_tensor(plan, materialized, gdn.norm, {128}),
-                .output     = part_weight(plan, materialized, gdn.output, TextConfig::hidden,
-                                          TextConfig::gdn_value_width),
+                                          TextConfig::hidden, rank),
+                .control    = part_weight(plan, materialized, shards, byte_plan, gdn.a_projection,
+                                          2 * TextConfig::gdn_value_heads, TextConfig::hidden, rank),
+                .a_log      = part_tensor(plan, materialized, shards, gdn.a_log,
+                                          {TextConfig::gdn_value_heads}, rank),
+                .dt_bias    = part_tensor(plan, materialized, shards, gdn.dt_bias,
+                                          {TextConfig::gdn_value_heads}, rank),
+                .convolution = part_tensor(plan, materialized, shards, gdn.convolution,
+                                           {TextConfig::gdn_conv_kernel, TextConfig::gdn_conv_channels}, rank),
+                .norm       = part_tensor(plan, materialized, shards, gdn.norm, {128}, rank),
+                .output     = part_weight(plan, materialized, shards, byte_plan, gdn.output,
+                                          TextConfig::hidden, TextConfig::gdn_value_width, rank),
             };
         }
 
         target.post_mixer = ops::MoeNvfp4Weights{
-            .router_shared    = part_weight(plan, materialized, source.moe.router,
-                                            TextConfig::experts + 1 +
-                                                2 * TextConfig::shared_intermediate,
-                                            TextConfig::hidden),
-            .shared_down      = part_weight(plan, materialized, source.moe.shared_down, TextConfig::hidden,
-                                            TextConfig::shared_intermediate),
-            .routed_gate_up   = part_library(plan, materialized, source.moe.routed_gate),
-            .routed_down      = part_library(plan, materialized, source.moe.routed_down),
+            .router_shared    = part_weight(plan, materialized, shards, byte_plan, source.moe.router,
+                                            TextConfig::experts + 1 + 2 * TextConfig::shared_intermediate,
+                                            TextConfig::hidden, rank),
+            .shared_down      = part_weight(plan, materialized, shards, byte_plan, source.moe.shared_down,
+                                            TextConfig::hidden, TextConfig::shared_intermediate, rank),
+            .routed_gate_up   = part_library(plan, materialized, shards, byte_plan, source.moe.routed_gate,
+                                             rank),
+            .routed_down      = part_library(plan, materialized, shards, byte_plan, source.moe.routed_down,
+                                             rank),
         };
+    }
+
+    return view;
+}
+
+} // namespace
+
+RankViews shard_views(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
+                      const ShardPlanByName& shards, int tp) {
+    const auto byte_plan = shard_byte_plan(plan, shards, tp);
+    RankViews views;
+    for (int rank = 0; rank < tp; ++rank) {
+        auto& view = views.views[static_cast<std::size_t>(rank)];
+        view = build_rank_view(plan, materialized, shards, byte_plan, rank);
+        view.tp = tp;
+    }
+    return views;
+}
+
+LoadedModelData::LoadedModelData(const BindingPlan& plan,
+                                 const artifact::MaterializedArtifact& materialized,
+                                 std::size_t loaded_layers, int tp,
+                                 const std::filesystem::path& artifact_path) {
+    ple_source_ = std::make_unique<PleTableSource>(artifact_path, plan);
+
+    const auto shards = shard_plan_by_name(tp);
+    views_ = shard_views(plan, materialized, shards, tp);
+
+    for (int rank = 0; rank < tp; ++rank) {
+        auto& view = views_.views[static_cast<std::size_t>(rank)];
+        view.loaded_layers = loaded_layers;
+        const BoundParameter& tail_norm = loaded_layers < static_cast<std::size_t>(TextConfig::layers)
+                                              ? plan.layers[loaded_layers].attention_hc.norm
+                                              : plan.final_hc.norm;
+        view.tail_norm = part_tensor(plan, materialized, shards, tail_norm,
+                                     {TextConfig::residual_width / TextConfig::hc_streams,
+                                      TextConfig::hc_streams}, rank);
+        view.ple.controls = ple_source_->controls();
+        view.ple.rows = qwen4_exp::PleRowSource{ple_source_.get(), &fetch_ple_rows,
+                                                 ple_source_->divisors()};
     }
 }
 

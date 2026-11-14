@@ -366,7 +366,7 @@ int main() {
     const artifact::MaterializedArtifact materialized =
         artifact::materialize(reader, binder.finish(), device);
     const std::filesystem::path artifact_path(path);
-    const detail::LoadedModelData data(plan, materialized, kLoadedLayers, artifact_path);
+    const detail::LoadedModelData data(plan, materialized, kLoadedLayers, 1, artifact_path);
 
     const char* long_count_text = std::getenv("NINFER_FLASH_NEXT_LONG_PROMPT");
     if (long_count_text != nullptr) {
@@ -378,7 +378,7 @@ int main() {
         }
         const std::span<const TokenId> prompt{tokens.data(), tokens.size()};
         const TokenId token =
-            run_long_prompt(device, data.view(), prompt, std::getenv("NINFER_FLASH_NEXT_DUMP"));
+            run_long_prompt(device, data.view(0), prompt, std::getenv("NINFER_FLASH_NEXT_DUMP"));
         require(token >= 0 && token < static_cast<TokenId>(detail::TextConfig::vocab),
                 "the long prompt greedy token is outside the vocabulary");
         if (reference.has_value()) {
@@ -394,16 +394,16 @@ int main() {
 
     const auto key_bytes = static_cast<std::uint64_t>(detail::TextConfig::residual_width) *
                            detail::TextConfig::hidden * 2;
-    const auto key_base = static_cast<const std::byte*>(data.view().ple.key.payload);
-    const auto value_base = static_cast<const std::byte*>(data.view().ple.value.payload);
+    const auto key_base = static_cast<const std::byte*>(data.view(0).ple.key.payload);
+    const auto value_base = static_cast<const std::byte*>(data.view(0).ple.value.payload);
     require(value_base - key_base == static_cast<std::ptrdiff_t>(key_bytes),
             "the PLE value view does not start at the value rows");
 
-    check_gdn_slot_mapping(device, data.view());
-    const RunOutcome outcome = run_prompt(device, data.view());
+    check_gdn_slot_mapping(device, data.view(0));
+    const RunOutcome outcome = run_prompt(device, data.view(0));
     require(outcome.token >= 0 && outcome.token < static_cast<TokenId>(detail::TextConfig::vocab),
             "the greedy token is outside the vocabulary");
-    const RunOutcome repeated = run_prompt(device, data.view());
+    const RunOutcome repeated = run_prompt(device, data.view(0));
     require(repeated.token == outcome.token, "the trunk is not deterministic across repeated runs");
 
     require(outcome.gdn_entries == 3, "the GDN state pool does not match the loaded GDN layers");
@@ -422,17 +422,17 @@ int main() {
         }
     }
 
-    ShiftedPleRows shifted{qwen4_exp::PleRowSource{data.view().ple.rows.context,
-                                                   data.view().ple.rows.fetch,
-                                                   data.view().ple.rows.divisors}};
-    auto shifted_view = data.view();
+    ShiftedPleRows shifted{qwen4_exp::PleRowSource{data.view(0).ple.rows.context,
+                                                   data.view(0).ple.rows.fetch,
+                                                   data.view(0).ple.rows.divisors}};
+    auto shifted_view = data.view(0);
     shifted_view.ple.rows.context = &shifted;
     shifted_view.ple.rows.fetch = &fetch_shifted_rows;
     const RunOutcome shifted_outcome = run_prompt(device, shifted_view);
     require(shifted_outcome.token != outcome.token,
             "the PLE row source did not change the sampled token");
 
-    auto zeroed_view = data.view();
+    auto zeroed_view = data.view(0);
     std::uint64_t mixer_bytes = 16;
     {
         const auto encoded = artifact::tensor_encoded_size(

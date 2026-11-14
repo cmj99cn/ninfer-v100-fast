@@ -2,10 +2,12 @@
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
+#include "core/device.h"
 #include "ninfer/ops/ple.h"
 #include "targets/qwen3_8_flash_next/impl/config.h"
 #include "targets/qwen3_8_flash_next/impl/load/geometry.h"
 #include "targets/qwen3_8_flash_next/impl/load/roles.h"
+#include "targets/qwen3_8_flash_next/impl/load/sharding.h"
 #include "targets/qwen3_8_flash_next/impl/variant.h"
 #include <ninfer/targets/qwen4_exp/model_view.h>
 #include <ninfer/targets/qwen3_8_flash_next/package.h>
@@ -15,6 +17,7 @@
 #include <filesystem>
 #include <memory>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -139,6 +142,41 @@ struct BindingPlan {
 
 [[nodiscard]] BindingPlan bind_artifact(artifact::Binder& binder, WeightsProfile profile, int tp);
 
+// The shard map of every text role at one tensor-parallel width, keyed by role name.
+using ShardPlanByName = std::map<std::string, sharding::ShardMapping, std::less<>>;
+
+// What one object's shard holds on each rank: the ranges the role map gives, in the order they
+// are concatenated, as parent-payload plane copies. Every object the plan binds appears once.
+struct ObjectShardPlan {
+    std::string object;
+    sharding::SplitAxis split = sharding::SplitAxis::Output;
+    std::vector<roles::Role> roles;
+    std::array<std::vector<artifact::SliceRange>, kMaximumDevices> ranges;
+    std::array<std::vector<artifact::PlaneCopy>, kMaximumDevices> copies;
+    std::array<std::vector<std::byte>, kMaximumDevices> prefix;
+    std::array<std::uint64_t, kMaximumDevices> encoded_bytes{};
+    std::array<std::uint64_t, kMaximumDevices> scale_plane_offset{};
+    std::array<std::uint64_t, kMaximumDevices> divisor_plane_offset{};
+};
+
+[[nodiscard]] ShardPlanByName shard_plan_by_name(int tp);
+
+[[nodiscard]] std::vector<ObjectShardPlan> shard_byte_plan(const BindingPlan& plan,
+                                                           const ShardPlanByName& shards, int tp);
+
+// The per-object placement the binder resolves from the shard map.
+[[nodiscard]] std::map<std::string, artifact::ShardPlacement> shard_placements(
+    const BindingPlan& plan, const ShardPlanByName& shards, int tp);
+
+// The per-rank weight views. Ranks outside [0, tp) stay empty.
+struct RankViews {
+    std::array<Variant::ModelView, kMaximumDevices> views;
+};
+
+[[nodiscard]] RankViews shard_views(const BindingPlan& plan,
+                                    const artifact::MaterializedArtifact& materialized,
+                                    const ShardPlanByName& shards, int tp);
+
 class PleTableSource {
 public:
     PleTableSource(const std::filesystem::path& path, const BindingPlan& plan);
@@ -163,18 +201,18 @@ void fetch_ple_rows(void* context, const ops::PleRowAddress* addresses, std::siz
 class LoadedModelData {
 public:
     LoadedModelData(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
-                    std::size_t loaded_layers, const std::filesystem::path& artifact_path);
+                    std::size_t loaded_layers, int tp, const std::filesystem::path& artifact_path);
 
     LoadedModelData(const LoadedModelData&)            = delete;
     LoadedModelData& operator=(const LoadedModelData&) = delete;
     LoadedModelData(LoadedModelData&&)                 = default;
     LoadedModelData& operator=(LoadedModelData&&)      = default;
 
-    [[nodiscard]] const Variant::ModelView& view() const noexcept { return model_; }
+    [[nodiscard]] const Variant::ModelView& view(int rank) const noexcept { return views_.views[static_cast<std::size_t>(rank)]; }
 
 private:
     std::unique_ptr<PleTableSource> ple_source_;
-    Variant::ModelView model_;
+    RankViews views_;
 };
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

@@ -27,7 +27,6 @@ void require(bool condition, const std::string& message) {
 const char* axis_name(Axis axis) {
     switch (axis) {
     case Axis::Replicated: return "replicated";
-    case Axis::Host:       return "host";
     case Axis::Vocab:      return "vocab";
     case Axis::Head:       return "head";
     case Axis::Expert:     return "expert";
@@ -45,7 +44,7 @@ struct ExpectedMapping {
 };
 
 constexpr ExpectedMapping kExpectedMappings[] = {
-    {Role::TokenEmbedding,    Axis::Host,       Split::Output, 0,      248320,  1},
+    {Role::TokenEmbedding,    Axis::Replicated, Split::Output, 0,      248320,  1},
     {Role::OutputHead,         Axis::Vocab,      Split::Output, 0,     248320,  1},
     {Role::FinalHcNorm,        Axis::Replicated, Split::Output, 0,     10240,   1},
     {Role::FinalHcDown,        Axis::Replicated, Split::Output, 0,     320,     1},
@@ -134,7 +133,7 @@ void test_every_role_has_a_mapping() {
             std::string(axis_name(mapping.axis)) + "; it maps to " + axis_name(entry.axis));
         require(mapping.split == entry.split,
                 name_of(entry.role) + " splits the wrong stored axis");
-        if (entry.axis == Axis::Replicated || entry.axis == Axis::Host) {
+        if (entry.axis == Axis::Replicated) {
             require(mapping.ranks.empty(),
                     name_of(entry.role) + " is a full copy but names a range");
             continue;
@@ -203,7 +202,7 @@ void test_expert_roles_partition_by_expert_set() {
 
 void test_split_roles_start_on_band_boundaries() {
     for (const auto& entry : kExpectedMappings) {
-        if (entry.axis == Axis::Replicated || entry.axis == Axis::Host) { continue; }
+        if (entry.axis == Axis::Replicated) { continue; }
         const auto mapping = sharding::shard_mapping(entry.role, 2);
         require(entry.begin % kBand == 0, name_of(entry.role) + " starts at " +
             std::to_string(entry.begin) + ", which is not a " + std::to_string(kBand) +
@@ -222,7 +221,7 @@ void test_replicated_set_is_exact() {
         if (sharding::shard_mapping(role, 2).axis == Axis::Replicated) { replicated.insert(role); }
     }
     const std::set<Role> expected_replicated = {
-        Role::FinalHcNorm,        Role::FinalHcDown,       Role::FinalHcUp,
+        Role::TokenEmbedding,     Role::FinalHcNorm,        Role::FinalHcDown,       Role::FinalHcUp,
         Role::AttentionHcNorm,    Role::AttentionHcDown,   Role::AttentionHcInject,
         Role::AttentionHcUp,      Role::MoeHcNorm,         Role::MoeHcDown,
         Role::MoeHcInject,        Role::MoeHcUp,           Role::GdnNorm,
@@ -236,8 +235,6 @@ void test_replicated_set_is_exact() {
         Role::PleConvolution,
     };
     require(replicated == expected_replicated, "the replicated set is not the replicated set");
-    require(sharding::shard_mapping(Role::TokenEmbedding, 2).axis == Axis::Host,
-            "the token embedding is not the host row source");
     require(sharding::shard_mapping(Role::OutputHead, 2).axis == Axis::Vocab,
             "the output head is not split on the vocab axis");
     require(sharding::shard_mapping(Role::MoeRoutedGate, 2).axis == Axis::Expert,
@@ -248,7 +245,7 @@ void test_tp1_yields_the_whole_range() {
     for (const auto& entry : kExpectedMappings) {
         const auto mapping = sharding::shard_mapping(entry.role, 1);
         require(mapping.axis == entry.axis, name_of(entry.role) + " changes axis at tp=1");
-        if (entry.axis == Axis::Replicated || entry.axis == Axis::Host) {
+        if (entry.axis == Axis::Replicated) {
             require(mapping.ranks.empty(), name_of(entry.role) +
                 " is a full copy but names a range at tp=1");
             continue;
@@ -317,7 +314,7 @@ int main() {
         test_tp1_yields_the_whole_range();
         test_illegal_boundary_names_the_role();
         std::cout << "flash-next sharding: all " << roles::kRoleCount << " roles map at tp=2 over "
-                  << "the head, expert and vocab axes, with the host embedding and the replicated "
+                  << "the head, expert and vocab axes, with the replicated embedding and the replicated "
                   << "set\n";
         return 0;
     } catch (const std::exception& error) {
