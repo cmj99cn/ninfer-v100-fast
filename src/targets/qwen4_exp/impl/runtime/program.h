@@ -38,6 +38,8 @@ struct LaneState {
     TextLaneContext context;
     runtime::TransientRegion transient;
     GenerationTimings timings;
+    TokenId last_round_token = 0;
+    bool has_last_round_token = false;
     bool active = false;
 };
 

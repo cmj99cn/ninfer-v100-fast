@@ -826,8 +826,8 @@ mixed decode unit and does not retain lanes across requests. The 262144-token pr
 `--kv-capacity 262144` (the native maximum) and, with `--expert-cache-mib auto`, sizes the resident
 expert cache from the memory left after weights, KV/state and workspace. The 8-token prompt
 `{1024, 7, 98140, 33, 4097, 512, 100, 2048}` produces the same greedy continuation through the
-Engine as through the direct 48-layer trunk: `4818` from prefill, then `24534`, and `128386` on the
-second decode round.
+Engine as through the direct 48-layer trunk. For a four-token request: prefill samples `4818`, the
+first decode round `24534`, the second `128386`, and the third `442`.
 
 ## 11. KV and expert residency geometry
 

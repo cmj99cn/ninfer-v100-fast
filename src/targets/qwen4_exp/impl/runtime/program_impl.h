@@ -104,7 +104,9 @@ std::uint32_t ProgramImplCore::page_groups_for(std::uint32_t tokens) const noexc
 }
 
 void ProgramImplCore::clear_lane(std::uint32_t lane) noexcept {
-    lanes_[lane] = LaneState{};
+    const GenerationTimings timings = lanes_[lane].timings;
+    lanes_[lane]                    = LaneState{};
+    lanes_[lane].timings            = timings;
 }
 
 void ProgramImplCore::prefill_chunk(LaneState& state, std::uint32_t begin, std::uint32_t count) {
@@ -212,8 +214,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_start).count();
 
     LaneState& state = lanes_[lane];
-    state.active    = true;
-    state.transient = std::move(transient);
+    state.timings    = GenerationTimings{};
+    state.active     = true;
+    state.transient  = std::move(transient);
     state.context.prompt_tokens = std::move(tokens);
     state.context.processed_prompt_tokens = chunk;
     state.timings.prefill_seconds += prefill_seconds;
@@ -292,9 +295,12 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
     for (const std::uint32_t lane : lanes) {
         LaneState& state         = lanes_[lane];
         const auto decode_start  = std::chrono::steady_clock::now();
-        round_tokens_.push_back(trunk_->decode(state.context.next_input));
+        const TokenId token      = trunk_->decode(state.context.next_input);
         state.timings.decode_seconds +=
             std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
+        state.last_round_token     = token;
+        state.has_last_round_token = true;
+        round_tokens_.push_back(token);
         round_row_counts_.push_back(1);
     }
 
@@ -344,8 +350,16 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         if (lane >= plan_->max_concurrency) {
             throw std::invalid_argument("qwen4_exp pending batch lane is outside the finalized concurrency");
         }
-        lanes_[lane].context.next_input = accepted_tokens[index];
-        if (terminal[index] || cancelled[index]) { clear_lane(lane); }
+        const bool finished = terminal[index] != 0 || cancelled[index] != 0;
+        if (!finished && accepted_tokens[index] != 0) {
+            LaneState& state = lanes_[lane];
+            if (!state.has_last_round_token) {
+                throw std::logic_error(
+                    "qwen4_exp pending batch has no generated token to continue from");
+            }
+            state.context.next_input = state.last_round_token;
+        }
+        if (finished) { clear_lane(lane); }
     }
 }
 

@@ -28,7 +28,7 @@ constexpr std::uint32_t kKvCapacity = 262144;
 constexpr std::uint32_t kPageTokens = 64;
 
 constexpr std::array<TokenId, 8> kPrompt{1024, 7, 98140, 33, 4097, 512, 100, 2048};
-constexpr std::array<TokenId, 2> kDirectPathTokens{4818, 24534};
+constexpr std::array<TokenId, 4> kDirectPathTokens{4818, 24534, 128386, 442};
 
 void require(bool condition, const std::string& message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -53,7 +53,8 @@ void check_cli_parse() {
             "--expert-cache-mib 1024 did not reach the CLI options");
 }
 
-EngineOptions engine_options(const char* path, std::uint32_t expert_cache_mib) {
+EngineOptions engine_options(const char* path, std::uint32_t expert_cache_mib,
+                             std::uint32_t max_concurrency = 1) {
     EngineOptions options;
     options.artifact_path    = path;
     options.device           = 0;
@@ -61,11 +62,25 @@ EngineOptions engine_options(const char* path, std::uint32_t expert_cache_mib) {
     options.devices          = {0, 1};
     options.max_context      = kKvCapacity;
     options.kv_capacity      = ninfer::KvCapacityPolicy::explicit_capacity(kKvCapacity);
-    options.max_concurrency  = 1;
+    options.max_concurrency  = max_concurrency;
     options.prefill_chunk    = 64;
     options.use_cuda_graph   = false;
     options.expert_cache_mib = expert_cache_mib;
     return options;
+}
+
+void check_concurrency_limit(const char* path) {
+    bool threw = false;
+    std::string message;
+    try {
+        Engine engine(engine_options(path, 0, 2));
+    } catch (const std::invalid_argument& error) {
+        threw   = true;
+        message = error.what();
+    }
+    require(threw, "a request concurrency above one was accepted");
+    require(message.find("one active request") != std::string::npos,
+            "the concurrency rejection does not name the single-request contract: " + message);
 }
 
 void check_over_budget_cache(const char* path) {
@@ -93,13 +108,20 @@ void check_engine_route(const char* path) {
 
     require(result.generated_token_ids.size() == kDirectPathTokens.size(),
             "the Engine returned an unexpected number of tokens");
-    require(result.generated_token_ids[0] == kDirectPathTokens[0] &&
-                result.generated_token_ids[1] == kDirectPathTokens[1],
-            "the Engine tokens do not match the direct 48-layer path");
+    for (std::size_t index = 0; index < kDirectPathTokens.size(); ++index) {
+        require(result.generated_token_ids[index] == kDirectPathTokens[index],
+                "the Engine token at position " + std::to_string(index) + " is " +
+                    std::to_string(result.generated_token_ids[index]) + " instead of " +
+                    std::to_string(kDirectPathTokens[index]));
+    }
+    require(result.timings.prefill_seconds > 0.0,
+            "the Engine did not report a positive prefill duration");
+    require(result.timings.decode_seconds > 0.0,
+            "the Engine did not report a positive decode duration");
 
     const ninfer::MetricsSnapshot metrics = engine.metrics();
-    require(metrics.scheduler.committed_decode_tokens == 1,
-            "the Engine did not report exactly one committed decode token");
+    require(metrics.scheduler.committed_decode_tokens == kDirectPathTokens.size() - 1,
+            "the Engine did not report one committed decode token per decode round");
 
     const MemorySummary memory = engine.memory_summary();
     const std::uint32_t pages   = kKvCapacity / kPageTokens + 1;
@@ -114,9 +136,11 @@ void check_engine_route(const char* path) {
     require(memory.expert_cache_bytes != 0,
             "the Engine reports no resident expert cache");
 
-    std::cout << "flash-next engine route: tokens " << result.generated_token_ids[0] << ' '
-              << result.generated_token_ids[1] << " kv-pages " << memory.kv_capacity_page_groups
-              << " expert-cache " << memory.expert_cache_bytes << '\n';
+    std::cout << "flash-next engine route: tokens";
+    for (const TokenId token : result.generated_token_ids) { std::cout << ' ' << token; }
+    std::cout << " kv-pages " << memory.kv_capacity_page_groups << " expert-cache "
+              << memory.expert_cache_bytes << " prefill-s " << result.timings.prefill_seconds
+              << " decode-s " << result.timings.decode_seconds << '\n';
 }
 
 } // namespace
@@ -141,6 +165,7 @@ int main() {
     }
 
     try {
+        check_concurrency_limit(path);
         check_engine_route(path);
         check_over_budget_cache(path);
     } catch (const std::exception& error) {

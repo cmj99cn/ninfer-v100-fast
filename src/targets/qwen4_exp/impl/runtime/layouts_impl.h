@@ -27,8 +27,9 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     if (options.tp < 1 || options.tp > static_cast<int>(kMaximumDevices)) {
         throw std::invalid_argument("qwen4_exp family requires tensor-parallel width in [1, 4]");
     }
-    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("qwen4_exp family requires concurrency in [1, 8]");
+    if (options.max_concurrency != 1) {
+        throw std::invalid_argument(
+            "qwen4_exp family serves one active request; EngineOptions.max_concurrency must be 1");
     }
 
     auto planner = std::make_unique<qwen4_exp::detail::SequencePlannerImpl<Variant>>();
