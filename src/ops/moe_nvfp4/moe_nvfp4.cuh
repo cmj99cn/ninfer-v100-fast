@@ -7,6 +7,7 @@
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -19,6 +20,33 @@ inline constexpr int kMoeTopK         = 10;
 inline constexpr int kMoeHidden       = 2560;
 inline constexpr int kMoeIntermediate = 640;
 
+template <class A>
+struct MoeAct;
+
+template <>
+struct MoeAct<__nv_bfloat16> {
+    __device__ __forceinline__ static float to_float(__nv_bfloat16 value) {
+        return __bfloat162float(value);
+    }
+    __device__ __forceinline__ static __nv_bfloat16 from_float(float value) {
+        return __float2bfloat16_rn(value);
+    }
+    __device__ __forceinline__ static float2 pair_to_float2(std::uint32_t bits) {
+        return bf16x2_bits_to_float2(bits);
+    }
+};
+
+template <>
+struct MoeAct<__half> {
+    __device__ __forceinline__ static float to_float(__half value) { return __half2float(value); }
+    __device__ __forceinline__ static __half from_float(float value) {
+        return __float2half_rn(value);
+    }
+    __device__ __forceinline__ static float2 pair_to_float2(std::uint32_t bits) {
+        return __half22float2(half2_from_bits(bits));
+    }
+};
+
 __device__ __forceinline__ std::size_t batched_nvfp4_scale_offset(std::int32_t row,
                                                                    std::int32_t group,
                                                                    std::int32_t columns) {
@@ -28,11 +56,12 @@ __device__ __forceinline__ std::size_t batched_nvfp4_scale_offset(std::int32_t r
            static_cast<std::size_t>((row % 128) / 32) * 4U + static_cast<std::size_t>(group % 4);
 }
 
+template <class A>
 __device__ __forceinline__ float batched_nvfp4_warp_dot(const std::uint8_t* codes_row,
                                                          const std::uint8_t* matrix_scales,
                                                          float inverse_divisor, std::int32_t row,
                                                          std::int32_t groups,
-                                                         const __nv_bfloat16* activation) {
+                                                         const A* activation) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
     float accumulator = 0.0F;
     for (int group = lane; group < groups; group += 32) {
@@ -49,7 +78,7 @@ __device__ __forceinline__ float batched_nvfp4_warp_dot(const std::uint8_t* code
         for (int byte = 0; byte < 8; ++byte) {
             const float2 code =
                 decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(codes_word >> (8 * byte)));
-            const float2 value = bf16x2_bits_to_float2(words[byte]);
+            const float2 value = MoeAct<A>::pair_to_float2(words[byte]);
             accumulator = fmaf(code.x * scale, value.x, accumulator);
             accumulator = fmaf(code.y * scale, value.y, accumulator);
         }
@@ -90,6 +119,20 @@ __device__ __forceinline__ float bf16_warp_dot(const std::uint32_t* weight_words
     for (int pair = lane; pair < pairs; pair += 32) {
         const float2 weight = bf16x2_bits_to_float2(weight_words[pair]);
         const float2 value  = bf16x2_bits_to_float2(activation_words[pair]);
+        accumulator = fmaf(weight.x, value.x, accumulator);
+        accumulator = fmaf(weight.y, value.y, accumulator);
+    }
+    return warp_reduce_sum(accumulator);
+}
+
+__device__ __forceinline__ float bf16_f16_warp_dot(const std::uint32_t* weight_words,
+                                                    const std::uint32_t* activation_words,
+                                                    std::int32_t pairs) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    float accumulator = 0.0F;
+    for (int pair = lane; pair < pairs; pair += 32) {
+        const float2 weight = bf16x2_bits_to_float2(weight_words[pair]);
+        const float2 value  = MoeAct<__half>::pair_to_float2(activation_words[pair]);
         accumulator = fmaf(weight.x, value.x, accumulator);
         accumulator = fmaf(weight.y, value.y, accumulator);
     }

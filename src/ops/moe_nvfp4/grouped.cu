@@ -5,18 +5,21 @@
 
 #include <cuda_bf16.h>
 
+#include <type_traits>
+
 #include <cstdint>
 
 namespace ninfer::ops::detail {
 namespace {
 
+template <class A>
 __global__ __launch_bounds__(256) void moe_nvfp4_grouped_kernel(
-    const __nv_bfloat16* __restrict__ x,
+    const A* __restrict__ x,
     const std::uint8_t* __restrict__ gate_up_codes, const std::uint8_t* __restrict__ gate_up_scales,
     const float* __restrict__ gate_up_divisors, const std::uint8_t* __restrict__ down_codes,
     const std::uint8_t* __restrict__ down_scales, const float* __restrict__ down_divisors,
     const std::int32_t* __restrict__ ids, const float* __restrict__ coefficients,
-    std::int32_t expert_begin, std::int32_t experts, __nv_bfloat16* __restrict__ destination) {
+    std::int32_t expert_begin, std::int32_t experts, A* __restrict__ destination) {
     const int token = static_cast<int>(blockIdx.x);
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
     const int lane  = static_cast<int>(threadIdx.x) & 31;
@@ -27,7 +30,7 @@ __global__ __launch_bounds__(256) void moe_nvfp4_grouped_kernel(
 
     for (int i = static_cast<int>(threadIdx.x); i < kMoeHidden; i += 256) accumulator[i] = 0.0F;
 
-    const __nv_bfloat16* x_column = x + static_cast<std::int64_t>(token) * kMoeHidden;
+    const A* x_column = x + static_cast<std::int64_t>(token) * kMoeHidden;
 
     for (int slot = 0; slot < kMoeTopK; ++slot) {
         const std::int32_t global     = ids[slot + kMoeTopK * token];
@@ -41,8 +44,8 @@ __global__ __launch_bounds__(256) void moe_nvfp4_grouped_kernel(
         const float inverse_divisor   = 1.0F / gate_up_divisors[expert];
 
         for (int row = warp; row < kMoeIntermediate * 2; row += 8) {
-            const float value = batched_nvfp4_warp_dot(codes, scales, inverse_divisor, row,
-                                                        kMoeHidden / 16, x_column);
+            const float value = batched_nvfp4_warp_dot<A>(codes, scales, inverse_divisor, row,
+                                                          kMoeHidden / 16, x_column);
             if (lane == 0) gate_up[row] = value;
         }
         __syncthreads();
@@ -65,10 +68,10 @@ __global__ __launch_bounds__(256) void moe_nvfp4_grouped_kernel(
         __syncthreads();
     }
 
-    __nv_bfloat16* destination_column = destination + static_cast<std::int64_t>(token) * kMoeHidden;
+    A* destination_column = destination + static_cast<std::int64_t>(token) * kMoeHidden;
     for (int i = static_cast<int>(threadIdx.x); i < kMoeHidden; i += 256) {
-        destination_column[i] = __float2bfloat16_rn(
-            accumulator[i] + __bfloat162float(destination_column[i]));
+        destination_column[i] = MoeAct<A>::from_float(
+            accumulator[i] + MoeAct<A>::to_float(destination_column[i]));
     }
 }
 
@@ -78,10 +81,18 @@ void moe_nvfp4_grouped_launch(const Tensor& x, MoeNvfp4BatchedPlanes gate_up,
                               MoeNvfp4BatchedPlanes down, const MoeNvfp4RouteOutputs& route,
                               std::int32_t expert_begin, std::int32_t experts,
                               Tensor& destination, cudaStream_t stream) {
-    moe_nvfp4_grouped_kernel<<<x.ne[1], 256, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), gate_up.codes, gate_up.scales, gate_up.divisors,
-        down.codes, down.scales, down.divisors, route.ids, route.coefficients, expert_begin,
-        experts, static_cast<__nv_bfloat16*>(destination.data));
+    if (x.dtype == DType::FP16) {
+        moe_nvfp4_grouped_kernel<__half><<<x.ne[1], 256, 0, stream>>>(
+            static_cast<const __half*>(x.data), gate_up.codes, gate_up.scales, gate_up.divisors,
+            down.codes, down.scales, down.divisors, route.ids, route.coefficients, expert_begin,
+            experts, static_cast<__half*>(destination.data));
+    } else {
+        moe_nvfp4_grouped_kernel<__nv_bfloat16><<<x.ne[1], 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), gate_up.codes, gate_up.scales,
+            gate_up.divisors, down.codes, down.scales, down.divisors, route.ids,
+            route.coefficients, expert_begin, experts,
+            static_cast<__nv_bfloat16*>(destination.data));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

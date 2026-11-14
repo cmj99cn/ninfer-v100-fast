@@ -47,7 +47,7 @@ struct MoeNvfp4Weights {
  *   K  selected experts per token, 10
  *   H  hidden width, 2560
  *   T  token extent, positive
- *   x            BF16 [H, T] contiguous, dimension 0 fastest
+ *   x            BF16 or FP16 [H, T] contiguous, dimension 0 fastest
  *   expert_ids   I32  [K, T] contiguous, dimension 0 fastest
  *   coefficients FP32 [K, T] contiguous, dimension 0 fastest
  *   shared_gate  FP32 [T]    contiguous
@@ -57,7 +57,7 @@ struct MoeNvfp4Weights {
  *   The exact registered geometry above. 16-byte aligned bases. Every positive T.
  *
  * Numeric:
- *   The oracle evaluates the complete formula in FP64 from the represented BF16 inputs.
+ *   The oracle evaluates the complete formula in FP64 from the represented activation.
  *   Scores, ranking, and the softmax accumulator are private execution choices; the published
  *   coefficients are FP32 outputs and are compared against the oracle. The tie rule is exact
  *   and observable.
@@ -82,7 +82,7 @@ void moe_nvfp4_route(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& ex
  *
  * Math / indexing:
  *   For a token column t with route ids[j, t] and coefficients[j, t] as defined by the routing
- *   control above, and for the represented BF16 column x[:, t]:
+ *   control above, and for the represented activation column x[:, t]:
  *
  *   F_e(v) = down_e * (SiLU(gate_e * v) * (up_e * v))
  *
@@ -97,8 +97,8 @@ void moe_nvfp4_route(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& ex
  *   matrix's scale plane and FP32 divisor. No selected-weight gather or repack occurs.
  *
  * Logical shapes:
- *   x           BF16 [H, T] contiguous, dimension 0 fastest
- *   destination BF16 [H, T] contiguous, dimension 0 fastest
+ *   x           BF16 or FP16 [H, T] contiguous, dimension 0 fastest
+ *   destination BF16 or FP16 [H, T] contiguous, dimension 0 fastest, matching x
  *   Element (d, t) is stored at d + H * t. The weights carry the geometry declared in
  *   MoeNvfp4Weights.
  *
@@ -111,8 +111,9 @@ void moe_nvfp4_route(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& ex
  *   16-element group, and the FP32 weight divisor of that matrix. A mispaired scale plane or
  *   divisor is a correctness failure even when the totals look plausible. Scores, route
  *   weights, activation representation, workspace representation, and reduction association
- *   are private execution choices. destination is a BF16 output, so its own storage rounding
- *   belongs to the Op's numerical criterion and not to the oracle.
+ *   are private execution choices. destination is a BF16 or FP16 output, so its own storage
+ *   rounding belongs to the Op's numerical criterion and not to the oracle; the routed and shared
+ *   dot products accumulate in FP32 and only the final destination value is rounded.
  *
  * Effects:
  *   destination is the accumulation target: its incoming value is preserved and the routed and

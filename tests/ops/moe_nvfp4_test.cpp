@@ -45,6 +45,9 @@ constexpr double kCoefficientSumTolerance =
 constexpr double kBf16UnitRoundoff = 1.0 / 256.0;
 constexpr ReductionCriterion kDestinationCriterion{kBf16UnitRoundoff, kBf16UnitRoundoff,
                                                    2.0 * kBf16UnitRoundoff};
+constexpr double kF16UnitRoundoff = 1.0 / 1024.0;
+constexpr ReductionCriterion kF16DestinationCriterion{kF16UnitRoundoff, kF16UnitRoundoff,
+                                                      2.0 * kF16UnitRoundoff};
 
 std::size_t align_up_256(std::size_t value) { return ((value + 255U) / 256U) * 256U; }
 
@@ -151,7 +154,8 @@ int verify_scale_word_domain() {
 }
 
 BatchedFixture make_batched(std::int32_t rows, std::int32_t columns, std::uint32_t seed,
-                            const std::vector<std::int32_t>& active_experts) {
+                            const std::vector<std::int32_t>& active_experts,
+                            float divisor_scale = 1.0F) {
     BatchedFixture fixture;
     fixture.rows      = rows;
     fixture.columns   = columns;
@@ -165,7 +169,7 @@ BatchedFixture make_batched(std::int32_t rows, std::int32_t columns, std::uint32
     for (const std::int32_t expert : active_experts) { fixture.active[expert] = true; }
 
     for (std::int32_t matrix = 0; matrix < kExperts; ++matrix) {
-        const float divisor = 1.0F + static_cast<float>(matrix % 7) * 0.125F;
+        const float divisor = (1.0F + static_cast<float>(matrix % 7) * 0.125F) * divisor_scale;
         fixture.divisors[matrix] = divisor;
         quantized_weight::detail::store_u32_le(fixture.payload,
                                     fixture.divisor_offset + static_cast<std::size_t>(matrix) * 4U,
@@ -756,6 +760,135 @@ int main() {
     failures += coefficients_buffer.verify_guards("moe_nvfp4 coefficients guard");
     failures += shared_gate_buffer.verify_guards("moe_nvfp4 shared gate guard");
     failures += destination_buffer.verify_guards("moe_nvfp4 destination guard");
+
+    constexpr float kF16ExpertDivisorScale = 4096.0F;
+    BatchedFixture gate_up_f16 =
+        make_batched(kGateUpRows, kHidden, 0x9abcU, active, kF16ExpertDivisorScale);
+    BatchedFixture down_f16 =
+        make_batched(kDownRows, kIntermediate, 0xdef0U, active, kF16ExpertDivisorScale);
+    DeviceBuffer device_gate_up_f16 = to_device(gate_up_f16.payload);
+    DeviceBuffer device_down_f16    = to_device(down_f16.payload);
+
+    MoeNvfp4Weights weights_f16;
+    weights_f16.router_shared  = weights.router_shared;
+    weights_f16.shared_down    = weights.shared_down;
+    weights_f16.routed_gate_up = gate_up_f16.view(device_gate_up_f16.p);
+    weights_f16.routed_down    = down_f16.view(device_down_f16.p);
+
+    std::vector<float> activation_f16(kTokens * kHidden);
+    std::vector<std::uint16_t> activation_f16_bits(kTokens * kHidden);
+    for (std::size_t t = 0; t < kTokens; ++t) {
+        for (std::int32_t c = 0; c < kHidden; ++c) {
+            const std::uint16_t bits = f32_to_f16(inputs.activation[t][static_cast<std::size_t>(c)]);
+            activation_f16_bits[t * kHidden + static_cast<std::size_t>(c)] = bits;
+            activation_f16[t * kHidden + static_cast<std::size_t>(c)] = f16_to_f32(bits);
+        }
+    }
+    std::vector<std::uint16_t> residual_f16_bits(kTokens * kHidden);
+    for (std::size_t i = 0; i < residual_f16_bits.size(); ++i) {
+        residual_f16_bits[i] = f32_to_f16(bf16_to_f32(residual_words[i]));
+    }
+
+    const DeviceBuffer x_f16 = to_device(activation_f16_bits);
+    Tensor x16{x_f16.p, DType::FP16, {kHidden, static_cast<std::int32_t>(kTokens)}};
+
+    GuardedDeviceBuffer ids_f16(kTokens * kTopK * sizeof(std::uint32_t));
+    GuardedDeviceBuffer coefficients_f16(kTokens * kTopK * sizeof(float));
+    GuardedDeviceBuffer shared_gate_f16(kTokens * sizeof(float));
+    Tensor ids16{ids_f16.data(), DType::I32, {kTopK, static_cast<std::int32_t>(kTokens)}};
+    Tensor coefficients16{coefficients_f16.data(), DType::FP32,
+                          {kTopK, static_cast<std::int32_t>(kTokens)}};
+    Tensor shared_gate16{shared_gate_f16.data(), DType::FP32,
+                         {static_cast<std::int32_t>(kTokens)}};
+    ops::moe_nvfp4_route(x16, weights_f16, ids16, coefficients16, shared_gate16, 0);
+
+    GuardedDeviceBuffer destination_f16(kTokens * kHidden * sizeof(std::uint16_t));
+    destination_f16.copy_from_host(residual_f16_bits.data(),
+                                   kTokens * kHidden * sizeof(std::uint16_t));
+    Tensor destination16{destination_f16.data(), DType::FP16,
+                         {kHidden, static_cast<std::int32_t>(kTokens)}};
+    WorkspaceArena workspace_f16(capacity);
+    ops::moe_routed_nvfp4(x16, weights_f16, destination16, workspace_f16, 0);
+    cuda_synchronize();
+
+    const std::vector<std::int32_t> got_ids_f16 =
+        from_device<std::int32_t>(ids_f16.data(), kTokens * kTopK);
+    const std::vector<double> got_coefficients_f16 =
+        read_f32(coefficients_f16.data(), kTokens * kTopK);
+    const std::vector<double> got_gate_f16 = read_f32(shared_gate_f16.data(), kTokens);
+    const std::vector<double> got_destination_f16 =
+        from_device_f16(destination_f16.data(), kTokens * kHidden);
+
+    std::vector<double> expected_destination_f16(kTokens * kHidden, 0.0);
+    bool routed_effect_f16 = false;
+    for (std::size_t t = 0; t < kTokens; ++t) {
+        std::vector<float> activation(activation_f16.begin() + static_cast<std::ptrdiff_t>(t * kHidden),
+                                      activation_f16.begin() + static_cast<std::ptrdiff_t>((t + 1) * kHidden));
+        const RouteOracle oracle = route_oracle(inputs.parent, activation);
+        for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+            if (got_ids_f16[t * kTopK + static_cast<std::size_t>(rank)] !=
+                oracle.ids[static_cast<std::size_t>(rank)]) {
+                std::cerr << "moe_nvfp4 f16 routing mismatch at token " << t << " rank " << rank << "\n";
+                ++failures;
+            }
+        }
+        for (std::size_t i = 0; i < kHidden; ++i) {
+            expected_destination_f16[t * kHidden + i] =
+                f16_to_f32(residual_f16_bits[t * kHidden + i]);
+        }
+        for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+            const std::int32_t expert = oracle.ids[static_cast<std::size_t>(rank)];
+            const std::vector<double> contribution =
+                expert_contribution(gate_up_f16, down_f16, expert, activation,
+                                    oracle.coefficients[static_cast<std::size_t>(rank)]);
+            for (std::size_t i = 0; i < kHidden; ++i) {
+                expected_destination_f16[t * kHidden + i] += contribution[i];
+            }
+        }
+        const std::vector<double> shared =
+            shared_contribution(inputs.parent, inputs.shared_down, activation, oracle.shared_gate);
+        for (std::size_t i = 0; i < kHidden; ++i) {
+            expected_destination_f16[t * kHidden + i] += shared[i];
+            if (std::abs(expected_destination_f16[t * kHidden + i] -
+                         f16_to_f32(residual_f16_bits[t * kHidden + i])) > 1.0e-3) {
+                routed_effect_f16 = true;
+            }
+        }
+        failures += verify_pointwise("moe_nvfp4 f16 token " + std::to_string(t) + " coefficients",
+                                     std::vector<double>(got_coefficients_f16.begin() +
+                                                             static_cast<std::ptrdiff_t>(t * kTopK),
+                                                         got_coefficients_f16.begin() +
+                                                             static_cast<std::ptrdiff_t>((t + 1) * kTopK)),
+                                     std::vector<double>(oracle.coefficients.begin(),
+                                                         oracle.coefficients.end()),
+                                     kRouteCoefficientCriterion);
+        failures += verify_pointwise("moe_nvfp4 f16 token " + std::to_string(t) + " shared gate",
+                                     std::vector<double>{got_gate_f16[t]},
+                                     std::vector<double>{oracle.shared_gate},
+                                     kRouteCoefficientCriterion);
+    }
+    if (!routed_effect_f16) {
+        std::cerr << "moe_nvfp4 f16 destination: the routed experts contribute nothing\n";
+        ++failures;
+    }
+    for (const double value : expected_destination_f16) {
+        if (!std::isfinite(value) || std::abs(value) > 65504.0) {
+            std::cerr << "moe_nvfp4 f16 destination: the fixture is not FP16-representable\n";
+            ++failures;
+            break;
+        }
+    }
+    failures += verify_reduction("moe_nvfp4 f16 destination", got_destination_f16,
+                                 expected_destination_f16, kF16DestinationCriterion);
+    failures += ids_f16.verify_guards("moe_nvfp4 f16 ids guard");
+    failures += coefficients_f16.verify_guards("moe_nvfp4 f16 coefficients guard");
+    failures += shared_gate_f16.verify_guards("moe_nvfp4 f16 shared gate guard");
+    failures += destination_f16.verify_guards("moe_nvfp4 f16 destination guard");
+    if (workspace_f16.used() > capacity) {
+        std::cerr << "moe_nvfp4 f16 workspace: used " << workspace_f16.used()
+                  << " exceeds the reported capacity " << capacity << "\n";
+        ++failures;
+    }
 
     const std::int32_t local_begin = 256;
     const std::int32_t local_count = 256;

@@ -52,13 +52,25 @@ void require_disjoint(const std::vector<AddressRange>& ranges) {
     }
 }
 
+bool is_activation(DType dtype) noexcept {
+    return dtype == DType::BF16 || dtype == DType::FP16;
+}
+
 std::int32_t require_tokens(const Tensor& tensor, const char* name) {
-    if (tensor.dtype != DType::BF16 || tensor.ne[0] != kHidden || tensor.ne[1] < 1 ||
+    if (!is_activation(tensor.dtype) || tensor.ne[0] != kHidden || tensor.ne[1] < 1 ||
         tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
         tensor.data == nullptr || !aligned_to(tensor.data, 16)) {
         throw std::invalid_argument(std::string("moe_nvfp4: invalid ") + name);
     }
     return tensor.ne[1];
+}
+
+void require_destination(const Tensor& tensor, DType activation, std::int32_t tokens) {
+    if (tensor.dtype != activation || tensor.ne[0] != kHidden || tensor.ne[1] != tokens ||
+        tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
+        tensor.data == nullptr || !aligned_to(tensor.data, 16)) {
+        throw std::invalid_argument("moe_nvfp4: invalid destination");
+    }
 }
 
 void require_output(const Tensor& tensor, DType dtype, std::int32_t n, std::int32_t tokens,
@@ -228,9 +240,7 @@ void moe_nvfp4_route(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& ex
 void moe_routed_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& destination,
                       WorkspaceArena& workspace, cudaStream_t stream) {
     const std::int32_t tokens = require_tokens(x, "x");
-    if (require_tokens(destination, "destination") != tokens) {
-        throw std::invalid_argument("moe_nvfp4: x and destination token counts must match");
-    }
+    require_destination(destination, x.dtype, tokens);
 
     const std::size_t required = route_workspace_bytes(tokens);
     if (workspace.base() == nullptr || workspace.capacity() < required ||
@@ -263,9 +273,7 @@ void moe_routed_nvfp4_partial(const Tensor& x, const MoeNvfp4Weights& weights,
                               const MoeNvfp4RouteView& route, Tensor& destination,
                               cudaStream_t stream) {
     const std::int32_t tokens = require_tokens(x, "x");
-    if (require_tokens(destination, "destination") != tokens) {
-        throw std::invalid_argument("moe_nvfp4: x and destination token counts must match");
-    }
+    require_destination(destination, x.dtype, tokens);
 
     std::vector<AddressRange> ranges;
     ranges.reserve(12);
@@ -284,9 +292,7 @@ void moe_routed_nvfp4_partial(const Tensor& x, const MoeNvfp4Weights& weights,
 void moe_shared_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights,
                       const MoeNvfp4RouteView& route, Tensor& destination, cudaStream_t stream) {
     const std::int32_t tokens = require_tokens(x, "x");
-    if (require_tokens(destination, "destination") != tokens) {
-        throw std::invalid_argument("moe_nvfp4: x and destination token counts must match");
-    }
+    require_destination(destination, x.dtype, tokens);
 
     std::vector<AddressRange> ranges;
     ranges.reserve(12);
