@@ -680,6 +680,22 @@ artifact::SliceRange role_range(const ShardPlanByName& shards, roles::Role role,
     return {begin, count};
 }
 
+const RoleBlock& role_block(const ObjectShardPlan& entry, roles::Role role, int rank) {
+    for (const auto& block : entry.blocks[static_cast<std::size_t>(rank)]) {
+        if (block.role == role) { return block; }
+    }
+    throw std::runtime_error("the shard byte plan has no role block for " +
+                             std::string(roles::role_name(role)));
+}
+
+std::uint64_t block_bytes(const ShardPlanByName& shards, const ObjectShardPlan& entry, roles::Role role,
+                          int rank) {
+    const auto geometry = role_geometry(role);
+    const auto own = role_range(shards, role, entry.split, rank);
+    return artifact::tensor_encoded_size(geometry.layout, geometry.format,
+                                         narrowed_object_shape(geometry.object_shape(), entry.split, own.count));
+}
+
 std::int64_t rank_extent(const ShardPlanByName& shards, roles::Role role, int rank) {
     const auto& mapping = shard_of(shards, roles::role_name(role));
     if (mapping.ranks.empty()) { return -1; }
@@ -699,6 +715,9 @@ std::uint64_t block_offset(const ShardPlanByName& shards, const ObjectShardPlan&
                            roles::Role role, int rank) {
     const std::vector<artifact::SliceRange> ranges{role_range(shards, role, entry.split, rank)};
     const auto geometry = role_geometry(role);
+    const auto axis = entry.split == sharding::SplitAxis::Input ? geometry.object_shape()[1]
+                                                                : geometry.object_shape()[0];
+    if (ranges.size() == 1 && ranges.front().begin == 0 && ranges.front().count == axis) { return 0; }
     const auto own = entry.split == sharding::SplitAxis::Input
         ? artifact::tensor_column_slice(geometry.layout, geometry.format, geometry.object_shape(), ranges)
         : artifact::tensor_row_slice(geometry.layout, geometry.format, geometry.object_shape(), ranges);
@@ -733,13 +752,16 @@ std::vector<ObjectShardPlan> shard_byte_plan(const BindingPlan& plan, const Shar
     std::vector<ObjectShardPlan> byte_plan;
     byte_plan.reserve(plan.objects.size());
     for (const auto& object : plan.objects) {
-        if (object.shape.empty()) { continue; }
         const auto owner = owners.find(object.name);
         const std::vector<const BoundParameter*> none;
         const auto& bound = owner == owners.end() ? none : owner->second;
         ObjectShardPlan entry;
         entry.object = object.name;
-        for (const auto* parameter : bound) { entry.roles.push_back(parameter->role); }
+        for (const auto* parameter : bound) {
+            if (std::find(entry.roles.begin(), entry.roles.end(), parameter->role) == entry.roles.end()) {
+                entry.roles.push_back(parameter->role);
+            }
+        }
         entry.split = bound.empty() ? sharding::SplitAxis::Output
                                     : shard_of(shards, roles::role_name(entry.roles.front())).split;
 
@@ -780,6 +802,14 @@ std::vector<ObjectShardPlan> shard_byte_plan(const BindingPlan& plan, const Shar
                 entry.prefix[static_cast<std::size_t>(rank)] = slice.prefix;
             }
 
+            for (const auto role : entry.roles) {
+                RoleBlock block;
+                block.role   = role;
+                block.offset = block_offset(shards, entry, role, rank);
+                block.bytes  = block_bytes(shards, entry, role, rank);
+                entry.blocks[static_cast<std::size_t>(rank)].push_back(block);
+            }
+
             if (object.layout == StorageLayout::BatchedBlockScaleK16M128x4V1) {
                 const auto geometry = artifact::batched_block_scale_geometry(object.format, shape);
                 entry.scale_plane_offset[static_cast<std::size_t>(rank)] = geometry.scale_plane_offset;
@@ -807,12 +837,17 @@ std::map<std::string, artifact::ShardPlacement> shard_placements(const BindingPl
             placements.emplace(entry.object, placement);
             continue;
         }
-        const auto& mapping = shard_of(shards, roles::role_name(entry.roles.front()));
+        bool split = false;
+        for (const auto role : entry.roles) {
+            if (shard_of(shards, roles::role_name(role)).axis != sharding::ShardAxis::Replicated) {
+                split = true;
+            }
+        }
         artifact::ShardPlacement placement;
-        if (mapping.axis == sharding::ShardAxis::Replicated) {
+        if (!split) {
             placement.axis = artifact::ShardAxis::Replicated;
         } else {
-            placement.axis = mapping.split == sharding::SplitAxis::Input
+            placement.axis = entry.split == sharding::SplitAxis::Input
                 ? artifact::ShardAxis::Columns
                 : artifact::ShardAxis::Rows;
             for (int rank = 0; rank < tp; ++rank) {
@@ -854,14 +889,12 @@ Weight part_weight(const BindingPlan& plan, const artifact::MaterializedArtifact
 
     Weight weight = artifact::materialized_weight(materialized, handle, geometry.format,
                                                   entry_rows, entry_columns, rank);
-    const auto offset = block_offset(shards, entry, parameter.role, rank);
-    if (offset == 0) { return weight; }
-    const auto shape = narrowed_object_shape(geometry.object_shape(), mapping.split,
-                                            static_cast<std::uint64_t>(extent));
-    const auto* base = static_cast<const std::byte*>(weight.payload) + offset;
+    const auto& block = role_block(entry, parameter.role, rank);
+    if (block.offset == 0) { return weight; }
+    const auto* base = static_cast<const std::byte*>(weight.payload) + block.offset;
     weight.payload = base;
     weight.qdata   = base;
-    weight.payload_bytes = artifact::tensor_encoded_size(geometry.layout, geometry.format, shape);
+    weight.payload_bytes = block.bytes;
     return weight;
 }
 

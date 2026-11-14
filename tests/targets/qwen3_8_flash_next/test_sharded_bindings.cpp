@@ -133,9 +133,31 @@ std::uint64_t word_bytes(NumericFormat format) {
     }
 }
 
+std::uint64_t oracle_bytes(StorageLayout layout, NumericFormat format,
+                           const std::vector<std::uint64_t>& shape) {
+    if (shape.size() == 1) { return shape[0] * word_bytes(format); }
+    if (layout == StorageLayout::ContiguousLeV1) { return shape[0] * shape[1] * word_bytes(format); }
+    if (layout == StorageLayout::RowSplitK128V1) {
+        const auto groups = align_up(shape[1], kKAlign) / kGroup;
+        return align_up(shape[0] * groups * kGroup, kAlign) + shape[0] * groups * 2;
+    }
+    if (layout == StorageLayout::BatchedBlockScaleK16M128x4V1) {
+        const auto code   = shape[1] * shape[2] / 2;
+        const auto scale  = shape[1] * shape[2] / 16;
+        return align_up(shape[0] * code, kAlign) + shape[0] * scale + shape[0] * 4;
+    }
+    if (layout == StorageLayout::RowPagedG16x4KV1) {
+        const auto rows_per_page = 4096 / (shape[1] / 2 + shape[1] / 16);
+        const auto pages = (shape[0] + rows_per_page - 1) / rows_per_page;
+        return pages * 4096 + 4;
+    }
+    throw std::runtime_error("the oracle does not cover this layout");
+}
+
 std::vector<std::uint64_t> narrowed_shape(const RoleGeometry& geometry, shard::SplitAxis split,
                                           std::uint64_t selected) {
     std::vector<std::uint64_t> shape(geometry.object_shape().begin(), geometry.object_shape().end());
+    if (shape.size() == 1) { shape[0] = selected; return shape; }
     if (split == shard::SplitAxis::Input) { shape[1] = selected; } else { shape[0] = selected; }
     return shape;
 }
@@ -147,7 +169,7 @@ Copies expected_copies(const RoleGeometry& geometry, shard::SplitAxis split,
                                                   geometry.object_shape().end());
     Copies out;
     if (ranges.empty()) {
-        out.push_back({0, 0, artifact::tensor_encoded_size(geometry.layout, geometry.format, shape)});
+        out.push_back({0, 0, oracle_bytes(geometry.layout, geometry.format, shape)});
         return out;
     }
     const std::uint64_t selected = total(ranges);
@@ -156,7 +178,7 @@ Copies expected_copies(const RoleGeometry& geometry, shard::SplitAxis split,
     // to re-derive, whatever the layout.
     const auto extent = split == shard::SplitAxis::Input ? shape[1] : shape[0];
     if (ranges.size() == 1 && ranges.front().begin == 0 && ranges.front().count == extent) {
-        out.push_back({0, 0, artifact::tensor_encoded_size(geometry.layout, geometry.format, shape)});
+        out.push_back({0, 0, oracle_bytes(geometry.layout, geometry.format, shape)});
         return out;
     }
 
@@ -282,6 +304,80 @@ struct BoundObject {
     std::vector<shard::SplitAxis> axes;
 };
 
+
+struct ExpectedRange {
+    std::uint64_t begin;
+    std::uint64_t count;
+};
+
+struct ExpectedRoleRanges {
+    roles::Role role;
+    std::array<ExpectedRange, 2> ranks;
+};
+
+// What each rank owns of each role, read off the role geometry table in `test_load_plan.cpp` and the
+// shard spans in `test_sharding.cpp`. This is the independent anchor for the ranges; the byte plan
+// must agree with it, not with a mirror of the implementation.
+constexpr ExpectedRoleRanges kExpectedRanges[] = {
+    {roles::Role::TokenEmbedding, {{{0, 248320}, {0, 248320}}}},
+    {roles::Role::OutputHead, {{{0, 124160}, {124160, 124160}}}},
+    {roles::Role::FinalHcNorm, {{{0, 10240}, {0, 10240}}}},
+    {roles::Role::FinalHcDown, {{{0, 320}, {0, 320}}}},
+    {roles::Role::FinalHcUp, {{{0, 10240}, {0, 10240}}}},
+    {roles::Role::AttentionHcNorm, {{{0, 10240}, {0, 10240}}}},
+    {roles::Role::AttentionHcDown, {{{0, 320}, {0, 320}}}},
+    {roles::Role::AttentionHcInject, {{{320, 4}, {320, 4}}}},
+    {roles::Role::AttentionHcUp, {{{0, 10240}, {0, 10240}}}},
+    {roles::Role::MoeHcNorm, {{{0, 10240}, {0, 10240}}}},
+    {roles::Role::MoeHcDown, {{{0, 320}, {0, 320}}}},
+    {roles::Role::MoeHcInject, {{{320, 4}, {320, 4}}}},
+    {roles::Role::MoeHcUp, {{{0, 10240}, {0, 10240}}}},
+    {roles::Role::GdnQuery, {{{0, 1024}, {1024, 1024}}}},
+    {roles::Role::GdnKey, {{{2048, 1024}, {3072, 1024}}}},
+    {roles::Role::GdnValue, {{{4096, 3072}, {7168, 3072}}}},
+    {roles::Role::GdnZ, {{{10240, 3072}, {13312, 3072}}}},
+    {roles::Role::GdnAProjection, {{{0, 48}, {0, 48}}}},
+    {roles::Role::GdnBProjection, {{{48, 48}, {48, 48}}}},
+    {roles::Role::GdnALog, {{{0, 48}, {0, 48}}}},
+    {roles::Role::GdnDtBias, {{{0, 48}, {0, 48}}}},
+    {roles::Role::GdnConvolution, {{{0, 4}, {0, 4}}}},
+    {roles::Role::GdnNorm, {{{0, 128}, {0, 128}}}},
+    {roles::Role::GdnOutput, {{{0, 3072}, {3072, 3072}}}},
+    {roles::Role::QsaQuery, {{{0, 3072}, {3072, 3072}}}},
+    {roles::Role::QsaKey, {{{0, 256}, {256, 256}}}},
+    {roles::Role::QsaValue, {{{512, 256}, {768, 256}}}},
+    {roles::Role::QsaIndexQuery, {{{1024, 256}, {1280, 256}}}},
+    {roles::Role::QsaIndexKey, {{{1536, 128}, {1536, 128}}}},
+    {roles::Role::QsaOutput, {{{0, 3072}, {3072, 3072}}}},
+    {roles::Role::QsaOutputGate, {{{6144, 3072}, {9216, 3072}}}},
+    {roles::Role::QsaQueryNorm, {{{0, 256}, {0, 256}}}},
+    {roles::Role::QsaIndexQueryNorm, {{{0, 128}, {0, 128}}}},
+    {roles::Role::QsaKeyNorm, {{{0, 256}, {0, 256}}}},
+    {roles::Role::QsaIndexKeyNorm, {{{0, 128}, {0, 128}}}},
+    {roles::Role::MoeRouter, {{{0, 512}, {0, 512}}}},
+    {roles::Role::MoeSharedScore, {{{512, 1}, {512, 1}}}},
+    {roles::Role::MoeSharedGate, {{{513, 640}, {513, 640}}}},
+    {roles::Role::MoeSharedUp, {{{1153, 640}, {1153, 640}}}},
+    {roles::Role::MoeSharedDown, {{{0, 640}, {0, 640}}}},
+    {roles::Role::MoeRoutedGate, {{{0, 256}, {256, 256}}}},
+    {roles::Role::MoeRoutedUp, {{{0, 256}, {256, 256}}}},
+    {roles::Role::MoeRoutedDown, {{{0, 256}, {256, 256}}}},
+    {roles::Role::PleTable, {{{0, 2500012}, {0, 2500012}}}},
+    {roles::Role::PleKey, {{{0, 10240}, {0, 10240}}}},
+    {roles::Role::PleValue, {{{10240, 2560}, {10240, 2560}}}},
+    {roles::Role::PleNormKey, {{{0, 10240}, {0, 10240}}}},
+    {roles::Role::PleNormQuery, {{{0, 10240}, {0, 10240}}}},
+    {roles::Role::PleNormConv, {{{0, 10240}, {0, 10240}}}},
+    {roles::Role::PleConvolution, {{{0, 4}, {0, 4}}}},
+};
+
+const ExpectedRoleRanges& expected_ranges_of(roles::Role role) {
+    for (const auto& entry : kExpectedRanges) {
+        if (entry.role == role) { return entry; }
+    }
+    throw std::runtime_error("the expected range table has no role");
+}
+
 std::map<std::string, BoundObject> bound_objects(const flash::BindingPlan& plan,
                                                   const flash::ShardPlanByName& shards) {
     std::map<std::string, BoundObject> by_object;
@@ -300,30 +396,15 @@ std::map<std::string, BoundObject> bound_objects(const flash::BindingPlan& plan,
     return by_object;
 }
 
-// What one rank owns of one object: every role bound to that object contributes its own range on
-// the object's split axis, or its whole rectangle when the role is replicated.
-std::vector<SliceRange> rank_ranges(const flash::ShardPlanByName& shards, const BoundObject& object,
-                                    int rank) {
+std::vector<SliceRange> rank_ranges(const BoundObject& object, int rank) {
     std::vector<SliceRange> ranges;
     for (const auto role : object.owners) {
-        const auto& mapping = mapping_of(shards, roles::role_name(role));
-        const auto geometry = role_geometry(role);
-        if (mapping.ranks.empty()) {
-            const auto begin = mapping.split == shard::SplitAxis::Input ? geometry.column_begin
-                                                                        : geometry.row_begin;
-            const auto count = mapping.split == shard::SplitAxis::Input ? geometry.column_count
-                                                                        : geometry.row_count;
-            ranges.push_back({begin, count});
-            continue;
-        }
-        const auto& part = mapping.ranks[static_cast<std::size_t>(rank)];
-        ranges.push_back({static_cast<std::uint64_t>(part.begin),
-                          static_cast<std::uint64_t>(part.end - part.begin)});
+        const auto& own = expected_ranges_of(role).ranks[static_cast<std::size_t>(rank)];
+        ranges.push_back({own.begin, own.count});
     }
     std::sort(ranges.begin(), ranges.end(), [](const SliceRange& a, const SliceRange& b) {
         return a.begin < b.begin;
     });
-    // Roles that share one batched stack name the same matrix range: the object owns it once.
     ranges.erase(std::unique(ranges.begin(), ranges.end(), [](const SliceRange& a, const SliceRange& b) {
         return a.begin == b.begin && a.count == b.count;
     }), ranges.end());
@@ -331,29 +412,32 @@ std::vector<SliceRange> rank_ranges(const flash::ShardPlanByName& shards, const 
 }
 
 void test_partition(const flash::ShardPlanByName& shards) {
+    std::size_t checked = 0;
     for (const auto role : roles::all_roles()) {
         const auto name = roles::role_name(role);
         const auto mapping = mapping_of(shards, name);
-        if (mapping.ranks.empty()) { continue; }
-        const auto geometry = role_geometry(role);
-        const auto begin = mapping.split == shard::SplitAxis::Input ? geometry.column_begin
-                     : (mapping.split == shard::SplitAxis::Batch ? 0 : geometry.row_begin);
-        const auto extent = mapping.split == shard::SplitAxis::Input ? geometry.column_count
-                     : (mapping.split == shard::SplitAxis::Batch ? geometry.object_shape()[0]
-                                                                 : geometry.row_count);
-        std::uint64_t cursor = begin;
-        for (const auto& part : mapping.ranks) {
-            require(part.begin == static_cast<std::int64_t>(cursor),
-                   std::string(name) + " rank ranges do not partition the role rectangle in order");
+        if (mapping.axis == shard::ShardAxis::Replicated) { continue; }
+        ++checked;
+        const auto& expected = expected_ranges_of(role);
+        require(mapping.split == shard::SplitAxis::Batch || mapping.split == shard::SplitAxis::Input ||
+                    mapping.split == shard::SplitAxis::Output,
+                std::string(name) + " has no split axis");
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto& part = mapping.ranks[static_cast<std::size_t>(rank)];
+            const auto& own = expected.ranks[static_cast<std::size_t>(rank)];
+            require(part.begin == static_cast<std::int64_t>(own.begin) &&
+                        part.end - part.begin == static_cast<std::int64_t>(own.count),
+                    std::string(name) + " rank " + std::to_string(rank) + " names " +
+                        std::to_string(part.begin) + "+" + std::to_string(part.end - part.begin) +
+                        "; the expected table gives " + std::to_string(own.begin) + "+" +
+                        std::to_string(own.count));
             require(part.begin % 128 == 0, std::string(name) + " rank starts inside a 128-row band");
             require((part.end - part.begin) % 128 == 0,
-                   std::string(name) + " rank covers part of a 128-row band");
-            cursor = static_cast<std::uint64_t>(part.end);
+                    std::string(name) + " rank covers part of a 128-row band");
         }
-        require(cursor == begin + extent, std::string(name) + " ranks end at " +
-                                      std::to_string(cursor) + "; the role rectangle ends at " +
-                                      std::to_string(begin + extent));
     }
+    require(checked == 15, "the shard map names " + std::to_string(checked) +
+                               " split roles; the expected table gives 15");
 }
 
 void test_expert_subsets(const flash::ShardPlanByName& shards) {
@@ -436,7 +520,7 @@ void test_byte_plan(const flash::BindingPlan& plan, const flash::ShardPlanByName
         }
         const auto split = object.axes.front();
         for (int rank = 0; rank < 2; ++rank) {
-            const auto ranges   = rank_ranges(shards, object, rank);
+            const auto ranges   = rank_ranges(object, rank);
             const auto expected = coalesced(expected_copies(object.geometry, split, ranges));
             const Copies actual = coalesced(entry.copies[static_cast<std::size_t>(rank)]);
             require(same(expected, actual),
@@ -449,16 +533,114 @@ void test_byte_plan(const flash::BindingPlan& plan, const flash::ShardPlanByName
                                             std::to_string(expected.size()));
             const auto shape = narrowed_shape(object.geometry, split, total(ranges));
             require(entry.encoded_bytes[static_cast<std::size_t>(rank)] ==
-                    artifact::tensor_encoded_size(object.geometry.layout, object.geometry.format, shape),
+                    oracle_bytes(object.geometry.layout, object.geometry.format, shape),
                     "the shard of " + entry.object + " rank " + std::to_string(rank) + " is " +
                         std::to_string(entry.encoded_bytes[static_cast<std::size_t>(rank)]) +
-                        " bytes; the narrowed shape gives " +
-                        std::to_string(artifact::tensor_encoded_size(object.geometry.layout,
-                                                                    object.geometry.format, shape)));
+                        " bytes; the oracle gives " +
+                        std::to_string(oracle_bytes(object.geometry.layout, object.geometry.format, shape)));
             ++matched;
         }
     }
     std::cout << "flash-next shard byte plan: " << matched << " object ranks match the layout formulas\n";
+}
+
+
+std::vector<SliceRange> ordered_ranges(std::vector<SliceRange> ranges) {
+    std::sort(ranges.begin(), ranges.end(), [](const SliceRange& a, const SliceRange& b) {
+        return a.begin < b.begin;
+    });
+    return ranges;
+}
+
+void test_role_blocks(const flash::BindingPlan& plan, const flash::ShardPlanByName& shards,
+                      const std::map<std::string, BoundObject>& by_object,
+                      const std::vector<flash::ObjectShardPlan>& byte_plan) {
+    const auto placements = flash::shard_placements(plan, shards, 2);
+    std::size_t checked = 0;
+    std::size_t shared = 0;
+    std::size_t offset_blocks = 0;
+    for (const auto& entry : byte_plan) {
+        const auto found = by_object.find(entry.object);
+        if (found == by_object.end()) { continue; }
+        const auto& object = found->second;
+        if (object.owners.empty()) { continue; }
+        const auto placement = placements.find(entry.object);
+        require(placement != placements.end(), "the object " + entry.object + " has no placement");
+        bool split_role = false;
+        for (const auto role : object.owners) {
+            if (mapping_of(shards, roles::role_name(role)).axis != shard::ShardAxis::Replicated) { split_role = true; }
+        }
+        if (!split_role) {
+            require(placement->second.axis == artifact::ShardAxis::Replicated,
+                    "the object " + entry.object + " is replicated but its placement is split");
+            continue;
+        }
+        const auto expected_axis = object.axes.front() == shard::SplitAxis::Input
+            ? artifact::ShardAxis::Columns
+            : artifact::ShardAxis::Rows;
+        require(placement->second.axis == expected_axis,
+                "the object " + entry.object + " splits axis " +
+                    std::to_string(static_cast<int>(object.axes.front())) +
+                    " but its placement names " + std::to_string(static_cast<int>(placement->second.axis)));
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto expected_ranges = ordered_ranges(rank_ranges(object, rank));
+            const auto& actual_ranges = placement->second.device_ranges[static_cast<std::size_t>(rank)];
+            require(expected_ranges.size() == actual_ranges.size(),
+                    "the placement for " + entry.object + " rank " + std::to_string(rank) + " names " +
+                        std::to_string(actual_ranges.size()) + " ranges; the byte plan copies " +
+                        std::to_string(expected_ranges.size()));
+            for (std::size_t index = 0; index < expected_ranges.size(); ++index) {
+                require(expected_ranges[index].begin == actual_ranges[index].begin &&
+                            expected_ranges[index].count == actual_ranges[index].count,
+                        "the placement for " + entry.object + " rank " + std::to_string(rank) +
+                            " range " + std::to_string(index) + " is " +
+                            std::to_string(actual_ranges[index].begin) + "+" +
+                            std::to_string(actual_ranges[index].count) + "; the byte plan copies " +
+                            std::to_string(expected_ranges[index].begin) + "+" +
+                            std::to_string(expected_ranges[index].count));
+            }
+        }
+        const auto split = object.axes.front();
+        if (object.owners.size() > 1) { ++shared; }
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto object_copies = coalesced(expected_copies(object.geometry, split,
+                                                                 rank_ranges(object, rank)));
+            require(entry.blocks[static_cast<std::size_t>(rank)].size() == object.owners.size(),
+                    "the object " + entry.object + " rank " + std::to_string(rank) + " names " +
+                        std::to_string(entry.blocks[static_cast<std::size_t>(rank)].size()) +
+                        " role blocks; the plan binds " + std::to_string(object.owners.size()));
+            for (const auto& block : entry.blocks[static_cast<std::size_t>(rank)]) {
+                const auto& own = expected_ranges_of(block.role).ranks[static_cast<std::size_t>(rank)];
+                const auto geometry = role_geometry(block.role);
+                require(block.bytes == oracle_bytes(geometry.layout, geometry.format,
+                                                    narrowed_shape(geometry, split, own.count)),
+                        "the role block " + std::string(roles::role_name(block.role)) + " in " +
+                            entry.object + " rank " + std::to_string(rank) + " is " +
+                            std::to_string(block.bytes) + " bytes; the oracle gives " +
+                            std::to_string(oracle_bytes(geometry.layout, geometry.format,
+                                                        narrowed_shape(geometry, split, own.count))));
+                const auto start = expected_copies(geometry, split, {{own.begin, own.count}}).front().source_offset;
+                const auto carrier = std::find_if(object_copies.begin(), object_copies.end(),
+                                                  [&](const PlaneCopy& copy) {
+                                                      return copy.source_offset <= start &&
+                                                             start < copy.source_offset + copy.bytes;
+                                                  });
+                require(carrier != object_copies.end(),
+                        "no copy carries the role block " + std::string(roles::role_name(block.role)));
+                require(carrier->dest_offset + (start - carrier->source_offset) == block.offset,
+                        "the role block " + std::string(roles::role_name(block.role)) + " in " +
+                            entry.object + " rank " + std::to_string(rank) + " lands at " +
+                            std::to_string(block.offset) + "; the oracle gives " +
+                            std::to_string(carrier->dest_offset + (start - carrier->source_offset)));
+                if (block.offset != 0) { ++offset_blocks; }
+                ++checked;
+            }
+        }
+    }
+    require(shared >= 1, "no object with more than one role was checked");
+    require(offset_blocks >= 1, "no role block sits at a non-zero offset");
+    std::cout << "flash-next role blocks: " << checked << " role blocks over " << shared <<
+               " multi-role objects, " << offset_blocks << " at a non-zero offset\n";
 }
 
 const std::vector<std::pair<roles::Role, std::uint32_t>> kSampled = {
@@ -497,7 +679,7 @@ void test_real_bytes(const flash::BindingPlan& plan, const flash::ShardPlanByNam
         const auto split   = mapping_of(shards, roles::role_name(parameter->role)).split;
         const auto parent  = read_object(reader, object.name);
         for (int rank = 0; rank < 2; ++rank) {
-            const auto ranges = rank_ranges(shards, info, rank);
+            const auto ranges = rank_ranges(info, rank);
             const auto expected = ordered(expected_copies(info.geometry, split, ranges));
             const Copies actual = ordered(entry.copies[static_cast<std::size_t>(rank)]);
             require(assemble(parent, actual) == assemble(parent, expected),
@@ -547,7 +729,6 @@ void test_scale_plane(const flash::ShardPlanByName& shards, const Reader& reader
                             "the shard of weight/000000 rank " + std::to_string(rank) +
                                 " has no copy carrying the parent scale word for matrix " +
                                 std::to_string(matrix));
-                    if (carrier == entry.copies[static_cast<std::size_t>(rank)].end()) { continue; }
                     require(carrier->dest_offset + (source - carrier->source_offset) == dest,
                             "the shard scale word for rank " + std::to_string(rank) + " index " +
                                 std::to_string(index) + " row " + std::to_string(row) + " group " +
@@ -637,7 +818,7 @@ int test_materialized_views(const char* path) {
         const auto parent  = read_object(reader, object.name);
         for (int rank = 0; rank < 2; ++rank) {
             const auto& view = views.views[static_cast<std::size_t>(rank)];
-            const auto ranges = rank_ranges(shards, info, rank);
+            const auto ranges = rank_ranges(info, rank);
             const auto expected = assemble(parent, ordered(expected_copies(info.geometry, split, ranges)));
             const Copies actual = ordered(entry.copies[static_cast<std::size_t>(rank)]);
             const auto base = entry_payload(view, parameter->role, parameter->layer);
@@ -717,6 +898,7 @@ int main(int argc, char** argv) {
         const auto by_object = bound_objects(plan, shards);
         test_replicated(shards, by_object, byte_plan);
         test_byte_plan(plan, shards, by_object, byte_plan);
+        test_role_blocks(plan, shards, by_object, byte_plan);
         test_real_bytes(plan, shards, reader, byte_plan);
         test_scale_plane(shards, reader, byte_plan);
 

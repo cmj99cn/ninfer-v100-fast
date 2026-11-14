@@ -147,6 +147,12 @@ using ShardPlanByName = std::map<std::string, sharding::ShardMapping, std::less<
 
 // What one object's shard holds on each rank: the ranges the role map gives, in the order they
 // are concatenated, as parent-payload plane copies. Every object the plan binds appears once.
+struct RoleBlock {
+    roles::Role role;
+    std::uint64_t offset = 0;
+    std::uint64_t bytes = 0;
+};
+
 struct ObjectShardPlan {
     std::string object;
     sharding::SplitAxis split = sharding::SplitAxis::Output;
@@ -154,6 +160,7 @@ struct ObjectShardPlan {
     std::array<std::vector<artifact::SliceRange>, kMaximumDevices> ranges;
     std::array<std::vector<artifact::PlaneCopy>, kMaximumDevices> copies;
     std::array<std::vector<std::byte>, kMaximumDevices> prefix;
+    std::array<std::vector<RoleBlock>, kMaximumDevices> blocks;
     std::array<std::uint64_t, kMaximumDevices> encoded_bytes{};
     std::array<std::uint64_t, kMaximumDevices> scale_plane_offset{};
     std::array<std::uint64_t, kMaximumDevices> divisor_plane_offset{};
