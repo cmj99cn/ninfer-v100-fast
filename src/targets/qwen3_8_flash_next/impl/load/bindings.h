@@ -182,7 +182,8 @@ struct RankViews {
 
 [[nodiscard]] RankViews shard_views(const BindingPlan& plan,
                                     const artifact::MaterializedArtifact& materialized,
-                                    const ShardPlanByName& shards, int tp);
+                                    const ShardPlanByName& shards, int tp,
+                                    std::size_t loaded_layers);
 
 class PleTableSource {
 public:

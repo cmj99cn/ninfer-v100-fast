@@ -1,4 +1,5 @@
-// Host-only: no device. The per-rank shard byte plan of the text roles at tp 2.
+// The per-rank shard byte plan of the text roles at tp 2, and the materialized views of the
+// loaded prefix of those layers.
 //
 // Every expected byte mapping is computed here from the storage-layout formulas of
 // docs/maintainer/storage-layouts.md (sections 3.7, 4 and 11) over the artifact's own stored
@@ -14,6 +15,8 @@
 #include "targets/qwen3_8_flash_next/impl/load/geometry.h"
 #include "targets/qwen3_8_flash_next/impl/load/roles.h"
 #include "targets/qwen3_8_flash_next/impl/load/sharding.h"
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -44,6 +47,7 @@ namespace flash = ninfer::targets::qwen3_8_flash_next::detail;
 namespace roles = ninfer::targets::qwen3_8_flash_next::detail::roles;
 namespace shard = ninfer::targets::qwen3_8_flash_next::detail::sharding;
 
+using ninfer::Weight;
 using ninfer::targets::qwen3_8_flash_next::detail::RoleGeometry;
 using ninfer::targets::qwen3_8_flash_next::detail::role_geometry;
 
@@ -64,6 +68,7 @@ constexpr std::uint64_t kTileColumn = 64;
 constexpr std::uint64_t kTileBytes  = 512;
 constexpr std::uint64_t kGroup      = 32;   // W8G32 group width
 constexpr std::uint64_t kKAlign     = 128;  // row-split K alignment
+constexpr std::size_t kLoadedLayers = 4;
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t unit) {
     return (value + unit - 1) / unit * unit;
@@ -287,6 +292,15 @@ std::vector<std::byte> assemble(const std::vector<std::byte>& parent, const Copi
             out[static_cast<std::size_t>(copy.dest_offset + index)] =
                 parent[static_cast<std::size_t>(copy.source_offset + index)];
         }
+    }
+    return out;
+}
+
+std::vector<std::byte> device_bytes(const void* base, std::size_t size) {
+    std::vector<std::byte> out(size);
+    if (size == 0) { return out; }
+    if (cudaMemcpy(out.data(), base, size, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        throw std::runtime_error("the shard view could not be read back to the host");
     }
     return out;
 }
@@ -751,10 +765,25 @@ const void* entry_payload(const flash::Variant::ModelView& view, roles::Role rol
         return view.layers[layer].post_mixer.routed_down.payload;
     case roles::Role::GdnQuery:
         return view.layers[layer].gdn_projection.qkvz.payload;
+    case roles::Role::QsaKey:
+        return view.layers[layer].attention_projection.key_value.payload;
     case roles::Role::TokenEmbedding:
         return view.embedding.payload;
     default:
         return nullptr;
+    }
+}
+
+Weight role_weight(const flash::Variant::ModelView& view, roles::Role role, std::size_t layer) {
+    switch (role) {
+    case roles::Role::GdnQuery:
+        return view.layers[layer].gdn_projection.qkvz;
+    case roles::Role::QsaKey:
+        return view.layers[layer].attention_projection.key_value;
+    case roles::Role::TokenEmbedding:
+        return view.embedding;
+    default:
+        throw std::runtime_error("the test has no view for this role");
     }
 }
 
@@ -776,10 +805,26 @@ int test_materialized_views(const char* path) {
     const auto placements = flash::shard_placements(plan, shards, 2);
     const auto parameters = plan.parameters();
 
+    const auto needed = [&](const std::string& name) {
+        for (const auto* parameter : parameters) {
+            for (const auto& part : parameter->parts) {
+                if (plan.objects.at(part.object).name != name) { continue; }
+                if (parameter->role == roles::Role::PleTable) { continue; }
+                if (!roles::is_layer_scoped(parameter->role) || parameter->layer < kLoadedLayers) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
     for (const auto& object : plan.objects) {
         require(placements.count(object.name) != 0,
                 "the tensor object " + object.name + " has no shard placement");
-        binder.materialize_on_device(object.handle);
+        if (needed(object.name)) {
+            binder.materialize_on_device(object.handle);
+        } else {
+            binder.validate_only(object.handle);
+        }
     }
     binder.validate_unconsumed_matching("text/");
     binder.validate_unconsumed_matching("resource/text/");
@@ -794,7 +839,7 @@ int test_materialized_views(const char* path) {
         std::cout << "skip: the two devices cannot be taken: " << error.what() << "\n";
         return 77;
     }
-    const auto views = flash::shard_views(plan, materialized, shards, 2);
+    const auto views = flash::shard_views(plan, materialized, shards, 2, kLoadedLayers);
 
     for (const auto [role, layer] : kSampled) {
         const auto name = std::string(roles::parameter_name(role, layer));
@@ -848,9 +893,7 @@ int test_materialized_views(const char* path) {
                         name + " rank " + std::to_string(rank) + " divisor plane is not the shard's plane");
             } else {
                 const auto rows = static_cast<std::int32_t>(total(ranges));
-                const auto weight = parameter->role == roles::Role::GdnQuery
-                                        ? view.layers[parameter->layer].gdn_projection.qkvz
-                                        : view.layers[parameter->layer].attention_projection.key_value;
+                const auto weight = role_weight(view, parameter->role, parameter->layer);
                 require(weight.n == rows, name + " rank " + std::to_string(rank) + " view spans " +
                                               std::to_string(weight.n) + " rows; the shard gives " +
                                               std::to_string(rows));
@@ -858,17 +901,18 @@ int test_materialized_views(const char* path) {
                         name + " rank " + std::to_string(rank) + " view spans " +
                             std::to_string(weight.k) + " columns");
             }
-            for (std::size_t index = 0; index < expected.size(); ++index) {
-                require(static_cast<const std::byte*>(base)[index] == expected[index],
-                        "the shard view of " + object.name + " rank " + std::to_string(rank) + " byte " +
-                            std::to_string(index) + " is not the byte the shard map places there");
-            }
+            const auto actual_bytes = device_bytes(base, expected.size());
+            require(actual_bytes == expected,
+                    "the shard view of " + object.name + " rank " + std::to_string(rank) +
+                        " is not the byte sequence the shard map places there");
         }
     }
 
     for (int rank = 0; rank < 2; ++rank) {
-        require(views.views[static_cast<std::size_t>(rank)].tp == 2,
-                "rank " + std::to_string(rank) + " view does not carry the shard width");
+        const auto& view = views.views[static_cast<std::size_t>(rank)];
+        require(view.tp == 2, "rank " + std::to_string(rank) + " view does not carry the shard width");
+        require(view.layers[kLoadedLayers].post_mixer.routed_gate_up.matrices == 0,
+                "rank " + std::to_string(rank) + " fills a layer past the loaded prefix");
     }
     return g_failures == 0 ? 0 : 1;
 }

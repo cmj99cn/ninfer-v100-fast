@@ -1022,7 +1022,8 @@ namespace {
 Variant::ModelView build_rank_view(const BindingPlan& plan,
                                    const artifact::MaterializedArtifact& materialized,
                                    const ShardPlanByName& shards,
-                                   const std::vector<ObjectShardPlan>& byte_plan, int rank) {
+                                   const std::vector<ObjectShardPlan>& byte_plan, int rank,
+                                   std::size_t loaded_layers) {
     Variant::ModelView view;
 
     view.embedding = part_weight(plan, materialized, shards, byte_plan, plan.token_embedding,
@@ -1047,7 +1048,7 @@ Variant::ModelView build_rank_view(const BindingPlan& plan,
                                   {TextConfig::ple_conv_kernel, TextConfig::residual_width}, rank),
     };
 
-    for (std::size_t layer = 0; layer < static_cast<std::size_t>(TextConfig::layers); ++layer) {
+    for (std::size_t layer = 0; layer < loaded_layers; ++layer) {
         const LayerPlan& source = plan.layers[layer];
         auto& target = view.layers[layer];
         target.attention_hc = hc_view(plan, materialized, shards, byte_plan, source.attention_hc,
@@ -1113,12 +1114,12 @@ Variant::ModelView build_rank_view(const BindingPlan& plan,
 } // namespace
 
 RankViews shard_views(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
-                      const ShardPlanByName& shards, int tp) {
+                      const ShardPlanByName& shards, int tp, std::size_t loaded_layers) {
     const auto byte_plan = shard_byte_plan(plan, shards, tp);
     RankViews views;
     for (int rank = 0; rank < tp; ++rank) {
         auto& view = views.views[static_cast<std::size_t>(rank)];
-        view = build_rank_view(plan, materialized, shards, byte_plan, rank);
+        view = build_rank_view(plan, materialized, shards, byte_plan, rank, loaded_layers);
         view.tp = tp;
     }
     return views;
@@ -1131,7 +1132,7 @@ LoadedModelData::LoadedModelData(const BindingPlan& plan,
     ple_source_ = std::make_unique<PleTableSource>(artifact_path, plan);
 
     const auto shards = shard_plan_by_name(tp);
-    views_ = shard_views(plan, materialized, shards, tp);
+    views_ = shard_views(plan, materialized, shards, tp, TextConfig::layers);
 
     for (int rank = 0; rank < tp; ++rank) {
         auto& view = views_.views[static_cast<std::size_t>(rank)];
