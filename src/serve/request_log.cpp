@@ -94,8 +94,10 @@ std::string tool_choice_name(const ToolChoice& choice) {
 const char* kv_cache_name(ninfer::KvCacheStorage storage) {
     switch (storage) {
     case ninfer::KvCacheStorage::BFloat16: return "bf16";
+    case ninfer::KvCacheStorage::Float16: return "fp16";
     case ninfer::KvCacheStorage::Int8Group64: return "int8-group64";
     case ninfer::KvCacheStorage::Int4NLGroup32: return "iq4nl-group32";
+    case ninfer::KvCacheStorage::MixedBf16Fp16: return "mixed-bf16-fp16";
     }
     return "unknown";
 }

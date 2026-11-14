@@ -32,6 +32,9 @@ enum class KvCacheStorage : std::uint8_t {
     // per contiguous 32-value group along the head dim. Same fused-codec model as Int8Group64;
     // logical decode is LUT[code] * FP16(scale) (docs/maintainer/iq4nl-kv-plan.md).
     Int4NLGroup32,
+    // K and index pages BF16, V pages FP16 — the Qwen3.8-Flash-Next QSA layout. Reported by that
+    // package's memory summary; not a selectable Engine KV codec.
+    MixedBf16Fp16,
 };
 
 enum class KvCapacityMode : std::uint8_t {

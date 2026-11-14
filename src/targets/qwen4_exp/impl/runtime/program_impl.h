@@ -305,10 +305,10 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.effective_max_context = Variant::maximum_context;
     out.rope_mode             = RopeMode::Native;
     out.yarn_mscale           = 1.0;
-    out.kv_cache              = KvCacheStorage::Int8Group64;
+    out.kv_cache              = KvCacheStorage::MixedBf16Fp16;
     out.kv_capacity           = plan_->kv_capacity;
-    out.kv_capacity_page_groups = plan_->main_page_groups;
-    out.kv_capacity_max_page_groups = plan_->main_page_groups;
+    out.kv_capacity_page_groups = plan_->main_page_groups + 1;
+    out.kv_capacity_max_page_groups = plan_->main_page_groups + 1;
     const auto slot = std::size_t{0};
     const TextResidentStats* resident = models_[slot]->resident;
     if (resident != nullptr) {

@@ -1422,8 +1422,9 @@ LoadedModelData::LoadedModelData(const BindingPlan& plan,
 void LoadedModelData::allocate_expert_cache(const EngineOptions& options,
                                             ExecutionContext& execution) {
     if (backing_ == nullptr || backing_->stats().tensor_count == 0) { return; }
-    if (execution.tp < 1 || execution.tp > static_cast<int>(kMaximumDevices)) {
-        throw std::invalid_argument("the expert cache needs one to four ranks");
+    if (execution.tp != 2) {
+        throw std::invalid_argument(
+            "the full-model expert cache requires tp=2; TP1 is only the four-layer parity path");
     }
     if (experts_[0] != nullptr) { return; }
 
@@ -1442,6 +1443,14 @@ void LoadedModelData::allocate_expert_cache(const EngineOptions& options,
         if (options.expert_cache_mib != 0) {
             cache_options.capacity_bytes =
                 static_cast<std::uint64_t>(options.expert_cache_mib) * 1024ULL * 1024ULL;
+            const std::uint64_t minimum = static_cast<std::uint64_t>(kRankExperts) * kPairBytes;
+            if (*cache_options.capacity_bytes < minimum) {
+                throw std::invalid_argument(
+                    "expert cache capacity " + std::to_string(*cache_options.capacity_bytes) +
+                    " bytes is below the " + std::to_string(minimum) +
+                    " bytes one layer needs; a layer can select up to " +
+                    std::to_string(kRankExperts) + " of this rank's experts");
+            }
         }
         cache_options.vram_reserve_bytes = kVramReserveBytes;
         experts_[slot] = std::make_unique<ExpertRuntime>(

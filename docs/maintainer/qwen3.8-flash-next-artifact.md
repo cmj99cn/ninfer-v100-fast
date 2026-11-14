@@ -801,7 +801,7 @@ layout. Against the artifact's census:
 | `fp32` / `contiguous_le_v1` | Usable as is. The GDN control vectors and the activation divisors are not GEMM operands. |
 | `q8_g32_fp16` / `row_split_k128_v1` | Usable as is. The W8 group-32 row-split GEMM exists (`src/ops/linear/w8`). |
 | `q4_g64_fp16` / `row_split_k128_v1` | Usable as is. The Q4 group-64 row-split GEMM exists (`src/ops/linear/q4`); this object is the M3 proposal head. |
-| `nvfp4` / `batched_block_scale_k16_m128x4_v1` | **Not usable yet.** The repository's NVFP4 path implements the non-batched `block_scale_k16_m128x4_v1` layout; the batched variant (per-matrix scale plane plus per-matrix FP32 divisor) has no kernel and no typed binding. The routed expert bank needs one. |
+| `nvfp4` / `batched_block_scale_k16_m128x4_v1` | Usable. The routed bank decodes through the batched NVFP4 MoE ops; the full-model route serves each expert pair from the resident slot cache (`moe_routed_nvfp4_cached`) and the four-layer parity path uses the dense rank shard. |
 | `nf4_g16_e4m3fn` / `row_paged_g16_4k_v1` | Decoded. The reader addresses a row (`row_paged_nf4_geometry`, `row_paged_nf4_row_offset`) and the PLE lookup Op (`src/ops/ple/lookup.cu`) yields the BF16 words of the codebook product divided by the stored per-shard FP32 divisor. The table is not resident as a whole: the caller stages the addressed row bytes and the 128 divisors. |
 | `fp8_e4m3fn_block128x128_bf16` / `block_scale_m128_k128_v1` | **Not usable yet.** The repository's FP8 GEMM is the row-scaled `FP8_E4M3FN_ROW_BF16S` format; the block-128x128 variant has no GEMM. Both objects of this format are the MTP expert banks (M3). |
 
@@ -809,6 +809,16 @@ The `text/*` parameter that still needs a new decode path is therefore the route
 (batched NVFP4). The PLE table (NF4) is decoded by `src/ops/ple/lookup.cu`. Every other text
 parameter is BF16, FP32 or a Q8 row-split projection, all of which the repository already
 decodes.
+
+### 10.1 Full-model execution width and expert residency
+
+The full 48-layer implementation runs at tensor-parallel width 2 only. Each rank owns 256 whole
+experts of every layer, and the expert slot cache is sized per rank; TP1 remains the reduced
+four-layer parity path and is not a full-model execution mode. A layer can select up to 256 of a
+rank's experts, so an explicit `--expert-cache-mib N` must hold at least 256 pairs
+(`256 * 2,764,800` bytes); smaller values are rejected at load time. The cache size changes how
+often a pair is read from the artifact, never the arithmetic: a warm run and a run with reloads
+produce bit-identical logits.
 
 ## 11. Host tier slab geometry
 

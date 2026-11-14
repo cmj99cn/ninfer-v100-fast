@@ -19,8 +19,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -49,10 +51,8 @@ constexpr std::uint64_t kHostBudget    = static_cast<std::uint64_t>(94.0e9 * 0.8
 
 constexpr std::array<TokenId, kPromptTokens> kPrompt{1024, 7, 98140, 33, 4097, 512, 100, 2048};
 
-std::vector<std::uint16_t> g_logits;
-std::int32_t g_logits_vocab  = 0;
-std::int32_t g_logits_tokens = 0;
-bool g_capture               = false;
+std::vector<std::vector<std::uint16_t>> g_steps;
+bool g_capture = false;
 
 void require(bool condition, const std::string& message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -97,10 +97,26 @@ std::vector<std::byte> read_artifact_row(const artifact::Reader& reader, const s
 void flash_next_capture_logits(const Tensor& logits, cudaStream_t stream, int rank, int) {
     if (!g_capture || rank != 0) { return; }
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    g_logits_vocab  = logits.ne[0];
-    g_logits_tokens = logits.ne[1];
-    g_logits.resize(logits.bytes() / 2);
-    CUDA_CHECK(cudaMemcpy(g_logits.data(), logits.data, logits.bytes(), cudaMemcpyDeviceToHost));
+    std::vector<std::uint16_t> words(logits.bytes() / 2);
+    CUDA_CHECK(cudaMemcpy(words.data(), logits.data, logits.bytes(), cudaMemcpyDeviceToHost));
+    g_steps.push_back(std::move(words));
+}
+
+std::int32_t argmax_last(const std::vector<std::uint16_t>& words, std::int32_t vocab,
+                         std::int32_t tokens) {
+    std::int32_t best = 0;
+    float best_value = -std::numeric_limits<float>::infinity();
+    const std::size_t base = static_cast<std::size_t>(tokens - 1) * static_cast<std::size_t>(vocab);
+    for (std::int32_t index = 0; index < vocab; ++index) {
+        __half value;
+        std::memcpy(&value, &words[base + static_cast<std::size_t>(index)], sizeof(value));
+        const float as_float = __half2float(value);
+        if (as_float > best_value) {
+            best_value = as_float;
+            best = index;
+        }
+    }
+    return best;
 }
 
 #define NINFER_QWEN4EXP_VARIANT ::ninfer::targets::qwen3_8_flash_next::detail::Variant
@@ -115,12 +131,17 @@ namespace {
 
 namespace rt = ninfer::targets::qwen4_exp::detail::flash_next_full_model_test_runtime;
 
+static_assert(detail::Variant::bytes_per_main_page_group == 69632);
+
+struct RunOutput {
+    std::array<TokenId, 3> tokens{};
+    std::vector<std::vector<std::uint16_t>> steps;
+};
+
 struct RunResult {
-    TokenId token_first  = 0;
-    TokenId token_second = 0;
-    std::vector<std::uint16_t> logits_first;
-    std::vector<std::uint16_t> logits_second;
-    std::vector<std::uint16_t> logits_third;
+    RunOutput first;
+    RunOutput second;
+    RunOutput third;
     MemorySummary memory;
     detail::CacheStats stats_first;
     detail::CacheStats stats_second;
@@ -154,6 +175,31 @@ RunResult run_variant(const char* path, std::uint32_t expert_cache_mib) {
         artifact::materialize(reader, load_plan.materialization(), execution);
     detail::LoadedModelData data(bindings, materialized, detail::TextConfig::layers, 2,
                                  std::filesystem::path(path));
+    {
+        ninfer::EngineOptions too_small = options;
+        too_small.expert_cache_mib = 64;
+        bool threw = false;
+        try {
+            data.allocate_expert_cache(too_small, execution);
+        } catch (const std::invalid_argument& error) {
+            threw = true;
+            require(std::string(error.what()).find("one layer") != std::string::npos,
+                    "the small-capacity rejection does not name the one-layer minimum");
+        }
+        require(threw, "the expert cache accepted a capacity below one layer's experts");
+    }
+    {
+        ExecutionContext single({0});
+        bool threw = false;
+        try {
+            data.allocate_expert_cache(options, single);
+        } catch (const std::invalid_argument& error) {
+            threw = true;
+            require(std::string(error.what()).find("tp=2") != std::string::npos,
+                    "the TP1 rejection does not name tp=2");
+        }
+        require(threw, "the expert cache accepted a tensor-parallel width other than 2");
+    }
     data.allocate_expert_cache(options, execution);
 
     const auto recipe = rt::text_workspace_recipe(kPromptTokens, 1);
@@ -184,7 +230,7 @@ RunResult run_variant(const char* path, std::uint32_t expert_cache_mib) {
     }
     rt::TextTrunk trunk(view_ptrs, state_ptrs, activation_ptrs, workspace_ptrs, execution, *comms);
 
-    auto run_prefill = [&](std::vector<std::uint16_t>& logits) {
+    auto run_sequence = [&]() {
         for (int rank = 0; rank < 2; ++rank) {
             const auto slot = static_cast<std::size_t>(rank);
             int previous    = 0;
@@ -195,21 +241,25 @@ RunResult run_variant(const char* path, std::uint32_t expert_cache_mib) {
             workspaces[slot]->reset();
             CUDA_CHECK(cudaSetDevice(previous));
         }
-        g_logits.clear();
+        RunOutput output;
+        g_steps.clear();
         g_capture = true;
-        const TokenId token = trunk.prefill(std::span<const TokenId>{kPrompt.data(), kPrompt.size()});
+        output.tokens[0] =
+            trunk.prefill(std::span<const TokenId>{kPrompt.data(), kPrompt.size()});
+        output.tokens[1] = trunk.decode(output.tokens[0]);
+        output.tokens[2] = trunk.decode(output.tokens[1]);
         g_capture = false;
         for (int rank = 0; rank < 2; ++rank) { execution.dev[rank]->synchronize(); }
-        logits = g_logits;
-        return token;
+        output.steps = std::move(g_steps);
+        return output;
     };
 
     RunResult result;
-    result.token_first = run_prefill(result.logits_first);
+    result.first = run_sequence();
     result.stats_first = data.expert_cache_stats(0);
-    result.token_second = run_prefill(result.logits_second);
+    result.second = run_sequence();
     result.stats_second = data.expert_cache_stats(0);
-    (void)run_prefill(result.logits_third);
+    result.third = run_sequence();
     result.stats_third = data.expert_cache_stats(0);
 
     auto planner = Package::make_sequence_planner(execution.primary(), options,
@@ -254,16 +304,50 @@ RunResult run_variant(const char* path, std::uint32_t expert_cache_mib) {
     return result;
 }
 
+void check_sequence(const RunOutput& output, const std::string& label) {
+    require(output.steps.size() == output.tokens.size(),
+            label + ": the sequence did not capture one logits step per forward");
+    for (std::size_t step = 0; step < output.steps.size(); ++step) {
+        const std::int32_t vocab  = detail::TextConfig::vocab;
+        const std::int32_t tokens = step == 0 ? static_cast<std::int32_t>(kPromptTokens) : 1;
+        require(output.steps[step].size() ==
+                    static_cast<std::size_t>(vocab) * static_cast<std::size_t>(tokens),
+                label + ": a forward step reported an unexpected logits extent");
+        for (const std::uint16_t word : output.steps[step]) {
+            __half value;
+            std::memcpy(&value, &word, sizeof(value));
+            require(std::isfinite(__half2float(value)),
+                    label + ": a logits step holds a non-finite value");
+        }
+        require(argmax_last(output.steps[step], vocab, tokens) ==
+                    static_cast<std::int32_t>(output.tokens[step]),
+                label + ": a step token is not the argmax of its own logits");
+    }
+}
+
 void check_variant(const RunResult& result, const std::string& label) {
-    require(result.logits_first.size() == result.logits_second.size(),
-            label + ": the two prefill runs produced different logits extents");
-    require(result.logits_second == result.logits_third,
-            label + ": the last two prefill runs are not bit-identical");
-    require(result.logits_first == result.logits_second,
-            label + ": the cold and warm prefill runs are not bit-identical");
+    check_sequence(result.first, label + " cold");
+    check_sequence(result.second, label + " warm");
+    check_sequence(result.third, label + " warm-repeat");
+    require(result.first.tokens == result.second.tokens &&
+                result.second.tokens == result.third.tokens,
+            label + ": the repeated sequences produced different greedy tokens");
+    require(result.first.steps.size() == result.second.steps.size() &&
+                result.second.steps.size() == result.third.steps.size(),
+            label + ": the repeated sequences captured different step counts");
+    for (std::size_t step = 0; step < result.first.steps.size(); ++step) {
+        require(result.first.steps[step] == result.second.steps[step],
+                label + ": the cold and warm logits differ at step " + std::to_string(step));
+        require(result.second.steps[step] == result.third.steps[step],
+                label + ": the two warm logits differ at step " + std::to_string(step));
+    }
     require(result.memory.weights.capacity_bytes != 0, label + ": the weights partition is empty");
     require(result.memory.expert_cache_bytes == result.cache_bytes,
             label + ": memory_summary does not report the expert cache bytes");
+    require(result.memory.kv_cache == ninfer::KvCacheStorage::MixedBf16Fp16,
+            label + ": memory_summary does not report the mixed BF16/FP16 KV layout");
+    require(result.memory.kv_capacity_page_groups == kKvCapacity / 64 + 1,
+            label + ": memory_summary does not report the allocated KV page count");
     require(result.memory.sequence.capacity_bytes + result.memory.workspace.capacity_bytes +
                     result.memory.weights.capacity_bytes + result.memory.expert_cache_bytes <=
                 kDeviceBudget,
@@ -274,18 +358,12 @@ void check_variant(const RunResult& result, const std::string& label) {
     }
     require(result.peak_host <= kHostBudget,
             label + ": the process peak host RSS exceeds 80% of 94 GB");
-    for (std::size_t index = 0; index < result.logits_first.size(); ++index) {
-        __half value;
-        std::memcpy(&value, &result.logits_first[index], sizeof(value));
-        require(__half2float(value) == __half2float(value),
-                label + ": the prefill logits are not finite");
-    }
     const std::uint64_t lookups =
         result.stats_third.lookups - result.stats_second.lookups;
     const std::uint64_t hits = result.stats_third.hits - result.stats_second.hits;
     std::cout << "flash-next full model: " << label << " weights " << result.weights_bytes
               << " expert-cache " << result.cache_bytes << " pairs "
-              << result.stats_second.residency << " second-run lookups " << lookups << " hits "
+              << result.stats_third.residency << " second-run lookups " << lookups << " hits "
               << hits << " miss-bytes "
               << (result.stats_third.miss_count - result.stats_second.miss_count) *
                      detail::kPairBytes
@@ -310,7 +388,9 @@ void run(const char* path) {
     require(large_hits != 0, "the auto cache recorded no warm hit");
     require(small_misses != 0,
             "the small cache recorded no miss on the second run, so the miss path was not exercised");
-    require(small.logits_third == large.logits_third,
+    require(small.third.tokens == large.third.tokens,
+            "the small and auto caches produced different warm greedy tokens");
+    require(small.third.steps == large.third.steps,
             "the small and auto caches produced different warm logits");
     require(small.cache_bytes < large.cache_bytes,
             "the small cache is not smaller than the auto cache");

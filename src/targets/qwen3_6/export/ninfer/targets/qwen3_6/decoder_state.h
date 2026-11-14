@@ -27,6 +27,7 @@ inline constexpr std::int32_t kKvQuantGroupI4NL = 32;
     case KvCacheStorage::Float16: return DType::FP16;
     case KvCacheStorage::Int8Group64: return DType::I8;
     case KvCacheStorage::Int4NLGroup32: return DType::I4NL;
+    case KvCacheStorage::MixedBf16Fp16: break;
     }
     throw std::invalid_argument("unregistered KV cache storage");
 }
