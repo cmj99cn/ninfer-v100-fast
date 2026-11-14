@@ -26,11 +26,11 @@ void require(bool condition, const std::string& message) {
 
 const char* axis_name(Axis axis) {
     switch (axis) {
-    case Axis::Replicated:   return "replicated";
-    case Axis::Host:         return "host";
-    case Axis::Vocab:        return "vocab";
-    case Axis::Head:         return "head";
-    case Axis::Intermediate: return "intermediate";
+    case Axis::Replicated: return "replicated";
+    case Axis::Host:       return "host";
+    case Axis::Vocab:      return "vocab";
+    case Axis::Head:       return "head";
+    case Axis::Expert:     return "expert";
     }
     return "unknown";
 }
@@ -45,56 +45,56 @@ struct ExpectedMapping {
 };
 
 constexpr ExpectedMapping kExpectedMappings[] = {
-    {Role::TokenEmbedding,    Axis::Host,        Split::Output, 0,      248320,  1},
-    {Role::OutputHead,         Axis::Vocab,       Split::Output, 0,     248320,  1},
-    {Role::FinalHcNorm,        Axis::Replicated,  Split::Output, 0,     10240,   1},
-    {Role::FinalHcDown,        Axis::Replicated,  Split::Output, 0,     320,     1},
-    {Role::FinalHcUp,          Axis::Replicated,  Split::Output, 0,     10240,   1},
-    {Role::AttentionHcNorm,    Axis::Replicated,  Split::Output, 0,     10240,   1},
-    {Role::AttentionHcDown,    Axis::Replicated,  Split::Output, 0,     320,     1},
-    {Role::AttentionHcInject,  Axis::Replicated,  Split::Output, 0,     4,       1},
-    {Role::AttentionHcUp,      Axis::Replicated,  Split::Output, 0,     10240,   1},
-    {Role::MoeHcNorm,          Axis::Replicated,  Split::Output, 0,     10240,   1},
-    {Role::MoeHcDown,          Axis::Replicated,  Split::Output, 0,     320,     1},
-    {Role::MoeHcInject,        Axis::Replicated,  Split::Output, 0,     4,       1},
-    {Role::MoeHcUp,            Axis::Replicated,  Split::Output, 0,     10240,   1},
-    {Role::GdnQuery,           Axis::Head,        Split::Output, 0,     2048,    128},
-    {Role::GdnKey,             Axis::Head,        Split::Output, 2048,  2048,    128},
-    {Role::GdnValue,           Axis::Head,        Split::Output, 4096,  6144,    128},
-    {Role::GdnZ,               Axis::Head,        Split::Output, 10240, 6144,    128},
-    {Role::GdnAProjection,     Axis::Replicated,  Split::Output, 0,     48,      1},
-    {Role::GdnBProjection,     Axis::Replicated,  Split::Output, 0,     48,      1},
-    {Role::GdnALog,            Axis::Replicated,  Split::Output, 0,     48,      1},
-    {Role::GdnDtBias,          Axis::Replicated,  Split::Output, 0,     48,      1},
-    {Role::GdnConvolution,     Axis::Replicated,  Split::Output, 0,     4,       1},
-    {Role::GdnNorm,            Axis::Replicated,  Split::Output, 0,     128,     1},
-    {Role::GdnOutput,          Axis::Head,        Split::Input,  0,     6144,    128},
-    {Role::QsaQuery,           Axis::Head,        Split::Output, 0,     6144,    256},
-    {Role::QsaKey,             Axis::Head,        Split::Output, 0,     512,     256},
-    {Role::QsaValue,           Axis::Head,        Split::Output, 512,   512,     256},
-    {Role::QsaIndexQuery,      Axis::Head,        Split::Output, 1024,  512,     128},
-    {Role::QsaIndexKey,        Axis::Replicated,  Split::Output, 0,     128,     1},
-    {Role::QsaOutput,          Axis::Head,        Split::Input,  0,     6144,    256},
-    {Role::QsaOutputGate,      Axis::Head,        Split::Output, 6144,  6144,    256},
-    {Role::QsaQueryNorm,       Axis::Replicated,  Split::Output, 0,     256,     1},
-    {Role::QsaIndexQueryNorm,  Axis::Replicated,  Split::Output, 0,     128,     1},
-    {Role::QsaKeyNorm,         Axis::Replicated,  Split::Output, 0,     256,     1},
-    {Role::QsaIndexKeyNorm,    Axis::Replicated,  Split::Output, 0,     128,     1},
-    {Role::MoeRouter,          Axis::Replicated,  Split::Output, 0,     512,     1},
-    {Role::MoeSharedScore,     Axis::Replicated,  Split::Output, 0,     1,       1},
-    {Role::MoeSharedGate,      Axis::Intermediate, Split::Output, 513,  640,     16},
-    {Role::MoeSharedUp,         Axis::Intermediate, Split::Output, 1153, 640,     16},
-    {Role::MoeSharedDown,      Axis::Intermediate, Split::Input,  0,    640,     16},
-    {Role::MoeRoutedGate,      Axis::Intermediate, Split::Output, 0,    640,     16},
-    {Role::MoeRoutedUp,         Axis::Intermediate, Split::Output, 640,  640,     16},
-    {Role::MoeRoutedDown,      Axis::Intermediate, Split::Input,  0,    640,     16},
-    {Role::PleTable,           Axis::Replicated,  Split::Output, 0,     2500012, 1},
-    {Role::PleKey,             Axis::Replicated,  Split::Output, 0,     10240,   1},
-    {Role::PleValue,           Axis::Replicated,  Split::Output, 0,     2560,    1},
-    {Role::PleNormKey,         Axis::Replicated,  Split::Output, 0,     10240,   1},
-    {Role::PleNormQuery,       Axis::Replicated,  Split::Output, 0,     10240,   1},
-    {Role::PleNormConv,        Axis::Replicated,  Split::Output, 0,     10240,   1},
-    {Role::PleConvolution,     Axis::Replicated,  Split::Output, 0,     4,       1},
+    {Role::TokenEmbedding,    Axis::Host,       Split::Output, 0,      248320,  1},
+    {Role::OutputHead,         Axis::Vocab,      Split::Output, 0,     248320,  1},
+    {Role::FinalHcNorm,        Axis::Replicated, Split::Output, 0,     10240,   1},
+    {Role::FinalHcDown,        Axis::Replicated, Split::Output, 0,     320,     1},
+    {Role::FinalHcUp,          Axis::Replicated, Split::Output, 0,     10240,   1},
+    {Role::AttentionHcNorm,    Axis::Replicated, Split::Output, 0,     10240,   1},
+    {Role::AttentionHcDown,    Axis::Replicated, Split::Output, 0,     320,     1},
+    {Role::AttentionHcInject,  Axis::Replicated, Split::Output, 0,     4,       1},
+    {Role::AttentionHcUp,      Axis::Replicated, Split::Output, 0,     10240,   1},
+    {Role::MoeHcNorm,          Axis::Replicated, Split::Output, 0,     10240,   1},
+    {Role::MoeHcDown,          Axis::Replicated, Split::Output, 0,     320,     1},
+    {Role::MoeHcInject,        Axis::Replicated, Split::Output, 0,     4,       1},
+    {Role::MoeHcUp,            Axis::Replicated, Split::Output, 0,     10240,   1},
+    {Role::GdnQuery,           Axis::Head,       Split::Output, 0,     2048,    128},
+    {Role::GdnKey,             Axis::Head,       Split::Output, 2048,  2048,    128},
+    {Role::GdnValue,           Axis::Head,       Split::Output, 4096,  6144,    128},
+    {Role::GdnZ,               Axis::Head,       Split::Output, 10240, 6144,    128},
+    {Role::GdnAProjection,     Axis::Replicated, Split::Output, 0,     48,      1},
+    {Role::GdnBProjection,     Axis::Replicated, Split::Output, 0,     48,      1},
+    {Role::GdnALog,            Axis::Replicated, Split::Output, 0,     48,      1},
+    {Role::GdnDtBias,          Axis::Replicated, Split::Output, 0,     48,      1},
+    {Role::GdnConvolution,     Axis::Replicated, Split::Output, 0,     4,       1},
+    {Role::GdnNorm,            Axis::Replicated, Split::Output, 0,     128,     1},
+    {Role::GdnOutput,          Axis::Head,       Split::Input,  0,     6144,    128},
+    {Role::QsaQuery,           Axis::Head,       Split::Output, 0,     6144,    256},
+    {Role::QsaKey,             Axis::Head,       Split::Output, 0,     512,     256},
+    {Role::QsaValue,           Axis::Head,       Split::Output, 512,   512,     256},
+    {Role::QsaIndexQuery,      Axis::Head,       Split::Output, 1024,  512,     128},
+    {Role::QsaIndexKey,        Axis::Replicated, Split::Output, 0,     128,     1},
+    {Role::QsaOutput,          Axis::Head,       Split::Input,  0,     6144,    256},
+    {Role::QsaOutputGate,      Axis::Head,       Split::Output, 6144,  6144,    256},
+    {Role::QsaQueryNorm,       Axis::Replicated, Split::Output, 0,     256,     1},
+    {Role::QsaIndexQueryNorm,  Axis::Replicated, Split::Output, 0,     128,     1},
+    {Role::QsaKeyNorm,         Axis::Replicated, Split::Output, 0,     256,     1},
+    {Role::QsaIndexKeyNorm,    Axis::Replicated, Split::Output, 0,     128,     1},
+    {Role::MoeRouter,          Axis::Replicated, Split::Output, 0,     512,     1},
+    {Role::MoeSharedScore,     Axis::Replicated, Split::Output, 0,     1,       1},
+    {Role::MoeSharedGate,      Axis::Replicated, Split::Output, 513,   640,     1},
+    {Role::MoeSharedUp,        Axis::Replicated, Split::Output, 1153,  640,     1},
+    {Role::MoeSharedDown,      Axis::Replicated, Split::Input,  0,     640,     1},
+    {Role::MoeRoutedGate,      Axis::Expert,     Split::Batch,  0,     512,     1},
+    {Role::MoeRoutedUp,        Axis::Expert,     Split::Batch,  0,     512,     1},
+    {Role::MoeRoutedDown,      Axis::Expert,     Split::Batch,  0,     512,     1},
+    {Role::PleTable,           Axis::Replicated, Split::Output, 0,     2500012, 1},
+    {Role::PleKey,             Axis::Replicated, Split::Output, 0,     10240,   1},
+    {Role::PleValue,           Axis::Replicated, Split::Output, 0,     2560,    1},
+    {Role::PleNormKey,         Axis::Replicated, Split::Output, 0,     10240,   1},
+    {Role::PleNormQuery,       Axis::Replicated, Split::Output, 0,     10240,   1},
+    {Role::PleNormConv,        Axis::Replicated, Split::Output, 0,     10240,   1},
+    {Role::PleConvolution,     Axis::Replicated, Split::Output, 0,     4,       1},
 };
 
 const ExpectedMapping& expected_of(Role role) {
@@ -128,18 +128,23 @@ void test_every_role_has_a_mapping() {
         require(seen.count(role) == 1, "the expected table holds no entry for " + name_of(role));
     }
 
-    for (const auto role : roles::all_roles()) {
-        const auto mapping = sharding::shard_mapping(role, 2);
-        const auto& expected = expected_of(role);
-        require(mapping.axis == expected.axis, name_of(role) + " maps to axis " +
-            std::string(axis_name(mapping.axis)) + "; it maps to " + axis_name(expected.axis));
-        require(mapping.split == expected.split, name_of(role) + " splits the wrong stored axis");
-        if (expected.axis == Axis::Replicated || expected.axis == Axis::Host) {
-            require(mapping.ranks.empty(), name_of(role) + " is a full copy but names a range");
+    for (const auto& entry : kExpectedMappings) {
+        const auto mapping = sharding::shard_mapping(entry.role, 2);
+        require(mapping.axis == entry.axis, name_of(entry.role) + " maps to axis " +
+            std::string(axis_name(mapping.axis)) + "; it maps to " + axis_name(entry.axis));
+        require(mapping.split == entry.split,
+                name_of(entry.role) + " splits the wrong stored axis");
+        if (entry.axis == Axis::Replicated || entry.axis == Axis::Host) {
+            require(mapping.ranks.empty(),
+                    name_of(entry.role) + " is a full copy but names a range");
             continue;
         }
-        require(mapping.ranks.size() == 2, name_of(role) + " names " +
+        require(mapping.ranks.size() == 2, name_of(entry.role) + " names " +
             std::to_string(mapping.ranks.size()) + " ranks at tp=2; it names two");
+        require(mapping.ranks[0].begin == entry.begin &&
+                    mapping.ranks[1].end == entry.begin + entry.extent,
+                name_of(entry.role) + " ranks do not join into the parent span " +
+                    ranks_text(mapping));
     }
 }
 
@@ -149,23 +154,18 @@ void test_head_roles_partition_by_head_width() {
         if (entry.axis == Axis::Head) { head_roles.insert(entry.role); }
     }
     const std::set<Role> expected_head = {
-        Role::GdnQuery,   Role::GdnKey,    Role::GdnValue,   Role::GdnZ,
-        Role::GdnOutput,  Role::QsaQuery,  Role::QsaKey,     Role::QsaValue,
-        Role::QsaIndexQuery, Role::QsaOutput, Role::QsaOutputGate,
+        Role::GdnQuery,   Role::GdnKey,    Role::GdnValue,   Role::GdnZ,      Role::GdnOutput,
+        Role::QsaQuery,   Role::QsaKey,    Role::QsaValue,   Role::QsaIndexQuery,
+        Role::QsaOutput,  Role::QsaOutputGate,
     };
     require(head_roles == expected_head, "the head-axis set is not the head-axis set");
 
     for (const auto& entry : kExpectedMappings) {
         if (entry.axis != Axis::Head) { continue; }
         const auto mapping = sharding::shard_mapping(entry.role, 2);
-        require(mapping.ranks[0].begin == entry.begin &&
-                    mapping.ranks[1].end == entry.begin + entry.extent,
-                name_of(entry.role) + " ranks do not join into the parent span " +
-                    ranks_text(mapping));
         require(mapping.ranks[0].end == mapping.ranks[1].begin,
                 name_of(entry.role) + " ranks do not join at one boundary");
         for (const auto& shard : mapping.ranks) {
-            require(shard.end > shard.begin, name_of(entry.role) + " names an empty rank");
             require(shard.end - shard.begin == entry.extent / 2, name_of(entry.role) +
                 " rank covers " + std::to_string(shard.end - shard.begin) + " rows; it covers " +
                 std::to_string(entry.extent / 2));
@@ -177,36 +177,41 @@ void test_head_roles_partition_by_head_width() {
     }
 }
 
-void test_intermediate_roles_cover_half_on_the_group_boundary() {
-    std::set<Role> intermediate_roles;
+void test_expert_roles_partition_by_expert_set() {
+    std::set<Role> expert_roles;
     for (const auto& entry : kExpectedMappings) {
-        if (entry.axis == Axis::Intermediate) { intermediate_roles.insert(entry.role); }
+        if (entry.axis == Axis::Expert) { expert_roles.insert(entry.role); }
     }
-    const std::set<Role> expected_intermediate = {
-        Role::MoeSharedGate,  Role::MoeSharedUp,   Role::MoeSharedDown,
-        Role::MoeRoutedGate,  Role::MoeRoutedUp,   Role::MoeRoutedDown,
+    const std::set<Role> expected_expert = {
+        Role::MoeRoutedGate,  Role::MoeRoutedUp,  Role::MoeRoutedDown,
     };
-    require(intermediate_roles == expected_intermediate,
-            "the intermediate-axis set is not the intermediate-axis set");
+    require(expert_roles == expected_expert, "the expert-axis set is not the expert-axis set");
 
     for (const auto& entry : kExpectedMappings) {
-        if (entry.axis != Axis::Intermediate) { continue; }
+        if (entry.axis != Axis::Expert) { continue; }
         const auto mapping = sharding::shard_mapping(entry.role, 2);
-        require(entry.extent % kBand == 0, name_of(entry.role) + " covers " +
-            std::to_string(entry.extent) + " rows, which is not a whole number of " +
-            std::to_string(kBand) + "-row bands");
-        require(mapping.ranks[0].begin == entry.begin &&
-                    mapping.ranks[1].end == entry.begin + entry.extent,
-                name_of(entry.role) + " ranks do not join into the parent span " +
-                    ranks_text(mapping));
+        require(mapping.ranks[0].begin == 0 && mapping.ranks[1].end == entry.extent,
+                name_of(entry.role) + " ranks do not cover the whole stack " + ranks_text(mapping));
+        require(mapping.ranks[0].end == mapping.ranks[1].begin,
+                name_of(entry.role) + " ranks do not join at one boundary");
         for (const auto& shard : mapping.ranks) {
-            require(shard.end - shard.begin == entry.extent / 2, name_of(entry.role) +
-                " rank covers " + std::to_string(shard.end - shard.begin) + " rows; it covers half "
-                "of " + std::to_string(entry.extent));
-            const auto offset = shard.begin - entry.begin;
-            require(offset % entry.unit == 0, name_of(entry.role) + " rank starts at offset " +
-                std::to_string(offset) + ", which is not a " + std::to_string(entry.unit) +
-                "-column group boundary");
+            require(shard.end - shard.begin == 256, name_of(entry.role) + " rank owns " +
+                std::to_string(shard.end - shard.begin) + " matrices; it owns whole experts, 256");
+        }
+    }
+}
+
+void test_split_roles_start_on_band_boundaries() {
+    for (const auto& entry : kExpectedMappings) {
+        if (entry.axis == Axis::Replicated || entry.axis == Axis::Host) { continue; }
+        const auto mapping = sharding::shard_mapping(entry.role, 2);
+        require(entry.begin % kBand == 0, name_of(entry.role) + " starts at " +
+            std::to_string(entry.begin) + ", which is not a " + std::to_string(kBand) +
+            "-row band boundary");
+        for (const auto& shard : mapping.ranks) {
+            require((shard.end - shard.begin) % kBand == 0, name_of(entry.role) + " rank covers " +
+                std::to_string(shard.end - shard.begin) + " units, which is not a whole number "
+                "of " + std::to_string(kBand) + "-row bands");
         }
     }
 }
@@ -225,6 +230,7 @@ void test_replicated_set_is_exact() {
         Role::GdnDtBias,          Role::GdnConvolution,    Role::QsaIndexKey,
         Role::QsaIndexKeyNorm,    Role::QsaIndexQueryNorm, Role::QsaKeyNorm,
         Role::QsaQueryNorm,       Role::MoeRouter,         Role::MoeSharedScore,
+        Role::MoeSharedGate,      Role::MoeSharedUp,       Role::MoeSharedDown,
         Role::PleTable,           Role::PleKey,            Role::PleValue,
         Role::PleNormKey,         Role::PleNormQuery,      Role::PleNormConv,
         Role::PleConvolution,
@@ -234,6 +240,8 @@ void test_replicated_set_is_exact() {
             "the token embedding is not the host row source");
     require(sharding::shard_mapping(Role::OutputHead, 2).axis == Axis::Vocab,
             "the output head is not split on the vocab axis");
+    require(sharding::shard_mapping(Role::MoeRoutedGate, 2).axis == Axis::Expert,
+            "the routed experts are not split by the expert set");
 }
 
 void test_tp1_yields_the_whole_range() {
@@ -257,7 +265,7 @@ void test_tp1_yields_the_whole_range() {
 void test_illegal_boundary_names_the_role() {
     const std::vector<Role> indivisible = {
         Role::GdnKey,         Role::QsaKey,        Role::QsaIndexQuery,
-        Role::MoeSharedGate,  Role::MoeRoutedDown, Role::OutputHead,
+        Role::MoeRoutedGate,  Role::MoeRoutedDown, Role::OutputHead,
     };
     for (const auto role : indivisible) {
         bool threw = false;
@@ -275,6 +283,20 @@ void test_illegal_boundary_names_the_role() {
 
     bool threw = false;
     try {
+        const auto mapping = sharding::shard_mapping(Role::MoeRoutedGate, 8);
+        require(mapping.ranks.size() == 8, "tp=8 is accepted for " + name_of(Role::MoeRoutedGate));
+    } catch (const std::invalid_argument& error) {
+        threw = true;
+        const std::string message = error.what();
+        require(message.find(name_of(Role::MoeRoutedGate)) != std::string::npos &&
+                    message.find("band") != std::string::npos,
+                "the rejection for " + name_of(Role::MoeRoutedGate) +
+                    " does not name the role and its band: " + message);
+    }
+    require(threw, "tp=8 is accepted for " + name_of(Role::MoeRoutedGate));
+
+    threw = false;
+    try {
         const auto mapping = sharding::shard_mapping(Role::GdnKey, 0);
         require(!mapping.ranks.empty(), "tp=0 is accepted for " + name_of(Role::GdnKey));
     } catch (const std::invalid_argument&) {
@@ -289,13 +311,14 @@ int main() {
     try {
         test_every_role_has_a_mapping();
         test_head_roles_partition_by_head_width();
-        test_intermediate_roles_cover_half_on_the_group_boundary();
+        test_expert_roles_partition_by_expert_set();
+        test_split_roles_start_on_band_boundaries();
         test_replicated_set_is_exact();
         test_tp1_yields_the_whole_range();
         test_illegal_boundary_names_the_role();
         std::cout << "flash-next sharding: all " << roles::kRoleCount << " roles map at tp=2 over "
-                  << "the head, intermediate and vocab axes, with the host embedding and the "
-                  << "replicated set\n";
+                  << "the head, expert and vocab axes, with the host embedding and the replicated "
+                  << "set\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

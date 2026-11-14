@@ -31,13 +31,11 @@ constexpr std::int64_t kGdnHead     = TextConfig::gdn_head_dim;
 constexpr std::int64_t kGdnControl  = TextConfig::gdn_value_heads;
 constexpr std::int64_t kGdnKernel   = TextConfig::gdn_conv_kernel;
 constexpr std::int64_t kExperts     = TextConfig::experts;
-constexpr std::int64_t kExpertWidth = TextConfig::expert_intermediate;
 constexpr std::int64_t kSharedWidth = TextConfig::shared_intermediate;
 constexpr std::int64_t kSharedBegin = kExperts + 1;
 constexpr std::int64_t kPleKernel   = TextConfig::ple_conv_kernel;
 constexpr std::int64_t kPleRows     = TextConfig::ple_shard_rows;
 constexpr std::int64_t kBand        = 128;
-constexpr std::int64_t kGroup       = 16;
 
 struct ShardSpec {
     Role role;
@@ -86,13 +84,13 @@ constexpr std::array<ShardSpec, roles::kRoleCount> kShardSpecs{{
     {Role::QsaIndexKeyNorm, Axis::Replicated, Split::Output, 0, kIndexHead, 1},
     {Role::MoeRouter, Axis::Replicated, Split::Output, 0, kExperts, 1},
     {Role::MoeSharedScore, Axis::Replicated, Split::Output, 0, 1, 1},
-    {Role::MoeSharedGate, Axis::Intermediate, Split::Output, kSharedBegin, kSharedWidth, kGroup},
-    {Role::MoeSharedUp, Axis::Intermediate, Split::Output, kSharedBegin + kSharedWidth,
-     kSharedWidth, kGroup},
-    {Role::MoeSharedDown, Axis::Intermediate, Split::Input, 0, kSharedWidth, kGroup},
-    {Role::MoeRoutedGate, Axis::Intermediate, Split::Output, 0, kExpertWidth, kGroup},
-    {Role::MoeRoutedUp, Axis::Intermediate, Split::Output, kExpertWidth, kExpertWidth, kGroup},
-    {Role::MoeRoutedDown, Axis::Intermediate, Split::Input, 0, kExpertWidth, kGroup},
+    {Role::MoeSharedGate, Axis::Replicated, Split::Output, kSharedBegin, kSharedWidth, 1},
+    {Role::MoeSharedUp, Axis::Replicated, Split::Output, kSharedBegin + kSharedWidth,
+     kSharedWidth, 1},
+    {Role::MoeSharedDown, Axis::Replicated, Split::Input, 0, kSharedWidth, 1},
+    {Role::MoeRoutedGate, Axis::Expert, Split::Batch, 0, kExperts, 1},
+    {Role::MoeRoutedUp, Axis::Expert, Split::Batch, 0, kExperts, 1},
+    {Role::MoeRoutedDown, Axis::Expert, Split::Batch, 0, kExperts, 1},
     {Role::PleTable, Axis::Replicated, Split::Output, 0, kPleRows, 1},
     {Role::PleKey, Axis::Replicated, Split::Output, 0, kResidual, 1},
     {Role::PleValue, Axis::Replicated, Split::Output, 0, kHidden, 1},
@@ -127,16 +125,23 @@ ShardMapping shard_mapping(roles::Role role, int tp) {
     const std::string name = roles::parameter_name(role, 0);
     if (spec.extent % tp != 0) {
         throw std::invalid_argument("shard_mapping: " + name + " spans " +
-                                    std::to_string(spec.extent) + " rows on the split axis, which "
+                                    std::to_string(spec.extent) + " units on the split axis, which "
                                     "is not divisible by tp=" + std::to_string(tp));
     }
-    if (spec.axis == Axis::Intermediate && spec.extent % kBand != 0) {
-        throw std::invalid_argument("shard_mapping: " + name + " covers " +
-                                    std::to_string(spec.extent) + " rows, which is not a whole "
-                                    "number of " + std::to_string(kBand) + "-row bands");
+    if (spec.begin % kBand != 0) {
+        throw std::invalid_argument("shard_mapping: " + name + " starts at " +
+                                    std::to_string(spec.begin) + " on the split axis, which is "
+                                    "not a " + std::to_string(kBand) + "-row band boundary");
     }
 
     const std::int64_t per_rank = spec.extent / tp;
+    if (per_rank % kBand != 0) {
+        throw std::invalid_argument("shard_mapping: " + name + " rank covers " +
+                                    std::to_string(per_rank) + " units on the split axis, which "
+                                    "is not a whole number of " + std::to_string(kBand) +
+                                    "-row bands");
+    }
+
     for (int rank = 0; rank < tp; ++rank) {
         const std::int64_t offset = rank * per_rank;
         if (offset % spec.unit != 0) {
