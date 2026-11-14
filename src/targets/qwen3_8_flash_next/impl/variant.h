@@ -51,11 +51,6 @@ struct Variant {
                                    stream);
     }
 
-    static void post_mixer(const Tensor& hidden, const MoeWeights& weights, Tensor& destination,
-                           WorkspaceArena& workspace, cudaStream_t stream) {
-        PostMixerLeaf::mix(hidden, weights, destination, workspace, stream);
-    }
-
     static void post_mixer_routed(const Tensor& hidden, const MoeWeights& weights,
                                   const ops::MoeNvfp4RouteView& route, Tensor& destination,
                                   cudaStream_t stream) {

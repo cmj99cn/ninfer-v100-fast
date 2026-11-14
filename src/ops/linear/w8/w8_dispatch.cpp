@@ -34,7 +34,6 @@ W8Launch select_w8_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
     // registered in the tp1 table; these are the tp2/tp4 halves and quarters.
     const bool vision_shard = (k == 4608 && (n == 2304 || n == 1152)) ||
                               (n == 5120 && (k == 2304 || k == 1152));
-    // Flash-Next text shards: hidden 2560, attention/GDN output 6144 -> 3072.
     const bool flash_next_shard = (k == 2560 && (n == 1024 || n == 3072)) ||
                                   (n == 2560 && k == 3072);
     if (flash_next_shard) {

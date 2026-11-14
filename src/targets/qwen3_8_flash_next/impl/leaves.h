@@ -52,9 +52,6 @@ struct GdnProjectionLeaf {
 };
 
 struct PostMixerLeaf {
-    static void mix(const Tensor& hidden, const MoeWeights& weights, Tensor& destination,
-                    WorkspaceArena& workspace, cudaStream_t stream);
-
     static void routed(const Tensor& hidden, const MoeWeights& weights,
                        const ops::MoeNvfp4RouteView& route, Tensor& destination,
                        cudaStream_t stream);

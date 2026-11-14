@@ -113,11 +113,6 @@ std::size_t GdnProjectionLeaf::workspace_capacity_bytes(std::int32_t tokens) {
                                                          TextConfig::hidden, tokens, tokens);
 }
 
-void PostMixerLeaf::mix(const Tensor& hidden, const MoeWeights& weights, Tensor& destination,
-                        WorkspaceArena& workspace, cudaStream_t stream) {
-    ops::moe_routed_nvfp4(hidden, weights, destination, workspace, stream);
-}
-
 void PostMixerLeaf::routed(const Tensor& hidden, const MoeWeights& weights,
                            const ops::MoeNvfp4RouteView& route, Tensor& destination,
                            cudaStream_t stream) {

@@ -46,6 +46,10 @@ public:
     [[nodiscard]] std::optional<std::size_t> gdn_state_index(std::size_t layer) const;
     [[nodiscard]] std::size_t gdn_state_entries() const noexcept;
 
+    [[nodiscard]] int device_id() const noexcept { return device_; }
+    [[nodiscard]] cudaStream_t stream() const noexcept { return stream_; }
+    [[nodiscard]] Tensor gdn_conv_kernel(std::size_t layer) const;
+
     [[nodiscard]] std::int32_t kv_heads() const noexcept { return kv_heads_; }
     [[nodiscard]] std::int32_t gdn_key_heads() const noexcept { return gdn_key_heads_; }
     [[nodiscard]] std::int32_t gdn_value_heads() const noexcept { return gdn_value_heads_; }
@@ -89,6 +93,7 @@ private:
     DeviceScope device_scope_;
     const qwen4_exp::PleRowSource ple_source_;
     int device_                  = 0;
+    int rank_                    = 0;
     cudaStream_t stream_         = nullptr;
     std::size_t layers_          = 0;
     std::size_t forward_tokens_  = 0;
@@ -105,6 +110,7 @@ private:
     ops::PleHashControls ple_controls_{};
     ops::PleNf4Table ple_table_{};
 
+    DeviceBuffer conv_kernels_;
     DeviceBuffer conv_states_;
     DeviceBuffer recurrent_states_;
     DeviceBuffer k_pages_;
@@ -143,45 +149,43 @@ public:
 
 private:
     TokenId forward(std::span<const TokenId> tokens);
-    TokenId forward_single(std::span<const TokenId> tokens);
-    TokenId forward_parallel(std::span<const TokenId> tokens);
 
-    void run_gdn(std::size_t layer, std::int32_t tokens, const Tensor& block_input,
-                 Tensor& mixer_out);
-    void run_qsa(std::size_t layer, std::int32_t tokens, const Tensor& block_input,
-                 const Tensor& positions, const Tensor& valid_columns, const Tensor& table_rows,
-                 Tensor& mixer_out);
-    void run_ple(std::int32_t tokens, const Tensor& residual, Tensor& updated, Tensor& normalized);
+    void run_gdn(std::size_t layer, std::int32_t tokens,
+                 const std::array<Tensor, kMaximumDevices>& block_input,
+                 std::array<Tensor, kMaximumDevices>& mixer_out,
+                 const std::array<Tensor, kMaximumDevices>& staging);
+    void run_qsa(std::size_t layer, std::int32_t tokens,
+                 const std::array<Tensor, kMaximumDevices>& block_input,
+                 const std::array<Tensor, kMaximumDevices>& positions,
+                 const std::array<Tensor, kMaximumDevices>& valid_columns,
+                 const std::array<Tensor, kMaximumDevices>& table_rows,
+                 std::array<Tensor, kMaximumDevices>& mixer_out,
+                 const std::array<Tensor, kMaximumDevices>& staging);
+    void run_ple(std::int32_t tokens, std::array<Tensor, kMaximumDevices>& residual,
+                 std::array<Tensor, kMaximumDevices>& updated,
+                 std::array<Tensor, kMaximumDevices>& normalized);
 
-    void run_gdn_parallel(std::size_t layer, std::int32_t tokens,
-                          const std::array<Tensor, kMaximumDevices>& block_input,
-                          std::array<Tensor, kMaximumDevices>& mixer_out,
-                          const std::array<Tensor, kMaximumDevices>& staging);
-    void run_qsa_parallel(std::size_t layer, std::int32_t tokens,
-                          const std::array<Tensor, kMaximumDevices>& block_input,
-                          const std::array<Tensor, kMaximumDevices>& positions,
-                          const std::array<Tensor, kMaximumDevices>& valid_columns,
-                          const std::array<Tensor, kMaximumDevices>& table_rows,
-                          std::array<Tensor, kMaximumDevices>& mixer_out,
-                          const std::array<Tensor, kMaximumDevices>& staging);
-    void run_ple_parallel(std::int32_t tokens,
-                          std::array<Tensor, kMaximumDevices>& residual,
-                          std::array<Tensor, kMaximumDevices>& updated,
-                          std::array<Tensor, kMaximumDevices>& normalized);
+    void row_parallel_linear(const std::array<Tensor, kMaximumDevices>& x,
+                             const std::array<Weight, kMaximumDevices>& w,
+                             const std::array<Tensor, kMaximumDevices>& out,
+                             const std::array<Tensor, kMaximumDevices>& staging,
+                             const std::array<WorkspaceArena*, kMaximumDevices>& workspaces) const;
+    void reduce_rows(const std::array<Tensor, kMaximumDevices>& buffer,
+                     const std::array<Tensor, kMaximumDevices>& staging) const;
 
     template <class Body>
     void for_each_rank(Body&& body) {
         int previous = 0;
         CUDA_CHECK(cudaGetDevice(&previous));
         for (int rank = 0; rank < tp_; ++rank) {
-            CUDA_CHECK(cudaSetDevice(execution_->dev[static_cast<std::size_t>(rank)]->device));
+            CUDA_CHECK(cudaSetDevice(states_[static_cast<std::size_t>(rank)]->device_id()));
             body(rank);
         }
         CUDA_CHECK(cudaSetDevice(previous));
     }
 
     [[nodiscard]] cudaStream_t stream_for(int rank) const noexcept {
-        return execution_->dev[static_cast<std::size_t>(rank)]->stream;
+        return states_[static_cast<std::size_t>(rank)]->stream();
     }
 
     std::array<const ModelView*, kMaximumDevices> models_{};
