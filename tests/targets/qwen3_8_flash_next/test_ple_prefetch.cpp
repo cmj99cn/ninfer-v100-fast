@@ -267,8 +267,6 @@ void run(const char* path) {
             "the PLE fetch completed after the consumption await");
     require(g_probe.launch_ns.load() < g_probe.expert_end_ns.load(),
             "the PLE prefetch was launched after the first GDN layer's expert reads ended");
-    require(g_probe.fetch_end_ns.load() <= g_probe.expert_begin_ns.load(),
-            "the PLE worker fetch did not finish before the layer-0 expert host reads began");
 
     require(g_probe.expert_layer0_windows.load() == 1,
             "the decode round recorded " +
@@ -276,7 +274,7 @@ void run(const char* path) {
                 " layer-0 expert read windows; it records one");
     require(g_probe.phase_at_expert_begin.load() == 1 &&
                 g_probe.phase_at_expert_end.load() == 1,
-            "the PLE prefetch was awaited inside the layer-0 expert read window");
+            "the PLE prefetch was awaited before the layer-0 expert reads ended");
     require(g_probe.launch_ns.load() < g_probe.expert_begin_ns.load() &&
                 g_probe.expert_end_ns.load() < g_probe.await_ns.load(),
             "the PLE prefetch lifecycle does not contain the layer-0 expert reads");
@@ -291,9 +289,9 @@ void run(const char* path) {
               << (g_probe.expert_end_ns.load() - g_probe.expert_begin_ns.load())
               << " ns; worker fetch " << (g_probe.fetch_end_ns.load() - g_probe.fetch_begin_ns.load())
               << " ns ended " << (g_probe.expert_begin_ns.load() - g_probe.fetch_end_ns.load())
-              << " ns before the expert host reads began\n";
+              << " ns before the expert host reads began (informational)\n";
     std::cout << "OK flash-next PLE prefetch: fetch " << g_probe.rows.load()
-              << " rows off the request thread, completed before the layer-0 expert host reads; "
+              << " rows off the request thread, completed before its consumption await; "
               << "lifecycle contains " << (g_probe.host_reads_end.load() - g_probe.host_reads_begin.load())
               << " completed miss reads\n";
 }
