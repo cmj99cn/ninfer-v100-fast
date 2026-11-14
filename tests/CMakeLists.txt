@@ -77,6 +77,10 @@ ninfer_add_test(ninfer_flash_next_roles_test
 add_test(NAME ninfer_flash_next_roles_artifact_test
   COMMAND ninfer_flash_next_roles_test artifact)
 set_tests_properties(ninfer_flash_next_roles_artifact_test PROPERTIES SKIP_RETURN_CODE 77)
+# Host-only: no artifact, no device. The TP2 shard map of the text roles.
+ninfer_add_test(ninfer_flash_next_sharding_test
+  SOURCES targets/qwen3_8_flash_next/test_sharding.cpp
+  LIBRARIES ninfer_flash_next_package)
 ninfer_add_test(ninfer_flash_next_load_plan_test
   SOURCES targets/qwen3_8_flash_next/test_load_plan.cpp
   LIBRARIES ninfer_flash_next_package)
