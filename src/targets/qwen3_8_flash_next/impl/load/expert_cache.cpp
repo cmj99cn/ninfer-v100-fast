@@ -2,6 +2,7 @@
 #include "targets/qwen3_8_flash_next/impl/load/roles.h"
 
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -108,6 +109,7 @@ HostPairSource::HostPairSource(const std::filesystem::path& path, std::uint64_t 
                 .row_count     = view.matrix_row_count,
                 .row_bytes     = view.column_count / 2,
                 .tile_bytes    = (view.column_count / kTileColumn) * kTileBytes,
+                .divisor       = geometry.weight_divisor_offset,
             };
         }
         geometry_.push_back(row);
@@ -132,6 +134,17 @@ void HostPairSource::read(std::uint32_t layer, std::uint32_t expert,
                                  (geometry.row_begin / kRowTile) * geometry.tile_bytes;
         const auto scale_bytes = (geometry.row_count / kRowTile) * geometry.tile_bytes;
         copy_range(reader_, geometry.base + scale_start, scale_bytes, destination, cursor);
+    }
+}
+
+void HostPairSource::read_divisors(std::uint32_t layer, std::uint32_t expert,
+                                   float (&out)[3]) const {
+    for (std::size_t index = 0; index < geometry_[layer].size(); ++index) {
+        const auto& geometry = geometry_[layer][index];
+        std::array<std::byte, 4> word{};
+        std::size_t cursor = 0;
+        copy_range(reader_, geometry.base + geometry.divisor + expert * 4, 4, word, cursor);
+        std::memcpy(&out[index], word.data(), sizeof(float));
     }
 }
 
@@ -161,9 +174,15 @@ ExpertCache::ExpertCache(const ExpertCacheOptions& options, std::uint64_t pair_b
     plan_.budget_exhausted   = plan_.pairs == plan_.budget_pairs;
     plan_.coverage_target_met = plan_.coverage_mass >= kCoverageTarget;
 
+    if (plan_.pairs == 0) {
+        throw std::invalid_argument(
+            "the available device memory holds no resident expert pair");
+    }
+
     slot_of_.assign(static_cast<std::size_t>(kRankPairs), -1);
     resident_.assign(static_cast<std::size_t>(plan_.pairs), {0, 0});
     reference_.assign(static_cast<std::size_t>(plan_.pairs), 0);
+    spare_mark_.assign(static_cast<std::size_t>(plan_.pairs), 0);
 
     if (options.profile.has_value()) { seed(*options.profile); }
 }
@@ -180,6 +199,16 @@ void ExpertCache::assign(std::uint32_t slot, std::uint32_t layer, std::uint32_t 
 
 std::uint32_t ExpertCache::place(std::uint32_t layer, std::uint32_t expert) {
     const auto slots = static_cast<std::uint32_t>(plan_.pairs);
+
+    if (!spare_.empty()) {
+        const auto slot = spare_.back();
+        spare_.pop_back();
+        spare_mark_[slot] = 0;
+        assign(slot, layer, expert);
+        ++stats_.insertions;
+        ++stats_.residency;
+        return slot;
+    }
 
     if (stats_.residency < slots) {
         const auto slot = next_free_++;
@@ -233,6 +262,53 @@ void ExpertCache::seed(const std::filesystem::path& profile) {
     for (const auto& entry : entries) {
         if (stats_.residency == static_cast<std::uint32_t>(plan_.pairs)) { break; }
         place(entry.layer, entry.expert);
+    }
+}
+
+std::int32_t ExpertCache::resident_slot(std::uint32_t layer, std::uint32_t expert) const noexcept {
+    return slot_of_[key(layer, expert)];
+}
+
+void ExpertCache::reserve(
+    std::uint32_t count,
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>>& protected_pairs) {
+    const auto slots = static_cast<std::uint32_t>(plan_.pairs);
+    const std::uint32_t never_used = slots - next_free_;
+    if (spare_.size() + never_used >= count) { return; }
+
+    std::vector<bool> protected_slot(static_cast<std::size_t>(slots), false);
+    for (const auto& [layer, expert] : protected_pairs) {
+        const auto slot = slot_of_[key(layer, expert)];
+        if (slot >= 0) { protected_slot[static_cast<std::size_t>(slot)] = true; }
+    }
+
+    std::uint32_t need = count - (spare_.size() + never_used);
+    while (need != 0) {
+        bool found = false;
+        for (std::uint32_t step = 0; step < 2 * slots; ++step) {
+            const std::uint32_t slot = hand_;
+            hand_ = (hand_ + 1) % slots;
+            if (slot >= next_free_) { continue; }
+            if (spare_mark_[slot] != 0) { continue; }
+            if (protected_slot[slot]) { continue; }
+            if (reference_[slot]) {
+                reference_[slot] = 0;
+                continue;
+            }
+            const auto evicted = resident_[slot];
+            slot_of_[key(evicted.first, evicted.second)] = -1;
+            reference_[slot] = 0;
+            resident_[slot] = {0, 0};
+            spare_mark_[slot] = 1;
+            spare_.push_back(slot);
+            --stats_.residency;
+            --need;
+            found = true;
+            break;
+        }
+        if (!found) {
+            throw std::logic_error("the expert cache cannot reserve a slot outside the protected set");
+        }
     }
 }
 

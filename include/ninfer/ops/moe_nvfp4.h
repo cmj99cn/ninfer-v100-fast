@@ -164,6 +164,42 @@ void moe_routed_nvfp4_partial(const Tensor& x, const MoeNvfp4Weights& weights,
                               cudaStream_t stream);
 
 /**
+ * The resident slot bank a routed top-K contribution reads instead of a materialized batched
+ * expert library.
+ *
+ * Each slot holds one expert's three matrices in this exact order, with no padding between the
+ * planes of one matrix and no per-matrix divisor plane:
+ *
+ *   gate codes [640, 2560] NVFP4, gate E4M3 scales;
+ *   up   codes [640, 2560] NVFP4, up   E4M3 scales;
+ *   down codes [2560, 640] NVFP4, down E4M3 scales.
+ *
+ * `divisors` carries the FP32 weight divisor of each matrix, three floats per slot in the same
+ * gate/up/down order. `lookup` is the rank's global-expert-id table: `lookup[id]` is the slot
+ * holding global expert `id`, or a negative value when that expert is not this rank's or not
+ * currently resident.
+ */
+struct MoeNvfp4ExpertSlots {
+    const std::uint8_t* payload = nullptr;
+    std::uint64_t slot_bytes    = 0;
+    std::int32_t slot_count     = 0;
+    const std::int32_t* lookup  = nullptr;
+    const float* divisors       = nullptr;
+};
+
+/**
+ * Op: the routed top-K contribution of a resident expert slot bank, added into `destination`.
+ *
+ * The route view is the output of moe_nvfp4_route for this `x`. For every route entry the global
+ * expert id is resolved through `experts.lookup`; an entry whose id is absent (negative lookup)
+ * contributes exactly zero. The selected expert's gate, up, and down matrices are read from that
+ * slot with the layout above. The shared expert is not part of this entry.
+ */
+void moe_routed_nvfp4_cached(const Tensor& x, const MoeNvfp4ExpertSlots& experts,
+                             const MoeNvfp4RouteView& route, Tensor& destination,
+                             cudaStream_t stream);
+
+/**
  * Op: the sigmoid-gated shared-expert contribution, added into `destination`.
  *
  * This is the replicated half of the MoE: every rank carries the same shared weights and the same

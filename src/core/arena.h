@@ -70,6 +70,10 @@ public:
     DeviceArena& operator=(DeviceArena&& other) noexcept;
 
     DeviceSpan alloc_bytes(std::size_t bytes, std::size_t align = 256);
+    // Advances the allocation cursor over a region the caller placed outside `alloc_bytes` (for
+    // example, an artifact materializer writing at planned offsets). `used` must not exceed the
+    // arena capacity.
+    void commit_used(std::size_t used);
     Tensor alloc(DType dtype, std::initializer_list<std::int32_t> shape, std::size_t align = 256);
     [[nodiscard]] Scope scope() noexcept;
     void reset() noexcept;

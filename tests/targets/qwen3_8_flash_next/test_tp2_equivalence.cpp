@@ -257,8 +257,11 @@ RunResult run_tp1(const char* path) {
     const flash::BindingPlan plan = flash::bind_artifact(binder, flash::WeightsProfile::Nvfp4, 1);
     place_prefix(plan, binder);
     binder.validate_unconsumed_matching();
-    const artifact::MaterializedArtifact materialized =
-        artifact::materialize(reader, binder.finish(), device);
+    artifact::MaterializationPlan materialization = binder.finish();
+    materialization.device_capacity_bytes[0] +=
+        flash::fp16_control_capacity_bytes(plan, 1, kLoadedLayers)[0];
+    artifact::MaterializedArtifact materialized =
+        artifact::materialize(reader, materialization, device);
     const flash::LoadedModelData data(plan, materialized, kLoadedLayers, 1,
                                       std::filesystem::path(path));
 
@@ -291,7 +294,11 @@ struct Tp2Model {
         (void)qwen4_exp::bind_frontend_resources(binder);
         place_prefix(plan, binder);
         binder.validate_unconsumed_matching();
-        materialized = artifact::materialize(reader, binder.finish(), execution);
+        artifact::MaterializationPlan materialization = binder.finish();
+        const auto fp16 = flash::fp16_control_capacity_bytes(plan, 2, kLoadedLayers);
+        materialization.device_capacity_bytes[0] += fp16[0];
+        materialization.device_capacity_bytes[1] += fp16[1];
+        materialized = artifact::materialize(reader, materialization, execution);
         data = std::make_unique<flash::LoadedModelData>(plan, materialized, kLoadedLayers, 2,
                                                         std::filesystem::path(path));
         comms = std::make_unique<ops::CollectiveComms>(execution);

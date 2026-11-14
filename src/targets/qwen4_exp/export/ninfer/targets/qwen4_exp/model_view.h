@@ -46,6 +46,20 @@ struct TextLayerWeights {
     MoePayload post_mixer;
 };
 
+// The live residency accounts of one rank. The package owns the storage behind this pointer; the
+// pointer itself is part of the model view so the family's memory summary can report the device
+// weights, the expert cache, and the host staging the package actually allocated.
+struct TextResidentStats {
+    std::uint64_t weights_capacity_bytes = 0;
+    std::uint64_t weights_used_bytes     = 0;
+    std::uint64_t expert_cache_bytes     = 0;
+    std::uint64_t expert_cache_pairs     = 0;
+    std::uint64_t expert_cache_hits      = 0;
+    std::uint64_t expert_cache_misses    = 0;
+    std::uint64_t expert_cache_miss_bytes = 0;
+    std::uint64_t expert_host_bytes      = 0;
+};
+
 // The text model view. Every entry is a geometric view over load-time device residency; nothing
 // here is decoded or repacked.
 template <class AttentionPayload, class GdnPayload, class MoePayload, std::size_t Layers>
@@ -60,6 +74,7 @@ struct TextModelView {
     Tensor tail_norm;
     PleWeights ple;
     std::array<Layer, Layers> layers;
+    TextResidentStats* resident = nullptr;
     std::size_t loaded_layers = 0;
     int tp = 1;
 

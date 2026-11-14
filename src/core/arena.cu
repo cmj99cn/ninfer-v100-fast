@@ -213,6 +213,12 @@ DeviceSpan DeviceArena::alloc_bytes(std::size_t bytes, std::size_t align) {
     return DeviceSpan{ptr, bytes};
 }
 
+void DeviceArena::commit_used(std::size_t used) {
+    if (used > cap_) { throw std::out_of_range("arena used offset exceeds its capacity"); }
+    off_ = used;
+    if (off_ > peak_) { peak_ = off_; }
+}
+
 Tensor DeviceArena::alloc(DType dtype, std::initializer_list<std::int32_t> shape,
                           std::size_t align) {
     Tensor view(nullptr, dtype, shape);

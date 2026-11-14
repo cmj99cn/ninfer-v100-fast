@@ -28,6 +28,12 @@ void moe_nvfp4_grouped_launch(const Tensor& x, MoeNvfp4BatchedPlanes gate_up,
                               std::int32_t expert_begin, std::int32_t experts,
                               Tensor& destination, cudaStream_t stream);
 
+void moe_nvfp4_cached_launch(const Tensor& x, const std::uint8_t* slots,
+                             std::uint64_t slot_bytes, std::int32_t slot_count,
+                             const std::int32_t* lookup, const float* divisors,
+                             const MoeNvfp4RouteOutputs& route, Tensor& destination,
+                             cudaStream_t stream);
+
 void moe_nvfp4_shared_launch(const Tensor& x, const void* control, const void* shared_down,
                              const MoeNvfp4RouteOutputs& route, Tensor& destination,
                              cudaStream_t stream);

@@ -32,7 +32,12 @@ struct GdnProjectionWeights {
     Weight output;
 };
 
-using MoeWeights = ops::MoeNvfp4Weights;
+class ExpertRuntime;
+
+struct MoeWeights : ops::MoeNvfp4Weights {
+    ExpertRuntime* cache = nullptr;
+    std::uint32_t layer  = 0;
+};
 
 struct AttentionProjectionLeaf {
     static void project(const Tensor& hidden, const AttentionProjectionWeights& weights,

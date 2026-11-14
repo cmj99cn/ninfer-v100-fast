@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "ninfer/ops/ple.h"
 #include "targets/qwen3_8_flash_next/impl/config.h"
+#include "targets/qwen3_8_flash_next/impl/load/expert_runtime.h"
 #include "targets/qwen3_8_flash_next/impl/load/geometry.h"
 #include "targets/qwen3_8_flash_next/impl/load/roles.h"
 #include "targets/qwen3_8_flash_next/impl/load/sharding.h"
@@ -144,6 +145,12 @@ struct BindingPlan {
 
 [[nodiscard]] bool is_fp16_control_object(const BindingPlan& plan, const BoundObject& object);
 
+// The per-rank device capacity the FP16 control replacement buffers need, aligned to the
+// materialization arena's 256-byte placement. `loaded_layers` follows the same prefix as
+// `shard_views`; the product path passes the complete stack.
+[[nodiscard]] std::array<std::uint64_t, kMaximumDevices>
+fp16_control_capacity_bytes(const BindingPlan& plan, int tp, std::size_t loaded_layers);
+
 // The shard map of every text role at one tensor-parallel width, keyed by role name.
 using ShardPlanByName = std::map<std::string, sharding::ShardMapping, std::less<>>;
 
@@ -210,7 +217,7 @@ void fetch_ple_rows(void* context, const ops::PleRowAddress* addresses, std::siz
 
 class LoadedModelData {
 public:
-    LoadedModelData(const BindingPlan& plan, const artifact::MaterializedArtifact& materialized,
+    LoadedModelData(const BindingPlan& plan, artifact::MaterializedArtifact& materialized,
                     std::size_t loaded_layers, int tp, const std::filesystem::path& artifact_path);
 
     LoadedModelData(const LoadedModelData&)            = delete;
@@ -220,10 +227,18 @@ public:
 
     [[nodiscard]] const Variant::ModelView& view(int rank) const noexcept { return views_.views[static_cast<std::size_t>(rank)]; }
 
+    void allocate_expert_cache(const EngineOptions& options, ExecutionContext& execution);
+
+    [[nodiscard]] CacheStats expert_cache_stats(int rank) const;
+    [[nodiscard]] std::uint64_t expert_cache_bytes(int rank) const;
+    [[nodiscard]] std::uint64_t expert_host_bytes(int rank) const;
+
 private:
+    artifact::MaterializedArtifact* backing_ = nullptr;
     std::unique_ptr<PleTableSource> ple_source_;
     RankViews views_;
-    std::vector<DeviceBuffer> fp16_control_;
+    std::array<qwen4_exp::TextResidentStats, kMaximumDevices> resident_{};
+    std::array<std::unique_ptr<ExpertRuntime>, kMaximumDevices> experts_;
 };
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

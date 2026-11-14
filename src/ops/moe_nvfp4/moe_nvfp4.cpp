@@ -17,6 +17,9 @@ constexpr std::int32_t kTopK         = 10;
 constexpr std::int32_t kHidden       = 2560;
 constexpr std::int32_t kIntermediate = 640;
 constexpr std::int32_t kParentRows   = 1793;
+constexpr std::uint64_t kSlotBytes =
+    3ULL * (static_cast<std::uint64_t>(kIntermediate) * kHidden / 2U +
+            static_cast<std::uint64_t>(kIntermediate) * kHidden / 16U);
 
 struct AddressRange {
     std::uintptr_t begin = 0;
@@ -227,7 +230,7 @@ void moe_nvfp4_route(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& ex
     ranges.push_back(address_range(expert_ids.data, expert_ids.bytes(), "expert_ids"));
     ranges.push_back(address_range(coefficients.data, coefficients.bytes(), "coefficients"));
     ranges.push_back(address_range(shared_gate.data, shared_gate.bytes(), "shared_gate"));
-    validate_weights(weights, ranges);
+    require_parent(weights.router_shared, ranges);
     require_disjoint(ranges);
 
     detail::MoeNvfp4RouteOutputs outputs{
@@ -289,6 +292,40 @@ void moe_routed_nvfp4_partial(const Tensor& x, const MoeNvfp4Weights& weights,
                                      bank.matrices, destination, stream);
 }
 
+void moe_routed_nvfp4_cached(const Tensor& x, const MoeNvfp4ExpertSlots& experts,
+                             const MoeNvfp4RouteView& route, Tensor& destination,
+                             cudaStream_t stream) {
+    const std::int32_t tokens = require_tokens(x, "x");
+    require_destination(destination, x.dtype, tokens);
+
+    if (experts.payload == nullptr || experts.slot_bytes != kSlotBytes ||
+        experts.slot_count < 1 || experts.lookup == nullptr || experts.divisors == nullptr ||
+        !aligned_to(experts.payload, 16) || !aligned_to(experts.lookup, 16) ||
+        !aligned_to(experts.divisors, 16)) {
+        throw std::invalid_argument("moe_nvfp4: invalid resident expert slots");
+    }
+
+    std::vector<AddressRange> ranges;
+    ranges.reserve(12);
+    ranges.push_back(address_range(x.data, x.bytes(), "x"));
+    ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
+    require_route(route, tokens, ranges);
+    ranges.push_back(address_range(
+        experts.payload, static_cast<std::size_t>(experts.slot_count) * experts.slot_bytes,
+        "expert slots"));
+    ranges.push_back(address_range(experts.lookup, static_cast<std::size_t>(kExperts) * 4,
+                                   "expert lookup"));
+    ranges.push_back(address_range(experts.divisors,
+                                   static_cast<std::size_t>(experts.slot_count) * 3 * 4,
+                                   "expert divisors"));
+    require_disjoint(ranges);
+
+    const detail::MoeNvfp4RouteOutputs outputs = route_outputs(route);
+    detail::moe_nvfp4_cached_launch(x, experts.payload, experts.slot_bytes, experts.slot_count,
+                                    experts.lookup, experts.divisors, outputs, destination,
+                                    stream);
+}
+
 void moe_shared_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights,
                       const MoeNvfp4RouteView& route, Tensor& destination, cudaStream_t stream) {
     const std::int32_t tokens = require_tokens(x, "x");
@@ -299,7 +336,8 @@ void moe_shared_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights,
     ranges.push_back(address_range(x.data, x.bytes(), "x"));
     ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
     require_route(route, tokens, ranges);
-    (void)require_expert_bank(weights, ranges);
+    require_parent(weights.router_shared, ranges);
+    require_shared_down(weights.shared_down, ranges);
     require_disjoint(ranges);
 
     const detail::MoeNvfp4RouteOutputs outputs = route_outputs(route);

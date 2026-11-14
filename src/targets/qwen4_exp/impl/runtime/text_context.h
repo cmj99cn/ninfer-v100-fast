@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <memory>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -69,6 +70,10 @@ public:
     [[nodiscard]] std::uint32_t next_position() const noexcept { return next_position_; }
     void advance_position(std::uint32_t tokens) noexcept { next_position_ += tokens; }
 
+    [[nodiscard]] std::uint64_t kv_payload_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t gdn_state_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t reserved_bytes() const noexcept;
+
     [[nodiscard]] std::uint64_t ple_tail(std::size_t index) const noexcept { return ple_tail_[index]; }
     void advance_ple_tail(std::uint64_t id) noexcept {
         ple_tail_[0] = ple_tail_[1];
@@ -104,7 +109,8 @@ private:
     std::int32_t conv_channels_  = 0;
     std::vector<std::size_t> gdn_layers_;
     std::vector<std::optional<std::size_t>> gdn_index_;
-    std::vector<std::byte> ple_staged_host_;
+    std::unique_ptr<PinnedHostBuffer> ple_rows_host_;
+    std::unique_ptr<PinnedHostBuffer> ple_staged_host_;
     std::uint32_t next_position_ = 0;
     std::uint64_t ple_tail_[2]   = {0, 0};
     ops::PleHashControls ple_controls_{};

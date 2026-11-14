@@ -50,12 +50,15 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
 
 class LoadedModel::Impl {
 public:
-    Impl(WeightsProfile weights_profile_in, LoadedModelData&& data_in,
+    Impl(WeightsProfile weights_profile_in, const BindingPlan& bindings,
+         artifact::MaterializedArtifact materialized, const std::filesystem::path& artifact_path,
          qwen4_exp::FrontendResources resources_in, int tensor_parallel)
-        : weights_profile(weights_profile_in), data(std::move(data_in)),
+        : weights_profile(weights_profile_in), materialized(std::move(materialized)),
+          data(bindings, this->materialized, TextConfig::layers, tensor_parallel, artifact_path),
           resources(std::move(resources_in)), tp(tensor_parallel) {}
 
     WeightsProfile weights_profile;
+    artifact::MaterializedArtifact materialized;
     LoadedModelData data;
     qwen4_exp::FrontendResources resources;
     int tp = 1;
@@ -106,16 +109,32 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     detail::BindingPlan bindings = detail::bind_artifact(binder, weights_profile, options.tp);
     qwen4_exp::FrontendResourcePlan resources = qwen4_exp::bind_frontend_resources(binder);
 
-    if constexpr (qwen4_exp::detail::kTextActivationDtype == DType::FP16) {
-        for (const auto& object : bindings.objects) {
+    const auto is_expert_library = [&bindings](const detail::BoundObject& object) {
+        for (const auto* parameter : bindings.parameters()) {
+            if (parameter->library.has_value() &&
+                parameter->library->handle.index == object.handle.index) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto is_ple_table = [&bindings](const detail::BoundObject& object) {
+        for (const auto& part : bindings.ple.table.parts) {
+            if (bindings.objects.at(part.object).handle.index == object.handle.index) { return true; }
+        }
+        return false;
+    };
+
+    for (const auto& object : bindings.objects) {
+        if (is_expert_library(object) || is_ple_table(object)) {
+            binder.validate_only(object.handle);
+        } else if constexpr (qwen4_exp::detail::kTextActivationDtype == DType::FP16) {
             if (detail::is_fp16_control_object(bindings, object)) {
                 binder.validate_only(object.handle);
             } else {
                 binder.materialize_on_device(object.handle);
             }
-        }
-    } else {
-        for (const auto& object : bindings.objects) {
+        } else {
             binder.materialize_on_device(object.handle);
         }
     }
@@ -125,9 +144,16 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
         binder.validate_only(object);
     }
 
+    artifact::MaterializationPlan materialization = binder.finish();
+    const auto fp16_control =
+        detail::fp16_control_capacity_bytes(bindings, options.tp, detail::TextConfig::layers);
+    for (std::size_t rank = 0; rank < static_cast<std::size_t>(options.tp); ++rank) {
+        materialization.device_capacity_bytes[rank] += fp16_control[rank];
+    }
+
     return LoadPlan(std::make_unique<LoadPlan::Impl>(weights_profile, std::move(bindings),
-                                                      binder.finish(), resources, options.tp,
-                                                      options.artifact_path));
+                                                      std::move(materialization), resources,
+                                                      options.tp, options.artifact_path));
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -140,10 +166,8 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     }
 
     auto impl = std::make_unique<LoadedModel::Impl>(
-        plan.impl_->weights_profile,
-        detail::LoadedModelData(plan.impl_->bindings, materialized, detail::TextConfig::layers,
-                                plan.impl_->tp, plan.impl_->artifact_path),
-        std::move(resources), plan.impl_->tp);
+        plan.impl_->weights_profile, plan.impl_->bindings, std::move(materialized),
+        plan.impl_->artifact_path, std::move(resources), plan.impl_->tp);
     plan.impl_.reset();
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
@@ -178,8 +202,10 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan,
     for (int rank = 0; rank < execution.tp; ++rank) {
         models[static_cast<std::size_t>(rank)] = &model.impl_->data.view(rank);
     }
-    return qwen4_exp::create_program<detail::Variant>(models, model.impl_->weights_profile,
-                                                       std::move(plan), execution, options);
+    auto program = qwen4_exp::create_program<detail::Variant>(models, model.impl_->weights_profile,
+                                                               std::move(plan), execution, options);
+    model.impl_->data.allocate_expert_cache(options, execution);
+    return program;
 }
 
 } // namespace ninfer::targets::qwen3_8_flash_next

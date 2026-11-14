@@ -539,6 +539,17 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     for (int index = 0; index < device_count; ++index) {
         CUDA_CHECK(cudaStreamSynchronize(devices[static_cast<std::size_t>(index)]->load_stream));
     }
+    for (int index = 0; index < device_count; ++index) {
+        const auto slot = static_cast<std::size_t>(index);
+        std::uint64_t end = 0;
+        for (const DeviceMaterialization& placement : plan.device_objects) {
+            if (placement.device == index) {
+                end = std::max(end, placement.offset + placement.bytes);
+            }
+        }
+        end = (end + 255U) / 256U * 256U;
+        out.device_arena_[slot]->commit_used(static_cast<std::size_t>(end));
+    }
     // Leave the caller on the primary device: the copy loop above walked the device list, and the
     // rest of the load path assumes the current device is still the one it set before calling.
     if (device_count > 1) { CUDA_CHECK(cudaSetDevice(devices[0]->device)); }

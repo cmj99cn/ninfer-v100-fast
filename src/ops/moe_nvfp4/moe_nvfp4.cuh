@@ -19,6 +19,16 @@ inline constexpr int kMoeExperts      = 512;
 inline constexpr int kMoeTopK         = 10;
 inline constexpr int kMoeHidden       = 2560;
 inline constexpr int kMoeIntermediate = 640;
+inline constexpr std::uint64_t kMoeMatrixCode =
+    static_cast<std::uint64_t>(kMoeIntermediate) * kMoeHidden / 2U;
+inline constexpr std::uint64_t kMoeMatrixScale =
+    static_cast<std::uint64_t>(kMoeIntermediate) * kMoeHidden / 16U;
+inline constexpr std::uint64_t kMoeGateScale = kMoeMatrixCode;
+inline constexpr std::uint64_t kMoeUpCode    = kMoeMatrixCode + kMoeMatrixScale;
+inline constexpr std::uint64_t kMoeUpScale   = 2U * kMoeMatrixCode + kMoeMatrixScale;
+inline constexpr std::uint64_t kMoeDownCode  = 2U * kMoeMatrixCode + 2U * kMoeMatrixScale;
+inline constexpr std::uint64_t kMoeDownScale = 3U * kMoeMatrixCode + 2U * kMoeMatrixScale;
+inline constexpr std::uint64_t kMoeSlotBytes = 3U * (kMoeMatrixCode + kMoeMatrixScale);
 
 template <class A>
 struct MoeAct;

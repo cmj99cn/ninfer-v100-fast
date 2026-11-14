@@ -1135,17 +1135,20 @@ Variant::ModelView build_rank_view(const BindingPlan& plan,
             };
         }
 
-        target.post_mixer = ops::MoeNvfp4Weights{
-            .router_shared    = part_weight(plan, materialized, shards, byte_plan, source.moe.router,
-                                            TextConfig::experts + 1 + 2 * TextConfig::shared_intermediate,
-                                            TextConfig::hidden, rank),
-            .shared_down      = part_weight(plan, materialized, shards, byte_plan, source.moe.shared_down,
-                                            TextConfig::hidden, TextConfig::shared_intermediate, rank),
-            .routed_gate_up   = part_library(plan, materialized, shards, byte_plan, source.moe.routed_gate,
-                                             rank),
-            .routed_down      = part_library(plan, materialized, shards, byte_plan, source.moe.routed_down,
-                                             rank),
-        };
+        target.post_mixer = MoeWeights{};
+        target.post_mixer.router_shared =
+            part_weight(plan, materialized, shards, byte_plan, source.moe.router,
+                        TextConfig::experts + 1 + 2 * TextConfig::shared_intermediate,
+                        TextConfig::hidden, rank);
+        target.post_mixer.shared_down =
+            part_weight(plan, materialized, shards, byte_plan, source.moe.shared_down,
+                        TextConfig::hidden, TextConfig::shared_intermediate, rank);
+        target.post_mixer.routed_gate_up =
+            part_library(plan, materialized, shards, byte_plan, source.moe.routed_gate, rank);
+        target.post_mixer.routed_down =
+            part_library(plan, materialized, shards, byte_plan, source.moe.routed_down, rank);
+        target.post_mixer.cache = nullptr;
+        target.post_mixer.layer = static_cast<std::uint32_t>(layer);
     }
 
     return view;
@@ -1208,8 +1211,8 @@ Weight fp16_host_weight(const BindingPlan& plan, artifact::Reader& reader,
                         const ShardPlanByName& shards,
                         const std::vector<ObjectShardPlan>& byte_plan,
                         const BoundParameter& parameter, std::int32_t rows, std::int32_t columns,
-                        int rank, int device, std::vector<DeviceBuffer>& buffers,
-                        std::map<std::pair<std::string, int>, std::size_t>& cache) {
+                        int rank, int device, DeviceArena& arena,
+                        std::map<std::pair<std::string, int>, const std::byte*>& cache) {
     const std::string& object_name = plan.objects.at(parameter.parts.front().object).name;
     const auto key = std::make_pair(object_name, rank);
     auto found = cache.find(key);
@@ -1253,10 +1256,9 @@ Weight fp16_host_weight(const BindingPlan& plan, artifact::Reader& reader,
             std::memcpy(shard.data() + word, &converted, sizeof(converted));
         }
         const BoundDevice bound(device);
-        DeviceBuffer buffer(shard.size());
-        buffer.copy_from_host(shard.data(), shard.size());
-        buffers.push_back(std::move(buffer));
-        found = cache.emplace(key, buffers.size() - 1).first;
+        const DeviceSpan span = arena.alloc_bytes(shard.size());
+        CUDA_CHECK(cudaMemcpy(span.data, shard.data(), shard.size(), cudaMemcpyHostToDevice));
+        found = cache.emplace(key, static_cast<const std::byte*>(span.data)).first;
     }
     const auto geometry = role_geometry(parameter.role);
     const auto mapping = shard_of(shards, roles::role_name(parameter.role));
@@ -1277,7 +1279,7 @@ Weight fp16_host_weight(const BindingPlan& plan, artifact::Reader& reader,
     }
     const auto& block = role_block(entry, parameter.role, rank);
     Weight weight;
-    const auto* base = static_cast<const std::byte*>(buffers[found->second].p) + block.offset;
+    const auto* base = found->second + block.offset;
     weight.payload = base;
     weight.qdata = base;
     weight.payload_bytes = static_cast<std::uint64_t>(entry_rows) * entry_columns * 2;
@@ -1295,14 +1297,52 @@ Weight fp16_host_weight(const BindingPlan& plan, artifact::Reader& reader,
 
 } // namespace
 
+std::array<std::uint64_t, kMaximumDevices>
+fp16_control_capacity_bytes(const BindingPlan& plan, int tp, std::size_t loaded_layers) {
+    std::array<std::uint64_t, kMaximumDevices> out{};
+    if constexpr (qwen4_exp::detail::kTextActivationDtype != DType::FP16) { return out; }
+
+    const auto shards = shard_plan_by_name(tp);
+    const auto byte_plan = shard_byte_plan(plan, shards, tp);
+    std::array<std::set<std::string>, kMaximumDevices> seen;
+    const auto add = [&](const BoundParameter& parameter) {
+        for (int rank = 0; rank < tp; ++rank) {
+            const auto& object = plan.objects.at(parameter.parts.front().object);
+            if (!is_fp16_control_object(plan, object)) { continue; }
+            if (!seen[static_cast<std::size_t>(rank)].insert(object.name).second) { continue; }
+            const auto& entry = object_entry(byte_plan, object.name);
+            out[static_cast<std::size_t>(rank)] +=
+                align_up_256(static_cast<std::int64_t>(entry.encoded_bytes[static_cast<std::size_t>(rank)]));
+        }
+    };
+
+    add(plan.output_head);
+    add(plan.final_hc.down);
+    add(plan.final_hc.up);
+    add(plan.ple.key);
+    add(plan.ple.value);
+    for (std::size_t layer = 0; layer < loaded_layers; ++layer) {
+        const LayerPlan& source = plan.layers[layer];
+        add(source.attention_hc.down);
+        add(source.attention_hc.up);
+        add(source.moe_hc.down);
+        add(source.moe_hc.up);
+        if (TextConfig::is_qsa_layer(static_cast<int>(layer))) {
+            add(std::get<QsaPlan>(source.mixer).key);
+        }
+    }
+    return out;
+}
+
 LoadedModelData::LoadedModelData(const BindingPlan& plan,
-                                 const artifact::MaterializedArtifact& materialized,
+                                 artifact::MaterializedArtifact& materialized,
                                  std::size_t loaded_layers, int tp,
-                                 const std::filesystem::path& artifact_path) {
+                                 const std::filesystem::path& artifact_path)
+    : backing_(&materialized) {
     ple_source_ = std::make_unique<PleTableSource>(artifact_path, plan);
 
     const auto shards = shard_plan_by_name(tp);
-    views_ = shard_views(plan, materialized, shards, tp, TextConfig::layers);
+    views_ = shard_views(plan, materialized, shards, tp, loaded_layers);
 
     if constexpr (qwen4_exp::detail::kTextActivationDtype == DType::FP16) {
         const auto probe_handle =
@@ -1314,20 +1354,15 @@ LoadedModelData::LoadedModelData(const BindingPlan& plan,
             }
             artifact::Reader reader(artifact_path);
             const auto byte_plan = shard_byte_plan(plan, shards, tp);
-            std::map<std::pair<std::string, int>, std::size_t> cache;
             for (int rank = 0; rank < tp; ++rank) {
-                int device = 0;
-                {
-                    const void* pointer = materialized.device_data(probe_handle, rank);
-                    cudaPointerAttributes attributes{};
-                    CUDA_CHECK(cudaPointerGetAttributes(&attributes, pointer));
-                    device = attributes.device;
-                }
+                const int device = materialized.physical_device(rank);
                 auto& view = views_.views[static_cast<std::size_t>(rank)];
+                DeviceArena& arena = materialized.device_arena(rank);
+                std::map<std::pair<std::string, int>, const std::byte*> cache;
                 const auto build = [&](const BoundParameter& parameter, std::int32_t rows,
                                        std::int32_t columns) {
                     return fp16_host_weight(plan, reader, shards, byte_plan, parameter, rows, columns,
-                                            rank, device, fp16_control_, cache);
+                                            rank, device, arena, cache);
                 };
                 view.output_head = build(plan.output_head, TextConfig::vocab, TextConfig::hidden);
                 view.final_hc.down_injection =
@@ -1374,7 +1409,71 @@ LoadedModelData::LoadedModelData(const BindingPlan& plan,
         view.ple.controls = ple_source_->controls();
         view.ple.rows = qwen4_exp::PleRowSource{ple_source_.get(), &fetch_ple_rows,
                                                  ple_source_->divisors()};
+        if (materialized.stats().tensor_count != 0) {
+            resident_[static_cast<std::size_t>(rank)].weights_capacity_bytes =
+                materialized.device_arena(rank).capacity();
+            resident_[static_cast<std::size_t>(rank)].weights_used_bytes =
+                materialized.device_arena(rank).used();
+        }
+        view.resident = &resident_[static_cast<std::size_t>(rank)];
     }
+}
+
+void LoadedModelData::allocate_expert_cache(const EngineOptions& options,
+                                            ExecutionContext& execution) {
+    if (backing_ == nullptr || backing_->stats().tensor_count == 0) { return; }
+    if (execution.tp < 1 || execution.tp > static_cast<int>(kMaximumDevices)) {
+        throw std::invalid_argument("the expert cache needs one to four ranks");
+    }
+    if (experts_[0] != nullptr) { return; }
+
+    constexpr std::uint64_t kVramReserveBytes = 1ULL << 30;
+    for (int rank = 0; rank < execution.tp; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        int previous    = 0;
+        CUDA_CHECK(cudaGetDevice(&previous));
+        CUDA_CHECK(cudaSetDevice(execution.dev[slot]->device));
+        std::size_t free_bytes  = 0;
+        std::size_t total_bytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        CUDA_CHECK(cudaSetDevice(previous));
+
+        ExpertCacheOptions cache_options;
+        if (options.expert_cache_mib != 0) {
+            cache_options.capacity_bytes =
+                static_cast<std::uint64_t>(options.expert_cache_mib) * 1024ULL * 1024ULL;
+        }
+        cache_options.vram_reserve_bytes = kVramReserveBytes;
+        experts_[slot] = std::make_unique<ExpertRuntime>(
+            options.artifact_path, execution.dev[slot]->device,
+            static_cast<std::uint32_t>(rank) * kRankExperts, cache_options, free_bytes,
+            &resident_[slot]);
+        auto& view = views_.views[slot];
+        for (std::size_t layer = 0; layer < TextConfig::layers; ++layer) {
+            view.layers[layer].post_mixer.cache = experts_[slot].get();
+        }
+    }
+}
+
+CacheStats LoadedModelData::expert_cache_stats(int rank) const {
+    if (rank < 0 || rank >= static_cast<int>(kMaximumDevices) || experts_[static_cast<std::size_t>(rank)] == nullptr) {
+        throw std::invalid_argument("the expert cache is not allocated for this rank");
+    }
+    return experts_[static_cast<std::size_t>(rank)]->cache().stats();
+}
+
+std::uint64_t LoadedModelData::expert_cache_bytes(int rank) const {
+    if (rank < 0 || rank >= static_cast<int>(kMaximumDevices) || experts_[static_cast<std::size_t>(rank)] == nullptr) {
+        return 0;
+    }
+    return experts_[static_cast<std::size_t>(rank)]->device_bytes();
+}
+
+std::uint64_t LoadedModelData::expert_host_bytes(int rank) const {
+    if (rank < 0 || rank >= static_cast<int>(kMaximumDevices) || experts_[static_cast<std::size_t>(rank)] == nullptr) {
+        return 0;
+    }
+    return experts_[static_cast<std::size_t>(rank)]->host_bytes();
 }
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

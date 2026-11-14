@@ -65,6 +65,7 @@ public:
     HostPairSource(const std::filesystem::path& path, std::uint64_t pair_bytes);
 
     void read(std::uint32_t layer, std::uint32_t expert, std::span<std::byte> destination) const;
+    void read_divisors(std::uint32_t layer, std::uint32_t expert, float (&out)[3]) const;
 
     [[nodiscard]] std::uint64_t pair_bytes() const noexcept { return pair_bytes_; }
 
@@ -78,6 +79,7 @@ private:
         std::uint64_t row_count    = 0;
         std::uint64_t row_bytes    = 0;
         std::uint64_t tile_bytes   = 0;
+        std::uint64_t divisor      = 0;
     };
 
     artifact::Reader reader_;
@@ -90,6 +92,9 @@ public:
                 std::uint64_t available_bytes, HostPairSource& source);
 
     [[nodiscard]] std::optional<std::uint32_t> find(std::uint32_t layer, std::uint32_t expert) noexcept;
+    [[nodiscard]] std::int32_t resident_slot(std::uint32_t layer, std::uint32_t expert) const noexcept;
+    void reserve(std::uint32_t count,
+                 const std::vector<std::pair<std::uint32_t, std::uint32_t>>& protected_pairs);
     [[nodiscard]] std::uint32_t load(std::uint32_t layer, std::uint32_t expert);
 
     [[nodiscard]] std::uint64_t slot_offset(std::uint32_t slot) const noexcept;
@@ -110,6 +115,8 @@ private:
     std::vector<std::int32_t> slot_of_;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> resident_;
     std::vector<std::uint8_t> reference_;
+    std::vector<std::uint32_t> spare_;
+    std::vector<std::uint8_t> spare_mark_;
     std::uint32_t hand_      = 0;
     std::uint32_t next_free_ = 0;
     CacheStats stats_;

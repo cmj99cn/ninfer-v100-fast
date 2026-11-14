@@ -4,6 +4,7 @@ add_library(ninfer_flash_next_package STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/leaves.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/bindings.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/expert_cache.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/expert_runtime.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/geometry.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/roles.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/sharding.cpp)

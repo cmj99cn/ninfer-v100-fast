@@ -591,6 +591,16 @@ struct MemorySummary {
     // divides it by the tensor-parallel width, so it is reported separately from the rest of the
     // sequence arena.
     std::size_t gdn_state_bytes = 0;
+    // The resident expert cache on THIS device: its slot payload bytes and the routing lookups it
+    // has served. `expert_cache_miss_bytes` is the host bytes the miss path has read at least once.
+    std::size_t expert_cache_bytes = 0;
+    std::size_t expert_cache_pairs = 0;
+    std::uint64_t expert_cache_hits = 0;
+    std::uint64_t expert_cache_misses = 0;
+    std::uint64_t expert_cache_miss_bytes = 0;
+    // Process-wide peak resident host set. The artifact volumes are memory mapped, so this counts
+    // the pages the process has actually touched (weights, PLE rows, the expert miss staging).
+    std::size_t host_resident_bytes = 0;
 };
 
 // One row of the per-device memory table the load summary prints. At tp == 1 only `devices[0]` is

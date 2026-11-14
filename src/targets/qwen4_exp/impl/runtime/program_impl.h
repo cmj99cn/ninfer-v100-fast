@@ -14,6 +14,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <sys/resource.h>
 #include <utility>
 #include <vector>
 
@@ -298,7 +299,46 @@ void ProgramImplCore::abort_lane(std::uint32_t lane) noexcept {
 }
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {
-    return MemorySummary{};
+    MemorySummary out;
+    out.device                = execution_.dev[0]->device;
+    out.max_context           = plan_->capacity;
+    out.effective_max_context = Variant::maximum_context;
+    out.rope_mode             = RopeMode::Native;
+    out.yarn_mscale           = 1.0;
+    out.kv_cache              = KvCacheStorage::Int8Group64;
+    out.kv_capacity           = plan_->kv_capacity;
+    out.kv_capacity_page_groups = plan_->main_page_groups;
+    out.kv_capacity_max_page_groups = plan_->main_page_groups;
+    const auto slot = std::size_t{0};
+    const TextResidentStats* resident = models_[slot]->resident;
+    if (resident != nullptr) {
+        out.weights = ArenaMemorySummary{static_cast<std::size_t>(resident->weights_capacity_bytes),
+                                         static_cast<std::size_t>(resident->weights_used_bytes),
+                                         static_cast<std::size_t>(resident->weights_used_bytes)};
+        out.expert_cache_bytes     = static_cast<std::size_t>(resident->expert_cache_bytes);
+        out.expert_cache_pairs     = static_cast<std::size_t>(resident->expert_cache_pairs);
+        out.expert_cache_hits      = resident->expert_cache_hits;
+        out.expert_cache_misses    = resident->expert_cache_misses;
+        out.expert_cache_miss_bytes = resident->expert_cache_miss_bytes;
+    }
+    const std::uint64_t state_bytes = states_[slot]->reserved_bytes();
+    out.sequence = ArenaMemorySummary{static_cast<std::size_t>(state_bytes),
+                                      static_cast<std::size_t>(state_bytes),
+                                      static_cast<std::size_t>(state_bytes)};
+    out.workspace = ArenaMemorySummary{
+        work_arenas_[slot]->capacity() + activation_arenas_[slot]->capacity(),
+        work_arenas_[slot]->used() + activation_arenas_[slot]->used(),
+        work_arenas_[slot]->peak_used() + activation_arenas_[slot]->peak_used()};
+    out.request_transient = ArenaMemorySummary{plan_->request_transient_capacity_bytes, 0, 0};
+    out.minimum_runtime_reservation_bytes = plan_->device_reservation_bytes;
+    out.runtime_reservation_bytes         = plan_->device_reservation_bytes;
+    out.kv_payload_bytes                  = states_[slot]->kv_payload_bytes();
+    out.gdn_state_bytes                   = states_[slot]->gdn_state_bytes();
+    rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        out.host_resident_bytes = static_cast<std::size_t>(usage.ru_maxrss) * 1024U;
+    }
+    return out;
 }
 
 MetricsSnapshot ProgramImplCore::metrics() const noexcept {

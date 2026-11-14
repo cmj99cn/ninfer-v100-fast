@@ -4,6 +4,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_split.h"
 #include "ninfer/ops/moe_nvfp4.h"
+#include "targets/qwen3_8_flash_next/impl/load/expert_runtime.h"
 
 #include <array>
 #include <cstdio>
@@ -116,6 +117,10 @@ std::size_t GdnProjectionLeaf::workspace_capacity_bytes(std::int32_t tokens) {
 void PostMixerLeaf::routed(const Tensor& hidden, const MoeWeights& weights,
                            const ops::MoeNvfp4RouteView& route, Tensor& destination,
                            cudaStream_t stream) {
+    if (weights.cache != nullptr) {
+        weights.cache->routed(weights.layer, hidden, route, destination, stream);
+        return;
+    }
     ops::moe_routed_nvfp4_partial(hidden, weights, route, destination, stream);
 }
 

@@ -84,6 +84,10 @@ inline TextState::TextState(DeviceContext& device, const ModelView& model,
       ple_rows_(ops::kPleHeads * forward_tokens_ * kBatch * 4),
       ple_staged_rows_(ops::kPleHeads * forward_tokens_ * kBatch * 128),
       ple_divisors_(ops::kPleShards * 4) {
+    ple_rows_host_ = std::make_unique<PinnedHostBuffer>(
+        static_cast<std::size_t>(ops::kPleHeads) * forward_tokens_ * kBatch * 4);
+    ple_staged_host_ = std::make_unique<PinnedHostBuffer>(
+        static_cast<std::size_t>(ops::kPleHeads) * forward_tokens_ * kBatch * 128);
     if (tp < 1 || rank < 0 || rank >= tp) {
         throw std::invalid_argument("the text state rank is outside the tensor-parallel group");
     }
@@ -171,10 +175,18 @@ inline void TextState::reset() {
     ple_history_.fill(0);
     ple_rows_.fill(0);
     ple_staged_rows_.fill(0);
+    {
+        std::vector<std::int32_t> table(pages_);
+        for (std::size_t page = 0; page < pages_; ++page) {
+            table[page] = static_cast<std::int32_t>(page);
+        }
+        page_table_.copy_from_host(table.data(), pages_ * 4);
+    }
     next_position_ = 0;
     ple_tail_[0]   = TextConfig::eos_token_id;
     ple_tail_[1]   = TextConfig::eos_token_id;
-    ple_staged_host_.assign(ple_staged_rows_.bytes, std::byte{0});
+    std::memset(ple_rows_host_->data(), 0, ple_rows_host_->size());
+    std::memset(ple_staged_host_->data(), 0, ple_staged_host_->size());
 }
 
 inline void TextState::prepare_ple_rows(std::span<const TokenId> tokens) {
@@ -194,13 +206,17 @@ inline void TextState::prepare_ple_rows(std::span<const TokenId> tokens) {
     for (std::size_t index = 0; index < rows.size(); ++index) {
         addresses[index] = ops::ple_row_address(ple_table_, rows[index]);
     }
-    ple_staged_host_.resize(rows.size() * row_bytes);
+    const std::size_t staged_bytes = rows.size() * row_bytes;
+    if (staged_bytes > ple_staged_host_->size() || rows.size() * 4 > ple_rows_host_->size()) {
+        throw std::runtime_error("the PLE row round exceeds its pinned staging capacity");
+    }
     ple_source_.fetch(ple_source_.context, addresses.data(), addresses.size(),
-                      ple_staged_host_.data());
-    CUDA_CHECK(cudaMemcpyAsync(ple_rows_.p, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice,
-                               stream_));
-    CUDA_CHECK(cudaMemcpyAsync(ple_staged_rows_.p, ple_staged_host_.data(),
-                               ple_staged_host_.size(), cudaMemcpyHostToDevice, stream_));
+                      static_cast<std::byte*>(ple_staged_host_->data()));
+    std::memcpy(ple_rows_host_->data(), rows.data(), rows.size() * 4);
+    CUDA_CHECK(cudaMemcpyAsync(ple_rows_.p, ple_rows_host_->data(), rows.size() * 4,
+                               cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(ple_staged_rows_.p, ple_staged_host_->data(), staged_bytes,
+                               cudaMemcpyHostToDevice, stream_));
     for (const TokenId token : tokens) { advance_ple_tail(token); }
 }
 
@@ -235,6 +251,23 @@ inline std::optional<std::size_t> TextState::gdn_state_index(std::size_t layer) 
 }
 
 inline std::size_t TextState::gdn_state_entries() const noexcept { return gdn_layers_.size(); }
+
+inline std::uint64_t TextState::kv_payload_bytes() const noexcept {
+    return static_cast<std::uint64_t>(k_pages_.bytes) + v_pages_.bytes + index_k_pages_.bytes +
+           page_table_.bytes + tail_raw_keys_.bytes + tail_first_rope_.bytes +
+           after_raw_keys_.bytes + after_first_rope_.bytes + record_raw_keys_.bytes +
+           record_rope_positions_.bytes + record_base_positions_.bytes;
+}
+
+inline std::uint64_t TextState::gdn_state_bytes() const noexcept {
+    return static_cast<std::uint64_t>(conv_kernels_.bytes) + conv_states_.bytes +
+           recurrent_states_.bytes;
+}
+
+inline std::uint64_t TextState::reserved_bytes() const noexcept {
+    return kv_payload_bytes() + gdn_state_bytes() + ple_history_.bytes + ple_rows_.bytes +
+           ple_staged_rows_.bytes + ple_divisors_.bytes;
+}
 
 inline ops::QsaCacheView TextState::cache() const {
     const std::int32_t pages = static_cast<std::int32_t>(pages_);
