@@ -4,6 +4,8 @@
 
 #include "core/tensor.h"
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -12,6 +14,27 @@
 #include <string>
 
 namespace ninfer::ops::detail {
+
+template <class A>
+struct PleAct;
+
+template <>
+struct PleAct<__nv_bfloat16> {
+    __device__ __forceinline__ static float to_float(__nv_bfloat16 value) {
+        return __bfloat162float(value);
+    }
+    __device__ __forceinline__ static __nv_bfloat16 from_float(float value) {
+        return __float2bfloat16_rn(value);
+    }
+};
+
+template <>
+struct PleAct<__half> {
+    __device__ __forceinline__ static float to_float(__half value) { return __half2float(value); }
+    __device__ __forceinline__ static __half from_float(float value) {
+        return __float2half_rn(value);
+    }
+};
 
 inline bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1U)) == 0U;
@@ -45,6 +68,12 @@ inline void require_shape(const Tensor& tensor, const char* label, DType dtype,
     }
     if (!aligned_to(tensor.data, 16)) {
         throw std::invalid_argument(std::string("ple: ") + label + " must be 16-byte aligned");
+    }
+}
+
+inline void require_activation(const Tensor& tensor, const char* label) {
+    if (tensor.dtype != DType::BF16 && tensor.dtype != DType::FP16) {
+        throw std::invalid_argument(std::string("ple: ") + label + " has a wrong dtype");
     }
 }
 

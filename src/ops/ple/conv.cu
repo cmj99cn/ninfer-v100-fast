@@ -19,11 +19,12 @@ namespace {
 constexpr int kConvBlock = 256;
 constexpr int kStateBlock = 256;
 
+template <class A>
 __global__ __launch_bounds__(kConvBlock) void ple_conv_kernel(
-    const __nv_bfloat16* history, const __nv_bfloat16* values, const __nv_bfloat16* residual,
-    const __nv_bfloat16* gated_value, const __nv_bfloat16* kernel, const std::int32_t* offsets,
-    const std::int32_t* counts, const __nv_bfloat16* next_norm, float epsilon,
-    __nv_bfloat16* updated_residual, __nv_bfloat16* normalized, std::int32_t tokens, bool normalize) {
+    const A* history, const A* values, const A* residual, const A* gated_value,
+    const __nv_bfloat16* kernel, const std::int32_t* offsets, const std::int32_t* counts,
+    const __nv_bfloat16* next_norm, float epsilon, A* updated_residual, A* normalized,
+    std::int32_t tokens, bool normalize) {
     const std::size_t column = blockIdx.x;
     const std::int32_t b = static_cast<std::int32_t>(column / tokens);
     const std::int32_t t = static_cast<std::int32_t>(column % tokens);
@@ -43,22 +44,22 @@ __global__ __launch_bounds__(kConvBlock) void ple_conv_kernel(
                                            static_cast<std::int32_t>(kPleConvDilation);
                 float source = 0.0F;
                 if (k < 0) {
-                    source = __bfloat162float(
+                    source = PleAct<A>::to_float(
                         history[c + kPleChannels * static_cast<std::size_t>(9 + k) +
                                 kPleChannels * kPleConvWindow * b]);
                 } else {
                     const std::size_t source_column =
                         static_cast<std::size_t>(offsets[b] + k) + static_cast<std::size_t>(tokens) * b;
-                    source = __bfloat162float(values[c + kPleChannels * source_column]);
+                    source = PleAct<A>::to_float(values[c + kPleChannels * source_column]);
                 }
                 conv += __bfloat162float(kernel[tap * kPleChannels + c]) * source;
             }
             const std::size_t index = c + kPleChannels * column;
-            const __nv_bfloat16 stored = __float2bfloat16_rn(
-                __bfloat162float(residual[index]) +
-                __bfloat162float(gated_value[c + kPleChannels * column]) + silu(conv));
+            const A stored = PleAct<A>::from_float(
+                PleAct<A>::to_float(residual[index]) +
+                PleAct<A>::to_float(gated_value[c + kPleChannels * column]) + silu(conv));
             updated_residual[index] = stored;
-            const float word = __bfloat162float(stored);
+            const float word = PleAct<A>::to_float(stored);
             sum_squares += word * word;
         }
         const float total = block_reduce_sum<kConvBlock>(sum_squares, scratch);
@@ -74,17 +75,17 @@ __global__ __launch_bounds__(kConvBlock) void ple_conv_kernel(
         for (std::int32_t d = static_cast<std::int32_t>(threadIdx.x); d < kPleHidden; d += kConvBlock) {
             const std::size_t c = s * kPleHidden + d;
             const std::size_t index = c + kPleChannels * column;
-            normalized[index] = __float2bfloat16_rn(
-                __bfloat162float(updated_residual[index]) *
+            normalized[index] = PleAct<A>::from_float(
+                PleAct<A>::to_float(updated_residual[index]) *
                 (1.0F + __bfloat162float(next_norm[c])) * inverse[s]);
         }
     }
 }
 
+template <class A>
 __global__ __launch_bounds__(kStateBlock) void ple_state_extract_kernel(
-    const __nv_bfloat16* before_history, const __nv_bfloat16* records_values,
-    const std::int32_t* accepted_columns, __nv_bfloat16* after_history, std::int32_t tokens,
-    std::size_t rows) {
+    const A* before_history, const A* records_values, const std::int32_t* accepted_columns,
+    A* after_history, std::int32_t tokens, std::size_t rows) {
     const std::size_t flat = static_cast<std::size_t>(blockIdx.x) * kStateBlock + threadIdx.x;
     if (flat >= rows) return;
 
@@ -117,14 +118,29 @@ void ple_conv_launch(const Tensor& history, const Tensor& values, const Tensor& 
                      cudaStream_t stream) {
     const std::size_t tokens = static_cast<std::size_t>(values.ne[1]);
     const std::size_t batch = static_cast<std::size_t>(values.ne[2]);
-    ple_conv_kernel<<<static_cast<int>(tokens * batch), kConvBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(history.data), static_cast<const __nv_bfloat16*>(values.data),
-        static_cast<const __nv_bfloat16*>(residual.data), static_cast<const __nv_bfloat16*>(gated_value.data),
-        static_cast<const __nv_bfloat16*>(kernel.data),
-        static_cast<const std::int32_t*>(offsets.data), static_cast<const std::int32_t*>(counts.data),
-        static_cast<const __nv_bfloat16*>(next_norm), epsilon,
-        static_cast<__nv_bfloat16*>(updated_residual.data), static_cast<__nv_bfloat16*>(normalized),
-        static_cast<std::int32_t>(tokens), normalize);
+    if (history.dtype == DType::FP16) {
+        ple_conv_kernel<__half><<<static_cast<int>(tokens * batch), kConvBlock, 0, stream>>>(
+            static_cast<const __half*>(history.data), static_cast<const __half*>(values.data),
+            static_cast<const __half*>(residual.data), static_cast<const __half*>(gated_value.data),
+            static_cast<const __nv_bfloat16*>(kernel.data),
+            static_cast<const std::int32_t*>(offsets.data),
+            static_cast<const std::int32_t*>(counts.data),
+            static_cast<const __nv_bfloat16*>(next_norm), epsilon,
+            static_cast<__half*>(updated_residual.data), static_cast<__half*>(normalized),
+            static_cast<std::int32_t>(tokens), normalize);
+    } else {
+        ple_conv_kernel<__nv_bfloat16><<<static_cast<int>(tokens * batch), kConvBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(history.data),
+            static_cast<const __nv_bfloat16*>(values.data),
+            static_cast<const __nv_bfloat16*>(residual.data),
+            static_cast<const __nv_bfloat16*>(gated_value.data),
+            static_cast<const __nv_bfloat16*>(kernel.data),
+            static_cast<const std::int32_t*>(offsets.data),
+            static_cast<const std::int32_t*>(counts.data),
+            static_cast<const __nv_bfloat16*>(next_norm), epsilon,
+            static_cast<__nv_bfloat16*>(updated_residual.data),
+            static_cast<__nv_bfloat16*>(normalized), static_cast<std::int32_t>(tokens), normalize);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -135,11 +151,19 @@ void ple_state_extract_launch(const Tensor& before_history, const Tensor& record
     const std::size_t tokens = static_cast<std::size_t>(records_values.ne[1]);
     const std::size_t rows = kPleChannels * batch;
     const int grid = static_cast<int>((rows + kStateBlock - 1) / kStateBlock);
-    ple_state_extract_kernel<<<grid, kStateBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(before_history.data),
-        static_cast<const __nv_bfloat16*>(records_values.data),
-        static_cast<const std::int32_t*>(accepted_columns.data),
-        static_cast<__nv_bfloat16*>(after_history.data), static_cast<std::int32_t>(tokens), rows);
+    if (before_history.dtype == DType::FP16) {
+        ple_state_extract_kernel<__half><<<grid, kStateBlock, 0, stream>>>(
+            static_cast<const __half*>(before_history.data),
+            static_cast<const __half*>(records_values.data),
+            static_cast<const std::int32_t*>(accepted_columns.data),
+            static_cast<__half*>(after_history.data), static_cast<std::int32_t>(tokens), rows);
+    } else {
+        ple_state_extract_kernel<__nv_bfloat16><<<grid, kStateBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(before_history.data),
+            static_cast<const __nv_bfloat16*>(records_values.data),
+            static_cast<const std::int32_t*>(accepted_columns.data),
+            static_cast<__nv_bfloat16*>(after_history.data), static_cast<std::int32_t>(tokens), rows);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -153,15 +177,24 @@ void require_conv_shapes(const Tensor& history, const Tensor& normalized_conv, c
     const std::int32_t tokens = normalized_conv.ne[1];
     const std::int32_t batch = normalized_conv.ne[2];
 
-    detail::require_shape(history, "history", DType::BF16,
+    detail::require_activation(history, "history");
+    detail::require_activation(normalized_conv, "normalized_conv");
+    detail::require_activation(residual, "residual");
+    detail::require_activation(gated_value, "gated_value");
+    const DType activation = history.dtype;
+    if (normalized_conv.dtype != activation || residual.dtype != activation ||
+        gated_value.dtype != activation) {
+        throw std::invalid_argument("ple: the convolution activation dtypes must agree");
+    }
+    detail::require_shape(history, "history", history.dtype,
                           {static_cast<std::int32_t>(kPleChannels), static_cast<std::int32_t>(kPleConvWindow),
                            batch});
-    detail::require_shape(normalized_conv, "normalized_conv", DType::BF16,
+    detail::require_shape(normalized_conv, "normalized_conv", normalized_conv.dtype,
                           {static_cast<std::int32_t>(kPleChannels), tokens, batch});
-    detail::require_shape(residual, "residual", DType::BF16,
+    detail::require_shape(residual, "residual", residual.dtype,
                           {static_cast<std::int32_t>(kPleHidden), static_cast<std::int32_t>(kPleStreams),
                            tokens, batch});
-    detail::require_shape(gated_value, "gated_value", DType::BF16,
+    detail::require_shape(gated_value, "gated_value", gated_value.dtype,
                           {static_cast<std::int32_t>(kPleChannels), tokens, batch});
     detail::require_shape(kernel, "kernel", DType::BF16,
                           {static_cast<std::int32_t>(kPleConvTaps), static_cast<std::int32_t>(kPleChannels)});
@@ -179,9 +212,13 @@ void ple_conv_add(const Tensor& history, const Tensor& normalized_conv, const Te
                   const Tensor& gated_value, const Tensor& kernel, const Tensor& offsets,
                   const Tensor& counts, Tensor& updated_residual, cudaStream_t stream) {
     require_conv_shapes(history, normalized_conv, residual, gated_value, kernel, offsets, counts);
-    detail::require_shape(updated_residual, "updated_residual", DType::BF16,
+    detail::require_activation(updated_residual, "updated_residual");
+    detail::require_shape(updated_residual, "updated_residual", updated_residual.dtype,
                           {static_cast<std::int32_t>(kPleHidden), static_cast<std::int32_t>(kPleStreams),
                            normalized_conv.ne[1], normalized_conv.ne[2]});
+    if (updated_residual.dtype != normalized_conv.dtype) {
+        throw std::invalid_argument("ple: the convolution activation dtypes must agree");
+    }
 
     detail::require_disjoint(updated_residual, history, "updated_residual");
     detail::require_disjoint(updated_residual, normalized_conv, "updated_residual");
@@ -202,10 +239,15 @@ void ple_conv_add_norm(const Tensor& history, const Tensor& normalized_conv, con
     require_conv_shapes(history, normalized_conv, residual, gated_value, kernel, offsets, counts);
     detail::require_shape(next_hc_norm_weight, "next_hc_norm_weight", DType::BF16,
                           {static_cast<std::int32_t>(kPleChannels)});
-    detail::require_shape(updated_residual, "updated_residual", DType::BF16,
+    detail::require_activation(updated_residual, "updated_residual");
+    detail::require_shape(updated_residual, "updated_residual", updated_residual.dtype,
                           {static_cast<std::int32_t>(kPleHidden), static_cast<std::int32_t>(kPleStreams),
                            normalized_conv.ne[1], normalized_conv.ne[2]});
-    detail::require_shape(normalized, "normalized", DType::BF16,
+    detail::require_activation(normalized, "normalized");
+    if (updated_residual.dtype != normalized_conv.dtype || normalized.dtype != normalized_conv.dtype) {
+        throw std::invalid_argument("ple: the convolution activation dtypes must agree");
+    }
+    detail::require_shape(normalized, "normalized", normalized.dtype,
                           {static_cast<std::int32_t>(kPleHidden), static_cast<std::int32_t>(kPleStreams),
                            normalized_conv.ne[1], normalized_conv.ne[2]});
     if (!(epsilon > 0.0F) || !std::isfinite(epsilon)) {
@@ -240,13 +282,22 @@ void ple_state_extract(const Tensor& before_history, const Tensor& records_value
     const std::int32_t batch = accepted_columns.ne[0];
     const std::int32_t tokens = records_values.ne[1];
 
-    detail::require_shape(before_history, "before_history", DType::BF16,
+    detail::require_activation(before_history, "before_history");
+    detail::require_activation(records_values, "records_values");
+    if (records_values.dtype != before_history.dtype) {
+        throw std::invalid_argument("ple: the state extraction activation dtypes must agree");
+    }
+    detail::require_shape(before_history, "before_history", before_history.dtype,
                           {static_cast<std::int32_t>(kPleChannels), static_cast<std::int32_t>(kPleConvWindow),
                            batch});
-    detail::require_shape(records_values, "records_values", DType::BF16,
+    detail::require_shape(records_values, "records_values", records_values.dtype,
                           {static_cast<std::int32_t>(kPleChannels), tokens, batch});
     detail::require_shape(accepted_columns, "accepted_columns", DType::I32, {batch});
-    detail::require_shape(after_history, "after_history", DType::BF16,
+    detail::require_activation(after_history, "after_history");
+    if (after_history.dtype != before_history.dtype) {
+        throw std::invalid_argument("ple: the state extraction activation dtypes must agree");
+    }
+    detail::require_shape(after_history, "after_history", after_history.dtype,
                           {static_cast<std::int32_t>(kPleChannels), static_cast<std::int32_t>(kPleConvWindow),
                            batch});
 

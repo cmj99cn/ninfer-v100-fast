@@ -82,6 +82,50 @@ std::uint16_t double_to_bf16(double value) {
 
 double bf16_bits_to_double(std::uint16_t bits) { return static_cast<double>(bf16_to_f32(bits)); }
 
+std::uint16_t double_to_f16(double value) { return f32_to_f16(static_cast<float>(value)); }
+double f16_bits_to_double(std::uint16_t bits) { return static_cast<double>(f16_to_f32(bits)); }
+
+std::vector<std::uint16_t> encode_f16(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) bits[i] = f32_to_f16(values[i]);
+    return bits;
+}
+
+std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values);
+
+template <DType A>
+struct PleBits;
+
+template <>
+struct PleBits<DType::BF16> {
+    static constexpr DType dtype = DType::BF16;
+    static std::vector<std::uint16_t> encode(const std::vector<float>& values) {
+        return encode_bf16(values);
+    }
+    static double to_double(std::uint16_t bits) { return bf16_bits_to_double(bits); }
+    static std::uint16_t from_double(double value) { return double_to_bf16(value); }
+    static std::uint16_t from_float(float value) { return f32_to_bf16(value); }
+    static std::vector<double> from_device(const void* device, std::size_t count) {
+        return from_device_bf16(device, count);
+    }
+    static ReductionCriterion criterion() { return kNormCriterion; }
+};
+
+template <>
+struct PleBits<DType::FP16> {
+    static constexpr DType dtype = DType::FP16;
+    static std::vector<std::uint16_t> encode(const std::vector<float>& values) {
+        return encode_f16(values);
+    }
+    static double to_double(std::uint16_t bits) { return f16_bits_to_double(bits); }
+    static std::uint16_t from_double(double value) { return double_to_f16(value); }
+    static std::uint16_t from_float(float value) { return f32_to_f16(value); }
+    static std::vector<double> from_device(const void* device, std::size_t count) {
+        return from_device_f16(device, count);
+    }
+    static ReductionCriterion criterion() { return ReductionCriterion{2.0e-3, 1.0e-5, 4.0e-3}; }
+};
+
 std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
     std::vector<std::uint16_t> bits(values.size());
     for (std::size_t i = 0; i < values.size(); ++i) bits[i] = f32_to_bf16(values[i]);
@@ -118,6 +162,20 @@ std::vector<std::uint16_t> decode_row_oracle(const std::vector<std::byte>& row,
             static_cast<std::uint8_t>(row[geometry.code_bytes_per_row + column / geometry.group_size]);
         const double product = oracle_e2m1(code) * oracle_e4m3(scale_byte);
         out[column] = double_to_bf16(product / divisor);
+    }
+    return out;
+}
+
+std::vector<std::uint16_t> decode_row_oracle_f16(const std::vector<std::byte>& row,
+                                                 const RowPagedNf4Geometry& geometry, double divisor) {
+    std::vector<std::uint16_t> out(geometry.columns);
+    for (std::uint64_t column = 0; column < geometry.columns; ++column) {
+        const std::uint8_t byte = static_cast<std::uint8_t>(row[column / 2]);
+        const std::uint8_t code = (column % 2 == 0) ? (byte & 0xFU) : (byte >> 4U);
+        const std::uint8_t scale_byte =
+            static_cast<std::uint8_t>(row[geometry.code_bytes_per_row + column / geometry.group_size]);
+        const double product = oracle_e2m1(code) * oracle_e4m3(scale_byte);
+        out[column] = double_to_f16(product / divisor);
     }
     return out;
 }
@@ -309,6 +367,7 @@ int test_hash_and_shard_mapping() {
 
     std::vector<std::byte> staged;
     std::vector<std::vector<std::uint16_t>> expected;
+    std::vector<std::vector<std::uint16_t>> expected_f16;
     std::vector<bool> exact;
     std::vector<std::size_t> tested_shards;
     for (const std::uint32_t row : tested_rows) {
@@ -327,6 +386,7 @@ int test_hash_and_shard_mapping() {
                               row_paged_nf4_row_offset(geometry, address.row), geometry.row_bytes);
         staged.insert(staged.end(), row_bytes.begin(), row_bytes.end());
         expected.push_back(decode_row_oracle(row_bytes, geometry, divisors[address.shard]));
+        expected_f16.push_back(decode_row_oracle_f16(row_bytes, geometry, divisors[address.shard]));
         exact.push_back(std::popcount(static_cast<std::uint64_t>(divisors[address.shard])) == 1);
     }
 
@@ -364,6 +424,27 @@ int test_hash_and_shard_mapping() {
         if (verify_decode("ple_lookup_rows row", slot, expected[i], exact[i])) return 1;
     }
 
+    DeviceBuffer embedding_f16(embedding_words * 2);
+    Tensor embedding_f16_view(embedding_f16.p, DType::FP16,
+                              {static_cast<std::int32_t>(ninfer::ops::kPleFeatures * ninfer::ops::kPleHeads),
+                               static_cast<std::int32_t>(tokens), 1});
+    ninfer::ops::ple_lookup_rows(table, static_cast<const std::uint32_t*>(device_rows.p),
+                                 tested_rows.size(), static_cast<const std::uint8_t*>(staged_block.p),
+                                 embedding_f16_view, 0);
+    cuda_synchronize();
+    const auto written_f16 = read_bits(embedding_f16.p, embedding_words);
+    for (std::size_t i = 0; i < tested_rows.size(); ++i) {
+        const std::size_t slot_base = (i / ninfer::ops::kPleHeads) *
+                                          (ninfer::ops::kPleFeatures * ninfer::ops::kPleHeads) +
+                                      (i % ninfer::ops::kPleHeads) * ninfer::ops::kPleFeatures;
+        std::vector<std::uint16_t> slot(written_f16.begin() + static_cast<std::ptrdiff_t>(slot_base),
+                                        written_f16.begin() +
+                                            static_cast<std::ptrdiff_t>(slot_base + ninfer::ops::kPleFeatures));
+        if (slot != expected_f16[i]) {
+            fail("ple_lookup_rows f16 row mismatch at row " + std::to_string(i));
+        }
+    }
+
     const std::vector<std::uint16_t> zeros(ninfer::ops::kPleFeatures * ninfer::ops::kPleHeads, 0);
     const std::uint32_t uncovered = ninfer::ops::kPleShards * ninfer::ops::kPleShardRows;
     std::vector<std::uint32_t> single(ninfer::ops::kPleHeads, uncovered);
@@ -394,7 +475,8 @@ int test_hash_and_shard_mapping() {
 }
 
 
-int test_gate() {
+template <DType Act>
+int test_gate_typed() {
     const std::int32_t tokens = 4;
     const std::int32_t batch = 2;
     const std::size_t columns = static_cast<std::size_t>(tokens) * batch;
@@ -415,13 +497,14 @@ int test_gate() {
     fill_uniform(norm_query, 9005U, -0.5F, 0.5F);
     fill_uniform(norm_conv, 9006U, -0.5F, 0.5F);
 
-    for (std::size_t d = 0; d < ninfer::ops::kPleHidden; ++d) key[d] = 1.0e-13F;
-    for (std::size_t d = 0; d < ninfer::ops::kPleHidden; ++d) key[ninfer::ops::kPleHidden + d] = -1.0e-13F;
+    const float tiny = Act == DType::FP16 ? 1.0e-6F : 1.0e-13F;
+    for (std::size_t d = 0; d < ninfer::ops::kPleHidden; ++d) key[d] = tiny;
+    for (std::size_t d = 0; d < ninfer::ops::kPleHidden; ++d) key[ninfer::ops::kPleHidden + d] = -tiny;
     for (std::size_t d = 0; d < ninfer::ops::kPleHidden; ++d) key[2 * ninfer::ops::kPleHidden + d] = 0.0F;
 
-    const auto key_bits = encode_bf16(key);
-    const auto value_bits = encode_bf16(value);
-    const auto residual_bits = encode_bf16(residual);
+    const auto key_bits = PleBits<Act>::encode(key);
+    const auto value_bits = PleBits<Act>::encode(value);
+    const auto residual_bits = PleBits<Act>::encode(residual);
     const auto norm_key_bits = encode_bf16(norm_key);
     const auto norm_query_bits = encode_bf16(norm_query);
     const auto norm_conv_bits = encode_bf16(norm_conv);
@@ -435,16 +518,16 @@ int test_gate() {
     GuardedDeviceBuffer gated(channels * columns * 2);
     GuardedDeviceBuffer normalized(channels * columns * 2);
 
-    Tensor key_view(key_device.p, DType::BF16, {static_cast<std::int32_t>(channels), tokens, batch});
-    Tensor value_view(value_device.p, DType::BF16, {static_cast<std::int32_t>(ninfer::ops::kPleHidden), tokens, batch});
-    Tensor residual_view(residual_device.p, DType::BF16,
+    Tensor key_view(key_device.p, Act, {static_cast<std::int32_t>(channels), tokens, batch});
+    Tensor value_view(value_device.p, Act, {static_cast<std::int32_t>(ninfer::ops::kPleHidden), tokens, batch});
+    Tensor residual_view(residual_device.p, Act,
                          {static_cast<std::int32_t>(ninfer::ops::kPleHidden), static_cast<std::int32_t>(ninfer::ops::kPleStreams),
                           tokens, batch});
     Tensor norm_key_view(norm_key_device.p, DType::BF16, {static_cast<std::int32_t>(channels)});
     Tensor norm_query_view(norm_query_device.p, DType::BF16, {static_cast<std::int32_t>(channels)});
     Tensor norm_conv_view(norm_conv_device.p, DType::BF16, {static_cast<std::int32_t>(channels)});
-    Tensor gated_view(gated.data(), DType::BF16, {static_cast<std::int32_t>(channels), tokens, batch});
-    Tensor normalized_view(normalized.data(), DType::BF16, {static_cast<std::int32_t>(channels), tokens, batch});
+    Tensor gated_view(gated.data(), Act, {static_cast<std::int32_t>(channels), tokens, batch});
+    Tensor normalized_view(normalized.data(), Act, {static_cast<std::int32_t>(channels), tokens, batch});
 
     ninfer::ops::ple_gate(key_view, value_view, residual_view, norm_key_view, norm_query_view,
                           norm_conv_view, epsilon, gated_view, normalized_view, 0);
@@ -466,9 +549,9 @@ int test_gate() {
                 std::vector<double> key_values(base + ninfer::ops::kPleHidden);
                 std::vector<double> query_values(base + ninfer::ops::kPleHidden);
                 for (std::size_t d = 0; d < ninfer::ops::kPleHidden; ++d) {
-                    key_values[base + d] = bf16_bits_to_double(key_bits[base + d + column * channels]);
+                    key_values[base + d] = PleBits<Act>::to_double(key_bits[base + d + column * channels]);
                     query_values[base + d] =
-                        bf16_bits_to_double(residual_bits[base + d + column * channels]);
+                        PleBits<Act>::to_double(residual_bits[base + d + column * channels]);
                 }
                 key_stream = std::span<const double>(key_values.data() + base, ninfer::ops::kPleHidden);
                 query_stream = std::span<const double>(query_values.data() + base, ninfer::ops::kPleHidden);
@@ -493,9 +576,10 @@ int test_gate() {
                 std::vector<std::uint16_t> stored(ninfer::ops::kPleHidden);
                 std::vector<double> stored_values(ninfer::ops::kPleHidden);
                 for (std::size_t d = 0; d < ninfer::ops::kPleHidden; ++d) {
-                    const double product = gate * bf16_bits_to_double(value_bits[d + column * ninfer::ops::kPleHidden]);
-                    stored[d] = double_to_bf16(product);
-                    stored_values[d] = bf16_bits_to_double(stored[d]);
+                    const double product =
+                        gate * PleBits<Act>::to_double(value_bits[d + column * ninfer::ops::kPleHidden]);
+                    stored[d] = PleBits<Act>::from_double(product);
+                    stored_values[d] = PleBits<Act>::to_double(stored[d]);
                     expected_gated[base + d + column * channels] = stored_values[d];
                 }
                 const double inverse_conv = oracle_inverse_rms(stored_values, epsilon);
@@ -515,23 +599,30 @@ int test_gate() {
     const auto gated_bits = read_bits(gated.data(), channels * columns);
     std::vector<std::uint16_t> exact_zero_gate;
     for (std::size_t d = 0; d < ninfer::ops::kPleHidden; ++d) {
-        exact_zero_gate.push_back(f32_to_bf16(0.5F * static_cast<float>(bf16_bits_to_double(value_bits[d]))));
+        exact_zero_gate.push_back(
+            PleBits<Act>::from_float(0.5F * static_cast<float>(PleBits<Act>::to_double(value_bits[d]))));
     }
     std::vector<std::uint16_t> zero_stream(gated_bits.begin() + 2 * ninfer::ops::kPleHidden,
                                            gated_bits.begin() + 3 * ninfer::ops::kPleHidden);
     failures += verify_exact("ple_gate gate at zero", zero_stream, exact_zero_gate);
     failures += normalized.verify_guards("ple_gate normalized_conv");
-    failures += verify_reduction("ple_gate gated_value", from_device_bf16(gated.data(), channels * columns),
-                                 expected_gated, kNormCriterion);
+    failures += verify_reduction("ple_gate gated_value",
+                                 PleBits<Act>::from_device(gated.data(), channels * columns),
+                                 expected_gated, PleBits<Act>::criterion());
     failures += verify_reduction("ple_gate normalized_conv",
-                                 from_device_bf16(normalized.data(), channels * columns), expected_normalized,
-                                 kNormCriterion);
-    if (failures == 0) std::cout << "OK ple_gate\n";
+                                 PleBits<Act>::from_device(normalized.data(), channels * columns),
+                                 expected_normalized, PleBits<Act>::criterion());
+    if (failures == 0) std::cout << "OK ple_gate" << (Act == DType::FP16 ? " f16" : "") << "\n";
     return failures;
 }
 
+int test_gate() {
+    return test_gate_typed<DType::BF16>() + test_gate_typed<DType::FP16>();
+}
 
-int test_conv(bool normalized_exit) {
+
+template <DType Act>
+int test_conv_typed(bool normalized_exit) {
     const std::int32_t tokens = 4;
     const std::int32_t batch = 2;
     const std::size_t columns = static_cast<std::size_t>(tokens) * batch;
@@ -552,10 +643,10 @@ int test_conv(bool normalized_exit) {
     fill_uniform(kernel, 7005U, -0.5F, 0.5F);
     fill_uniform(next_norm, 7006U, -0.5F, 0.5F);
 
-    const auto history_bits = encode_bf16(history);
-    const auto values_bits = encode_bf16(values);
-    const auto residual_bits = encode_bf16(residual);
-    const auto gated_bits = encode_bf16(gated);
+    const auto history_bits = PleBits<Act>::encode(history);
+    const auto values_bits = PleBits<Act>::encode(values);
+    const auto residual_bits = PleBits<Act>::encode(residual);
+    const auto gated_bits = PleBits<Act>::encode(gated);
     const auto kernel_bits = encode_bf16(kernel);
     const auto next_norm_bits = encode_bf16(next_norm);
 
@@ -572,24 +663,26 @@ int test_conv(bool normalized_exit) {
     const DeviceBuffer counts_device = to_device_i32(counts);
     GuardedDeviceBuffer updated(channels * columns * 2);
     GuardedDeviceBuffer normalized(normalized_exit ? channels * columns * 2 : 0);
+    updated.fill(0);
+    if (normalized_exit) { normalized.fill(0); }
 
-    Tensor history_view(history_device.p, DType::BF16,
+    Tensor history_view(history_device.p, Act,
                         {static_cast<std::int32_t>(channels), static_cast<std::int32_t>(ninfer::ops::kPleConvWindow), batch});
-    Tensor values_view(values_device.p, DType::BF16, {static_cast<std::int32_t>(channels), tokens, batch});
-    Tensor residual_view(residual_device.p, DType::BF16,
+    Tensor values_view(values_device.p, Act, {static_cast<std::int32_t>(channels), tokens, batch});
+    Tensor residual_view(residual_device.p, Act,
                          {static_cast<std::int32_t>(ninfer::ops::kPleHidden), static_cast<std::int32_t>(ninfer::ops::kPleStreams),
                           tokens, batch});
-    Tensor gated_view(gated_device.p, DType::BF16, {static_cast<std::int32_t>(channels), tokens, batch});
+    Tensor gated_view(gated_device.p, Act, {static_cast<std::int32_t>(channels), tokens, batch});
     Tensor kernel_view(kernel_device.p, DType::BF16, {static_cast<std::int32_t>(ninfer::ops::kPleConvTaps), static_cast<std::int32_t>(channels)});
     Tensor next_norm_view(next_norm_device.p, DType::BF16, {static_cast<std::int32_t>(channels)});
     Tensor offsets_view(offsets_device.p, DType::I32, {batch});
     Tensor counts_view(counts_device.p, DType::I32, {batch});
-    Tensor updated_view(updated.data(), DType::BF16,
+    Tensor updated_view(updated.data(), Act,
                         {static_cast<std::int32_t>(ninfer::ops::kPleHidden), static_cast<std::int32_t>(ninfer::ops::kPleStreams),
                          tokens, batch});
     Tensor normalized_view;
     if (normalized_exit) {
-        normalized_view = Tensor(normalized.data(), DType::BF16,
+        normalized_view = Tensor(normalized.data(), Act,
                                  {static_cast<std::int32_t>(ninfer::ops::kPleHidden), static_cast<std::int32_t>(ninfer::ops::kPleStreams),
                                   tokens, batch});
     }
@@ -618,14 +711,14 @@ int test_conv(bool normalized_exit) {
                                            static_cast<std::int32_t>(tap) * static_cast<std::int32_t>(ninfer::ops::kPleConvDilation);
                     double source = 0.0;
                     if (k < 0) {
-                        source = bf16_bits_to_double(
+                        source = PleBits<Act>::to_double(
                             history_bits[c + channels * static_cast<std::size_t>(9 + k) +
                                         channels * ninfer::ops::kPleConvWindow * b]);
                         ++history_taps;
                     } else {
                         const std::size_t column = static_cast<std::size_t>(offsets[b] + k) +
                                                    static_cast<std::size_t>(tokens) * b;
-                        source = bf16_bits_to_double(values_bits[c + channels * column]);
+                        source = PleBits<Act>::to_double(values_bits[c + channels * column]);
                     }
                     sum += bf16_bits_to_double(kernel_bits[tap * channels + c]) * source;
                 }
@@ -633,10 +726,11 @@ int test_conv(bool normalized_exit) {
                 const std::size_t d = c % ninfer::ops::kPleHidden;
                 const std::size_t column = static_cast<std::size_t>(t) + static_cast<std::size_t>(tokens) * b;
                 const std::size_t index = d + ninfer::ops::kPleHidden * s + channels * column;
-                const double ideal = bf16_bits_to_double(residual_bits[index]) +
-                                     bf16_bits_to_double(gated_bits[c + channels * column]) + oracle_silu(sum);
-                stored[index] = double_to_bf16(ideal);
-                expected_updated[index] = bf16_bits_to_double(stored[index]);
+                const double ideal = PleBits<Act>::to_double(residual_bits[index]) +
+                                     PleBits<Act>::to_double(gated_bits[c + channels * column]) +
+                                     oracle_silu(sum);
+                stored[index] = PleBits<Act>::from_double(ideal);
+                expected_updated[index] = PleBits<Act>::to_double(stored[index]);
             }
         }
     }
@@ -662,20 +756,29 @@ int test_conv(bool normalized_exit) {
 
     int failures = updated.verify_guards("ple_conv_add updated_residual");
     failures += verify_reduction("ple_conv_add updated_residual",
-                                 from_device_bf16(updated.data(), channels * columns), expected_updated,
-                                 kNormCriterion);
+                                 PleBits<Act>::from_device(updated.data(), channels * columns),
+                                 expected_updated, PleBits<Act>::criterion());
     if (normalized_exit) {
         failures += normalized.verify_guards("ple_conv_add_norm normalized");
         failures += verify_reduction("ple_conv_add_norm normalized",
-                                     from_device_bf16(normalized.data(), channels * columns),
-                                     expected_normalized, kNormCriterion);
+                                     PleBits<Act>::from_device(normalized.data(), channels * columns),
+                                     expected_normalized, PleBits<Act>::criterion());
     }
-    if (failures == 0) std::cout << "OK ple_conv_add" << (normalized_exit ? "_norm" : "") << "\n";
+    if (failures == 0) {
+        std::cout << "OK ple_conv_add" << (normalized_exit ? "_norm" : "")
+                  << (Act == DType::FP16 ? " f16" : "") << "\n";
+    }
     return failures;
 }
 
+int test_conv(bool normalized_exit) {
+    return test_conv_typed<DType::BF16>(normalized_exit) +
+           test_conv_typed<DType::FP16>(normalized_exit);
+}
 
-int test_state_extract() {
+
+template <DType Act>
+int test_state_extract_typed() {
     const std::int32_t tokens = 4;
     const std::int32_t batch = 2;
     const std::size_t channels = ninfer::ops::kPleChannels;
@@ -686,8 +789,8 @@ int test_state_extract() {
     fill_uniform(before, 6001U, -1.0F, 1.0F);
     fill_uniform(records, 6002U, -1.0F, 1.0F);
 
-    const auto before_bits = encode_bf16(before);
-    const auto records_bits = encode_bf16(records);
+    const auto before_bits = PleBits<Act>::encode(before);
+    const auto records_bits = PleBits<Act>::encode(records);
     const std::vector<std::int32_t> accepted = {0, 4};
 
     const DeviceBuffer before_device = to_device(before_bits);
@@ -695,10 +798,10 @@ int test_state_extract() {
     const DeviceBuffer accepted_device = to_device_i32(accepted);
     GuardedDeviceBuffer after(channels * window * batch * 2);
 
-    Tensor before_view(before_device.p, DType::BF16, {static_cast<std::int32_t>(channels), static_cast<std::int32_t>(window), batch});
-    Tensor records_view(records_device.p, DType::BF16, {static_cast<std::int32_t>(channels), tokens, batch});
+    Tensor before_view(before_device.p, Act, {static_cast<std::int32_t>(channels), static_cast<std::int32_t>(window), batch});
+    Tensor records_view(records_device.p, Act, {static_cast<std::int32_t>(channels), tokens, batch});
     Tensor accepted_view(accepted_device.p, DType::I32, {batch});
-    Tensor after_view(after.data(), DType::BF16, {static_cast<std::int32_t>(channels), static_cast<std::int32_t>(window), batch});
+    Tensor after_view(after.data(), Act, {static_cast<std::int32_t>(channels), static_cast<std::int32_t>(window), batch});
 
     ninfer::ops::ple_state_extract(before_view, records_view, accepted_view, after_view, 0);
     cuda_synchronize();
@@ -719,12 +822,14 @@ int test_state_extract() {
     }
 
     int failures = after.verify_guards("ple_state_extract");
-    failures += verify_exact("ple_state_extract", read_bits(after.data(), expected.size()), expected);
+    failures += verify_exact(("ple_state_extract" +
+                              std::string(Act == DType::FP16 ? " f16" : "")).c_str(),
+                             read_bits(after.data(), expected.size()), expected);
 
     const DeviceBuffer alias_device = to_device(before_bits);
-    Tensor before_alias(alias_device.p, DType::BF16,
+    Tensor before_alias(alias_device.p, Act,
                         {static_cast<std::int32_t>(channels), static_cast<std::int32_t>(window), batch});
-    Tensor after_alias(alias_device.p, DType::BF16,
+    Tensor after_alias(alias_device.p, Act,
                        {static_cast<std::int32_t>(channels), static_cast<std::int32_t>(window), batch});
     ninfer::ops::ple_state_extract(before_alias, records_view, accepted_view, after_alias, 0);
     cuda_synchronize();
@@ -744,10 +849,19 @@ int test_state_extract() {
         }
     }
 
-    failures += verify_exact("ple_state_extract alias", read_bits(alias_device.p, alias.size()), alias);
+    failures += verify_exact(("ple_state_extract alias" +
+                              std::string(Act == DType::FP16 ? " f16" : "")).c_str(),
+                             read_bits(alias_device.p, alias.size()), alias);
 
-    if (failures == 0) std::cout << "OK ple_state_extract\n";
+    if (failures == 0) {
+        std::cout << "OK ple_state_extract" << (Act == DType::FP16 ? " f16" : "") << "\n";
+    }
     return failures;
+}
+
+int test_state_extract() {
+    return test_state_extract_typed<DType::BF16>() +
+           test_state_extract_typed<DType::FP16>();
 }
 
 } // namespace

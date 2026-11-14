@@ -18,10 +18,11 @@ namespace {
 
 constexpr int kGateBlock = 256;
 
+template <class A>
 __global__ __launch_bounds__(kGateBlock) void ple_gate_kernel(
-    const __nv_bfloat16* key, const __nv_bfloat16* value, const __nv_bfloat16* residual,
-    const __nv_bfloat16* norm_key, const __nv_bfloat16* norm_query, const __nv_bfloat16* norm_conv,
-    float epsilon, __nv_bfloat16* gated_value, __nv_bfloat16* normalized_conv) {
+    const A* key, const A* value, const A* residual, const __nv_bfloat16* norm_key,
+    const __nv_bfloat16* norm_query, const __nv_bfloat16* norm_conv, float epsilon,
+    A* gated_value, A* normalized_conv) {
     const std::size_t column = blockIdx.x;
     const std::size_t channel_base = column * kPleChannels;
     const std::size_t hidden_base = column * kPleHidden;
@@ -37,8 +38,8 @@ __global__ __launch_bounds__(kGateBlock) void ple_gate_kernel(
         float sum_key = 0.0F;
         float sum_query = 0.0F;
         for (std::int32_t d = static_cast<std::int32_t>(threadIdx.x); d < kPleHidden; d += kGateBlock) {
-            const float k = __bfloat162float(key[base + d]);
-            const float q = __bfloat162float(residual[base + d]);
+            const float k = PleAct<A>::to_float(key[base + d]);
+            const float q = PleAct<A>::to_float(residual[base + d]);
             sum_key += k * k;
             sum_query += q * q;
         }
@@ -58,9 +59,10 @@ __global__ __launch_bounds__(kGateBlock) void ple_gate_kernel(
         for (std::int32_t d = static_cast<std::int32_t>(threadIdx.x); d < kPleHidden; d += kGateBlock) {
             const std::size_t weight = s * kPleHidden + d;
             const float normalized_key =
-                __bfloat162float(key[base + d]) * (1.0F + __bfloat162float(norm_key[weight]));
+                PleAct<A>::to_float(key[base + d]) * (1.0F + __bfloat162float(norm_key[weight]));
             const float normalized_query =
-                __bfloat162float(residual[base + d]) * (1.0F + __bfloat162float(norm_query[weight]));
+                PleAct<A>::to_float(residual[base + d]) *
+                (1.0F + __bfloat162float(norm_query[weight]));
             dot += normalized_key * normalized_query;
         }
         const float total = block_reduce_sum<kGateBlock>(dot, scratch);
@@ -77,10 +79,10 @@ __global__ __launch_bounds__(kGateBlock) void ple_gate_kernel(
         const std::size_t base = channel_base + s * kPleHidden;
         float sum_squares = 0.0F;
         for (std::int32_t d = static_cast<std::int32_t>(threadIdx.x); d < kPleHidden; d += kGateBlock) {
-            const __nv_bfloat16 stored =
-                __float2bfloat16_rn(gate[s] * __bfloat162float(value[hidden_base + d]));
+            const A stored = PleAct<A>::from_float(gate[s] *
+                                                   PleAct<A>::to_float(value[hidden_base + d]));
             gated_value[base + d] = stored;
-            const float word = __bfloat162float(stored);
+            const float word = PleAct<A>::to_float(stored);
             sum_squares += word * word;
         }
         const float total = block_reduce_sum<kGateBlock>(sum_squares, scratch);
@@ -93,8 +95,8 @@ __global__ __launch_bounds__(kGateBlock) void ple_gate_kernel(
     for (std::size_t s = 0; s < kPleStreams; ++s) {
         const std::size_t base = channel_base + s * kPleHidden;
         for (std::int32_t d = static_cast<std::int32_t>(threadIdx.x); d < kPleHidden; d += kGateBlock) {
-            const float word = __bfloat162float(gated_value[base + d]);
-            normalized_conv[base + d] = __float2bfloat16_rn(
+            const float word = PleAct<A>::to_float(gated_value[base + d]);
+            normalized_conv[base + d] = PleAct<A>::from_float(
                 word * (1.0F + __bfloat162float(norm_conv[s * kPleHidden + d])) * inverse_conv[s]);
         }
     }
@@ -107,14 +109,25 @@ void ple_gate_launch(const Tensor& key, const Tensor& value, const Tensor& resid
                      float epsilon, const Tensor& gated_value, const Tensor& normalized_conv,
                      cudaStream_t stream) {
     const std::size_t columns = static_cast<std::size_t>(key.ne[1]) * static_cast<std::size_t>(key.ne[2]);
-    ple_gate_kernel<<<static_cast<int>(columns), kGateBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(key.data), static_cast<const __nv_bfloat16*>(value.data),
-        static_cast<const __nv_bfloat16*>(residual.data),
-        static_cast<const __nv_bfloat16*>(norm_key.data),
-        static_cast<const __nv_bfloat16*>(norm_query.data),
-        static_cast<const __nv_bfloat16*>(norm_conv.data), epsilon,
-        static_cast<__nv_bfloat16*>(gated_value.data),
-        static_cast<__nv_bfloat16*>(normalized_conv.data));
+    if (key.dtype == DType::FP16) {
+        ple_gate_kernel<__half><<<static_cast<int>(columns), kGateBlock, 0, stream>>>(
+            static_cast<const __half*>(key.data), static_cast<const __half*>(value.data),
+            static_cast<const __half*>(residual.data),
+            static_cast<const __nv_bfloat16*>(norm_key.data),
+            static_cast<const __nv_bfloat16*>(norm_query.data),
+            static_cast<const __nv_bfloat16*>(norm_conv.data), epsilon,
+            static_cast<__half*>(gated_value.data), static_cast<__half*>(normalized_conv.data));
+    } else {
+        ple_gate_kernel<__nv_bfloat16><<<static_cast<int>(columns), kGateBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(key.data),
+            static_cast<const __nv_bfloat16*>(value.data),
+            static_cast<const __nv_bfloat16*>(residual.data),
+            static_cast<const __nv_bfloat16*>(norm_key.data),
+            static_cast<const __nv_bfloat16*>(norm_query.data),
+            static_cast<const __nv_bfloat16*>(norm_conv.data), epsilon,
+            static_cast<__nv_bfloat16*>(gated_value.data),
+            static_cast<__nv_bfloat16*>(normalized_conv.data));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -126,19 +139,31 @@ void ple_gate(const Tensor& projected_key, const Tensor& projected_value, const 
     const std::int32_t tokens = projected_key.ne[1];
     const std::int32_t batch = projected_key.ne[2];
 
-    detail::require_shape(projected_key, "projected.key", DType::BF16,
+    detail::require_activation(projected_key, "projected.key");
+    detail::require_activation(projected_value, "projected.value");
+    detail::require_activation(residual, "residual");
+    const DType activation = projected_key.dtype;
+    if (projected_value.dtype != activation || residual.dtype != activation) {
+        throw std::invalid_argument("ple: the gate activation dtypes must agree");
+    }
+    detail::require_shape(projected_key, "projected.key", projected_key.dtype,
                           {static_cast<std::int32_t>(kPleChannels), tokens, batch});
-    detail::require_shape(projected_value, "projected.value", DType::BF16,
+    detail::require_shape(projected_value, "projected.value", projected_value.dtype,
                           {static_cast<std::int32_t>(kPleHidden), tokens, batch});
-    detail::require_shape(residual, "residual", DType::BF16,
+    detail::require_shape(residual, "residual", residual.dtype,
                           {static_cast<std::int32_t>(kPleHidden), static_cast<std::int32_t>(kPleStreams),
                            tokens, batch});
     detail::require_shape(norm_key, "norm_key", DType::BF16, {static_cast<std::int32_t>(kPleChannels)});
     detail::require_shape(norm_query, "norm_query", DType::BF16, {static_cast<std::int32_t>(kPleChannels)});
     detail::require_shape(norm_conv, "norm_conv", DType::BF16, {static_cast<std::int32_t>(kPleChannels)});
-    detail::require_shape(gated_value, "gated_value", DType::BF16,
+    detail::require_activation(gated_value, "gated_value");
+    detail::require_activation(normalized_conv, "normalized_conv");
+    if (gated_value.dtype != activation || normalized_conv.dtype != activation) {
+        throw std::invalid_argument("ple: the gate activation dtypes must agree");
+    }
+    detail::require_shape(gated_value, "gated_value", gated_value.dtype,
                           {static_cast<std::int32_t>(kPleChannels), tokens, batch});
-    detail::require_shape(normalized_conv, "normalized_conv", DType::BF16,
+    detail::require_shape(normalized_conv, "normalized_conv", normalized_conv.dtype,
                           {static_cast<std::int32_t>(kPleChannels), tokens, batch});
 
     if (tokens <= 0 || batch <= 0) {
