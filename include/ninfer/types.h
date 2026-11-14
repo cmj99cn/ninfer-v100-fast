@@ -601,6 +601,10 @@ struct MemorySummary {
     std::uint64_t expert_cache_hits = 0;
     std::uint64_t expert_cache_misses = 0;
     std::uint64_t expert_cache_miss_bytes = 0;
+    // Pinned host staging the expert miss path copies through, per device. It is host memory, not
+    // device residency, so it is reported separately from the device arenas and from the process
+    // RSS peak below.
+    std::size_t expert_host_bytes = 0;
     // Process-wide peak resident host set. The artifact volumes are memory mapped, so this counts
     // the pages the process has actually touched (weights, PLE rows, the expert miss staging).
     std::size_t host_resident_bytes = 0;

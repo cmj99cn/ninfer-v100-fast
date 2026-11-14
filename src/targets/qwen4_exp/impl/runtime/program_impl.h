@@ -320,6 +320,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
         out.expert_cache_hits      = resident->expert_cache_hits;
         out.expert_cache_misses    = resident->expert_cache_misses;
         out.expert_cache_miss_bytes = resident->expert_cache_miss_bytes;
+        out.expert_host_bytes      = static_cast<std::size_t>(resident->expert_host_bytes);
     }
     const std::uint64_t state_bytes = states_[slot]->reserved_bytes();
     out.sequence = ArenaMemorySummary{static_cast<std::size_t>(state_bytes),

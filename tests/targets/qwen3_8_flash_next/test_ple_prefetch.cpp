@@ -267,6 +267,8 @@ void run(const char* path) {
             "the PLE fetch completed after the consumption await");
     require(g_probe.launch_ns.load() < g_probe.expert_end_ns.load(),
             "the PLE prefetch was launched after the first GDN layer's expert reads ended");
+    require(g_probe.fetch_end_ns.load() <= g_probe.expert_begin_ns.load(),
+            "the PLE worker fetch did not finish before the layer-0 expert host reads began");
 
     require(g_probe.expert_layer0_windows.load() == 1,
             "the decode round recorded " +
@@ -274,27 +276,26 @@ void run(const char* path) {
                 " layer-0 expert read windows; it records one");
     require(g_probe.phase_at_expert_begin.load() == 1 &&
                 g_probe.phase_at_expert_end.load() == 1,
-            "the PLE prefetch was not outstanding across the layer-0 expert reads");
+            "the PLE prefetch was awaited inside the layer-0 expert read window");
     require(g_probe.launch_ns.load() < g_probe.expert_begin_ns.load() &&
                 g_probe.expert_end_ns.load() < g_probe.await_ns.load(),
-            "the PLE prefetch window does not contain the layer-0 expert reads");
+            "the PLE prefetch lifecycle does not contain the layer-0 expert reads");
     require(after.miss_count > before.miss_count,
             "the decode round did not exercise the expert miss path");
     require(g_probe.host_reads_end.load() > g_probe.host_reads_begin.load(),
             "the layer-0 host pair source recorded no completed miss reads inside the window");
 
     const std::int64_t base = g_probe.launch_ns.load();
-    const bool contained = g_probe.launch_ns.load() < g_probe.expert_begin_ns.load() &&
-                           g_probe.expert_end_ns.load() < g_probe.await_ns.load();
-    std::cout << "flash-next PLE prefetch: prefetch window "
+    std::cout << "flash-next PLE prefetch: lifecycle "
               << (g_probe.await_ns.load() - base) << " ns contains layer-0 expert window "
               << (g_probe.expert_end_ns.load() - g_probe.expert_begin_ns.load())
-              << " ns (" << (contained ? "yes" : "no") << "), worker fetch "
-              << (g_probe.fetch_end_ns.load() - g_probe.fetch_begin_ns.load()) << " ns\n";
-    std::cout << "OK flash-next PLE prefetch: fetch " << g_probe.rows.load() << " rows on "
-              << "the worker between launch and await, expert misses "
-              << (g_probe.host_reads_end.load() - g_probe.host_reads_begin.load())
-              << " inside the layer-0 window\n";
+              << " ns; worker fetch " << (g_probe.fetch_end_ns.load() - g_probe.fetch_begin_ns.load())
+              << " ns ended " << (g_probe.expert_begin_ns.load() - g_probe.fetch_end_ns.load())
+              << " ns before the expert host reads began\n";
+    std::cout << "OK flash-next PLE prefetch: fetch " << g_probe.rows.load()
+              << " rows off the request thread, completed before the layer-0 expert host reads; "
+              << "lifecycle contains " << (g_probe.host_reads_end.load() - g_probe.host_reads_begin.load())
+              << " completed miss reads\n";
 }
 
 } // namespace

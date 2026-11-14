@@ -344,6 +344,10 @@ void check_variant(const RunResult& result, const std::string& label) {
     require(result.memory.weights.capacity_bytes != 0, label + ": the weights partition is empty");
     require(result.memory.expert_cache_bytes == result.cache_bytes,
             label + ": memory_summary does not report the expert cache bytes");
+    require(result.memory.expert_host_bytes == result.host_bytes,
+            label + ": memory_summary does not report the pinned expert staging bytes");
+    require(result.memory.expert_host_bytes != 0,
+            label + ": memory_summary reports no pinned expert staging");
     require(result.memory.kv_cache == ninfer::KvCacheStorage::MixedBf16Fp16,
             label + ": memory_summary does not report the mixed BF16/FP16 KV layout");
     require(result.memory.kv_capacity_page_groups == kKvCapacity / 64 + 1,
