@@ -892,7 +892,20 @@ Engine route always loads the full 48 layers.
   `ple_hash_tokens`, fetches those encoded rows through the target's file-backed row source, and
   stages them together with the 128 divisor words. Materializing all 128 shards as one device
   table would require changing the Op contract, which this milestone does not do.
-- Greedy parity compares the produced token with `NINFER_FLASH_NEXT_REFERENCE_TOKEN`. The reference
-  value is a placeholder until the independent reference model lands; the assertion is exact and
-  is not relaxed.
+- Greedy parity compares the produced token with `NINFER_FLASH_NEXT_REFERENCE_TOKEN`. The M2
+  mathematical oracle is `tools/reference/qwen3_8_flash_next`: it decodes the stored codes, scales
+  and divisors (including the per-shard PLE divisors and the per-expert NVFP4 divisors) into a
+  naive FP64/FP32 evaluation, uses BF16-K / FP16-V QSA cache semantics, and reproduces the
+  observable BF16/FP32 storage boundaries. The 8-token configuration produces token `20560` with
+  top-two logit margin `0.086052638`.
+- `tests/targets/qwen3_8_flash_next/test_reference_parity.py` checks three properties: the greedy
+  token, the sixteen PLE hash row numbers of every token, and the selected QSA block set of every
+  token. A long deterministic prompt exercises the index budget: at 2052 tokens (`C = 513`) the
+  model-level selected sets match exactly, and a 2100-token run (`C = 525`, 512 selected) verifies
+  the top-K pruning against the reference indexer fed the same index-query and index-key inputs.
+  At 2100 tokens the two full-model hidden states differ by BF16/FP32 rounding that the
+  near-zero per-stream RMS norm amplifies, so the model-level exact-set assertion uses the
+  2052-token case and the 2100-token case isolates the indexer. The production kernel uses FP32
+  accumulation and BF16 outputs; those are implementation-profile differences, not semantic
+  differences.
 - The tokenizer is outside M2: the test feeds token ids directly.

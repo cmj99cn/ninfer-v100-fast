@@ -26,10 +26,16 @@ struct QsaDumpEntry {
 };
 
 std::vector<QsaDumpEntry> g_qsa_entries;
+std::vector<std::uint16_t> g_index_query;
+std::vector<std::uint16_t> g_index_keys;
+std::int32_t g_index_tokens = 0;
+std::int32_t g_index_pages  = 0;
 bool g_qsa_recording = false;
 
 void flash_next_record_qsa(const ninfer::ops::QsaBatchView& batch,
-                           const ninfer::ops::QsaBlockSelection& selected, cudaStream_t stream) {
+                           const ninfer::ops::QsaBlockSelection& selected,
+                           const ninfer::Tensor& index_query,
+                           const ninfer::ops::ConstQsaIndexCacheView& cache, cudaStream_t stream) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
     const std::int32_t tokens = batch.positions.ne[0];
     const std::int32_t axes   = batch.positions.ne[1];
@@ -43,6 +49,14 @@ void flash_next_record_qsa(const ninfer::ops::QsaBatchView& batch,
                           cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(selection.data(), selected.selection.data, selection.size() * 4,
                           cudaMemcpyDeviceToHost));
+    g_index_query.resize(index_query.bytes() / 2);
+    g_index_keys.resize(cache.index_k_pages.bytes() / 2);
+    CUDA_CHECK(cudaMemcpy(g_index_query.data(), index_query.data, index_query.bytes(),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(g_index_keys.data(), cache.index_k_pages.data, cache.index_k_pages.bytes(),
+                          cudaMemcpyDeviceToHost));
+    g_index_tokens = tokens;
+    g_index_pages  = cache.index_k_pages.ne[3];
     for (std::int32_t b = 0; b < rows; ++b) {
         for (std::int32_t t = 0; t < tokens; ++t) {
             QsaDumpEntry entry;
@@ -63,7 +77,7 @@ inline void ninfer_flash_next_dump_qsa_indexer(const Tensor& index_query,
                                                WorkspaceArena& workspace,
                                                QsaBlockSelection& selected, cudaStream_t stream) {
     qsa_indexer(index_query, cache, batch, max_visible_tokens, workspace, selected, stream);
-    if (g_qsa_recording) { flash_next_record_qsa(batch, selected, stream); }
+    if (g_qsa_recording) { flash_next_record_qsa(batch, selected, index_query, cache, stream); }
 }
 } // namespace ninfer::ops
 
@@ -122,6 +136,22 @@ void write_parity_dump(const char* path, const rt::TextState& state,
         std::fprintf(file, "\n");
     }
     std::fclose(file);
+    const std::string index_path = std::string(path) + ".index";
+    std::FILE* index_file = std::fopen(index_path.c_str(), "wb");
+    if (index_file == nullptr) { throw std::runtime_error("cannot open the index dump path"); }
+    const std::uint64_t query_words = g_index_query.size();
+    const std::uint64_t key_words   = g_index_keys.size();
+    std::fwrite(&g_index_tokens, sizeof(g_index_tokens), 1, index_file);
+    std::fwrite(&g_index_pages, sizeof(g_index_pages), 1, index_file);
+    std::fwrite(&query_words, sizeof(query_words), 1, index_file);
+    std::fwrite(&key_words, sizeof(key_words), 1, index_file);
+    if (!g_index_query.empty()) {
+        std::fwrite(g_index_query.data(), sizeof(std::uint16_t), g_index_query.size(), index_file);
+    }
+    if (!g_index_keys.empty()) {
+        std::fwrite(g_index_keys.data(), sizeof(std::uint16_t), g_index_keys.size(), index_file);
+    }
+    std::fclose(index_file);
 }
 
 void place_reduced(const detail::BindingPlan& plan, artifact::Binder& binder) {
@@ -259,6 +289,25 @@ void fetch_shifted_rows(void* context, const ops::PleRowAddress* addresses, std:
     shifted->base.fetch(shifted->base.context, moved.data(), moved.size(), destination);
 }
 
+TokenId run_long_prompt(DeviceContext& device, const detail::Variant::ModelView& view,
+                        std::span<const TokenId> prompt, const char* dump_path) {
+    using ModelView = detail::Variant::ModelView;
+    const std::uint32_t tokens = static_cast<std::uint32_t>(prompt.size());
+    rt::TextState state(device, view, tokens, tokens);
+
+    const auto recipe = rt::text_workspace_recipe(tokens, 1);
+    DeviceArena activations(rt::text_activation_capacity_bytes(tokens));
+    DeviceArena workspace(recipe.lane_capacity_bytes);
+    rt::TextTrunk trunk(view, state, activations, workspace, device.stream);
+
+    g_qsa_entries.clear();
+    g_qsa_recording = true;
+    const TokenId token = trunk.prefill(prompt);
+    g_qsa_recording = false;
+    if (dump_path != nullptr) { write_parity_dump(dump_path, state, prompt); }
+    return token;
+}
+
 } // namespace
 
 int main() {
@@ -290,6 +339,30 @@ int main() {
         artifact::materialize(reader, binder.finish(), device);
     const std::filesystem::path artifact_path(path);
     const detail::LoadedModelData data(plan, materialized, kLoadedLayers, artifact_path);
+
+    const char* long_count_text = std::getenv("NINFER_FLASH_NEXT_LONG_PROMPT");
+    if (long_count_text != nullptr) {
+        const std::size_t count = static_cast<std::size_t>(std::stoul(long_count_text));
+        require(count > 0, "the long prompt needs tokens");
+        std::vector<TokenId> tokens(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            tokens[index] = static_cast<TokenId>(1024 + (index * 7) % 200000);
+        }
+        const std::span<const TokenId> prompt{tokens.data(), tokens.size()};
+        const TokenId token =
+            run_long_prompt(device, data.view(), prompt, std::getenv("NINFER_FLASH_NEXT_DUMP"));
+        require(token >= 0 && token < static_cast<TokenId>(detail::TextConfig::vocab),
+                "the long prompt greedy token is outside the vocabulary");
+        if (reference.has_value()) {
+            require(token == *reference, "the long prompt token " + std::to_string(token) +
+                                             " does not match the reference token " +
+                                             std::to_string(*reference));
+        } else {
+            std::cout << "SKIP: the long prompt reference token parity check\n";
+        }
+        std::cout << "OK flash-next long prompt: token " << token << " tokens " << count << "\n";
+        return 0;
+    }
 
     const auto key_bytes = static_cast<std::uint64_t>(detail::TextConfig::residual_width) *
                            detail::TextConfig::hidden * 2;

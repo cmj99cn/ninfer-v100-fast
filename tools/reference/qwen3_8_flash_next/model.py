@@ -237,14 +237,25 @@ class RefModel:
         activation = silu(projection[:, : CFG.shared_intermediate]) * projection[:, CFG.shared_intermediate :]
         down = activation @ np.asarray(weights["shared_down"], dtype=np.float64).T
         total = np.asarray(shared, dtype=np.float64)[:, None] * down
-        for token in range(tokens):
-            for slot in range(CFG.experts_per_token):
-                expert = int(ids[token, slot])
-                gate_up = self.store.nvfp4(weights["gate_object"], expert).astype(np.float64)
-                expert_down = self.store.nvfp4(weights["down_object"], expert).astype(np.float64)
-                projected = xf[token] @ gate_up.T
-                activated = silu(projected[: CFG.expert_intermediate]) * projected[CFG.expert_intermediate :]
-                total[token] += float(coefficients[token, slot]) * (activated @ expert_down.T)
+        flat_ids = ids.reshape(-1)
+        flat_coefficients = coefficients.reshape(-1).astype(np.float64)
+        order = np.argsort(flat_ids, kind="stable")
+        sorted_ids = flat_ids[order]
+        start = 0
+        while start < order.size:
+            expert = int(sorted_ids[start])
+            end = start + 1
+            while end < order.size and int(sorted_ids[end]) == expert:
+                end += 1
+            chosen = order[start:end]
+            token_index = chosen // CFG.experts_per_token
+            coefficient = flat_coefficients[chosen]
+            gate_up = self.store.nvfp4(weights["gate_object"], expert).astype(np.float64)
+            expert_down = self.store.nvfp4(weights["down_object"], expert).astype(np.float64)
+            projected = xf[token_index] @ gate_up.T
+            activated = silu(projected[:, : CFG.expert_intermediate]) * projected[:, CFG.expert_intermediate :]
+            total[token_index] += coefficient[:, None] * (activated @ expert_down.T)
+            start = end
         return bf16(total)
 
     def _ple(self, residual, weights, rows, state):

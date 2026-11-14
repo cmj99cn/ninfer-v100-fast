@@ -139,17 +139,19 @@ def qsa_indexer(index_query, index_key, positions, budget):
     query = np.asarray(index_query, dtype=np.float64)
     keys = np.asarray(index_key, dtype=np.float64)
     tokens = query.shape[0]
-    heads = query.shape[1]
+    counts = np.minimum((np.asarray(positions, dtype=np.int64) + 1) // 4, keys.shape[0])
+    width = int(counts.max()) if tokens else 0
+    scores = np.zeros((tokens, width), dtype=np.float64)
+    for g in range(width):
+        positive = np.maximum(0.0, np.einsum("thd,d->th", query, keys[g]))
+        scores[:, g] = np.sum(positive, axis=1)
+    arange = np.arange(width)
+    scores = np.where(arange[None, :] >= counts[:, None], -np.inf, scores)
     selections = []
     for t in range(tokens):
-        count = (int(positions[t]) + 1) // 4
-        count = min(count, keys.shape[0])
-        scores = np.zeros(count, dtype=np.float64)
-        for g in range(count):
-            positive = np.maximum(0.0, np.sum(query[t, :, :] * keys[g][None, :], axis=1))
-            scores[g] = float(np.sum(positive, dtype=np.float64))
+        count = int(counts[t])
         selected = int(min(budget, count))
-        order = np.lexsort((np.arange(count), -scores))[:selected]
+        order = np.lexsort((arange[:count], -scores[t, :count]))[:selected]
         selections.append(np.sort(order.astype(np.int32)))
     return selections
 
@@ -167,22 +169,22 @@ def qsa_sparse_gqa(query, output_gate, k_cache, v_cache, selections, positions, 
     for t in range(tokens):
         position = int(positions[t])
         complete = (position + 1) // compress
-        visible = []
+        visible = set()
         for block in selections[t]:
-            visible.extend(range(int(block) * compress, int(block) * compress + compress))
-        visible.extend(range(complete * compress, position + 1))
-        visible = sorted(set(j for j in visible if 0 <= j <= position))
-        if not visible:
+            start = int(block) * compress
+            visible.update(range(start, start + compress))
+        visible.update(range(complete * compress, position + 1))
+        index = np.asarray(sorted(j for j in visible if 0 <= j <= position), dtype=np.int64)
+        if index.size == 0:
             continue
-        index = np.asarray(visible, dtype=np.int64)
-        for head in range(q_heads):
-            kvh = head // group
-            scores = key[index, kvh, :] @ q[t, head, :] * scale
-            scores = scores - np.max(scores)
+        for kvh in range(kv_heads):
+            heads = slice(kvh * group, (kvh + 1) * group)
+            scores = q[t, heads, :] @ key[index, kvh, :].T * scale
+            scores = scores - np.max(scores, axis=1, keepdims=True)
             weights = np.exp(scores)
-            weights = weights / np.sum(weights)
+            weights = weights / np.sum(weights, axis=1, keepdims=True)
             attention = weights @ value[index, kvh, :]
-            out[t, head, :] = attention * sigmoid(gate[t, head, :])
+            out[t, heads, :] = attention * sigmoid(gate[t, heads, :])
     return bf16(out)
 
 
@@ -210,18 +212,17 @@ def gated_delta_net(q, k, v, g, beta, state, scale, epsilon):
     tokens, qk_heads, dim = qf.shape
     value_heads = vf.shape[1]
     group = value_heads // qk_heads
+    head_map = np.arange(value_heads, dtype=np.int64) // group
+    qn = normalize_qk(qf, epsilon)[:, head_map, :]
+    kn = normalize_qk(kf, epsilon)[:, head_map, :]
+    matrix = np.array(state, dtype=np.float64, copy=True)
     out = np.zeros((tokens, value_heads, dim), dtype=np.float64)
-    state = np.asarray(state, dtype=np.float64)
-    for head in range(value_heads):
-        qk_head = head // group
-        matrix = np.array(state[head], dtype=np.float64, copy=True)
-        for t in range(tokens):
-            alpha = math.exp(float(gf[t, head]))
-            qn = normalize_qk(qf[t, qk_head], epsilon)
-            kn = normalize_qk(kf[t, qk_head], epsilon)
-            delta = bf[t, head] * (vf[t, head] - alpha * (matrix @ kn))
-            matrix = alpha * matrix + np.outer(delta, kn)
-            out[t, head, :] = scale * (matrix @ qn)
+    for t in range(tokens):
+        alpha = np.exp(gf[t])
+        sk = np.einsum("hij,hj->hi", matrix, kn[t])
+        delta = bf[t][:, None] * (vf[t] - alpha[:, None] * sk)
+        matrix = alpha[:, None, None] * matrix + delta[:, :, None] * kn[t][:, None, :]
+        out[t] = scale * np.einsum("hij,hj->hi", matrix, qn[t])
     return out
 
 
