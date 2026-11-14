@@ -898,14 +898,27 @@ Engine route always loads the full 48 layers.
   naive FP64/FP32 evaluation, uses BF16-K / FP16-V QSA cache semantics, and reproduces the
   observable BF16/FP32 storage boundaries. The 8-token configuration produces token `20560` with
   top-two logit margin `0.086052638`.
-- `tests/targets/qwen3_8_flash_next/test_reference_parity.py` checks three properties: the greedy
-  token, the sixteen PLE hash row numbers of every token, and the selected QSA block set of every
-  token. A long deterministic prompt exercises the index budget: at 2052 tokens (`C = 513`) the
-  model-level selected sets match exactly, and a 2100-token run (`C = 525`, 512 selected) verifies
-  the top-K pruning against the reference indexer fed the same index-query and index-key inputs.
-  At 2100 tokens the two full-model hidden states differ by BF16/FP32 rounding that the
-  near-zero per-stream RMS norm amplifies, so the model-level exact-set assertion uses the
-  2052-token case and the 2100-token case isolates the indexer. The production kernel uses FP32
-  accumulation and BF16 outputs; those are implementation-profile differences, not semantic
-  differences.
+- `tests/targets/qwen3_8_flash_next/test_reference_parity.py` checks the greedy token, the
+  sixteen PLE hash row numbers of every token, and the selected QSA block set of every token.
+  The acceptance criteria are:
+  - Short prompt (8 tokens): the greedy token must equal the reference token exactly, and the
+    top-two logit margin must be at least `1e-2`. Measured: token `20560`, margin `0.086052638`.
+  - Long prompt: the operator-level evidence is exact per-token block-set equality when the
+    reference indexer is fed the same `index_query` and `index_keys` as the production kernel.
+    Measured at 2100 tokens (`C = 525`, 512 selected): `2100/2100` tokens equal. The model-level
+    evidence is exact per-token set equality at 2052 tokens (`C = 513`). At 2100 tokens a
+    divergent model-level block set is acceptable only on a token whose truncated score gap
+    (rank 512 versus rank 513) is below the measured maximum score perturbation `2.307295`; the
+    run must report the number of divergent pruned tokens and the reference boundary gap `δ`.
+    Measured: `16` divergent of `49` pruned tokens, every divergent token has a boundary gap in
+    `[1.43e-2, 7.21e-1]`, and `δ = 0.7208509`. The greedy token still equals the reference
+    (`225013` at 2052 tokens, margin `0.00173172358`).
+  - The 2100-token model-level divergence is a conditioning result, not an implementation
+    defect. Section 5 rounds `residual` and `normalized` to BF16 words, and `hc_combine_norm`
+    amplifies a one-ulp difference when a per-stream RMS is near zero; the smallest measured
+    layer-0 per-stream RMS is `1.6761e-3` (stream 0, token 98). The production kernel's FP32
+    accumulation and BF16 outputs therefore do not reproduce the reference FP64 evaluation
+    bit-for-bit, and the QSA top-512 boundary is discontinuous. The production kernel's FP32
+    accumulation and BF16 outputs are implementation-profile differences, not semantic
+    differences.
 - The tokenizer is outside M2: the test feeds token ids directly.

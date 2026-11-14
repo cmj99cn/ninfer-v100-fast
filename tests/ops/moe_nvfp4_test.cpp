@@ -82,9 +82,73 @@ struct BatchedFixture {
     }
 };
 
-constexpr std::uint8_t kScaleWords[]{
-    0x00U, 0x04U, 0x08U, 0x0bU, 0x10U, 0x13U, 0x18U, 0x1dU,
-};
+constexpr std::array<std::int32_t, 7> kCheckedRows{0, 1, 63, 64, 127, 128, 255};
+constexpr std::array<std::int32_t, 8> kCheckedGroups{0, 1, 2, 3, 4, 5, 6, 7};
+
+const std::array<std::uint8_t, 253>& scale_words() {
+    static const std::array<std::uint8_t, 253> words = [] {
+        std::array<std::uint8_t, 253> values{};
+        std::size_t index = 0;
+        values[index++] = 0x00U;
+        for (std::uint32_t word = 0x01U; word < 0x7fU; ++word) {
+            values[index++] = static_cast<std::uint8_t>(word);
+        }
+        for (std::uint32_t word = 0x81U; word < 0xffU; ++word) {
+            values[index++] = static_cast<std::uint8_t>(word);
+        }
+        return values;
+    }();
+    return words;
+}
+
+std::size_t checked_rank(std::int32_t matrix, std::int32_t row) {
+    const auto matrix_it = std::find(kViewExperts.begin(), kViewExperts.end(), matrix);
+    const auto row_it = std::find(kCheckedRows.begin(), kCheckedRows.end(), row);
+    if (matrix_it == kViewExperts.end() || row_it == kCheckedRows.end()) {
+        return kViewExperts.size() * kCheckedRows.size();
+    }
+    return static_cast<std::size_t>(matrix_it - kViewExperts.begin()) * kCheckedRows.size() +
+           static_cast<std::size_t>(row_it - kCheckedRows.begin());
+}
+
+std::size_t scale_word_index(std::int32_t matrix, std::int32_t row, std::int32_t group) {
+    const std::size_t rank = checked_rank(matrix, row);
+    if (rank < kViewExperts.size() * kCheckedRows.size() &&
+        group < static_cast<std::int32_t>(kCheckedGroups.size())) {
+        return rank * kCheckedGroups.size() + static_cast<std::size_t>(group);
+    }
+    return static_cast<std::size_t>(
+        (static_cast<std::uint64_t>(matrix) * 0x9e3779b1U +
+         static_cast<std::uint64_t>(row) * 0x85ebca6bU +
+         static_cast<std::uint64_t>(group) * 0xc2b2ae35U) %
+        scale_words().size());
+}
+
+int verify_scale_word_domain() {
+    std::array<bool, 253> used{};
+    int failures = 0;
+    for (const std::int32_t matrix : kViewExperts) {
+        for (const std::int32_t row : kCheckedRows) {
+            for (const std::int32_t group : kCheckedGroups) {
+                const std::size_t index = scale_word_index(matrix, row, group);
+                if (used[index]) {
+                    std::cerr << "scale fixture: colliding word for matrix " << matrix << " row "
+                              << row << " group " << group << "\n";
+                    ++failures;
+                }
+                used[index] = true;
+                if (group >= 4 &&
+                    scale_word_index(matrix, row, group) ==
+                        scale_word_index(matrix, row, group % 4)) {
+                    std::cerr << "scale fixture: missing-tile offset is not detectable for matrix "
+                              << matrix << " row " << row << " group " << group << "\n";
+                    ++failures;
+                }
+            }
+        }
+    }
+    return failures;
+}
 
 BatchedFixture make_batched(std::int32_t rows, std::int32_t columns, std::uint32_t seed,
                             const std::vector<std::int32_t>& active_experts) {
@@ -138,12 +202,8 @@ BatchedFixture make_batched(std::int32_t rows, std::int32_t columns, std::uint32
                     static_cast<std::size_t>(row_inner % 32) * 16U +
                     static_cast<std::size_t>(row_inner / 32) * 4U +
                     static_cast<std::size_t>(group % 4);
-                const std::uint64_t pattern =
-                    (static_cast<std::uint64_t>(matrix) * 3U +
-                     static_cast<std::uint64_t>(row) * 5U +
-                     static_cast<std::uint64_t>(group) * 3U + seed) &
-                    7U;
-                fixture.payload[stored_offset] = kScaleWords[pattern];
+                fixture.payload[stored_offset] =
+                    scale_words()[scale_word_index(matrix, row, group)];
             }
         }
     }
@@ -464,7 +524,7 @@ int main() {
         return 77;
     }
 
-    int failures = 0;
+    int failures = verify_scale_word_domain();
 
     failures += verify_view_planes(make_batched(kGateUpRows, kHidden, 0x5eb3U, kViewExperts));
     failures += verify_view_planes(make_batched(kDownRows, kIntermediate, 0xc2b2U, kViewExperts));
