@@ -147,17 +147,19 @@ private:
  *
  * written back to every `buffer[r]`, which afterwards hold the bitwise-identical sum.
  *
- * `buffer[r]` is a contiguous BF16 tensor resident on `ec.dev[r]`; every rank carries the same
- * shape. `staging[r]` is scratch of the same dtype and shape, also resident on `ec.dev[r]`, and
- * must not overlap `buffer[r]`. The implementation uses only rank 0's `staging[0]` as the star
+ * `buffer[r]` is a contiguous BF16 or FP16 tensor resident on `ec.dev[r]`; every rank carries
+ * the same dtype and shape. `staging[r]` is scratch of the same dtype and shape, also resident
+ * on `ec.dev[r]`, and must not overlap `buffer[r]`. The implementation uses only rank 0's `staging[0]` as the star
  * accumulator; every rank must still supply a valid staging slot because the caller owns the
  * per-rank allocation uniformly.
  *
- * The oracle evaluates `ideal` in FP64 from the represented BF16 inputs; the observable BF16
- * output is that value rounded once to BF16 storage. NCCL's in-place ncclAllReduce(ncclSum)
- * evaluates that sum with an internal association that need not match the oracle bit-for-bit, so
- * the output is checked within the BF16 rounding bound rather than by byte equality. The Op holds
- * no persistent state and allocates nothing.
+ * The oracle evaluates `ideal` in FP64 from the represented activation words. The observable
+ * output is stored in the buffer's activation dtype, BF16 or FP16. The mailbox route adds the
+ * ranks in rank order and rounds to that dtype after each addition; NCCL's in-place
+ * ncclAllReduce(ncclSum) evaluates the sum with its own internal association. Neither route is
+ * required to match the oracle bit-for-bit, so the output is checked within the activation
+ * dtype's unit-roundoff bound rather than by byte equality. The Op holds no persistent state and
+ * allocates nothing.
  *
  * Requires `ec.tp >= 1`, `ec.tp <= kMaximumDevices`, a live `comms` created for the same `tp`, and
  * (`ec.tp >= 2`) distinct devices. At `ec.tp == 1` it validates and returns. Consecutive calls

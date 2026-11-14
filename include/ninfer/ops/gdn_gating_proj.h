@@ -27,23 +27,25 @@ namespace ninfer::ops {
                                                                         std::int32_t max_tokens);
 
 /**
- * Fuses two BF16 projections with Gated DeltaNet gate preparation. For each h,t:
+ * Fuses two control-weight projections with Gated DeltaNet gate preparation. For each h,t:
  *
  *   a[h,t]    = sum_k a_weight[h,k] * x[k,t]
  *   b[h,t]    = sum_k b_weight[h,k] * x[k,t]
  *   g[h,t]    = -exp(A_log[h]) * softplus(a[h,t] + dt_bias[h])
  *   beta[h,t] = sigmoid(b[h,t]).
  *
- * `x` is contiguous BF16 [5120,T]; both weights are contiguous BF16_CTRL [48,5120]; A_log and
+ * `x` is contiguous BF16 or FP16 [5120,T]; both weights are contiguous BF16_CTRL [48,5120]
+ * (the FP16 activation path reads the BF16 control words directly); A_log and
  * dt_bias are contiguous FP32 [48]; g and beta are distinct contiguous FP32 [48,T]. The numerical
  * contract accepts every positive T. The oracle evaluates the logical formula naively in FP64
- * from the represented inputs. Projection staging, accumulator precision, and any private
- * materialization are implementation choices. The FP32 outputs are promoted and compared directly
- * with that oracle under the Op's named criterion. All inputs and outputs are non-overlapping.
+ * from the represented inputs. Projection staging, accumulator precision, and the private
+ * BF16-to-FP16 operand conversion of the FP16 path are implementation choices. The FP32 outputs
+ * are promoted and compared directly with that oracle under the Op's named criterion. All inputs
+ * and outputs are non-overlapping.
  * `ws` provides the transient capacity reported above and is scoped to the call; there is no
  * persistent state side effect.
- * The 27B GGML_K form preserves Q4_K/Q6_K [48,5120] rows and stored scales. It evaluates the
- * projections into FP32 and applies the same gating formula, using no transient workspace.
+ * The 27B GGML_K form preserves Q4_K/Q6_K [48,5120] rows and stored scales. It evaluates a
+ * BF16 activation into FP32 and applies the same gating formula, using no transient workspace.
  */
 void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                      const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g,

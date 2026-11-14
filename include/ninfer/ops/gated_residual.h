@@ -18,30 +18,31 @@ namespace ninfer::ops {
  *   normalized[d,s,m] = embedding[d,m] * (1 + norm_weight[d,s])
  *                       / sqrt( sum_{d' = 0}^{H-1} embedding[d',m]^2 / H + epsilon )
  *
- * The residual is an exact copy of the embedding BF16 words, signed zero included. The four
+ * The residual is an exact copy of the embedding activation words, signed zero included. The four
  * streams share one statistic per column m. The gain 1 + norm_weight[d,s] is evaluated and
- * applied in FP32 and is never rounded to BF16 before the multiplication.
+ * applied in FP32 and is never rounded before the multiplication.
  *
  * Logical shapes:
  *   H  hidden width, positive
  *   S  stream count, positive
  *   M  column extent (tokens * batch), positive
- *   embedding   BF16 [H, M]    contiguous, dimension 0 fastest
+ *   embedding   BF16 or FP16 [H, M]    contiguous, dimension 0 fastest
  *   norm_weight BF16 [H, S]    contiguous, dimension 0 fastest
- *   residual    BF16 [H, S, M] contiguous, dimension 0 fastest
- *   normalized  BF16 [H, S, M] contiguous, dimension 0 fastest
+ *   residual    BF16 or FP16 [H, S, M] contiguous, dimension 0 fastest
+ *   normalized  BF16 or FP16 [H, S, M] contiguous, dimension 0 fastest
  *   Element (d,s,m) of a three-dimensional tensor is stored at d + H * s + H * S * m, so the
  *   channel index of the four-stream residual is c = s * H + d. A [T,B] block flattens as
  *   M = T * B with m = t + T * b.
  *
  * Supported domain:
- *   BF16 in and out, 16-byte aligned bases, M > 0, epsilon positive and finite. The
- *   Qwen3.8-Flash-Next text package registers H = 2560 and S = 4.
+ *   BF16 or FP16 activation in and out (all activation operands sharing one dtype), 16-byte
+ *   aligned bases, M > 0, epsilon positive and finite. The Qwen3.8-Flash-Next text package
+ *   registers H = 2560 and S = 4.
  *
  * Numeric:
  *   The statistic must be accumulated in FP32; that accumulator precision is a required
  *   implementation profile. The oracle evaluates the formula in FP64 from the represented
- *   inputs; the BF16 output is promoted and compared against that result, so the output
+ *   inputs; the activation output is promoted and compared against that result, so the output
  *   storage rounding belongs to the Op's numerical criterion and not to the oracle. Reduction
  *   association and staging are implementation choices.
  *
@@ -73,19 +74,20 @@ void hc_expand_norm(const Tensor& embedding, const Tensor& norm_weight, float ep
  *   H  hidden width, positive
  *   S  stream count, positive
  *   M  column extent (tokens * batch), positive
- *   residual    BF16 [H, S, M] contiguous, dimension 0 fastest
+ *   residual    BF16 or FP16 [H, S, M] contiguous, dimension 0 fastest
  *   norm_weight BF16 [H, S]    contiguous, dimension 0 fastest
- *   normalized  BF16 [H, S, M] contiguous, dimension 0 fastest
+ *   normalized  BF16 or FP16 [H, S, M] contiguous, dimension 0 fastest
  *   Element (d,s,m) is stored at d + H * s + H * S * m.
  *
  * Supported domain:
- *   BF16 in and out, 16-byte aligned bases, M > 0, epsilon positive and finite. The
- *   Qwen3.8-Flash-Next text package registers H = 2560 and S = 4.
+ *   BF16 or FP16 activation in and out (all activation operands sharing one dtype), 16-byte
+ *   aligned bases, M > 0, epsilon positive and finite. The Qwen3.8-Flash-Next text package
+ *   registers H = 2560 and S = 4.
  *
  * Numeric:
  *   The statistic must be accumulated in FP32; that accumulator precision is a required
  *   implementation profile. The oracle evaluates the formula in FP64 from the represented
- *   inputs; the BF16 output is promoted and compared against that result, so the output
+ *   inputs; the activation output is promoted and compared against that result, so the output
  *   storage rounding belongs to the Op's numerical criterion and not to the oracle. Reduction
  *   association and staging are implementation choices.
  *
@@ -116,23 +118,23 @@ void hc_grouped_rmsnorm(const Tensor& residual, const Tensor& norm_weight, float
  *   H  hidden width, positive
  *   S  stream count, positive
  *   M  column extent (tokens * batch), positive
- *   residual        BF16 [H, S, M] contiguous, dimension 0 fastest
- *   block_output   BF16 [H, M]    contiguous, dimension 0 fastest
+ *   residual        BF16 or FP16 [H, S, M] contiguous, dimension 0 fastest
+ *   block_output   BF16 or FP16 [H, M]    contiguous, dimension 0 fastest
  *   injection       FP32 [S, M]    contiguous, dimension 0 fastest
- *   updated_residual BF16 [H, S, M] contiguous, dimension 0 fastest
+ *   updated_residual BF16 or FP16 [H, S, M] contiguous, dimension 0 fastest
  *   Element (d,s,m) is stored at d + H * s + H * S * m; injection[s,m] is stored at
  *   s + S * m and block_output[d,m] at d + H * m.
  *
  * Supported domain:
- *   BF16 residual and block output, FP32 injection, 16-byte aligned bases, M > 0. The
- *   injection holds finite, already activated coefficients in [0, 2]; that range is a caller
- *   precondition and is not enforced.
+ *   BF16 or FP16 residual and block output (matching), FP32 injection, 16-byte aligned bases,
+ *   M > 0. The injection holds finite, already activated coefficients in [0, 2]; that range is a
+ *   caller precondition and is not enforced.
  *
  * Numeric:
- *   The update is evaluated in FP32 and stored in BF16. The oracle evaluates the formula in
- *   FP64 from the represented inputs; the BF16 output is promoted and compared against that
- *   result, so the output storage rounding belongs to the Op's numerical criterion and not to
- *   the oracle.
+ *   The update is evaluated in FP32 and stored in the activation dtype. The oracle evaluates the
+ *   formula in FP64 from the represented inputs; the activation output is promoted and compared
+ *   against that result, so the output storage rounding belongs to the Op's numerical criterion
+ *   and not to the oracle.
  *
  * Effects:
  *   Writes the complete updated_residual. It may exactly alias the residual view or be
@@ -157,32 +159,33 @@ void hc_combine(const Tensor& residual, const Tensor& block_output, const Tensor
  *   normalized[d,s,m]       = updated_residual[d,s,m] * (1 + next_norm_weight[d,s])
  *                             / sqrt( sum_{d' = 0}^{H-1} updated_residual[d',s,m]^2 / H + epsilon )
  *
- * The normalization consumes the actual BF16 words of updated_residual, so the stored update
+ * The normalization consumes the actual activation words of updated_residual, so the stored update
  * is the normalization's input and not an unrounded ideal value. The gain 1 +
- * next_norm_weight[d,s] is never rounded to BF16 before the multiplication.
+ * next_norm_weight[d,s] is never rounded before the multiplication.
  *
  * Logical shapes:
  *   H  hidden width, positive
  *   S  stream count, positive
  *   M  column extent (tokens * batch), positive
- *   residual        BF16 [H, S, M] contiguous, dimension 0 fastest
- *   block_output   BF16 [H, M]    contiguous, dimension 0 fastest
+ *   residual        BF16 or FP16 [H, S, M] contiguous, dimension 0 fastest
+ *   block_output   BF16 or FP16 [H, M]    contiguous, dimension 0 fastest
  *   injection       FP32 [S, M]    contiguous, dimension 0 fastest
  *   next_norm_weight BF16 [H, S]   contiguous, dimension 0 fastest
- *   updated_residual BF16 [H, S, M] contiguous, dimension 0 fastest
- *   normalized      BF16 [H, S, M] contiguous, dimension 0 fastest
+ *   updated_residual BF16 or FP16 [H, S, M] contiguous, dimension 0 fastest
+ *   normalized      BF16 or FP16 [H, S, M] contiguous, dimension 0 fastest
  *   Element (d,s,m) is stored at d + H * s + H * S * m.
  *
  * Supported domain:
- *   BF16 residual, block output and norm weight, FP32 injection, 16-byte aligned bases,
- *   M > 0, epsilon positive and finite. The injection holds finite, already activated
- *   coefficients in [0, 2]; that range is a caller precondition and is not enforced.
+ *   BF16 or FP16 residual and block output (matching) with a BF16 norm weight, FP32 injection,
+ *   16-byte aligned bases, M > 0, epsilon positive and finite. The injection holds finite,
+ *   already activated coefficients in [0, 2]; that range is a caller precondition and is not
+ *   enforced.
  *
  * Numeric:
- *   The statistic is accumulated in FP32 over the stored BF16 update words. The oracle
+ *   The statistic is accumulated in FP32 over the stored activation words. The oracle
  *   evaluates the complete formula in FP64 from the represented inputs and reproduces the
- *   BF16 storage rounding of updated_residual, which is an observable output of this Op; the
- *   normalized output is promoted and compared against that result, so its own storage
+ *   activation-dtype storage rounding of updated_residual, which is an observable output of this
+ *   Op; the normalized output is promoted and compared against that result, so its own storage
  *   rounding belongs to the Op's numerical criterion and not to the oracle.
  *
  * Effects:
@@ -205,7 +208,7 @@ void hc_combine_norm(const Tensor& residual, const Tensor& block_output, const T
 /**
  * The low-rank mixing weights of a four-stream residual.
  *
- * Both members are contiguous BF16 matrices whose second extent is the contiguous one, with
+ * Both members are contiguous BF16_CTRL or FP16_CTRL matrices whose second extent is the contiguous one, with
  * no bias and no padding, and with 16-byte aligned bases.
  *
  *   down_injection [R + S, H * S]
@@ -222,7 +225,7 @@ struct HcMixWeights {
 /**
  * The low-rank mixing weights of the final four-stream residual, without injection rows.
  *
- * Both members are contiguous BF16 matrices whose second extent is the contiguous one, with
+ * Both members are contiguous BF16_CTRL or FP16_CTRL matrices whose second extent is the contiguous one, with
  * no bias and no padding, and with 16-byte aligned bases.
  *
  *   down [R, H * S]
@@ -255,8 +258,8 @@ struct HcFinalMixWeights {
  *   S  stream count, positive
  *   M  column extent (tokens * batch), positive
  *   R  low-rank width, positive
- *   normalized BF16 [H, S, M] contiguous, dimension 0 fastest
- *   block_input BF16 [H, M]   contiguous, dimension 0 fastest
+ *   normalized BF16 or FP16 [H, S, M] contiguous, dimension 0 fastest
+ *   block_input BF16 or FP16 [H, M]   contiguous, dimension 0 fastest
  *   injection    FP32 [S, M]   contiguous, dimension 0 fastest
  *   The weights carry the geometry above: down_injection is [R + S, H * S] and up is
  *   [H * S, R]. R is the second extent of up, S is the second extent of normalized, and the
@@ -264,21 +267,23 @@ struct HcFinalMixWeights {
  *   down_injection.n = R + S.
  *
  * Supported domain:
- *   BF16 normalized and weights, FP32 injection, 16-byte aligned bases, M > 0. The weights
- *   have exactly the declared native BF16 geometry, without bias or padding. The
+ *   BF16 or FP16 normalized with matching control weights (BF16_CTRL for BF16, FP16_CTRL for
+ *   FP16), FP32 injection, 16-byte aligned bases, M > 0. The weights have exactly the declared
+ *   native geometry, without bias or padding. The
  *   Qwen3.8-Flash-Next text package registers H = 2560, S = 4 and R = 320, which binds
- *   down_injection [324, 10240] and up [10240, 320]. M > 1 requires a Volta build or a BF16
- *   linear problem registered for these geometries; M = 1 uses an architecture-independent
- *   GEMV path.
+ *   down_injection [324, 10240] and up [10240, 320]. M > 1 requires a Volta build or a linear
+ *   problem registered for these geometries; the BF16 M = 1 path uses an
+ *   architecture-independent GEMV.
  *
  * Numeric:
  *   The oracle evaluates the complete formula in FP64 from the represented inputs and keeps
  *   that result. The private down, activation and gate representations are not observable
- *   cast boundaries: the block input's private chain may round at the BF16 storage boundary
- *   because the block input itself is a BF16 output and its own storage rounding dominates.
+ *   cast boundaries: the block input's private chain may round at the activation storage
+ *   boundary because the block input itself is an activation output and its own storage rounding
+ *   dominates.
  *   The injection is an FP32 output, so its projection over the injection rows is evaluated
  *   in FP32 and its accuracy is the FP32 accumulation profile of that contraction rather
- *   than a BF16 boundary. The block input and the injection are promoted and compared
+ *   than an activation boundary. The block input and the injection are promoted and compared
  *   directly with the oracle results.
  *
  * Effects:
@@ -315,23 +320,24 @@ void hc_mix(const Tensor& normalized, const HcMixWeights& weights, WorkspaceAren
  *   S  stream count, positive
  *   M  column extent (tokens * batch), positive
  *   R  low-rank width, positive
- *   normalized  BF16 [H, S, M] contiguous, dimension 0 fastest
- *   sample_hidden BF16 [H, M]  contiguous, dimension 0 fastest
+ *   normalized  BF16 or FP16 [H, S, M] contiguous, dimension 0 fastest
+ *   sample_hidden BF16 or FP16 [H, M]  contiguous, dimension 0 fastest
  *   The weights carry the geometry above: down is [R, H * S] and up is [H * S, R]. R is the
  *   second extent of up, S is the second extent of normalized, and down.k = up.n = H * S.
  *
  * Supported domain:
- *   BF16 normalized and weights, 16-byte aligned bases, M > 0. The weights have exactly the
- *   declared native BF16 geometry, without bias or padding. The Qwen3.8-Flash-Next text
+ *   BF16 or FP16 normalized with matching control weights, 16-byte aligned bases, M > 0. The
+ *   weights have exactly the declared native geometry, without bias or padding. The
+ *   Qwen3.8-Flash-Next text
  *   package registers H = 2560, S = 4 and R = 320, which binds down [320, 10240] and up
- *   [10240, 320]. M > 1 requires a Volta build or a BF16 linear problem registered for these
- *   geometries; M = 1 uses an architecture-independent GEMV path.
+ *   [10240, 320]. M > 1 requires a Volta build or a linear problem registered for these
+ *   geometries; the BF16 M = 1 path uses an architecture-independent GEMV.
  *
  * Numeric:
  *   The oracle evaluates the complete formula in FP64 from the represented inputs and keeps
  *   that result. The private down, activation and gate representations are not observable
- *   cast boundaries, so the private chain may round at the BF16 storage boundary because the
- *   sample hidden state itself is a BF16 output. The sample hidden state is promoted and
+ *   cast boundaries, so the private chain may round at the activation storage boundary because
+ *   the sample hidden state itself is an activation output. The sample hidden state is promoted and
  *   compared directly with the oracle result.
  *
  * Effects:

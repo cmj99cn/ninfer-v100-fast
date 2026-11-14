@@ -280,10 +280,32 @@ conversion to I32. A
 producer must not silently wrap, truncate, or saturate a value merely because the destination word
 has a fixed width.
 
-The direct format does not encode a model role. `BF16_CTRL`, `FP32_CTRL`, and `I32_CTRL` are internal
-execution `QType` names, not persistent NInfer format identities, and receive no aliases in the
-artifact registry. Control parameters, ordinary weights, norms, indexes, and maps use a direct
-format plus a separate model-assignment role.
+The direct format does not encode a model role. `BF16_CTRL`, `FP16_CTRL`, `FP32_CTRL`, and
+`I32_CTRL` are internal execution `QType` names, not persistent NInfer format identities, and
+receive no aliases in the artifact registry. Control parameters, ordinary weights, norms, indexes,
+and maps use a direct format plus a separate model-assignment role.
+
+#### FP16_CTRL execution residency
+
+`FP16_CTRL` is an internal contiguous row-major FP16 matrix, not a persistent format. Its host and
+device words are IEEE binary16 logical values of the same matrix. A target whose text activation
+profile is FP16 may materialize a persistent `BF16_CTRL` control object as `FP16_CTRL` at load
+time: the loader assembles that rank's shard from the artifact payload, converts each BF16 word to
+the nearest FP16 word, and keeps the FP16 copy as the resident weight. The artifact keeps the
+persistent BF16 identity; no second artifact format, container branch, or runtime weight repack is
+introduced.
+
+The conversion is range-checked word by word. A source magnitude that does not satisfy
+`|value| <= 65504` (including NaN) fails the load with the parameter name and the observed maximum,
+and the loader never clamps, saturates, or substitutes a finite value. A control object is
+materialized exactly once per rank in this representation, so the BF16 source is not resident
+alongside it and the replacement is byte-neutral. A BF16 build keeps the original `BF16_CTRL`
+residency and does not run the conversion.
+
+The flash-next text loader applies this replacement to the vocabulary output head, the HC down/up
+projections (including the inject rows carried by the same object), the PLE key/value projections,
+and the QSA key/value/index-query/index-key parent. Runtime code that consumes these weights sees
+only the `FP16_CTRL` view; the artifact binding and role table are unchanged.
 
 ### 3.2 Grouped signed-integer weight identities
 
@@ -781,8 +803,8 @@ it does not create a NInfer registry entry, loader branch, conversion option, or
 Binary16 remains the scale component denoted by `F16S`; an `F16S` scale does not imply the tensor's
 own direct format is `FP16` (registered for direct use in Section 1, but independently of `F16S`).
 Likewise, the internal execution dtype `FP8_E4M3FN` is not a persistent direct format. The
-internal execution names `BF16_CTRL`, `FP32_CTRL`, and `I32_CTRL` are not persistent registry
-identities.
+internal execution names `BF16_CTRL`, `FP16_CTRL`, `FP32_CTRL`, and `I32_CTRL` are not persistent
+registry identities.
 
 ## 11. Admission and retirement
 

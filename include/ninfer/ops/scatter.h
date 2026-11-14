@@ -55,12 +55,12 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
  *   destination[d,t] = source[source_column + d,t], 0<=d<D', 0<=t<T.
  *
  * Logical shapes:
- *   Contiguous BF16 source [D,T] and destination [D',T]. Despite the historical parameter name,
- *   source_column is an offset in the fastest (ne[0]) dimension; 0<=source_column and
- *   source_column+D'<=D.
+ *   Contiguous BF16 or FP16 source [D,T] and destination [D',T], sharing one dtype. Despite the
+ *   historical parameter name, source_column is an offset in the fastest (ne[0]) dimension;
+ *   0<=source_column and source_column+D'<=D.
  *
  * Numeric:
- *   Exact BF16 element copies.
+ *   Exact activation-word copies.
  *
  * Effects:
  *   Writes the full destination; source and destination must not alias.

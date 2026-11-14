@@ -154,7 +154,7 @@ struct PleRowAddress {
  *
  *   code[d]        = nibble of `staged_rows[i]` holding element d, low nibble first
  *   group_scale[g] = exact E4M3FN value of the scale byte of group g = d / 16
- *   embedding[160 * head + d, t, b] = round_bf16(code_value[d] * group_scale[g] / divisor[shard])
+ *   embedding[160 * head + d, t, b] = round_act(code_value[d] * group_scale[g] / divisor[shard])
  *
  * The codebook is the registered E2M1 codebook shared with the NVFP4 path, and the group scale is
  * the exact stored E4M3FN byte. `staged_rows[i]` must be the `row_bytes` bytes of `rows[i]` at
@@ -165,7 +165,7 @@ struct PleRowAddress {
  * Logical shapes:
  *   rows          U32 [16 * T * B] device, contiguous, entry order (t, b, head)
  *   staged_rows   bytes [16 * T * B * row_bytes] device, one encoded row per entry, same order
- *   embedding     BF16 [160 * 16, T, B] device, contiguous, dimension 0 fastest
+ *   embedding     BF16 or FP16 [160 * 16, T, B] device, contiguous, dimension 0 fastest
  *   Element (f, t, b) of the embedding is stored at f + 2560 * (t + T * b); head `head` owns
  *   features `[160 * head, 160 * head + 160)`.
  *
@@ -175,11 +175,12 @@ struct PleRowAddress {
  * the staged block, and `rows`, `staged_rows` and the embedding bases must be 16-byte aligned with
  * a positive entry count.
  *
- * Numeric: the codebook value times the exact stored group scale is exactly representable in
- * BF16, so the codebook exit is an exact rounding boundary and signed zero is preserved. The
- * per-shard divisor is the only rounding point of the Op. The oracle decodes each stored code
+ * Numeric: the codebook value times the exact stored group scale is exactly representable in both
+ * BF16 and FP16, so the codebook exit is an exact rounding boundary and signed zero is preserved.
+ * The per-shard divisor is the only rounding point of the Op. The oracle decodes each stored code
  * with the exact stored scale and divisor in FP64; the output is exact when the FP32 division of
- * that product is exact, and is otherwise within one BF16 ULP of the oracle.
+ * that product is exact, and is otherwise within one unit in the last place of the activation
+ * dtype.
  *
  * Effects: writes all of embedding. `table`, `rows` and `staged_rows` are read-only.
  *
@@ -203,12 +204,12 @@ void ple_lookup_rows(const PleNf4Table& table, const std::uint32_t* rows, std::s
  *   a_s    = sum_d k_s[d] * q_s[d] / sqrt(H)
  *   v_s    = sign(a_s) * sqrt(max(|a_s|, 1e-6))
  *   g_s    = 1 / (1 + exp(-v_s))
- *   gated_value[d + H * s, t, b]    = round_bf16(g_s * projected.value[d, t, b])
+ *   gated_value[d + H * s, t, b]    = round_act(g_s * projected.value[d, t, b])
  *   normalized_conv[d + H * s, t, b] = Norm(stored gated_value, norm_conv[d + H * s], eps)
  *
  * `sign(0) = 0`, so the gate is 0.5 at zero, and the `1e-6` floor is independent of `eps`. The
- * convolution norm consumes the stored BF16 words of `gated_value`, which is an observable output
- * of this Op. Every gain `1 + w` is evaluated and applied in FP32 and is never rounded to BF16
+ * convolution norm consumes the stored activation words of `gated_value`, which is an observable
+ * output of this Op. Every gain `1 + w` is evaluated and applied in FP32 and is never rounded
  * before the multiplication.
  *
  * Logical shapes:
@@ -217,26 +218,26 @@ void ple_lookup_rows(const PleNf4Table& table, const std::uint32_t* rows, std::s
  *   C  channels, H * S = 10240
  *   T  token extent, positive
  *   B  batch rows, positive
- *   projected.key    BF16 [C, T, B]  contiguous, dimension 0 fastest
- *   projected.value  BF16 [H, T, B]  contiguous, dimension 0 fastest, shared by every stream
- *   residual         BF16 [H, S, T, B] contiguous, dimension 0 fastest
+ *   projected.key    activation dtype [C, T, B]  contiguous, dimension 0 fastest
+ *   projected.value  activation dtype [H, T, B]  contiguous, dimension 0 fastest, shared by every stream
+ *   residual         activation dtype [H, S, T, B] contiguous, dimension 0 fastest
  *   norm_key         BF16 [C]         contiguous, stream-major
  *   norm_query       BF16 [C]         contiguous, stream-major
  *   norm_conv        BF16 [C]         contiguous, stream-major
- *   gated_value      BF16 [C, T, B]   contiguous, dimension 0 fastest
- *   normalized_conv  BF16 [C, T, B]   contiguous, dimension 0 fastest
+ *   gated_value      activation dtype [C, T, B]   contiguous, dimension 0 fastest
+ *   normalized_conv  activation dtype [C, T, B]   contiguous, dimension 0 fastest
  *   Element (d, s, t, b) of a four-dimensional operand is stored at
  *   d + H * s + H * S * (t + T * b); element (f, t, b) of a two-dimensional operand is stored at
  *   f + C * (t + T * b).
  *
- * Supported domain: the registered geometry above, 16-byte aligned bases, epsilon positive and
- * finite.
+ * Supported domain: the registered geometry above, all activation operands sharing BF16 or FP16,
+ * 16-byte aligned bases, epsilon positive and finite.
  *
  * Numeric: the statistics and the dot product are accumulated in FP32; that accumulator precision
  * is a required implementation profile. The oracle evaluates the complete formula in FP64 from
- * the represented inputs and reproduces the BF16 storage rounding of `gated_value`, which is an
- * observable output; both outputs are promoted and compared against that result, so their own
- * storage rounding belongs to the numerical criterion and not to the oracle.
+ * the represented inputs and reproduces the activation-dtype storage rounding of `gated_value`,
+ * which is an observable output; both outputs are promoted and compared against that result, so
+ * their own storage rounding belongs to the numerical criterion and not to the oracle.
  *
  * Effects: writes all of `gated_value` and all of `normalized_conv`. The two outputs are mutually
  * disjoint and disjoint from every input. Read-only inputs may share backing and are preserved.
@@ -260,7 +261,7 @@ void ple_gate(const Tensor& projected_key, const Tensor& projected_value, const 
  *              = normalized_conv[c, offsets[b] + k, b]   for 0 <= k < n[b]
  *
  *   v[c, t, b] = sum_{j = 0}^{3} kernel[c, j] * N[c, t - 9 + 3 * j, b]
- *   updated_residual[d, s, t, b] = round_bf16(residual[d, s, t, b] + gated_value[c, t, b] + SiLU(v[c, t, b]))
+ *   updated_residual[d, s, t, b] = round_act(residual[d, s, t, b] + gated_value[c, t, b] + SiLU(v[c, t, b]))
  *
  * The dilation is 3, tap 0 reads `t - 9` and tap 3 reads `t`, and there is no bias. `SiLU(x) =
  * x / (1 + exp(-x))`. The gate's `normalized_conv` is the convolution input, so this Op consumes
@@ -271,7 +272,7 @@ void ple_gate(const Tensor& projected_key, const Tensor& projected_value, const 
  *   normalized[d, s, t, b] = updated_residual[d, s, t, b] * (1 + next_hc_norm_weight[d + H * s])
  *                            / sqrt( sum_{d' = 0}^{H-1} stored_updated_residual[d', s, t, b]^2 / H + epsilon )
  *
- * and consumes the stored BF16 words of `updated_residual`. The trunk uses the unnormalized exit
+ * and consumes the stored activation words of `updated_residual`. The trunk uses the unnormalized exit
  * at the PLE boundary because the PLE layer's combine already skipped its normalization; the
  * normalized exit is the one that feeds the next HC.
  *
@@ -281,30 +282,30 @@ void ple_gate(const Tensor& projected_key, const Tensor& projected_value, const 
  *   C  channels, 10240
  *   T  token extent, positive
  *   B  batch rows, positive
- *   history            BF16 [C, 9, B] contiguous, dimension 0 fastest
- *   normalized_conv    BF16 [C, T, B] contiguous, dimension 0 fastest
- *   residual           BF16 [H, S, T, B] contiguous, dimension 0 fastest
- *   gated_value        BF16 [C, T, B] contiguous, dimension 0 fastest
+ *   history            activation dtype [C, 9, B] contiguous, dimension 0 fastest
+ *   normalized_conv    activation dtype [C, T, B] contiguous, dimension 0 fastest
+ *   residual           activation dtype [H, S, T, B] contiguous, dimension 0 fastest
+ *   gated_value        activation dtype [C, T, B] contiguous, dimension 0 fastest
  *   kernel             BF16 [4, C]    contiguous, tap-major: element (j, c) at j * C + c
  *   offsets            I32 [B]        contiguous, column start of each row inside normalized_conv
  *   counts             I32 [B]        contiguous, live column count n[b] of each row
  *   next_hc_norm_weight BF16 [C]      contiguous, stream-major
- *   updated_residual   BF16 [H, S, T, B] contiguous, dimension 0 fastest
- *   normalized         BF16 [H, S, T, B] contiguous, dimension 0 fastest
+ *   updated_residual   activation dtype [H, S, T, B] contiguous, dimension 0 fastest
+ *   normalized         activation dtype [H, S, T, B] contiguous, dimension 0 fastest
  *   Element (d, s, t, b) of a four-dimensional operand is stored at
  *   d + H * s + C * (t + T * b); element (c, k, b) of a three-dimensional operand is stored at
  *   c + C * k + C * extent * b.
  *
- * Supported domain: the registered geometry above, 16-byte aligned bases, epsilon positive and
- * finite. `counts[b] <= T`, `offsets[b] + counts[b] <= T`, and the live columns of different rows
+ * Supported domain: the registered geometry above, all activation operands sharing BF16 or FP16,
+ * 16-byte aligned bases, epsilon positive and finite. `counts[b] <= T`, `offsets[b] + counts[b] <= T`, and the live columns of different rows
  * do not overlap. `n[b] = 0` writes nothing for that row.
  *
  * Numeric: the convolution sum and the SiLU are evaluated in FP32, and the statistic is
- * accumulated in FP32 over the stored BF16 update words; both are required implementation
+ * accumulated in FP32 over the stored activation words; both are required implementation
  * profiles. The oracle evaluates the complete formula in FP64 from the represented inputs and
- * reproduces the BF16 storage rounding of `updated_residual`, which is an observable output; the
- * outputs are promoted and compared against that result, so their own storage rounding belongs to
- * the numerical criterion and not to the oracle.
+ * reproduces the activation-dtype storage rounding of `updated_residual`, which is an observable
+ * output; the outputs are promoted and compared against that result, so their own storage
+ * rounding belongs to the numerical criterion and not to the oracle.
  *
  * Effects: writes all of `updated_residual`, and for the normalized exit all of `normalized`. The
  * outputs are disjoint from every input. Read-only inputs may share backing and are preserved.
@@ -333,20 +334,20 @@ void ple_conv_add_norm(const Tensor& history, const Tensor& normalized_conv, con
  *   after_history[c, j, b] = before_history[c, 9 + k, b]  when k < 0
  *                          = records_values[c, k, b]      otherwise
  *
- * `a = 0` copies the complete `before` history. The extraction is exact BF16 word copying; no
- * floating-point evaluation is involved, and signed zero is preserved.
+ * `a = 0` copies the complete `before` history. The extraction is exact activation-word copying;
+ * no floating-point evaluation is involved, and signed zero is preserved.
  *
  * Logical shapes:
  *   C  channels, 10240
  *   B  batch rows, positive
- *   before_history   BF16 [C, 9, B] contiguous, dimension 0 fastest
- *   records_values   BF16 [C, T, B] contiguous, dimension 0 fastest, columns `[0, a)` only
+ *   before_history   activation dtype [C, 9, B] contiguous, dimension 0 fastest
+ *   records_values   activation dtype [C, T, B] contiguous, dimension 0 fastest, columns `[0, a)` only
  *   accepted_columns I32 [B]        contiguous
- *   after_history    BF16 [C, 9, B] contiguous, dimension 0 fastest
+ *   after_history    activation dtype [C, 9, B] contiguous, dimension 0 fastest
  *   Element (c, j, b) of a history tensor is stored at c + C * j + C * 9 * b.
  *
- * Supported domain: the registered geometry above, 16-byte aligned bases, `accepted_columns[b]` in
- * `[0, T]`.
+ * Supported domain: the registered geometry above, all three history/record operands sharing BF16
+ * or FP16, 16-byte aligned bases, `accepted_columns[b]` in `[0, T]`.
  *
  * Numeric: exact word copy.
  *

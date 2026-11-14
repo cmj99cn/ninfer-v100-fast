@@ -36,7 +36,7 @@ void nccl_check(ncclResult_t result, const char* what) {
 }
 
 // Moves bytes, so any element type NCCL names is valid. The collective call sites carry BF16
-// activations, I32/I64 token and index lanes, and FP32 staging; the mapping is the one place the
+// or FP16 activations, I32/I64 token and index lanes, and FP32 staging; the mapping is the one place the
 // element type is translated, and an unmapped type fails loudly rather than moving wrong bytes.
 ncclDataType_t nccl_element_type(DType dtype, const char* op) {
     switch (dtype) {
