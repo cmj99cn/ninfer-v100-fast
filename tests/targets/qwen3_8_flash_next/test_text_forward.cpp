@@ -106,6 +106,26 @@ struct RunOutcome {
     std::array<std::int32_t, kDecodeRounds + 1> base_positions{};
 };
 
+void check_gdn_slot_mapping(DeviceContext& device, const detail::Variant::ModelView& view) {
+    const rt::TextState state(device, view, kKvCapacityTokens, kPromptTokens);
+    std::vector<std::size_t> slots;
+    for (std::size_t layer = 0; layer < kLoadedLayers; ++layer) {
+        const std::optional<std::size_t> slot = state.gdn_state_index(layer);
+        if (detail::TextConfig::is_qsa_layer(static_cast<int>(layer))) {
+            require(!slot.has_value(), "a QSA layer mapped to a GDN state slot");
+            continue;
+        }
+        require(slot.has_value(), "a GDN layer has no state slot");
+        require(*slot < state.gdn_state_entries(), "a GDN state slot is outside the pool");
+        slots.push_back(*slot);
+    }
+    require(slots.size() == state.gdn_state_entries(), "the GDN slots do not cover the pool");
+    std::sort(slots.begin(), slots.end());
+    for (std::size_t index = 0; index < slots.size(); ++index) {
+        require(slots[index] == index, "the GDN state slots are not a permutation");
+    }
+}
+
 RunOutcome run_prompt(DeviceContext& device, const detail::Variant::ModelView& view) {
     using ModelView = detail::Variant::ModelView;
     rt::TextState state(device, view, kKvCapacityTokens, kPromptTokens);
@@ -186,6 +206,7 @@ int main() {
     require(value_base - key_base == static_cast<std::ptrdiff_t>(key_bytes),
             "the PLE value view does not start at the value rows");
 
+    check_gdn_slot_mapping(device, data.view());
     const RunOutcome outcome = run_prompt(device, data.view());
     require(outcome.token >= 0 && outcome.token < static_cast<TokenId>(detail::TextConfig::vocab),
             "the greedy token is outside the vocabulary");

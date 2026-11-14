@@ -77,7 +77,7 @@ inline TextState::TextState(DeviceContext& device, const ModelView& model,
     std::size_t gdn = 0;
     for (std::size_t layer = 0; layer < layers_; ++layer) {
         if (TextConfig::is_qsa_layer(static_cast<int>(layer))) {
-            gdn_index_[layer] = gdn_layers_.size();
+            gdn_index_[layer] = std::nullopt;
         } else {
             gdn_index_[layer] = gdn;
             gdn_layers_[gdn++] = layer;
@@ -159,7 +159,7 @@ inline Tensor TextState::gdn_recurrent_state(std::size_t gdn_index) const {
                   DType::FP32, {128, 128, TextConfig::gdn_value_heads});
 }
 
-inline std::size_t TextState::gdn_state_index(std::size_t layer) const {
+inline std::optional<std::size_t> TextState::gdn_state_index(std::size_t layer) const {
     return gdn_index_.at(layer);
 }
 
@@ -270,7 +270,11 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T, const Tensor& 
     copy_segment(k, key_width);
     copy_segment(v, 2 * key_width);
 
-    const std::size_t gdn_index = state_.gdn_state_index(layer);
+    const std::optional<std::size_t> slot = state_.gdn_state_index(layer);
+    if (!slot.has_value()) {
+        throw std::logic_error("a QSA layer has no GDN state slot");
+    }
+    const std::size_t gdn_index = *slot;
     Tensor conv_state = state_.gdn_conv_state(gdn_index);
     Tensor conv_kernel =
         weights.convolution.view({TextConfig::gdn_conv_channels, TextConfig::gdn_conv_kernel});

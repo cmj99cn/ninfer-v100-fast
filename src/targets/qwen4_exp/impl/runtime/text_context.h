@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -37,7 +38,7 @@ public:
 
     [[nodiscard]] Tensor gdn_conv_state(std::size_t gdn_index) const;
     [[nodiscard]] Tensor gdn_recurrent_state(std::size_t gdn_index) const;
-    [[nodiscard]] std::size_t gdn_state_index(std::size_t layer) const;
+    [[nodiscard]] std::optional<std::size_t> gdn_state_index(std::size_t layer) const;
     [[nodiscard]] std::size_t gdn_state_entries() const noexcept;
 
     [[nodiscard]] ops::QsaCacheView cache() const;
@@ -82,7 +83,7 @@ private:
     std::size_t forward_tokens_  = 0;
     std::size_t pages_           = 0;
     std::vector<std::size_t> gdn_layers_;
-    std::vector<std::size_t> gdn_index_;
+    std::vector<std::optional<std::size_t>> gdn_index_;
     std::vector<std::byte> ple_staged_host_;
     std::uint32_t next_position_ = 0;
     std::uint64_t ple_tail_[2]   = {0, 0};
