@@ -161,9 +161,12 @@ CollectiveComms& CollectiveComms::operator=(CollectiveComms&& other) noexcept {
     return *this;
 }
 
-bool CollectiveComms::mailbox_allreduce_bf16(const std::array<Tensor, kMaximumDevices>& buffer,
-                                             const ExecutionContext& ec) const {
-    return mailbox_ != nullptr && mailbox_->allreduce_bf16(buffer, ec);
+bool CollectiveComms::mailbox_allreduce_16bit(const std::array<Tensor, kMaximumDevices>& buffer,
+                                              DType dtype, const ExecutionContext& ec) const {
+    if (mailbox_ == nullptr) { return false; }
+    if (dtype == DType::BF16) { return mailbox_->allreduce_bf16(buffer, ec); }
+    if (dtype == DType::FP16) { return mailbox_->allreduce_f16(buffer, ec); }
+    return false;
 }
 
 bool CollectiveComms::mailbox_allgather_rows_bf16(
@@ -198,9 +201,8 @@ void allreduce_sum(const std::array<Tensor, kMaximumDevices>& buffer,
     if (elems == 0) return;
     comms.note_allreduce();
 
-    // Small BF16 messages take the probed mailbox transport; FP16 and larger messages stay on
-    // NCCL.
-    if (buffer[0].dtype == DType::BF16 && comms.mailbox_allreduce_bf16(buffer, ec)) { return; }
+    // Small 16-bit messages take the probed mailbox transport; larger messages stay on NCCL.
+    if (comms.mailbox_allreduce_16bit(buffer, buffer[0].dtype, ec)) { return; }
 
     const CurrentDeviceGuard guard;
     nccl_check(ncclGroupStart(), kOp);

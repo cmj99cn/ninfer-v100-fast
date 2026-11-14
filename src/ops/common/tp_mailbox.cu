@@ -4,6 +4,7 @@
 #include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -80,6 +81,63 @@ __device__ __forceinline__ void fold_rank_order_bf16(__nv_bfloat16& acc, __nv_bf
     acc = __float2bfloat16(__bfloat162float(acc) + __bfloat162float(other));
 }
 
+__device__ __forceinline__ void fold_rank_order_f16x8(uint4& acc, const uint4& other) {
+    auto* a        = reinterpret_cast<__half2*>(&acc);
+    const auto* b  = reinterpret_cast<const __half2*>(&other);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 fa = __half22float2(a[j]);
+        const float2 fb = __half22float2(b[j]);
+        a[j]            = __float22half2_rn(make_float2(fa.x + fb.x, fa.y + fb.y));
+    }
+}
+
+__device__ __forceinline__ void fold_rank_order_f16(__half& acc, __half other) {
+    acc = __float2half(__half2float(acc) + __half2float(other));
+}
+
+template <class T>
+struct MailboxFold;
+
+template <>
+struct MailboxFold<__nv_bfloat16> {
+    __device__ __forceinline__ static void fold8(uint4& acc, const uint4& other) {
+        fold_rank_order_bf16x8(acc, other);
+    }
+    __device__ __forceinline__ static void fold1(__nv_bfloat16& acc, __nv_bfloat16 other) {
+        fold_rank_order_bf16(acc, other);
+    }
+};
+
+template <>
+struct MailboxFold<__half> {
+    __device__ __forceinline__ static void fold8(uint4& acc, const uint4& other) {
+        fold_rank_order_f16x8(acc, other);
+    }
+    __device__ __forceinline__ static void fold1(__half& acc, __half other) {
+        fold_rank_order_f16(acc, other);
+    }
+};
+
+template <class T>
+struct MailboxConvert;
+
+template <>
+struct MailboxConvert<__nv_bfloat16> {
+    __host__ __device__ static float to_float(__nv_bfloat16 value) {
+        return __bfloat162float(value);
+    }
+    __host__ __device__ static __nv_bfloat16 from_float(float value) {
+        return __float2bfloat16(value);
+    }
+};
+
+template <>
+struct MailboxConvert<__half> {
+    __host__ __device__ static float to_float(__half value) { return __half2float(value); }
+    __host__ __device__ static __half from_float(float value) { return __float2half(value); }
+};
+
 __device__ __forceinline__ void spin_wait(const volatile std::uint64_t* flag, std::uint64_t step,
                                           long long start) {
     while (*flag < step) {
@@ -91,7 +149,8 @@ __device__ __forceinline__ void spin_wait(const volatile std::uint64_t* flag, st
 
 // Host transport: every rank publishes its slice into the shared pinned block and folds every
 // rank's slice (own included) back in rank order.
-__global__ void host_mailbox_allreduce_kernel(__nv_bfloat16* x, int n, int rank, int ranks,
+template <class T>
+__global__ void host_mailbox_allreduce_kernel(T* x, int n, int rank, int ranks,
                                               HostMailbox* mb, std::uint64_t* steps) {
     const int blk            = static_cast<int>(blockIdx.x);
     const std::uint64_t step = steps[blk] + 1;
@@ -101,13 +160,14 @@ __global__ void host_mailbox_allreduce_kernel(__nv_bfloat16* x, int n, int rank,
     const int tid            = static_cast<int>(threadIdx.x);
     const int rem            = (end - base) & 7;
     const int vec_end        = end - rem;
+    T* own_slot = reinterpret_cast<T*>(mb->data[rank][parity]);
 
     for (int e = base + tid * 8; e < vec_end; e += blockDim.x * 8) {
-        store_vec(&mb->data[rank][parity][e], load_vec<uint4>(&x[e]));
+        store_vec(&own_slot[e], load_vec<uint4>(&x[e]));
     }
     if (tid < rem) {
         const int e = vec_end + tid;
-        store_vec(&mb->data[rank][parity][e], load_vec<__nv_bfloat16>(&x[e]));
+        store_vec(&own_slot[e], load_vec<T>(&x[e]));
     }
     __threadfence_system();
     __syncthreads();
@@ -124,27 +184,28 @@ __global__ void host_mailbox_allreduce_kernel(__nv_bfloat16* x, int n, int rank,
     __threadfence_system();
 
     for (int e = base + tid * 8; e < vec_end; e += blockDim.x * 8) {
-        uint4 acc = __ldcv(reinterpret_cast<const uint4*>(&mb->data[0][parity][e]));
+        uint4 acc = __ldcv(reinterpret_cast<const uint4*>(
+            &reinterpret_cast<const T*>(mb->data[0][parity])[e]));
         for (int src = 1; src < ranks; ++src) {
-            fold_rank_order_bf16x8(
-                acc, __ldcv(reinterpret_cast<const uint4*>(&mb->data[src][parity][e])));
+            MailboxFold<T>::fold8(
+                acc, __ldcv(reinterpret_cast<const uint4*>(
+                         &reinterpret_cast<const T*>(mb->data[src][parity])[e])));
         }
         store_vec(&x[e], acc);
     }
     if (tid < rem) {
         const int e = vec_end + tid;
-        __nv_bfloat16 acc = mb->data[0][parity][e];
+        T acc = reinterpret_cast<const T*>(mb->data[0][parity])[e];
         for (int src = 1; src < ranks; ++src) {
-            fold_rank_order_bf16(acc, mb->data[src][parity][e]);
+            MailboxFold<T>::fold1(acc, reinterpret_cast<const T*>(mb->data[src][parity])[e]);
         }
         x[e] = acc;
     }
     if (tid == 0) { steps[blk] = step; }
 }
 
-// Device transport: every rank pushes its slice straight into each peer's inbox and then reads
-// every rank's slice from its own inbox (own value from the source buffer).
-__global__ void nvlink_allreduce_kernel(__nv_bfloat16* x, int n, int rank, int ranks, Inbox* mine,
+template <class T>
+__global__ void nvlink_allreduce_kernel(T* x, int n, int rank, int ranks, Inbox* mine,
                                         Inbox* const* peers, std::uint64_t* steps) {
     const int blk            = static_cast<int>(blockIdx.x);
     const std::uint64_t step = steps[blk] + 1;
@@ -159,15 +220,15 @@ __global__ void nvlink_allreduce_kernel(__nv_bfloat16* x, int n, int rank, int r
         const uint4 v = load_vec<uint4>(&x[e]);
         for (int src = 0; src < ranks; ++src) {
             if (src == rank) { continue; }
-            store_vec(&peers[src]->data[rank][parity][e], v);
+            store_vec(&reinterpret_cast<T*>(peers[src]->data[rank][parity])[e], v);
         }
     }
     if (tid < rem) {
         const int e = vec_end + tid;
-        const __nv_bfloat16 v = load_vec<__nv_bfloat16>(&x[e]);
+        const T v = load_vec<T>(&x[e]);
         for (int src = 0; src < ranks; ++src) {
             if (src == rank) { continue; }
-            peers[src]->data[rank][parity][e] = v;
+            reinterpret_cast<T*>(peers[src]->data[rank][parity])[e] = v;
         }
     }
     __threadfence_system();
@@ -187,29 +248,29 @@ __global__ void nvlink_allreduce_kernel(__nv_bfloat16* x, int n, int rank, int r
     __syncthreads();
     __threadfence_system();
 
-    // Fold strictly in source order 0, 1, ..., ranks-1 on every rank: this rank's own value is
-    // substituted for its source slot, so all ranks evaluate the identical association and end
-    // with bit-identical bytes. (Folding each rank's own value first is commutative for two ranks
-    // but not associative for more.)
     for (int e = base + tid * 8; e < vec_end; e += blockDim.x * 8) {
         const uint4 own = load_vec<uint4>(&x[e]);
         uint4 acc       = rank == 0
                               ? own
-                              : __ldcv(reinterpret_cast<const uint4*>(&mine->data[0][parity][e]));
+                              : __ldcv(reinterpret_cast<const uint4*>(
+                                    &reinterpret_cast<const T*>(mine->data[0][parity])[e]));
         for (int src = 1; src < ranks; ++src) {
-            fold_rank_order_bf16x8(
-                acc, src == rank ? own
-                                 : __ldcv(reinterpret_cast<const uint4*>(&mine->data[src][parity][e])));
+            MailboxFold<T>::fold8(
+                acc, src == rank
+                         ? own
+                         : __ldcv(reinterpret_cast<const uint4*>(
+                               &reinterpret_cast<const T*>(mine->data[src][parity])[e])));
         }
         store_vec(&x[e], acc);
     }
     if (tid < rem) {
         const int e = vec_end + tid;
-        const __nv_bfloat16 own = load_vec<__nv_bfloat16>(&x[e]);
-        __nv_bfloat16 acc = rank == 0 ? own : mine->data[0][parity][e];
+        const T own = load_vec<T>(&x[e]);
+        T acc = rank == 0 ? own : reinterpret_cast<const T*>(mine->data[0][parity])[e];
         for (int src = 1; src < ranks; ++src) {
-            fold_rank_order_bf16(acc,
-                                 src == rank ? own : mine->data[src][parity][e]);
+            MailboxFold<T>::fold1(
+                acc, src == rank ? own
+                                 : reinterpret_cast<const T*>(mine->data[src][parity])[e]);
         }
         x[e] = acc;
     }
@@ -379,6 +440,7 @@ void nccl_check(ncclResult_t result, const char* what) {
 struct TpMailboxPlan::Impl {
     int tp                       = 0;
     TpMailboxTransport transport = TpMailboxTransport::Nccl;
+    bool f16_ok                  = false;
     HostMailbox* host            = nullptr;
     std::array<HostMailbox*, kRanks> host_dev{};
     std::array<int, kRanks> device{-1, -1, -1, -1};
@@ -423,17 +485,17 @@ struct TpMailboxPlan::Impl {
 
 namespace {
 
+template <class T>
 void launch_allreduce(const TpMailboxPlan::Impl& impl, TpMailboxTransport transport,
-                      const ExecutionContext& ec, const std::array<__nv_bfloat16*, kRanks>& buffer,
-                      int n) {
+                      const ExecutionContext& ec, const std::array<T*, kRanks>& buffer, int n) {
     const int blocks = (n + kMailboxSlice - 1) / kMailboxSlice;
     for (int r = 0; r < impl.tp; ++r) {
         DeviceGuard::set(ec.dev[r]->device);
         if (transport == TpMailboxTransport::Device) {
-            nvlink_allreduce_kernel<<<blocks, 64, 0, ec.dev[r]->stream>>>(
+            nvlink_allreduce_kernel<T><<<blocks, 64, 0, ec.dev[r]->stream>>>(
                 buffer[r], n, r, impl.tp, impl.inbox[r], impl.peer_ptrs[r], impl.steps[r]);
         } else {
-            host_mailbox_allreduce_kernel<<<blocks, 64, 0, ec.dev[r]->stream>>>(
+            host_mailbox_allreduce_kernel<T><<<blocks, 64, 0, ec.dev[r]->stream>>>(
                 buffer[r], n, r, impl.tp, impl.host_dev[r], impl.steps[r]);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -478,35 +540,35 @@ const char* transport_name(TpMailboxTransport transport) {
 
 // Exactness self-check: rank r contributes r + 1 everywhere, so every element must come back as
 // the exact integer sum tp(tp+1)/2 on every rank. The odd size also exercises the scalar tail.
+template <class T>
 bool self_check_allreduce(const TpMailboxPlan::Impl& impl, const ExecutionContext& ec,
-                          TpMailboxTransport transport,
-                          const std::array<__nv_bfloat16*, kRanks>& scratch) {
+                          TpMailboxTransport transport, const std::array<T*, kRanks>& scratch) {
     const int sizes[] = {kMailboxMaxElements, kMailboxMaxElements - 3};
     const float expected = static_cast<float>(impl.tp * (impl.tp + 1) / 2);
     for (const int n : sizes) {
         for (int r = 0; r < impl.tp; ++r) {
-            std::vector<__nv_bfloat16> host(static_cast<std::size_t>(n),
-                                            __float2bfloat16(static_cast<float>(r + 1)));
+            std::vector<T> host(static_cast<std::size_t>(n),
+                                MailboxConvert<T>::from_float(static_cast<float>(r + 1)));
             DeviceGuard::set(ec.dev[r]->device);
             CUDA_CHECK(cudaMemcpyAsync(scratch[r], host.data(),
-                                       static_cast<std::size_t>(n) * sizeof(__nv_bfloat16),
+                                       static_cast<std::size_t>(n) * sizeof(T),
                                        cudaMemcpyHostToDevice, ec.dev[r]->stream));
         }
-        launch_allreduce(impl, transport, ec, scratch, n);
+        launch_allreduce<T>(impl, transport, ec, scratch, n);
         for (int r = 0; r < impl.tp; ++r) {
-            std::vector<__nv_bfloat16> out(static_cast<std::size_t>(n));
+            std::vector<T> out(static_cast<std::size_t>(n));
             DeviceGuard::set(ec.dev[r]->device);
             CUDA_CHECK(cudaMemcpyAsync(out.data(), scratch[r],
-                                       static_cast<std::size_t>(n) * sizeof(__nv_bfloat16),
+                                       static_cast<std::size_t>(n) * sizeof(T),
                                        cudaMemcpyDeviceToHost, ec.dev[r]->stream));
             CUDA_CHECK(cudaStreamSynchronize(ec.dev[r]->stream));
             for (int i = 0; i < n; ++i) {
-                if (__bfloat162float(out[i]) != expected) {
+                if (MailboxConvert<T>::to_float(out[i]) != expected) {
                     std::fprintf(stderr,
                                  "[ninfer] TP mailbox self-check failed (%s): rank %d element "
                                  "%d/%d got %f, expected %f\n",
-                                 transport_name(transport), r, i, n, __bfloat162float(out[i]),
-                                 expected);
+                                 transport_name(transport), r, i, n,
+                                 MailboxConvert<T>::to_float(out[i]), expected);
                     return false;
                 }
             }
@@ -637,9 +699,21 @@ std::unique_ptr<TpMailboxPlan::Impl> init_plan(const ExecutionContext& ec,
     }
 
     const bool host_ok =
-        impl->host != nullptr && self_check_allreduce(*impl, ec, TpMailboxTransport::Host, scratch);
+        impl->host != nullptr &&
+        self_check_allreduce<__nv_bfloat16>(*impl, ec, TpMailboxTransport::Host, scratch);
     const bool device_ok = device_available &&
-                           self_check_allreduce(*impl, ec, TpMailboxTransport::Device, scratch);
+                           self_check_allreduce<__nv_bfloat16>(*impl, ec, TpMailboxTransport::Device,
+                                                               scratch);
+    std::array<__half*, kRanks> scratch_f16{};
+    for (int r = 0; r < impl->tp; ++r) {
+        scratch_f16[r] = reinterpret_cast<__half*>(scratch[r]);
+    }
+    const bool f16_host_ok =
+        host_ok &&
+        self_check_allreduce<__half>(*impl, ec, TpMailboxTransport::Host, scratch_f16);
+    const bool f16_device_ok =
+        device_ok &&
+        self_check_allreduce<__half>(*impl, ec, TpMailboxTransport::Device, scratch_f16);
 
     // Race the survivors against NCCL on a decode-sized message (T=4 x 5120 = 40 KB) and keep the
     // fastest.
@@ -650,15 +724,15 @@ std::unique_ptr<TpMailboxPlan::Impl> init_plan(const ExecutionContext& ec,
     const double host_us =
         host_ok ? time_candidate(
                       ec,
-                      [&] { launch_allreduce(*impl, TpMailboxTransport::Host, ec, scratch,
-                                             kProbeElements); },
+                      [&] { launch_allreduce<__nv_bfloat16>(*impl, TpMailboxTransport::Host, ec,
+                                                            scratch, kProbeElements); },
                       kIterations)
                 : 1.0e9;
     const double device_us =
         device_ok ? time_candidate(
                         ec,
-                        [&] { launch_allreduce(*impl, TpMailboxTransport::Device, ec, scratch,
-                                               kProbeElements); },
+                        [&] { launch_allreduce<__nv_bfloat16>(*impl, TpMailboxTransport::Device,
+                                                              ec, scratch, kProbeElements); },
                         kIterations)
                   : 1.0e9;
 
@@ -668,6 +742,8 @@ std::unique_ptr<TpMailboxPlan::Impl> init_plan(const ExecutionContext& ec,
     } else if (host_ok && host_us < nccl_us) {
         impl->transport = TpMailboxTransport::Host;
     }
+    impl->f16_ok = (impl->transport == TpMailboxTransport::Host && f16_host_ok) ||
+                   (impl->transport == TpMailboxTransport::Device && f16_device_ok);
     std::fprintf(stderr,
                  "[ninfer] TP%d mailbox probe (40 KB all-reduce): nccl %.1f us, host %.1f us, "
                  "nvlink %.1f us -> %s\n",
@@ -721,7 +797,30 @@ bool TpMailboxPlan::allreduce_bf16(const std::array<Tensor, kMaximumDevices>& bu
         pointers[r] = static_cast<__nv_bfloat16*>(buffer[r].data);
     }
     DeviceGuard guard;
-    launch_allreduce(*impl_, impl_->transport, ec, pointers, static_cast<int>(elements));
+    launch_allreduce<__nv_bfloat16>(*impl_, impl_->transport, ec, pointers,
+                                    static_cast<int>(elements));
+    return true;
+}
+
+bool TpMailboxPlan::allreduce_f16(const std::array<Tensor, kMaximumDevices>& buffer,
+                                  const ExecutionContext& ec) {
+    if (impl_ == nullptr || !impl_->f16_ok || impl_->transport == TpMailboxTransport::Nccl) {
+        return false;
+    }
+    if (ec.tp != impl_->tp) { return false; }
+    const std::int64_t elements = buffer[0].numel();
+    if (elements <= 0 || elements > kMailboxMaxElements) { return false; }
+    std::array<__half*, kRanks> pointers{};
+    for (int r = 0; r < impl_->tp; ++r) {
+        if (buffer[r].data == nullptr || buffer[r].dtype != DType::FP16 ||
+            !buffer[r].is_contiguous() || buffer[r].numel() != elements) {
+            return false;
+        }
+        if (reinterpret_cast<std::uintptr_t>(buffer[r].data) % 16 != 0) { return false; }
+        pointers[r] = static_cast<__half*>(buffer[r].data);
+    }
+    DeviceGuard guard;
+    launch_allreduce<__half>(*impl_, impl_->transport, ec, pointers, static_cast<int>(elements));
     return true;
 }
 

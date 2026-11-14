@@ -20,15 +20,16 @@
 // because a single host thread drives all communicators; without it the first collective
 // deadlocks waiting for a peer call the same thread has not issued yet.
 //
-// SMALL-MESSAGE FAST PATH. At construction the collective set probes a mailbox transport for BF16
-// messages up to 128 KB (the 128 row-parallel all-reduces of one decode round are 10-128 KB) and
-// for the vocabulary row gather: a purpose-built kernel that publishes one slice per CTA into a
+// SMALL-MESSAGE FAST PATH. At construction the collective set probes a mailbox transport for
+// 16-bit float messages (BF16 and FP16) up to 128 KB (the 128 row-parallel all-reduces of one
+// decode round are 10-128 KB) and for the vocabulary row gather: a purpose-built kernel that publishes one slice per CTA into a
 // mapped pinned host block or a peer device inbox, spins on per-block step flags, and folds the
 // per-rank contributions in rank order. It measures faster than NCCL's small-message protocol on
 // this box, keeps the step counters in device memory so CUDA-Graph replays stay correct, and
 // produces bitwise-identical bytes on every rank. `NINFER_TP_MAILBOX=0` disables it; every
 // message over the capacity, of another dtype, or of a shape the fast path does not cover falls
-// back to NCCL. See docs/maintainer/sm70-v2-mailbox-port-plan.md.
+// back to NCCL. The FP16 fold uses the same rank-ordered association with an FP16 rounding at
+// each step, so the BF16 path is unchanged. See docs/maintainer/sm70-v2-mailbox-port-plan.md.
 //
 // The calls are stream-ordered GPU work with no host round trip, host-memory spin flag, or
 // explicit host staging, so they are CUDA-Graph capturable. Ordering between consecutive
@@ -125,8 +126,8 @@ public:
     // Small-message fast-path dispatch for the free collective ops. Both return false when the
     // probed mailbox cannot carry the call (no plan, transport NCCL, wrong dtype, capacity), in
     // which case the caller runs the grouped NCCL route.
-    [[nodiscard]] bool mailbox_allreduce_bf16(const std::array<Tensor, kMaximumDevices>& buffer,
-                                              const ExecutionContext& ec) const;
+    [[nodiscard]] bool mailbox_allreduce_16bit(const std::array<Tensor, kMaximumDevices>& buffer,
+                                               DType dtype, const ExecutionContext& ec) const;
     [[nodiscard]] bool mailbox_allgather_rows_bf16(
         const std::array<Tensor, kMaximumDevices>& destination,
         const std::array<Tensor, kMaximumDevices>& part, const ExecutionContext& ec) const;

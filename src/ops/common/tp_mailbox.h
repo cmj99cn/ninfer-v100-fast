@@ -16,8 +16,8 @@
 // Both fold the per-rank contributions in rank order, so every rank ends with bit-identical
 // bytes; both keep per-block step counters in device memory and double-buffer through parity
 // slots, so repeated eager calls and CUDA-Graph replays are correct with no host synchronization.
-// NCCL stays the fallback for messages over the mailbox capacity, non-BF16 traffic, and any rank
-// count or shape the fast path does not cover.
+// NCCL stays the fallback for messages over the mailbox capacity, traffic that is not a 16-bit
+// float type, and any rank count or shape the fast path does not cover.
 
 #include "core/device.h"
 #include "core/tensor.h"
@@ -51,6 +51,9 @@ public:
     // NCCL.
     [[nodiscard]] bool allreduce_bf16(const std::array<Tensor, kMaximumDevices>& buffer,
                                       const ExecutionContext& ec);
+    // FP16 all-reduce fast path over the same 16-bit transport. False = the caller must use NCCL.
+    [[nodiscard]] bool allreduce_f16(const std::array<Tensor, kMaximumDevices>& buffer,
+                                     const ExecutionContext& ec);
     // BF16 row-gather fast path: every rank's destination is filled with all ranks' parts at
     // their prefix element offsets, bit-identical on every rank. False = the caller must use
     // NCCL.

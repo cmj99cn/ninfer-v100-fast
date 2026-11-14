@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -41,10 +42,17 @@ namespace {
 // most 2^-8 relative error. Each of the tp-1 local additions contributes this bound to the
 // accumulated deviation from the exact sum.
 constexpr double kBf16RoundingRelative = 3.90625e-3; // 2^-8
+constexpr double kF16RoundingRelative  = 4.8828125e-4; // 2^-11
 
 std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
     std::vector<std::uint16_t> bits(values.size());
     for (std::size_t i = 0; i < values.size(); ++i) bits[i] = f32_to_bf16(values[i]);
+    return bits;
+}
+
+std::vector<std::uint16_t> encode_f16(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) bits[i] = f32_to_f16(values[i]);
     return bits;
 }
 
@@ -153,6 +161,80 @@ int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, st
                                  ((tp - 1) * abs_sum[i] + std::abs(expected[i]));
         const double error = std::abs(static_cast<double>(observed[0][i]) - expected[i]);
         const double ratio = error / (tolerance + 1.0e-30);
+        if (ratio > worst_ratio) {
+            worst_ratio = ratio;
+            worst_i     = i;
+        }
+    }
+    if (worst_ratio > 1.0) {
+        std::cout << "FAIL " << label << ": accumulated-rounding bound exceeded at index " << worst_i
+                  << " (ratio " << worst_ratio << ", actual " << observed[0][worst_i]
+                  << ", reference " << expected[worst_i] << ")\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int run_allreduce_f16_case(const char* label, std::int32_t ne0, std::int32_t ne1,
+                           std::uint32_t seed, const ExecutionContext& ec,
+                           const ops::CollectiveComms& events) {
+    const int tp            = ec.tp;
+    const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
+
+    std::vector<std::vector<float>> partials(tp);
+    for (int rank = 0; rank < tp; ++rank) {
+        partials[rank].resize(count);
+        fill_uniform(partials[rank], seed + static_cast<std::uint32_t>(rank), -8.0f, 8.0f);
+        round_to_f16(partials[rank]);
+    }
+    const auto expected = allreduce_sum_oracle(partials);
+
+    Guards buffers, staging;
+    std::array<Tensor, kMaximumDevices> buffer{};
+    std::array<Tensor, kMaximumDevices> staging_t{};
+    for (int rank = 0; rank < tp; ++rank) {
+        set_device(ec, rank);
+        buffers[rank] = std::make_unique<GuardedDeviceBuffer>(count * sizeof(std::uint16_t));
+        staging[rank] = std::make_unique<GuardedDeviceBuffer>(count * sizeof(std::uint16_t));
+        const auto bits = encode_f16(partials[rank]);
+        buffers[rank]->copy_from_host(bits.data(), count * sizeof(std::uint16_t));
+        staging[rank]->fill(0);
+        buffer[rank]    = Tensor(buffers[rank]->data(), DType::FP16, {ne0, ne1});
+        staging_t[rank] = Tensor(staging[rank]->data(), DType::FP16, {ne0, ne1});
+    }
+
+    retire_staging(ec);
+    ops::allreduce_sum(buffer, staging_t, ec, events);
+    synchronize_all(ec);
+
+    std::vector<std::vector<double>> observed(tp);
+    int failures = 0;
+    for (int rank = 0; rank < tp; ++rank) {
+        set_device(ec, rank);
+        observed[rank] = from_device_f16(buffers[rank]->data(), count);
+        failures += buffers[rank]->verify_guards("allreduce f16 buffer device guard");
+        failures += staging[rank]->verify_guards("allreduce f16 staging device guard");
+    }
+
+    for (int rank = 1; rank < tp; ++rank) {
+        if (observed[rank] != observed[0]) {
+            std::cout << "FAIL " << label << ": rank " << rank << " is not bitwise-equal to rank 0\n";
+            ++failures;
+        }
+    }
+
+    std::vector<double> abs_sum(count, 0.0);
+    for (const std::vector<float>& partial : partials) {
+        for (std::size_t i = 0; i < count; ++i) {
+            abs_sum[i] += std::abs(static_cast<double>(partial[i]));
+        }
+    }
+    double worst_ratio  = 0.0;
+    std::size_t worst_i = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const double tolerance = kF16RoundingRelative * ((tp - 1) * abs_sum[i] + std::abs(expected[i]));
+        const double error     = std::abs(observed[0][i] - expected[i]);
+        const double ratio     = error / (tolerance + 1.0e-30);
         if (ratio > worst_ratio) {
             worst_ratio = ratio;
             worst_i     = i;
@@ -526,6 +608,9 @@ int run_suite(int tp) {
     failures += run_allreduce_case("allreduce_sum [1]", 1, 1, 104u, ec, events);
     failures += run_allreduce_case("allreduce_sum [3]", 3, 1, 105u, ec, events);
     failures += run_allreduce_case("allreduce_sum [17,3]", 17, 3, 106u, ec, events);
+    failures += run_allreduce_f16_case("allreduce_sum f16 [5120]", 5120, 1, 107u, ec, events);
+    failures += run_allreduce_f16_case("allreduce_sum f16 [5120,48]", 5120, 48, 108u, ec, events);
+    if (std::getenv("NINFER_ALLREDUCE_ONLY") != nullptr) { return failures; }
 
     // The remaining collectives are documented validate-and-return no-ops at tp == 1, so their
     // relocation cases only have meaning with at least two ranks. allreduce_sum above still runs at
