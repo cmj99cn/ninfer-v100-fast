@@ -577,6 +577,132 @@ int run_route_case(const Case& inputs, std::size_t token, const std::string& lab
     return failures;
 }
 
+struct SlotBank {
+    std::vector<std::uint8_t> payload;
+    std::vector<float> divisors;
+    std::vector<std::int32_t> lookup;
+    std::int32_t slots = 0;
+};
+
+SlotBank make_slot_bank(const BatchedFixture& gate_up, const BatchedFixture& down,
+                        const std::vector<std::int32_t>& selected) {
+    std::vector<std::int32_t> experts = selected;
+    std::sort(experts.begin(), experts.end());
+    experts.erase(std::unique(experts.begin(), experts.end()), experts.end());
+
+    constexpr std::size_t kHalfCode  = static_cast<std::size_t>(kIntermediate) * kHidden / 2U;
+    constexpr std::size_t kHalfScale = static_cast<std::size_t>(kIntermediate) * kHidden / 16U;
+    constexpr std::size_t kSlotBytes = 3U * (kHalfCode + kHalfScale);
+    const std::size_t gate_up_code  = static_cast<std::size_t>(kGateUpRows) * kHidden / 2U;
+    const std::size_t gate_up_scale = static_cast<std::size_t>(kGateUpRows) * kHidden / 16U;
+    const std::size_t down_code     = static_cast<std::size_t>(kDownRows) * kIntermediate / 2U;
+    const std::size_t down_scale    = static_cast<std::size_t>(kDownRows) * kIntermediate / 16U;
+
+    SlotBank bank;
+    bank.slots = static_cast<std::int32_t>(experts.size());
+    bank.payload.assign(static_cast<std::size_t>(bank.slots) * kSlotBytes, 0);
+    bank.divisors.assign(static_cast<std::size_t>(bank.slots) * 3, 0.0F);
+    bank.lookup.assign(static_cast<std::size_t>(kExperts), -1);
+
+    for (std::size_t slot = 0; slot < experts.size(); ++slot) {
+        const auto expert = static_cast<std::size_t>(experts[slot]);
+        std::uint8_t* base = bank.payload.data() + slot * kSlotBytes;
+        const std::uint8_t* source = gate_up.payload.data();
+        std::copy_n(source + expert * gate_up_code, kHalfCode, base);
+        std::copy_n(source + gate_up.scale_plane_offset + expert * gate_up_scale, kHalfScale,
+                    base + kHalfCode);
+        std::copy_n(source + expert * gate_up_code + kHalfCode, kHalfCode,
+                    base + kHalfCode + kHalfScale);
+        std::copy_n(source + gate_up.scale_plane_offset + expert * gate_up_scale + kHalfScale,
+                    kHalfScale, base + 2U * (kHalfCode + kHalfScale));
+        const std::uint8_t* down_source = down.payload.data();
+        std::copy_n(down_source + expert * down_code, down_code,
+                    base + 2U * (kHalfCode + kHalfScale));
+        std::copy_n(down_source + down.scale_plane_offset + expert * down_scale, down_scale,
+                    base + 2U * (kHalfCode + kHalfScale) + down_code);
+
+        const float up_divisor = gate_up.divisors[expert];
+        bank.divisors[3U * slot + 0U] = up_divisor;
+        bank.divisors[3U * slot + 1U] = up_divisor;
+        bank.divisors[3U * slot + 2U] = down.divisors[expert];
+        bank.lookup[expert] = static_cast<std::int32_t>(slot);
+    }
+    return bank;
+}
+
+int run_cached_bitwise_case(const BatchedFixture& gate_up, const BatchedFixture& down,
+                            const MoeNvfp4Weights& full_weights,
+                            const std::vector<float>& activation_values, DType dtype,
+                            const std::string& label) {
+    const bool fp16 = dtype == DType::FP16;
+    std::vector<std::uint16_t> activation_words(kHidden);
+    std::vector<std::uint16_t> residual_words(kHidden);
+    for (std::int32_t row = 0; row < kHidden; ++row) {
+        const float value = activation_values[static_cast<std::size_t>(row)];
+        activation_words[static_cast<std::size_t>(row)] = fp16 ? f32_to_f16(value) : f32_to_bf16(value);
+        const std::uint32_t hash = static_cast<std::uint32_t>(row) * 0x9e3779b9U ^ 0x85ebca6bU;
+        const float residual = static_cast<float>(static_cast<int>((hash >> 9) & 0xffU) - 128) *
+                               (1.0F / 2048.0F);
+        residual_words[static_cast<std::size_t>(row)] = fp16 ? f32_to_f16(residual) : f32_to_bf16(residual);
+    }
+
+    DeviceBuffer device_x = to_device(activation_words);
+    GuardedDeviceBuffer ids_buffer(kTopK * sizeof(std::int32_t));
+    GuardedDeviceBuffer coefficients_buffer(kTopK * sizeof(float));
+    GuardedDeviceBuffer shared_gate_buffer(sizeof(float));
+    Tensor x{device_x.p, dtype, {kHidden, 1}};
+    Tensor ids{ids_buffer.data(), DType::I32, {kTopK, 1}};
+    Tensor coefficients{coefficients_buffer.data(), DType::FP32, {kTopK, 1}};
+    Tensor shared_gate{shared_gate_buffer.data(), DType::FP32, {1, 1}};
+    ops::moe_nvfp4_route(x, full_weights, ids, coefficients, shared_gate, 0);
+    cuda_synchronize();
+
+    const MoeNvfp4RouteView route{ids, coefficients, shared_gate};
+    const std::vector<std::int32_t> selected = from_device<std::int32_t>(ids_buffer.data(), kTopK);
+    const SlotBank slots = make_slot_bank(gate_up, down, selected);
+
+    DeviceBuffer slot_payload = to_device(slots.payload);
+    DeviceBuffer slot_divisors = to_device(slots.divisors);
+    DeviceBuffer slot_lookup = to_device(slots.lookup);
+    const std::size_t slot_bytes = slots.payload.size() / static_cast<std::size_t>(slots.slots);
+    const MoeNvfp4ExpertSlots bank{
+        .payload    = static_cast<const std::uint8_t*>(slot_payload.p),
+        .slot_bytes = slot_bytes,
+        .slot_count = slots.slots,
+        .lookup     = static_cast<const std::int32_t*>(slot_lookup.p),
+        .divisors   = static_cast<const float*>(slot_divisors.p),
+    };
+    DeviceBuffer scratch(kTopK * kIntermediate * sizeof(float));
+    const MoeNvfp4ExpertScratch scratch_view{static_cast<float*>(scratch.p)};
+
+    const std::size_t destination_bytes = static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t);
+    GuardedDeviceBuffer parallel(destination_bytes);
+    GuardedDeviceBuffer serial(destination_bytes);
+    parallel.copy_from_host(residual_words.data(), destination_bytes);
+    serial.copy_from_host(residual_words.data(), destination_bytes);
+    Tensor parallel_destination{parallel.data(), dtype, {kHidden, 1}};
+    Tensor serial_destination{serial.data(), dtype, {kHidden, 1}};
+
+    ops::moe_routed_nvfp4_cached(x, bank, scratch_view, route, parallel_destination, 0);
+    ops::moe_routed_nvfp4_cached(x, bank, MoeNvfp4ExpertScratch{}, route, serial_destination, 0);
+    cuda_synchronize();
+
+    const std::vector<std::uint16_t> got_parallel =
+        from_device<std::uint16_t>(parallel.data(), kHidden);
+    const std::vector<std::uint16_t> got_serial =
+        from_device<std::uint16_t>(serial.data(), kHidden);
+
+    int failures = 0;
+    if (got_parallel != got_serial) {
+        std::cerr << label << ": the multi-CTA slot path is not bitwise identical to the "
+                             "single-CTA slot path\n";
+        ++failures;
+    }
+    failures += parallel.verify_guards(label + " parallel guard");
+    failures += serial.verify_guards(label + " serial guard");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -940,7 +1066,7 @@ int main() {
     Tensor local_destination{local_destination_buffer.data(), DType::BF16,
                              {kHidden, static_cast<std::int32_t>(kTokens)}};
     ops::moe_routed_nvfp4_partial(x, local_weights, route, local_destination, 0);
-    ops::moe_shared_nvfp4(x, local_weights, route, local_destination, 0);
+    ops::moe_shared_nvfp4(x, local_weights, MoeNvfp4ExpertScratch{}, route, local_destination, 0);
     cuda_synchronize();
     const std::vector<double> got_local =
         from_device_bf16(local_destination_buffer.data(), kTokens * kHidden);
@@ -970,6 +1096,11 @@ int main() {
     failures += verify_reduction("moe_nvfp4 local subset", got_local, expected_local,
                                  kDestinationCriterion);
     failures += local_destination_buffer.verify_guards("moe_nvfp4 local destination guard");
+
+    failures += run_cached_bitwise_case(inputs.gate_up, inputs.down, weights,
+                                        inputs.activation[0], DType::BF16, "moe_nvfp4 cached bf16");
+    failures += run_cached_bitwise_case(gate_up_f16, down_f16, weights_f16,
+                                        inputs.activation[0], DType::FP16, "moe_nvfp4 cached f16");
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " moe_nvfp4 correctness\n";
     return failures == 0 ? 0 : 1;

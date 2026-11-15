@@ -188,14 +188,32 @@ struct MoeNvfp4ExpertSlots {
 };
 
 /**
+ * The caller-owned transient scratch the single-token slot-bank path stages its intermediate
+ * activation in.
+ *
+ *   activation  FP32 [K, I] contiguous, at least K * I floats
+ *
+ * K is the route count and I the expert intermediate width. The buffer is disjoint from x,
+ * destination, the weights, and the slot bank; it is otherwise unobserved. It may be null when
+ * the activation carries more than one token, or to select the single-CTA evaluator.
+ */
+struct MoeNvfp4ExpertScratch {
+    float* activation = nullptr;
+};
+
+/**
  * Op: the routed top-K contribution of a resident expert slot bank, added into `destination`.
  *
  * The route view is the output of moe_nvfp4_route for this `x`. For every route entry the global
  * expert id is resolved through `experts.lookup`; an entry whose id is absent (negative lookup)
  * contributes exactly zero. The selected expert's gate, up, and down matrices are read from that
  * slot with the layout above. The shared expert is not part of this entry.
+ *
+ * With a single token, a non-null `scratch` selects a multi-CTA grid over (route, output row
+ * tile); a null `scratch` runs the single-CTA evaluator.
  */
 void moe_routed_nvfp4_cached(const Tensor& x, const MoeNvfp4ExpertSlots& experts,
+                             const MoeNvfp4ExpertScratch& scratch,
                              const MoeNvfp4RouteView& route, Tensor& destination,
                              cudaStream_t stream);
 
@@ -205,9 +223,13 @@ void moe_routed_nvfp4_cached(const Tensor& x, const MoeNvfp4ExpertSlots& experts
  * This is the replicated half of the MoE: every rank carries the same shared weights and the same
  * routing control, so every rank adds the identical contribution exactly once after the routed
  * partials have been reduced. The routed experts are not part of this entry.
+ *
+ * With a single token, a non-null `scratch` selects a multi-CTA grid over the output row tiles;
+ * only its first I floats are used. A null `scratch` runs the single-CTA evaluator.
  */
 void moe_shared_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights,
-                      const MoeNvfp4RouteView& route, Tensor& destination, cudaStream_t stream);
+                      const MoeNvfp4ExpertScratch& scratch, const MoeNvfp4RouteView& route,
+                      Tensor& destination, cudaStream_t stream);
 
 /**
  * Minimum call-local workspace capacity for every T in the inclusive

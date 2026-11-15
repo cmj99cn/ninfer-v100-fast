@@ -269,7 +269,7 @@ void moe_routed_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& d
                                      weights.routed_gate_up.expert_begin,
                                      weights.routed_gate_up.matrices, destination, stream);
     detail::moe_nvfp4_shared_launch(x, weights.router_shared.qdata, weights.shared_down.qdata,
-                                    outputs, destination, stream);
+                                    detail::MoeNvfp4Scratch{}, outputs, destination, stream);
 }
 
 void moe_routed_nvfp4_partial(const Tensor& x, const MoeNvfp4Weights& weights,
@@ -293,6 +293,7 @@ void moe_routed_nvfp4_partial(const Tensor& x, const MoeNvfp4Weights& weights,
 }
 
 void moe_routed_nvfp4_cached(const Tensor& x, const MoeNvfp4ExpertSlots& experts,
+                             const MoeNvfp4ExpertScratch& scratch,
                              const MoeNvfp4RouteView& route, Tensor& destination,
                              cudaStream_t stream) {
     const std::int32_t tokens = require_tokens(x, "x");
@@ -303,6 +304,10 @@ void moe_routed_nvfp4_cached(const Tensor& x, const MoeNvfp4ExpertSlots& experts
         !aligned_to(experts.payload, 16) || !aligned_to(experts.lookup, 16) ||
         !aligned_to(experts.divisors, 16)) {
         throw std::invalid_argument("moe_nvfp4: invalid resident expert slots");
+    }
+    if (tokens == 1 && scratch.activation != nullptr && !aligned_to(scratch.activation, 16)) {
+        throw std::invalid_argument("moe_nvfp4: the single-token slot bank needs an aligned "
+                                    "activation scratch");
     }
 
     std::vector<AddressRange> ranges;
@@ -318,18 +323,31 @@ void moe_routed_nvfp4_cached(const Tensor& x, const MoeNvfp4ExpertSlots& experts
     ranges.push_back(address_range(experts.divisors,
                                    static_cast<std::size_t>(experts.slot_count) * 3 * 4,
                                    "expert divisors"));
+    if (tokens == 1 && scratch.activation != nullptr) {
+        ranges.push_back(address_range(
+            scratch.activation,
+            static_cast<std::size_t>(kTopK) * kIntermediate * sizeof(float),
+            "activation scratch"));
+    }
     require_disjoint(ranges);
 
     const detail::MoeNvfp4RouteOutputs outputs = route_outputs(route);
+    const detail::MoeNvfp4Scratch scratch_planes{tokens == 1 ? scratch.activation : nullptr};
     detail::moe_nvfp4_cached_launch(x, experts.payload, experts.slot_bytes, experts.slot_count,
-                                    experts.lookup, experts.divisors, outputs, destination,
-                                    stream);
+                                    experts.lookup, experts.divisors, scratch_planes, outputs,
+                                    destination, stream);
 }
 
 void moe_shared_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights,
-                      const MoeNvfp4RouteView& route, Tensor& destination, cudaStream_t stream) {
+                      const MoeNvfp4ExpertScratch& scratch, const MoeNvfp4RouteView& route,
+                      Tensor& destination, cudaStream_t stream) {
     const std::int32_t tokens = require_tokens(x, "x");
     require_destination(destination, x.dtype, tokens);
+    const bool parallel = tokens == 1 && scratch.activation != nullptr;
+    if (parallel && !aligned_to(scratch.activation, 16)) {
+        throw std::invalid_argument("moe_nvfp4: the single-token shared expert needs an aligned "
+                                    "activation scratch");
+    }
 
     std::vector<AddressRange> ranges;
     ranges.reserve(12);
@@ -338,11 +356,17 @@ void moe_shared_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights,
     require_route(route, tokens, ranges);
     require_parent(weights.router_shared, ranges);
     require_shared_down(weights.shared_down, ranges);
+    if (parallel) {
+        ranges.push_back(address_range(
+            scratch.activation, static_cast<std::size_t>(kIntermediate) * sizeof(float),
+            "activation scratch"));
+    }
     require_disjoint(ranges);
 
     const detail::MoeNvfp4RouteOutputs outputs = route_outputs(route);
+    const detail::MoeNvfp4Scratch scratch_planes{parallel ? scratch.activation : nullptr};
     detail::moe_nvfp4_shared_launch(x, weights.router_shared.qdata, weights.shared_down.qdata,
-                                    outputs, destination, stream);
+                                    scratch_planes, outputs, destination, stream);
 }
 
 } // namespace ninfer::ops

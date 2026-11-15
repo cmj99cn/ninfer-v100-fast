@@ -11,6 +11,7 @@
 #include <ninfer/targets/qwen3_8_flash_next/package.h>
 #include <ninfer/targets/qwen4_exp/runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -37,8 +38,8 @@ using Package = ninfer::targets::qwen3_8_flash_next::Package;
 
 constexpr std::uint32_t kRanks        = 2;
 constexpr std::uint32_t kKvCapacity   = 262144;
-constexpr std::uint32_t kPromptTokens = 512;
-constexpr std::uint32_t kDecodeTokens = 6;
+constexpr std::uint32_t kForwardTokens = 512;
+constexpr std::uint32_t kDecodeTokens  = 6;
 constexpr int kEventPool              = 4096;
 
 std::int64_t now_ns() {
@@ -155,10 +156,10 @@ void require(bool condition, const std::string& message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
-std::vector<TokenId> make_prompt() {
+std::vector<TokenId> make_prompt(std::uint32_t prompt_tokens) {
     constexpr std::array<TokenId, 8> base{1024, 7, 98140, 33, 4097, 512, 100, 2048};
-    std::vector<TokenId> prompt(kPromptTokens);
-    for (std::uint32_t index = 0; index < kPromptTokens; ++index) {
+    std::vector<TokenId> prompt(prompt_tokens);
+    for (std::uint32_t index = 0; index < prompt_tokens; ++index) {
         prompt[index] = base[index % base.size()];
     }
     return prompt;
@@ -177,7 +178,7 @@ namespace {
 
 namespace rt = ninfer::targets::qwen4_exp::detail::flash_next_phase_profile_runtime;
 
-void run(const char* path) {
+void run(const char* path, std::uint32_t prompt_tokens) {
     ExecutionContext execution({0, 1});
     artifact::Reader reader(path);
     artifact::Binder binder(reader, 2);
@@ -190,7 +191,7 @@ void run(const char* path) {
     options.max_context      = kKvCapacity;
     options.kv_capacity      = ninfer::KvCapacityPolicy::explicit_capacity(kKvCapacity);
     options.max_concurrency  = 1;
-    options.prefill_chunk    = kPromptTokens;
+    options.prefill_chunk    = kForwardTokens;
     options.expert_cache_mib = 0;
 
     auto load_plan = Package::plan_load(binder, options, detail::WeightsProfile::Nvfp4);
@@ -201,7 +202,7 @@ void run(const char* path) {
                                  std::filesystem::path(path));
     data.allocate_expert_cache(options, execution);
 
-    const auto recipe = rt::text_workspace_recipe(kPromptTokens, 1);
+    const auto recipe = rt::text_workspace_recipe(kForwardTokens, 1);
     std::unique_ptr<ninfer::ops::CollectiveComms> comms =
         std::make_unique<ninfer::ops::CollectiveComms>(execution);
     std::array<std::unique_ptr<rt::TextState>, ninfer::kMaximumDevices> states;
@@ -217,9 +218,9 @@ void run(const char* path) {
         CUDA_CHECK(cudaGetDevice(&previous));
         CUDA_CHECK(cudaSetDevice(execution.dev[slot]->device));
         states[slot] = std::make_unique<rt::TextState>(*execution.dev[slot], data.view(rank),
-                                                       kKvCapacity, kPromptTokens, 2, rank);
+                                                       kKvCapacity, kForwardTokens, 2, rank);
         activations[slot] =
-            std::make_unique<DeviceArena>(rt::text_activation_capacity_bytes(kPromptTokens));
+            std::make_unique<DeviceArena>(rt::text_activation_capacity_bytes(kForwardTokens));
         workspaces[slot] = std::make_unique<DeviceArena>(recipe.lane_capacity_bytes);
         state_ptrs[slot]      = states[slot].get();
         view_ptrs[slot]       = &data.view(rank);
@@ -229,10 +230,14 @@ void run(const char* path) {
     }
     rt::TextTrunk trunk(view_ptrs, state_ptrs, activation_ptrs, workspace_ptrs, execution, *comms);
 
-    const std::vector<TokenId> prompt = make_prompt();
+    const std::vector<TokenId> prompt = make_prompt(prompt_tokens);
     const detail::CacheStats cold = data.expert_cache_stats(0);
     const std::int64_t prefill_begin = now_ns();
-    TokenId token = trunk.prefill(std::span<const TokenId>{prompt.data(), prompt.size()});
+    TokenId token = 0;
+    for (std::size_t offset = 0; offset < prompt.size(); offset += kForwardTokens) {
+        const std::size_t count = std::min<std::size_t>(kForwardTokens, prompt.size() - offset);
+        token = trunk.prefill(std::span<const TokenId>{prompt.data() + offset, count});
+    }
     for (std::uint32_t rank = 0; rank < kRanks; ++rank) { execution.dev[rank]->synchronize(); }
     const double prefill_ms = static_cast<double>(now_ns() - prefill_begin) / 1.0e6;
     const detail::CacheStats warm = data.expert_cache_stats(0);
@@ -261,7 +266,7 @@ void run(const char* path) {
 
     std::cout << "{\n";
     std::cout << "  \"artifact\": \"" << path << "\",\n";
-    std::cout << "  \"prompt_tokens\": " << kPromptTokens << ",\n";
+    std::cout << "  \"prompt_tokens\": " << prompt_tokens << ",\n";
     std::cout << "  \"decode_tokens\": " << kDecodeTokens << ",\n";
     std::cout << "  \"prefill_ms\": " << prefill_ms << ",\n";
     std::cout << "  \"cold_misses\": " << (warm.miss_count - cold.miss_count) << ",\n";
@@ -316,8 +321,10 @@ int main(int argc, char** argv) {
         std::cerr << "flash_next_phase_profile: two devices are required\n";
         return 1;
     }
+    std::uint32_t prompt_tokens = kForwardTokens;
+    if (argc > 2) { prompt_tokens = static_cast<std::uint32_t>(std::stoul(argv[2])); }
     try {
-        run(path);
+        run(path, prompt_tokens);
     } catch (const std::exception& error) {
         std::cerr << "flash_next_phase_profile: " << error.what() << '\n';
         return 1;

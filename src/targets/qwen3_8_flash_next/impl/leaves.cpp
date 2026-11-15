@@ -127,7 +127,9 @@ void PostMixerLeaf::routed(const Tensor& hidden, const MoeWeights& weights,
 void PostMixerLeaf::shared(const Tensor& hidden, const MoeWeights& weights,
                            const ops::MoeNvfp4RouteView& route, Tensor& destination,
                            cudaStream_t stream) {
-    ops::moe_shared_nvfp4(hidden, weights, route, destination, stream);
+    const ops::MoeNvfp4ExpertScratch scratch{
+        weights.cache != nullptr ? weights.cache->activation_scratch() : nullptr};
+    ops::moe_shared_nvfp4(hidden, weights, scratch, route, destination, stream);
 }
 
 std::size_t PostMixerLeaf::workspace_capacity_bytes(std::int32_t tokens) {

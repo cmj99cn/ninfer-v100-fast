@@ -32,8 +32,12 @@ public:
                 Tensor& destination, cudaStream_t stream);
 
     [[nodiscard]] const ExpertCache& cache() const noexcept { return cache_; }
+    [[nodiscard]] float* activation_scratch() const noexcept {
+        return static_cast<float*>(activation_scratch_.p);
+    }
     [[nodiscard]] std::uint64_t device_bytes() const noexcept {
-        return static_cast<std::uint64_t>(slab_.bytes + lookup_.bytes + divisors_.bytes);
+        return static_cast<std::uint64_t>(slab_.bytes + lookup_.bytes + divisors_.bytes +
+                                          activation_scratch_.bytes);
     }
     [[nodiscard]] std::uint64_t host_bytes() const noexcept {
         return static_cast<std::uint64_t>(kCopyStages) * kPairBytes;
@@ -57,6 +61,7 @@ private:
     DeviceBuffer slab_;
     DeviceBuffer lookup_;
     DeviceBuffer divisors_;
+    DeviceBuffer activation_scratch_;
     std::vector<std::int32_t> host_lookup_;
     std::vector<std::int32_t> host_ids_;
     std::vector<float> host_divisors_;

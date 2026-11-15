@@ -41,6 +41,9 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
     slab_    = DeviceBuffer(static_cast<std::size_t>(cache_.plan().bytes));
     lookup_  = DeviceBuffer(static_cast<std::size_t>(TextConfig::experts) * 4);
     divisors_ = DeviceBuffer(static_cast<std::size_t>(cache_.slots()) * 3 * 4);
+    activation_scratch_ = DeviceBuffer(
+        static_cast<std::size_t>(TextConfig::experts_per_token) *
+        static_cast<std::size_t>(TextConfig::expert_intermediate) * sizeof(float));
     for (auto& staging : staging_) {
         staging = std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(kPairBytes));
     }
@@ -151,7 +154,10 @@ void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
         .lookup     = static_cast<const std::int32_t*>(lookup_.p),
         .divisors   = static_cast<const float*>(divisors_.p),
     };
-    ops::moe_routed_nvfp4_cached(x, bank, route, destination, stream);
+    const ops::MoeNvfp4ExpertScratch scratch{
+        .activation = static_cast<float*>(activation_scratch_.p),
+    };
+    ops::moe_routed_nvfp4_cached(x, bank, scratch, route, destination, stream);
 
     if (stats_ != nullptr) {
         const CacheStats stats = cache_.stats();
