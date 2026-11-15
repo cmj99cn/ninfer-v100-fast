@@ -86,8 +86,11 @@ struct WorkspaceRecipe {
         channels * static_cast<std::size_t>(ops::kPleConvWindow) * kBf16Bytes;
 
     const std::size_t layer_per_token = std::max(qsa_per_token, gdn_per_token + ple_per_token);
+    const std::size_t route_logits =
+        (static_cast<std::size_t>(TextConfig::experts) + 1) * sizeof(float);
     const std::size_t alignment_slack = 256 * 48;
-    return align_up((trunk_per_token + layer_per_token) * tokens + ple_history + alignment_slack,
+    return align_up((trunk_per_token + layer_per_token) * tokens + ple_history + route_logits +
+                        alignment_slack,
                     16);
 }
 

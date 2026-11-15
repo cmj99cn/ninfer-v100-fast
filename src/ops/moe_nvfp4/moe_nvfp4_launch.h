@@ -38,9 +38,11 @@ void moe_nvfp4_cached_launch(const Tensor& x, const std::uint8_t* slots,
                              MoeNvfp4Scratch scratch, const MoeNvfp4RouteOutputs& route,
                              Tensor& destination, cudaStream_t stream);
 
-void moe_nvfp4_route_unique_launch(const std::int32_t* ids, std::int32_t entries,
-                                   std::int32_t* unique_ids, std::int32_t* unique_count,
-                                   cudaStream_t stream);
+void moe_nvfp4_route_probe_launch(const std::int32_t* ids, std::int32_t entries,
+                                  const std::int32_t* lookup, std::int32_t expert_begin,
+                                  std::int32_t expert_end, std::int32_t* active_ids,
+                                  std::int32_t* miss_ids, std::int32_t* active_count,
+                                  std::int32_t* miss_count, cudaStream_t stream);
 
 void moe_nvfp4_shared_launch(const Tensor& x, const void* control, const void* shared_down,
                              MoeNvfp4Scratch scratch, const MoeNvfp4RouteOutputs& route,

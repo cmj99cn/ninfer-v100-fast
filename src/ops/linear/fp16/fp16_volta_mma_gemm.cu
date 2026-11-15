@@ -19,11 +19,18 @@ void launch_fp16_volta_mma_typed(const Tensor& x, const Weight& w, Tensor& out,
     const std::int32_t t      = x.ne[1];
     const std::int32_t out_ld = static_cast<std::int32_t>(out.nb[1] / sizeof(std::uint16_t));
 
+    const auto* wdata = static_cast<const __half*>(w.qdata);
+    if (t == 1 && n <= 1024) {
+        using D = Fp16VoltaMmaDecodeSchedule;
+        const dim3 grid(static_cast<unsigned>((n + D::kRowsPerCta - 1) / D::kRowsPerCta), 1u, 1u);
+        fp16_volta_mma_gemm_kernel<A, D><<<grid, D::kThreads, 0, stream>>>(
+            wdata, static_cast<const A*>(x.data), static_cast<A*>(out.data), out_ld, n, k, t);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const dim3 grid(static_cast<unsigned>((n + S::kRowsPerCta - 1) / S::kRowsPerCta),
                     1u,
                     static_cast<unsigned>((t + S::kTTile - 1) / S::kTTile));
-    const auto* wdata = static_cast<const __half*>(w.qdata);
-
     fp16_volta_mma_gemm_kernel<A><<<grid, S::kThreads, 0, stream>>>(
         wdata, static_cast<const A*>(x.data), static_cast<A*>(out.data), out_ld, n, k, t);
     CUDA_CHECK(cudaGetLastError());

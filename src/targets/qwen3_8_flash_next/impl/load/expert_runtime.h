@@ -43,11 +43,13 @@ public:
     }
     [[nodiscard]] std::uint64_t host_bytes() const noexcept {
         return static_cast<std::uint64_t>(kCopyStages) * kPairBytes + lookup_host_->size() +
-               probe_host_->size();
+               kProbeBytes;
     }
 
 private:
     static constexpr std::uint32_t kCopyStages = 3;
+    static constexpr std::size_t kProbeBytes =
+        (2 + 2 * static_cast<std::size_t>(TextConfig::experts)) * sizeof(std::int32_t);
 
     void launch_pull(std::uint32_t layer, std::uint32_t expert, std::uint32_t slot);
     void refresh_lookup();
@@ -68,11 +70,16 @@ private:
     DeviceBuffer divisors_;
     DeviceBuffer activation_scratch_;
     std::unique_ptr<PinnedHostBuffer> lookup_host_;
-    std::unique_ptr<PinnedHostBuffer> probe_host_;
-    std::int32_t* probe_ids_dev_   = nullptr;
-    std::int32_t* probe_count_dev_ = nullptr;
-    std::int32_t* probe_ids_host_   = nullptr;
-    std::int32_t* probe_count_host_ = nullptr;
+    std::vector<std::int32_t> host_ids_;
+    std::int32_t* probe_host_          = nullptr;
+    std::int32_t* probe_miss_count_    = nullptr;
+    std::int32_t* probe_active_count_  = nullptr;
+    std::int32_t* probe_miss_ids_      = nullptr;
+    std::int32_t* probe_active_ids_    = nullptr;
+    std::int32_t* probe_miss_count_dev_   = nullptr;
+    std::int32_t* probe_active_count_dev_ = nullptr;
+    std::int32_t* probe_miss_ids_dev_     = nullptr;
+    std::int32_t* probe_active_ids_dev_   = nullptr;
 };
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

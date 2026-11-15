@@ -31,14 +31,30 @@ struct Fp16VoltaMmaSchedule {
     static constexpr int kXPad       = 8;  // shared row padding (see Q5VoltaMmaSchedule)
     static constexpr int kRowsPerCta = kWarps * 8;
     static constexpr int kThreads    = kWarps * 32;
+    static constexpr bool kSingleRowA = false;
 };
 
-template <class A>
-__global__ __launch_bounds__(Fp16VoltaMmaSchedule::kThreads, 8) void fp16_volta_mma_gemm_kernel(
+struct Fp16VoltaMmaDecodeSchedule {
+    static constexpr int kWarps      = 1;
+    static constexpr int kKStep      = 256;
+    static constexpr int kTTile      = 32;
+    static constexpr int kXPad       = 8;
+    static constexpr int kRowsPerCta = kWarps * 8;
+    static constexpr int kThreads    = kWarps * 32;
+    static constexpr bool kSingleRowA = true;
+};
+
+template <class A, class S = Fp16VoltaMmaSchedule>
+__global__ __launch_bounds__(S::kThreads, 8) void fp16_volta_mma_gemm_kernel(
     const __half* __restrict__ w, const A* __restrict__ x,
     A* __restrict__ out, int out_ld, int n, int k, int t) {
-    using S = Fp16VoltaMmaSchedule;
-    constexpr int kVecs = S::kKStep / 8;  // uint4 (8 half) per row per tile
+    constexpr int kVecs   = S::kKStep / 8;   // uint4 (8 half) per row per tile
+    constexpr int kChunks = S::kKStep / 32;  // 32-element weight staging groups per iteration
+    constexpr int kXRows = S::kSingleRowA ? 1 : S::kTTile;
+    static_assert(S::kKStep % 32 == 0);
+    static_assert(S::kKStep / 8 <= S::kThreads);
+    static_assert((S::kSingleRowA ? 1 : S::kTTile) * (S::kKStep / 8) <= S::kThreads);
+    static_assert(S::kSingleRowA || S::kTTile >= 32);
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
@@ -46,7 +62,7 @@ __global__ __launch_bounds__(Fp16VoltaMmaSchedule::kThreads, 8) void fp16_volta_
     const int t0   = static_cast<int>(blockIdx.z) * S::kTTile;
     const int tcnt = min(S::kTTile, t - t0);
 
-    __shared__ __align__(16) __half x_sh[2][S::kTTile][S::kKStep + S::kXPad];
+    __shared__ __align__(16) __half x_sh[2][kXRows][S::kKStep + S::kXPad];
     __shared__ __align__(16) __half w_sh[2][S::kWarps][8][S::kKStep + S::kXPad];
 
     // Split the global load from the shared store with a register carrier, so the mma loop runs
@@ -56,18 +72,19 @@ __global__ __launch_bounds__(Fp16VoltaMmaSchedule::kThreads, 8) void fp16_volta_
     struct Carry {
         uint4 xraw;
         bool xactive;
-        uint4 wraw;
+        uint4 wraw[kChunks];
         bool wactive;
     };
     Carry carry;
 
     auto prefetch = [&](int kbase) {
         const int nvalid = min(S::kKStep, k - kbase);
-        const int idx    = static_cast<int>(threadIdx.x);
-        carry.xactive    = idx < tcnt * kVecs;
+        const int index  = static_cast<int>(threadIdx.x);
+        const int xslots = S::kSingleRowA ? kVecs : tcnt * kVecs;
+        carry.xactive    = index < xslots;
         if (carry.xactive) {
-            const int row = idx / kVecs;
-            const int v   = idx % kVecs;
+            const int row = index / kVecs;
+            const int v   = index % kVecs;
             if (v * 8 + 8 <= nvalid) {
                 carry.xraw = *reinterpret_cast<const uint4*>(
                     x + static_cast<std::int64_t>(t0 + row) * k + kbase + v * 8);
@@ -78,32 +95,40 @@ __global__ __launch_bounds__(Fp16VoltaMmaSchedule::kThreads, 8) void fp16_volta_
         const int row     = n0 + (lane >> 2);
         carry.wactive     = row < n;
         if (carry.wactive) {
-            if ((lane & 3) * 8 + 8 <= nvalid) {
-                carry.wraw = *reinterpret_cast<const uint4*>(
-                    w + static_cast<std::int64_t>(row) * k + kbase + (lane & 3) * 8);
-            } else {
-                carry.wraw = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+            for (int chunk = 0; chunk < kChunks; ++chunk) {
+                const int offset = chunk * 32 + (lane & 3) * 8;
+                if (offset + 8 <= nvalid) {
+                    carry.wraw[chunk] = *reinterpret_cast<const uint4*>(
+                        w + static_cast<std::int64_t>(row) * k + kbase + offset);
+                } else {
+                    carry.wraw[chunk] = make_uint4(0u, 0u, 0u, 0u);
+                }
             }
         }
     };
 
     auto commit = [&](const Carry& r, int buf) {
         if (r.xactive) {
-            const int idx = static_cast<int>(threadIdx.x);
+            const int index = static_cast<int>(threadIdx.x);
             if constexpr (std::is_same_v<A, __nv_bfloat16>) {
                 const auto* src = reinterpret_cast<const __nv_bfloat16*>(&r.xraw);
                 __half tmp[8];
 #pragma unroll
                 for (int j = 0; j < 8; ++j) { tmp[j] = __float2half(__bfloat162float(src[j])); }
-                *reinterpret_cast<uint4*>(&x_sh[buf][idx / kVecs][(idx % kVecs) * 8]) =
+                *reinterpret_cast<uint4*>(&x_sh[buf][index / kVecs][(index % kVecs) * 8]) =
                     *reinterpret_cast<const uint4*>(tmp);
             } else {
-                *reinterpret_cast<uint4*>(&x_sh[buf][idx / kVecs][(idx % kVecs) * 8]) = r.xraw;
+                *reinterpret_cast<uint4*>(&x_sh[buf][index / kVecs][(index % kVecs) * 8]) = r.xraw;
             }
         }
         if (r.wactive) {
-            *reinterpret_cast<uint4*>(&w_sh[buf][warp][lane >> 2][(lane & 3) * 8]) =
-                *reinterpret_cast<const uint4*>(&r.wraw);
+#pragma unroll
+            for (int chunk = 0; chunk < kChunks; ++chunk) {
+                *reinterpret_cast<uint4*>(
+                    &w_sh[buf][warp][lane >> 2][chunk * 32 + (lane & 3) * 8]) =
+                    r.wraw[chunk];
+            }
         }
     };
 
@@ -125,7 +150,7 @@ __global__ __launch_bounds__(Fp16VoltaMmaSchedule::kThreads, 8) void fp16_volta_
         for (int kk = 0; kk < S::kKStep; kk += 8) {
             half2 a[4], b[4];
             volta_load_qp(a, reinterpret_cast<const half2*>(&x_sh[buf][0][kk]),
-                          (S::kKStep + S::kXPad) / 2);
+                          S::kSingleRowA ? 0 : (S::kKStep + S::kXPad) / 2);
             volta_load_k(b, reinterpret_cast<const half2*>(&w_sh[buf][warp][0][kk]),
                          (S::kKStep + S::kXPad) / 2);
             volta_mma_qk(d, a, b);

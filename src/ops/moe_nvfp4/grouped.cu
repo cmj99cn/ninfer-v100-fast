@@ -142,7 +142,12 @@ __global__ __launch_bounds__(256) void moe_nvfp4_cached_kernel(
     }
 }
 
-inline constexpr int kMoeDecodeTile = 16;
+inline constexpr int kMoeDecodeGateUpTile = 16;
+inline constexpr int kMoeDecodeDownTile   = 8;
+static_assert(kMoeIntermediate % kMoeDecodeGateUpTile == 0);
+static_assert(kMoeHidden % kMoeDecodeDownTile == 0);
+static_assert(kMoeDecodeGateUpTile % 8 == 0);
+static_assert(kMoeDecodeDownTile >= 8);
 
 template <class A>
 __global__ __launch_bounds__(256) void moe_nvfp4_cached_gate_up_kernel(
@@ -151,7 +156,7 @@ __global__ __launch_bounds__(256) void moe_nvfp4_cached_gate_up_kernel(
     const float* __restrict__ divisors, const std::int32_t* __restrict__ ids,
     float* __restrict__ activation) {
     const int route    = static_cast<int>(blockIdx.x);
-    const int row_base = static_cast<int>(blockIdx.y) * kMoeDecodeTile;
+    const int row_base = static_cast<int>(blockIdx.y) * kMoeDecodeGateUpTile;
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
     const int lane     = static_cast<int>(threadIdx.x) & 31;
 
@@ -169,7 +174,7 @@ __global__ __launch_bounds__(256) void moe_nvfp4_cached_gate_up_kernel(
     const std::uint8_t* up_scales   = base + kMoeUpScale;
 
     float* activation_column = activation + static_cast<std::size_t>(route) * kMoeIntermediate;
-    for (int row = row_base + warp; row < row_base + kMoeDecodeTile; row += 8) {
+    for (int row = row_base + warp; row < row_base + kMoeDecodeGateUpTile; row += 8) {
         const float gate = batched_nvfp4_warp_dot<A>(gate_codes, gate_scales, inverse_gate, row,
                                                      kMoeHidden / 16, x);
         const float up = batched_nvfp4_warp_dot<A>(up_codes, up_scales, inverse_up, row,
@@ -184,14 +189,14 @@ __global__ __launch_bounds__(256) void moe_nvfp4_cached_down_kernel(
     const std::int32_t* __restrict__ lookup, const float* __restrict__ divisors,
     const std::int32_t* __restrict__ ids, const float* __restrict__ coefficients,
     const float* __restrict__ activation, A* __restrict__ destination) {
-    const int row_base = static_cast<int>(blockIdx.x) * kMoeDecodeTile;
+    const int row_base = static_cast<int>(blockIdx.x) * kMoeDecodeDownTile;
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
     const int lane     = static_cast<int>(threadIdx.x) & 31;
 
     __shared__ float route_activation[kMoeIntermediate];
-    __shared__ float accumulator[kMoeDecodeTile];
+    __shared__ float accumulator[kMoeDecodeDownTile];
 
-    for (int i = static_cast<int>(threadIdx.x); i < kMoeDecodeTile; i += 256) accumulator[i] = 0.0F;
+    for (int i = static_cast<int>(threadIdx.x); i < kMoeDecodeDownTile; i += 256) accumulator[i] = 0.0F;
 
     for (int route = 0; route < kMoeTopK; ++route) {
         const std::int32_t global = ids[route];
@@ -208,7 +213,7 @@ __global__ __launch_bounds__(256) void moe_nvfp4_cached_down_kernel(
             route_activation[i] = source[i];
         }
         __syncthreads();
-        for (int row = row_base + warp; row < row_base + kMoeDecodeTile; row += 8) {
+        for (int row = row_base + warp; row < row_base + kMoeDecodeDownTile; row += 8) {
             const float value = coefficient * batched_nvfp4_warp_dot_f32(
                 down_codes, down_scales, inverse_down, row, kMoeIntermediate / 16,
                 route_activation);
@@ -217,7 +222,7 @@ __global__ __launch_bounds__(256) void moe_nvfp4_cached_down_kernel(
         __syncthreads();
     }
 
-    for (int i = static_cast<int>(threadIdx.x); i < kMoeDecodeTile; i += 256) {
+    for (int i = static_cast<int>(threadIdx.x); i < kMoeDecodeDownTile; i += 256) {
         const int row = row_base + i;
         destination[row] = MoeAct<A>::from_float(
             accumulator[i] + MoeAct<A>::to_float(destination[row]));
@@ -254,11 +259,11 @@ void moe_nvfp4_cached_launch(const Tensor& x, const std::uint8_t* slots,
     const bool parallel = x.ne[1] == 1 && scratch.activation != nullptr;
     if (x.dtype == DType::FP16) {
         if (parallel) {
-            const dim3 gate_up_grid(kMoeTopK, kMoeIntermediate / kMoeDecodeTile);
+            const dim3 gate_up_grid(kMoeTopK, kMoeIntermediate / kMoeDecodeGateUpTile);
             moe_nvfp4_cached_gate_up_kernel<__half><<<gate_up_grid, 256, 0, stream>>>(
                 static_cast<const __half*>(x.data), slots, slot_bytes, lookup, divisors,
                 route.ids, scratch.activation);
-            const dim3 down_grid(kMoeHidden / kMoeDecodeTile);
+            const dim3 down_grid(kMoeHidden / kMoeDecodeDownTile);
             moe_nvfp4_cached_down_kernel<__half><<<down_grid, 256, 0, stream>>>(
                 slots, slot_bytes, lookup, divisors, route.ids, route.coefficients,
                 scratch.activation, static_cast<__half*>(destination.data));
@@ -269,11 +274,11 @@ void moe_nvfp4_cached_launch(const Tensor& x, const std::uint8_t* slots,
         }
     } else {
         if (parallel) {
-            const dim3 gate_up_grid(kMoeTopK, kMoeIntermediate / kMoeDecodeTile);
+            const dim3 gate_up_grid(kMoeTopK, kMoeIntermediate / kMoeDecodeGateUpTile);
             moe_nvfp4_cached_gate_up_kernel<__nv_bfloat16><<<gate_up_grid, 256, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data), slots, slot_bytes, lookup, divisors,
                 route.ids, scratch.activation);
-            const dim3 down_grid(kMoeHidden / kMoeDecodeTile);
+            const dim3 down_grid(kMoeHidden / kMoeDecodeDownTile);
             moe_nvfp4_cached_down_kernel<__nv_bfloat16><<<down_grid, 256, 0, stream>>>(
                 slots, slot_bytes, lookup, divisors, route.ids, route.coefficients,
                 scratch.activation, static_cast<__nv_bfloat16*>(destination.data));

@@ -48,13 +48,19 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
         static_cast<std::size_t>(kTopK) *
         static_cast<std::size_t>(TextConfig::expert_intermediate) * sizeof(float));
     lookup_host_ = std::make_unique<PinnedHostBuffer>(kLookupEntries * 4);
-    probe_host_  = std::make_unique<PinnedHostBuffer>((static_cast<std::size_t>(kExperts) + 1) * 4);
-    probe_ids_host_   = static_cast<std::int32_t*>(probe_host_->data());
-    probe_count_host_ = probe_ids_host_ + kExperts;
+    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&probe_host_), kProbeBytes,
+                             cudaHostAllocMapped | cudaHostAllocPortable));
+    std::memset(probe_host_, 0, kProbeBytes);
+    probe_miss_count_   = probe_host_;
+    probe_active_count_ = probe_host_ + 1;
+    probe_miss_ids_     = probe_host_ + 2;
+    probe_active_ids_   = probe_host_ + 2 + kExperts;
     void* probe_dev = nullptr;
-    CUDA_CHECK(cudaHostGetDevicePointer(&probe_dev, probe_host_->data(), 0));
-    probe_ids_dev_   = static_cast<std::int32_t*>(probe_dev);
-    probe_count_dev_ = probe_ids_dev_ + kExperts;
+    CUDA_CHECK(cudaHostGetDevicePointer(&probe_dev, probe_host_, 0));
+    probe_miss_count_dev_   = static_cast<std::int32_t*>(probe_dev);
+    probe_active_count_dev_ = probe_miss_count_dev_ + 1;
+    probe_miss_ids_dev_     = probe_miss_count_dev_ + 2;
+    probe_active_ids_dev_   = probe_miss_ids_dev_ + kExperts;
     for (auto& staging : staging_) {
         staging = std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(kPairBytes));
     }
@@ -76,6 +82,7 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
 
 ExpertRuntime::~ExpertRuntime() {
     const ScopedDevice scope(device_);
+    if (probe_host_ != nullptr) { (void)cudaFreeHost(probe_host_); }
     if (copy_stream_ != nullptr) { (void)cudaStreamDestroy(copy_stream_); }
     if (probe_done_ != nullptr) { (void)cudaEventDestroy(probe_done_); }
     if (copy_done_ != nullptr) { (void)cudaEventDestroy(copy_done_); }
@@ -129,27 +136,52 @@ void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
     const auto* table_row = static_cast<const std::int32_t*>(lookup_.p) +
                             static_cast<std::size_t>(layer) * kExperts;
 
-    ops::detail::moe_nvfp4_route_unique_launch(
-        static_cast<const std::int32_t*>(route.expert_ids.data), kTopK * tokens, probe_ids_dev_,
-        probe_count_dev_, stream);
-    CUDA_CHECK(cudaEventRecord(probe_done_, stream));
-    CUDA_CHECK(cudaEventSynchronize(probe_done_));
-
-    const std::int32_t active_count = *probe_count_host_;
     std::vector<std::pair<std::uint32_t, std::int32_t>> needed;
     bool any_missing = false;
-    for (std::int32_t index = 0; index < active_count; ++index) {
-        const std::int32_t global = probe_ids_host_[index];
-        if (global < expert_begin || global >= expert_end) { continue; }
-        const auto local = static_cast<std::uint32_t>(global - expert_begin);
-        needed.emplace_back(local, global);
-        if (cache_.resident_slot(layer, local) < 0) { any_missing = true; }
+    if (tokens == 1) {
+        ops::detail::moe_nvfp4_route_probe_launch(
+            static_cast<const std::int32_t*>(route.expert_ids.data), kTopK, table_row,
+            expert_begin, expert_end, probe_active_ids_dev_, probe_miss_ids_dev_,
+            probe_active_count_dev_, probe_miss_count_dev_, stream);
+        CUDA_CHECK(cudaEventRecord(probe_done_, stream));
+        CUDA_CHECK(cudaEventSynchronize(probe_done_));
+        const std::int32_t active_count = *probe_active_count_;
+        if (*probe_miss_count_ == 0) {
+            cache_.record_resident_lookups(static_cast<std::uint64_t>(active_count));
+        } else {
+            any_missing = true;
+            needed.reserve(static_cast<std::size_t>(active_count));
+            for (std::int32_t index = 0; index < active_count; ++index) {
+                const std::int32_t global = probe_active_ids_[index];
+                needed.emplace_back(static_cast<std::uint32_t>(global - expert_begin), global);
+            }
+        }
+    } else {
+        host_ids_.resize(static_cast<std::size_t>(kTopK) * tokens);
+        CUDA_CHECK(cudaMemcpyAsync(host_ids_.data(), route.expert_ids.data,
+                                   host_ids_.size() * 4, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        std::vector<bool> seen(static_cast<std::size_t>(kRankExperts), false);
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            for (std::int32_t slot = 0; slot < kTopK; ++slot) {
+                const std::int32_t global =
+                    host_ids_[static_cast<std::size_t>(slot) + static_cast<std::size_t>(kTopK) * token];
+                if (global < expert_begin || global >= expert_end) { continue; }
+                const auto local = static_cast<std::uint32_t>(global - expert_begin);
+                if (seen[local]) { continue; }
+                seen[local] = true;
+                needed.emplace_back(local, global);
+                if (cache_.resident_slot(layer, local) < 0) { any_missing = true; }
+            }
+        }
+        if (!any_missing) {
+            cache_.record_resident_lookups(static_cast<std::uint64_t>(needed.size()));
+        }
     }
 
     bool copied = false;
-    if (!any_missing) {
-        cache_.record_resident_lookups(static_cast<std::uint64_t>(needed.size()));
-    } else {
+    if (any_missing) {
         if (needed.size() > cache_.slots()) {
             throw std::logic_error("one layer selected more experts than the cache can hold");
         }

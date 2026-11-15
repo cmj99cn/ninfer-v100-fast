@@ -84,6 +84,7 @@ struct TextConfig {
     [[nodiscard]] static constexpr int gdn_layers() { return layers - qsa_layers(); }
 };
 
+static_assert(TextConfig::experts == 512);
 static_assert(TextConfig::residual_width == 10240);
 static_assert(TextConfig::query_width == 6144);
 static_assert(TextConfig::kv_width == 512);

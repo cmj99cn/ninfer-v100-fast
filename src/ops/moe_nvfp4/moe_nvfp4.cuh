@@ -16,6 +16,7 @@
 namespace ninfer::ops::detail {
 
 inline constexpr int kMoeExperts      = 512;
+static_assert(kMoeExperts == 512);
 inline constexpr int kMoeTopK         = 10;
 inline constexpr int kMoeHidden       = 2560;
 inline constexpr int kMoeIntermediate = 640;
