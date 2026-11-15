@@ -531,6 +531,9 @@ ninfer_add_op_test(ninfer_linear_tp2_split_test
 ninfer_add_op_test(ninfer_qsa_test
   SOURCES ops/qsa_test.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_qsa_reduction_order_test
+  SOURCES ops/qsa_reduction_order_test.cu
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_linear_split_test
   SOURCES ops/linear_split_test.cpp
   LIBRARIES ninfer_ops)

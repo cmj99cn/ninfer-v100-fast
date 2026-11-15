@@ -18,6 +18,10 @@ using detail::QsaAct;
 using detail::qsa_is_activation;
 using detail::qsa_row_position;
 
+inline constexpr int kScoreWarpLanes = 8;
+inline constexpr int kScoreWarpWidth = kScoreWarpLanes * 32;
+static_assert(kScoreWarpWidth == 256, "qsa score warp reduction requires head_dim 256");
+
 __device__ float block_reduce_sum(float* scratch, float value) {
     scratch[threadIdx.x] = value;
     __syncthreads();
@@ -107,9 +111,9 @@ __global__ void sparse_gqa_kernel(const A* query, const A* output_gate,
     for (int j = warp; j < count_j; j += warps) {
         const int token = token_of(j);
         const std::int64_t cache_base = key_offset(token);
-        float partial[8];
+        float partial[kScoreWarpLanes];
 #pragma unroll
-        for (int k = 0; k < 8; ++k) {
+        for (int k = 0; k < kScoreWarpLanes; ++k) {
             const int d = lane + 32 * k;
             partial[k] = QsaAct<A>::to_float(query[output_base + d]) *
                          __bfloat162float(k_pages[cache_base + d]);
@@ -187,7 +191,8 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate, const QsaCac
     const std::int32_t tokens   = query.ne[2];
     const std::int32_t batch_sz = query.ne[3];
     const std::int32_t kv_heads = cache.k_pages.ne[2];
-    qsa_require(head_dim == 256 && q_heads > 0 && kv_heads > 0 && tokens > 0 && batch_sz > 0,
+    qsa_require(head_dim == kScoreWarpWidth && q_heads > 0 && kv_heads > 0 && tokens > 0 &&
+                    batch_sz > 0,
                 "invalid query geometry");
     qsa_require(q_heads % kv_heads == 0, "q_heads must be divisible by kv_heads");
     qsa_require(output_gate.ne[0] == head_dim && output_gate.ne[1] == q_heads &&
