@@ -42,6 +42,7 @@ __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
 #else
     const unsigned exponent = (storage >> 3) & 0x0FU;
     const unsigned mantissa = storage & 0x07U;
+    if (exponent == 15U && mantissa == 7U) { return __uint_as_float(0x7FFFFFFFU); }
     unsigned bits = (exponent == 0)
                         ? __float_as_uint(static_cast<float>(mantissa) * 0.001953125F)
                         : (((exponent + 120U) << 23) | (mantissa << 20));

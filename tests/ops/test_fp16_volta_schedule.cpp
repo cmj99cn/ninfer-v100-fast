@@ -14,6 +14,7 @@
 using namespace ninfer;
 using namespace ninfer::test;
 
+#ifdef NINFER_VOLTA_BUILD
 namespace {
 
 Weight make_weight(void* data, std::int32_t n, std::int32_t k) {
@@ -87,6 +88,7 @@ int run_case(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 }
 
 } // namespace
+#endif
 
 int main() {
     if (cuda_unavailable()) {
