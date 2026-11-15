@@ -65,6 +65,7 @@ private:
     cudaStream_t copy_stream_                = nullptr;
     cudaEvent_t copy_done_                   = nullptr;
     cudaEvent_t probe_done_                  = nullptr;
+    cudaEvent_t down_done_                   = nullptr;
     DeviceBuffer slab_;
     DeviceBuffer lookup_;
     DeviceBuffer divisors_;

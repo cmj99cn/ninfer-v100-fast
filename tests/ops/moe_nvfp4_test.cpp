@@ -710,32 +710,90 @@ ProbeReference reference_probe(const std::vector<std::int32_t>& ids,
     return reference;
 }
 
+struct ProbeBuffers {
+    DeviceBuffer payload{3ULL * (static_cast<std::uint64_t>(kIntermediate) * kHidden / 2U +
+                                 static_cast<std::uint64_t>(kIntermediate) * kHidden / 16U)};
+    DeviceBuffer divisors{3U * sizeof(float)};
+    DeviceBuffer lookup{kExperts * sizeof(std::int32_t)};
+    DeviceBuffer ids{kTopK * sizeof(std::int32_t)};
+    DeviceBuffer coefficients{kTopK * sizeof(float)};
+    DeviceBuffer shared_gate{sizeof(float)};
+    DeviceBuffer x{static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t)};
+    DeviceBuffer activation{static_cast<std::size_t>(kTopK) * kIntermediate * sizeof(float)};
+    std::int32_t* host = nullptr;
+    cudaEvent_t probe_done = nullptr;
+
+    ProbeBuffers() {
+        cuda_check(cudaMemset(payload.p, 0, payload.bytes), "payload memset");
+        const float divisors_host[3] = {1.0F, 1.0F, 1.0F};
+        cuda_check(cudaMemcpy(divisors.p, divisors_host, sizeof(divisors_host),
+                              cudaMemcpyHostToDevice),
+                   "divisor copy");
+        cuda_check(cudaMemset(x.p, 0, x.bytes), "x memset");
+        cuda_check(cudaMemset(coefficients.p, 0, coefficients.bytes), "coefficient memset");
+        cuda_check(cudaMemset(shared_gate.p, 0, shared_gate.bytes), "gate memset");
+        cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&host), (2 + 2 * kExperts) * 4,
+                                 cudaHostAllocMapped | cudaHostAllocPortable),
+                   "cudaHostAlloc probe");
+        host[0] = 0;
+        host[1] = 0;
+        cuda_check(cudaEventCreateWithFlags(&probe_done, cudaEventDisableTiming),
+                   "cudaEventCreate probe");
+    }
+
+    ~ProbeBuffers() {
+        if (probe_done != nullptr) { (void)cudaEventDestroy(probe_done); }
+        if (host != nullptr) { (void)cudaFreeHost(host); }
+    }
+
+    [[nodiscard]] std::int32_t* miss_count() const noexcept { return host; }
+    [[nodiscard]] std::int32_t* active_count() const noexcept { return host + 1; }
+    [[nodiscard]] std::int32_t* miss_ids() const noexcept { return host + 2; }
+    [[nodiscard]] std::int32_t* active_ids() const noexcept { return host + 2 + kExperts; }
+
+    [[nodiscard]] std::int32_t* device_base() const {
+        void* device = nullptr;
+        cuda_check(cudaHostGetDevicePointer(&device, host, 0), "cudaHostGetDevicePointer");
+        return static_cast<std::int32_t*>(device);
+    }
+};
+
 int run_probe_case(const char* label, const std::vector<std::int32_t>& ids,
                    const std::vector<std::int32_t>& lookup, std::int32_t expert_begin,
-                   std::int32_t expert_end) {
+                   std::int32_t expert_end, bool repair) {
     const ProbeReference reference = reference_probe(ids, lookup, expert_begin, expert_end);
+    ProbeBuffers buffers;
+    cuda_check(cudaMemcpy(buffers.ids.p, ids.data(), ids.size() * sizeof(std::int32_t),
+                          cudaMemcpyHostToDevice),
+               "id copy");
+    cuda_check(cudaMemcpy(buffers.lookup.p, lookup.data(), lookup.size() * sizeof(std::int32_t),
+                          cudaMemcpyHostToDevice),
+               "lookup copy");
 
-    DeviceBuffer device_ids = to_device(ids);
-    DeviceBuffer device_lookup = to_device(lookup);
-    std::int32_t* host = nullptr;
-    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&host), (2 + 2 * kExperts) * 4,
-                             cudaHostAllocMapped | cudaHostAllocPortable),
-               "cudaHostAlloc probe");
-    host[0] = 0;
-    host[1] = 0;
-    void* device_host = nullptr;
-    cuda_check(cudaHostGetDevicePointer(&device_host, host, 0), "cudaHostGetDevicePointer");
-    auto* device = static_cast<std::int32_t*>(device_host);
-    std::int32_t* active_ids   = device + 2;
-    std::int32_t* miss_ids     = active_ids + kExperts;
-    std::int32_t* active_count = device;
-    std::int32_t* miss_count   = device + 1;
+    const ops::detail::MoeNvfp4RouteOutputs outputs{
+        static_cast<std::int32_t*>(buffers.ids.p),
+        static_cast<float*>(buffers.coefficients.p),
+        static_cast<float*>(buffers.shared_gate.p)};
+    const ops::detail::MoeNvfp4Scratch scratch{static_cast<float*>(buffers.activation.p)};
+    const Tensor x{buffers.x.p, DType::BF16, {kHidden, 1}};
 
-    ops::detail::moe_nvfp4_route_probe_launch(
-        static_cast<const std::int32_t*>(device_ids.p), static_cast<std::int32_t>(ids.size()),
-        static_cast<const std::int32_t*>(device_lookup.p), expert_begin, expert_end, active_ids,
-        miss_ids, active_count, miss_count, nullptr);
-    cuda_synchronize();
+    auto run = [&](const ops::detail::MoeNvfp4Probe& probe) {
+        ops::detail::moe_nvfp4_cached_gate_up_launch(
+            x, static_cast<const std::uint8_t*>(buffers.payload.p), buffers.payload.bytes,
+            static_cast<const std::int32_t*>(buffers.lookup.p),
+            static_cast<const float*>(buffers.divisors.p), scratch, outputs, &probe, nullptr);
+        cuda_check(cudaEventRecord(buffers.probe_done, nullptr), "probe event record");
+        cuda_check(cudaEventSynchronize(buffers.probe_done), "probe event sync");
+    };
+
+    const std::int32_t* probe_device = buffers.device_base();
+    const ops::detail::MoeNvfp4Probe probe{
+        const_cast<std::int32_t*>(probe_device + 2 + kExperts),
+        const_cast<std::int32_t*>(probe_device + 2),
+        const_cast<std::int32_t*>(probe_device + 1),
+        const_cast<std::int32_t*>(probe_device),
+        expert_begin, expert_end};
+    run(probe);
 
     int failures = 0;
     const auto require = [&](bool condition, const std::string& message) {
@@ -744,35 +802,48 @@ int run_probe_case(const char* label, const std::vector<std::int32_t>& ids,
             ++failures;
         }
     };
-    require(*active_count == static_cast<std::int32_t>(reference.active.size()),
+    require(*buffers.active_count() == static_cast<std::int32_t>(reference.active.size()),
             "probe active count disagrees with the host dedup");
-    require(*miss_count == static_cast<std::int32_t>(reference.miss.size()),
+    require(*buffers.miss_count() == static_cast<std::int32_t>(reference.miss.size()),
             "probe miss count disagrees with the host dedup");
     for (std::size_t i = 0; i < reference.active.size(); ++i) {
-        require(active_ids[i] == reference.active[i], "probe active order disagrees");
+        require(buffers.active_ids()[i] == reference.active[i], "probe active order disagrees");
     }
     for (std::size_t i = 0; i < reference.miss.size(); ++i) {
-        require(miss_ids[i] == reference.miss[i], "probe miss set disagrees");
+        require(buffers.miss_ids()[i] == reference.miss[i], "probe miss set disagrees");
     }
-    cuda_check(cudaFreeHost(host), "cudaFreeHost probe");
+
+    if (repair) {
+        std::vector<std::int32_t> repaired = lookup;
+        for (const std::int32_t id : reference.miss) {
+            repaired[static_cast<std::size_t>(id)] = 0;
+        }
+        cuda_check(cudaMemcpy(buffers.lookup.p, repaired.data(),
+                              repaired.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice),
+                   "lookup repair");
+        run(probe);
+        require(*buffers.miss_count() == 0, "repaired probe still reports misses");
+        require(*buffers.active_count() == static_cast<std::int32_t>(reference.active.size()),
+                "repaired probe changed the active set");
+    }
     return failures;
 }
 
 int run_probe_cases() {
     std::vector<std::int32_t> lookup(kExperts, -1);
     for (std::int32_t expert = 0; expert < kExperts; ++expert) {
-        if (expert % 3 == 0) { lookup[static_cast<std::size_t>(expert)] = expert % 5; }
+        if (expert % 3 == 0) { lookup[static_cast<std::size_t>(expert)] = 0; }
     }
     int failures = 0;
-    failures += run_probe_case(
-        "probe mixed",
-        {100, 100, 150, 99, 200, 100, 150, 101, 101, 101, 300, 150, 199, 102, 102},
-        lookup, 100, 200);
-    failures += run_probe_case("probe empty", {}, lookup, 100, 200);
-    failures += run_probe_case("probe all miss", {101, 104, 107, 101}, lookup, 100, 200);
-    failures += run_probe_case("probe all hit", {102, 105, 108, 102}, lookup, 100, 200);
-    failures += run_probe_case("probe out of range", {-1, 0, 64, 511, 512, 1000},
-                               lookup, 0, 512);
+    failures += run_probe_case("probe mixed",
+                               {100, 100, 150, 99, 200, 100, 150, 101, 101, 300}, lookup, 100,
+                               200, false);
+    failures += run_probe_case("probe all miss", {101, 104, 107, 101, 104, 107, 101, 104, 107, 101},
+                               lookup, 100, 200, true);
+    failures += run_probe_case("probe all hit", {102, 105, 108, 102, 105, 108, 102, 105, 108, 102},
+                               lookup, 100, 200, false);
+    failures += run_probe_case("probe out of range", {0, 10, 64, 250, 300, 511, 100, 150, 100, 150},
+                               lookup, 100, 200, false);
     bool threw = false;
     try {
         ops::detail::moe_nvfp4_route_probe_launch(nullptr, kExperts + 1, nullptr, 0, 0, nullptr,

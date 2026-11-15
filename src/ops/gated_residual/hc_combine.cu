@@ -39,9 +39,9 @@ __global__ __launch_bounds__(kBlock) void hc_combine_kernel(
 
 template <class A>
 __global__ __launch_bounds__(kBlock) void hc_combine_norm_kernel(
-    const A* __restrict__ residual, const A* __restrict__ block_output,
+    const A* residual, const A* __restrict__ block_output,
     const float* __restrict__ injection, const __nv_bfloat16* __restrict__ norm_weight,
-    A* __restrict__ updated, A* __restrict__ normalized, std::int32_t hidden,
+    A* updated, A* __restrict__ normalized, std::int32_t hidden,
     std::int32_t streams, float epsilon) {
     const std::int32_t m    = static_cast<std::int32_t>(blockIdx.x);
     const std::int32_t s    = static_cast<std::int32_t>(blockIdx.y);

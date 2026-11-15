@@ -193,6 +193,9 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
     options.max_concurrency  = 1;
     options.prefill_chunk    = kForwardTokens;
     options.expert_cache_mib = 0;
+    if (const char* cache_mib = std::getenv("NINFER_FLASH_PHASE_CACHE_MIB")) {
+        options.expert_cache_mib = static_cast<std::uint64_t>(std::stoull(cache_mib));
+    }
 
     auto load_plan = Package::plan_load(binder, options, detail::WeightsProfile::Nvfp4);
     const detail::BindingPlan& bindings = load_plan.bindings();

@@ -70,6 +70,7 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
     }
     CUDA_CHECK(cudaEventCreateWithFlags(&copy_done_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&probe_done_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&down_done_, cudaEventDisableTiming));
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
     refresh_lookup();
     CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
@@ -86,6 +87,7 @@ ExpertRuntime::~ExpertRuntime() {
     if (probe_host_ != nullptr) { (void)cudaFreeHost(probe_host_); }
     if (copy_stream_ != nullptr) { (void)cudaStreamDestroy(copy_stream_); }
     if (probe_done_ != nullptr) { (void)cudaEventDestroy(probe_done_); }
+    if (down_done_ != nullptr) { (void)cudaEventDestroy(down_done_); }
     if (copy_done_ != nullptr) { (void)cudaEventDestroy(copy_done_); }
     for (cudaEvent_t& event : stage_ready_) {
         if (event != nullptr) { (void)cudaEventDestroy(event); }
@@ -143,6 +145,21 @@ void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
     const ops::MoeNvfp4ExpertScratch scratch{.activation = activation_scratch()};
     const ops::detail::MoeNvfp4Scratch detail_scratch{.activation = activation_scratch()};
 
+    struct DestinationRestore {
+        bool active = false;
+        cudaStream_t stream = nullptr;
+        cudaStream_t copy_stream = nullptr;
+        void* destination = nullptr;
+        const void* backup = nullptr;
+        std::size_t bytes = 0;
+        ~DestinationRestore() {
+            if (!active) { return; }
+            (void)cudaMemcpyAsync(destination, backup, bytes, cudaMemcpyDeviceToDevice, stream);
+            (void)cudaStreamSynchronize(stream);
+            if (copy_stream != nullptr) { (void)cudaStreamSynchronize(copy_stream); }
+        }
+    } restore;
+
     std::vector<std::pair<std::uint32_t, std::int32_t>> needed;
     bool any_missing = false;
     if (tokens == 1) {
@@ -165,12 +182,19 @@ void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
         ops::detail::moe_nvfp4_cached_down_launch(
             static_cast<const std::uint8_t*>(slab_.p), kPairBytes, table_row,
             static_cast<const float*>(divisors_.p), detail_scratch, outputs, destination, stream);
+        CUDA_CHECK(cudaEventRecord(down_done_, stream));
         CUDA_CHECK(cudaEventSynchronize(probe_done_));
         const std::int32_t active_count = *probe_active_count_;
         if (*probe_miss_count_ == 0) {
             cache_.record_resident_lookups(static_cast<std::uint64_t>(active_count));
         } else {
             any_missing = true;
+            restore.active     = true;
+            restore.stream     = stream;
+            restore.copy_stream = copy_stream_;
+            restore.destination = destination.data;
+            restore.backup     = rollback_.p;
+            restore.bytes      = static_cast<std::size_t>(TextConfig::hidden) * sizeof(std::uint16_t);
             needed.reserve(static_cast<std::size_t>(active_count));
             for (std::int32_t index = 0; index < *probe_miss_count_; ++index) {
                 const std::int32_t global = probe_miss_ids_[index];
@@ -207,6 +231,7 @@ void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
     }
 
     if (any_missing) {
+        if (tokens == 1) { CUDA_CHECK(cudaStreamWaitEvent(copy_stream_, down_done_, 0)); }
         if (needed.size() > cache_.slots()) {
             throw std::logic_error("one layer selected more experts than the cache can hold");
         }
@@ -247,6 +272,7 @@ void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
         ops::detail::moe_nvfp4_cached_down_launch(
             static_cast<const std::uint8_t*>(slab_.p), kPairBytes, table_row,
             static_cast<const float*>(divisors_.p), detail_scratch, outputs, destination, stream);
+        restore.active = false;
     } else {
         const ops::MoeNvfp4ExpertSlots bank{
             .payload    = static_cast<const std::uint8_t*>(slab_.p),

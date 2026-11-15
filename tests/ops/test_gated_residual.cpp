@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/direct_fp16_weight.h"
+#include "ops/gated_residual/gated_residual.h"
 #include "ops/op_tester.h"
 
 #include <cuda_bf16.h>
@@ -493,6 +494,151 @@ int run_combine_norm_case(const char* label, std::int32_t columns, std::uint32_t
     return failures;
 }
 
+int run_combine_norm_bitwise_case(const char* label, std::int32_t columns, std::uint32_t seed,
+                                   bool in_place, DType dtype = DType::BF16) {
+    const std::size_t residual_count = static_cast<std::size_t>(kHidden) * kStreams * columns;
+    const std::size_t output_count    = static_cast<std::size_t>(kHidden) * columns;
+    const std::size_t injection_count = static_cast<std::size_t>(kStreams) * columns;
+    const std::size_t weight_count    = static_cast<std::size_t>(kHidden) * kStreams;
+
+    std::vector<float> residual(residual_count);
+    std::vector<float> block_output(output_count);
+    std::vector<float> injection(injection_count);
+    std::vector<float> next_weight(weight_count);
+    fill_uniform(residual, seed, -4.0F, 4.0F);
+    fill_uniform(block_output, seed + 1U, -2.0F, 2.0F);
+    fill_uniform(injection, seed + 2U, 0.0F, 2.0F);
+    fill_uniform(next_weight, seed + 3U, -0.5F, 0.5F);
+    round_to_activation(residual, dtype);
+    round_to_activation(block_output, dtype);
+    round_to_bf16(next_weight);
+
+    const std::vector<std::uint16_t> residual_bits = encode_activation(residual, dtype);
+    const std::vector<std::uint16_t> block_bits    = encode_activation(block_output, dtype);
+    const std::vector<std::uint16_t> weight_bits   = encode_bf16(next_weight);
+
+    GuardedDeviceBuffer fused_residual(residual_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer reference_residual(residual_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_block(output_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_injection(injection_count * sizeof(float));
+    GuardedDeviceBuffer device_weight(weight_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer fused_updated(residual_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer reference_updated(residual_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer fused_normalized(residual_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer reference_normalized(residual_count * sizeof(std::uint16_t));
+    fused_residual.copy_from_host(residual_bits.data(), fused_residual.bytes());
+    reference_residual.copy_from_host(residual_bits.data(), reference_residual.bytes());
+    device_block.copy_from_host(block_bits.data(), device_block.bytes());
+    device_injection.copy_from_host(injection.data(), device_injection.bytes());
+    device_weight.copy_from_host(weight_bits.data(), device_weight.bytes());
+
+    const Tensor fused_residual_tensor =
+        activation_tensor(fused_residual.data(), dtype, kHidden, kStreams, columns);
+    const Tensor reference_residual_tensor =
+        activation_tensor(reference_residual.data(), dtype, kHidden, kStreams, columns);
+    const Tensor block_tensor = activation_tensor(device_block.data(), dtype, kHidden, columns);
+    const Tensor injection_tensor(device_injection.data(), DType::FP32, {kStreams, columns});
+    const Tensor weight_tensor = bf16_tensor(device_weight.data(), kHidden, kStreams);
+    Tensor fused_updated_tensor =
+        in_place ? activation_tensor(fused_residual.data(), dtype, kHidden, kStreams, columns)
+                 : activation_tensor(fused_updated.data(), dtype, kHidden, kStreams, columns);
+    Tensor reference_updated_tensor =
+        in_place ? activation_tensor(reference_residual.data(), dtype, kHidden, kStreams, columns)
+                 : activation_tensor(reference_updated.data(), dtype, kHidden, kStreams, columns);
+    Tensor fused_normalized_tensor =
+        activation_tensor(fused_normalized.data(), dtype, kHidden, kStreams, columns);
+    Tensor reference_normalized_tensor =
+        activation_tensor(reference_normalized.data(), dtype, kHidden, kStreams, columns);
+
+    ops::hc_combine_norm(fused_residual_tensor, block_tensor, injection_tensor, weight_tensor,
+                         kEpsilon, fused_updated_tensor, fused_normalized_tensor, nullptr);
+    ops::hc_combine(reference_residual_tensor, block_tensor, injection_tensor,
+                    reference_updated_tensor, nullptr);
+    ops::hc_grouped_rmsnorm(reference_updated_tensor, weight_tensor, kEpsilon,
+                            reference_normalized_tensor, nullptr);
+    cuda_synchronize();
+
+    const void* fused_updated_data = in_place ? fused_residual.data() : fused_updated.data();
+    const void* reference_updated_data =
+        in_place ? reference_residual.data() : reference_updated.data();
+    const std::vector<std::uint16_t> fused_updated_bits =
+        from_device<std::uint16_t>(fused_updated_data, residual_count);
+    const std::vector<std::uint16_t> reference_updated_bits =
+        from_device<std::uint16_t>(reference_updated_data, residual_count);
+    const std::vector<std::uint16_t> fused_normalized_bits =
+        from_device<std::uint16_t>(fused_normalized.data(), residual_count);
+    const std::vector<std::uint16_t> reference_normalized_bits =
+        from_device<std::uint16_t>(reference_normalized.data(), residual_count);
+
+    int failures = 0;
+    failures += verify_exact((std::string(label) + " updated raw bits").c_str(),
+                             fused_updated_bits, reference_updated_bits);
+    failures += verify_exact((std::string(label) + " normalized raw bits").c_str(),
+                             fused_normalized_bits, reference_normalized_bits);
+    return failures;
+}
+
+int run_large_columns_case() {
+    constexpr std::int32_t hidden  = 8;
+    constexpr std::int32_t streams = kStreams;
+    constexpr std::int32_t columns = 65536;
+    const std::size_t residual_count = static_cast<std::size_t>(hidden) * streams * columns;
+    const std::size_t output_count    = static_cast<std::size_t>(hidden) * columns;
+    const std::size_t injection_count = static_cast<std::size_t>(streams) * columns;
+    const std::size_t weight_count    = static_cast<std::size_t>(hidden) * streams;
+
+    std::vector<float> residual(residual_count);
+    std::vector<float> block_output(output_count, 0.0F);
+    std::vector<float> injection(injection_count, 0.0F);
+    std::vector<float> next_weight(weight_count, 0.0F);
+    fill_uniform(residual, 9101U, -4.0F, 4.0F);
+    round_to_bf16(residual);
+
+    GuardedDeviceBuffer device_residual(residual_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer fused_residual(residual_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_block(output_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_injection(injection_count * sizeof(float));
+    GuardedDeviceBuffer device_weight(weight_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer updated(residual_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer normalized(residual_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer reference_normalized(residual_count * sizeof(std::uint16_t));
+    const std::vector<std::uint16_t> residual_bits = encode_bf16(residual);
+    const std::vector<std::uint16_t> weight_bits   = encode_bf16(next_weight);
+    device_residual.copy_from_host(residual_bits.data(), device_residual.bytes());
+    fused_residual.copy_from_host(residual_bits.data(), fused_residual.bytes());
+    device_block.copy_from_host(block_output.data(), device_block.bytes());
+    device_injection.copy_from_host(injection.data(), device_injection.bytes());
+    device_weight.copy_from_host(weight_bits.data(), device_weight.bytes());
+
+    const Tensor residual_tensor = activation_tensor(device_residual.data(), DType::BF16, hidden,
+                                                     streams, columns);
+    const Tensor block_tensor = activation_tensor(device_block.data(), DType::BF16, hidden, columns);
+    const Tensor injection_tensor(device_injection.data(), DType::FP32, {streams, columns});
+    const Tensor weight_tensor = bf16_tensor(device_weight.data(), hidden, streams);
+    Tensor updated_tensor = activation_tensor(updated.data(), DType::BF16, hidden, streams, columns);
+    Tensor normalized_tensor =
+        activation_tensor(normalized.data(), DType::BF16, hidden, streams, columns);
+    Tensor reference_normalized_tensor =
+        activation_tensor(reference_normalized.data(), DType::BF16, hidden, streams, columns);
+
+    ops::hc_combine(residual_tensor, block_tensor, injection_tensor, updated_tensor, nullptr);
+    ops::hc_combine_norm(residual_tensor, block_tensor, injection_tensor, weight_tensor, kEpsilon,
+                         updated_tensor, normalized_tensor, nullptr);
+    ops::hc_grouped_rmsnorm(updated_tensor, weight_tensor, kEpsilon, reference_normalized_tensor,
+                            nullptr);
+    cuda_synchronize();
+
+    int failures = 0;
+    failures += verify_exact("hc_combine large columns updated",
+                             from_device<std::uint16_t>(updated.data(), residual_count),
+                             residual_bits);
+    failures += verify_exact("hc_combine_norm large columns normalized",
+                             from_device<std::uint16_t>(normalized.data(), residual_count),
+                             from_device<std::uint16_t>(reference_normalized.data(),
+                                                        residual_count));
+    return failures;
+}
+
 std::vector<float> weight_floats(const direct_bf16_weight::HostWeight& weight) {
     std::vector<float> values(weight.bits.size());
     for (std::size_t i = 0; i < weight.bits.size(); ++i) { values[i] = bf16_to_f32(weight.bits[i]); }
@@ -546,6 +692,64 @@ MixWeights make_mix_weights(std::int32_t down_rows, std::int32_t channels, std::
         weights.up_values = weight_floats(weights.up_bf16->host);
     }
     return weights;
+}
+
+int run_mix_bitwise_case(const char* label, std::uint32_t seed) {
+    constexpr std::int32_t columns = 1;
+    const std::int32_t channels    = kHidden * kStreams;
+    const std::size_t normal_count = static_cast<std::size_t>(channels) * columns;
+    const std::size_t block_count  = static_cast<std::size_t>(kHidden) * columns;
+    const std::size_t injection_count = static_cast<std::size_t>(kStreams) * columns;
+
+    std::vector<float> normalized(normal_count);
+    fill_uniform(normalized, seed, -1.0F, 1.0F);
+    round_to_bf16(normalized);
+    const MixWeights weights = make_mix_weights(kRank + kStreams, channels, seed + 1U, DType::BF16);
+
+    const DeviceBuffer device_normalized = to_device_bf16(normalized);
+    GuardedDeviceBuffer fused_block(block_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer fused_injection(injection_count * sizeof(float));
+    GuardedDeviceBuffer reference_block(block_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer reference_injection(injection_count * sizeof(float));
+    GuardedDeviceBuffer low(kRank * sizeof(std::uint16_t));
+    GuardedDeviceBuffer gates(static_cast<std::size_t>(channels) * sizeof(std::uint16_t));
+
+    const Tensor normalized_tensor = bf16_tensor(device_normalized.p, kHidden, kStreams, columns);
+    Tensor fused_block_tensor      = bf16_tensor(fused_block.data(), kHidden, columns);
+    Tensor fused_injection_tensor(fused_injection.data(), DType::FP32, {kStreams, columns});
+    Tensor reference_block_tensor = bf16_tensor(reference_block.data(), kHidden, columns);
+    Tensor reference_injection_tensor(reference_injection.data(), DType::FP32, {kStreams, columns});
+    Tensor low_tensor   = bf16_tensor(low.data(), kRank, columns);
+    Tensor gates_tensor = bf16_tensor(gates.data(), channels, columns);
+    const Tensor flattened = normalized_tensor.view({channels, columns});
+
+    const std::size_t capacity =
+        ops::hc_mix_workspace_capacity_bytes(ops::HcMixWeights{weights.down, weights.up}, 1, columns);
+    WorkspaceArena workspace(capacity);
+    ops::hc_mix(normalized_tensor, ops::HcMixWeights{weights.down, weights.up}, workspace,
+                fused_block_tensor, fused_injection_tensor, nullptr);
+
+    ops::detail::hc_project_gemv_launch(weights.down.qdata, kRank, channels, flattened.data,
+                                        low_tensor, nullptr);
+    ops::detail::hc_mix_silu_launch(low_tensor, kStreams, nullptr);
+    ops::detail::hc_project_gemv_launch(weights.up.qdata, channels, kRank, low.data(),
+                                        gates_tensor, nullptr);
+    ops::detail::hc_mix_gate_launch(gates_tensor, normalized_tensor, reference_block_tensor,
+                                    kHidden, kStreams, nullptr);
+    const auto* injection_rows = static_cast<const std::uint8_t*>(weights.down.qdata) +
+                                 static_cast<std::size_t>(kRank) * channels * 2;
+    ops::detail::hc_mix_injection_launch(injection_rows, DType::BF16, flattened, channels,
+                                         kStreams, reference_injection_tensor, nullptr);
+    cuda_synchronize();
+
+    int failures = 0;
+    failures += verify_exact((std::string(label) + " block raw bits").c_str(),
+                             from_device<std::uint16_t>(fused_block.data(), block_count),
+                             from_device<std::uint16_t>(reference_block.data(), block_count));
+    failures += verify_exact((std::string(label) + " injection raw bits").c_str(),
+                             from_device<float>(fused_injection.data(), injection_count),
+                             from_device<float>(reference_injection.data(), injection_count));
+    return failures;
 }
 
 int run_mix_case(const char* label, std::int32_t columns, std::uint32_t seed, bool final_mix,
@@ -850,6 +1054,18 @@ int main() {
     failures += run_combine_norm_case("hc_combine_norm M=1 in place", 1, 2403U, true);
     failures += run_combine_norm_case("hc_combine_norm M=7", 7, 2402U, false);
     failures += run_mix_case("hc_mix M=1", 1, 2501U, false);
+    failures += run_mix_bitwise_case("hc_mix bitwise M=1", 2511U);
+    failures += run_combine_norm_bitwise_case("hc_combine_norm bitwise M=1", 1, 2411U, false);
+    failures += run_combine_norm_bitwise_case("hc_combine_norm bitwise M=1 in place", 1, 2412U,
+                                              true);
+    failures += run_combine_norm_bitwise_case("hc_combine_norm bitwise M=7", 7, 2413U, false);
+    failures += run_combine_norm_bitwise_case("hc_combine_norm bitwise f16 M=1", 1, 3411U, false,
+                                              DType::FP16);
+    failures += run_combine_norm_bitwise_case("hc_combine_norm bitwise f16 M=1 in place", 1, 3412U,
+                                              true, DType::FP16);
+    failures += run_combine_norm_bitwise_case("hc_combine_norm bitwise f16 M=7", 7, 3413U, false,
+                                              DType::FP16);
+    failures += run_large_columns_case();
     failures += run_mix_case("hc_final_mix M=1", 1, 2601U, true);
 #ifdef NINFER_VOLTA_BUILD
     failures += run_mix_case("hc_mix M=7", 7, 2502U, false);
