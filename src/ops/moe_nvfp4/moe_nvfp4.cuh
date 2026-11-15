@@ -31,6 +31,33 @@ inline constexpr std::uint64_t kMoeDownCode  = 2U * kMoeMatrixCode + 2U * kMoeMa
 inline constexpr std::uint64_t kMoeDownScale = 3U * kMoeMatrixCode + 2U * kMoeMatrixScale;
 inline constexpr std::uint64_t kMoeSlotBytes = 3U * (kMoeMatrixCode + kMoeMatrixScale);
 
+__device__ __forceinline__ void moe_nvfp4_probe_routes(
+    const std::int32_t* __restrict__ ids, std::int32_t entries,
+    const std::int32_t* __restrict__ lookup, std::int32_t expert_begin,
+    std::int32_t expert_end, std::int32_t* __restrict__ active_ids,
+    std::int32_t* __restrict__ miss_ids, std::int32_t* __restrict__ active_count,
+    std::int32_t* __restrict__ miss_count) {
+    std::int32_t active = 0;
+    std::int32_t miss   = 0;
+    for (std::int32_t entry = 0; entry < entries; ++entry) {
+        const std::int32_t id = ids[entry];
+        if (id < expert_begin || id >= expert_end) { continue; }
+        bool duplicate = false;
+        for (std::int32_t other = 0; other < active; ++other) {
+            if (active_ids[other] == id) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) { continue; }
+        active_ids[active++] = id;
+        if (lookup[id] < 0) { miss_ids[miss++] = id; }
+    }
+    __threadfence_system();
+    *active_count = active;
+    *miss_count   = miss;
+}
+
 template <class A>
 struct MoeAct;
 

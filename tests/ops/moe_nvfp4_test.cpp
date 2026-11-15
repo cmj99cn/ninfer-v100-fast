@@ -4,6 +4,7 @@
 #include "ops/direct_bf16_weight.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/moe_nvfp4/moe_nvfp4_launch.h"
 
 #include <cuda_runtime.h>
 
@@ -688,6 +689,104 @@ std::size_t changed_rows(const std::vector<std::uint16_t>& got,
     return changed;
 }
 
+struct ProbeReference {
+    std::vector<std::int32_t> active;
+    std::vector<std::int32_t> miss;
+};
+
+ProbeReference reference_probe(const std::vector<std::int32_t>& ids,
+                               const std::vector<std::int32_t>& lookup,
+                               std::int32_t expert_begin, std::int32_t expert_end) {
+    ProbeReference reference;
+    for (const std::int32_t id : ids) {
+        if (id < expert_begin || id >= expert_end) { continue; }
+        if (std::find(reference.active.begin(), reference.active.end(), id) !=
+            reference.active.end()) {
+            continue;
+        }
+        reference.active.push_back(id);
+        if (lookup[static_cast<std::size_t>(id)] < 0) { reference.miss.push_back(id); }
+    }
+    return reference;
+}
+
+int run_probe_case(const char* label, const std::vector<std::int32_t>& ids,
+                   const std::vector<std::int32_t>& lookup, std::int32_t expert_begin,
+                   std::int32_t expert_end) {
+    const ProbeReference reference = reference_probe(ids, lookup, expert_begin, expert_end);
+
+    DeviceBuffer device_ids = to_device(ids);
+    DeviceBuffer device_lookup = to_device(lookup);
+    std::int32_t* host = nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&host), (2 + 2 * kExperts) * 4,
+                             cudaHostAllocMapped | cudaHostAllocPortable),
+               "cudaHostAlloc probe");
+    host[0] = 0;
+    host[1] = 0;
+    void* device_host = nullptr;
+    cuda_check(cudaHostGetDevicePointer(&device_host, host, 0), "cudaHostGetDevicePointer");
+    auto* device = static_cast<std::int32_t*>(device_host);
+    std::int32_t* active_ids   = device + 2;
+    std::int32_t* miss_ids     = active_ids + kExperts;
+    std::int32_t* active_count = device;
+    std::int32_t* miss_count   = device + 1;
+
+    ops::detail::moe_nvfp4_route_probe_launch(
+        static_cast<const std::int32_t*>(device_ids.p), static_cast<std::int32_t>(ids.size()),
+        static_cast<const std::int32_t*>(device_lookup.p), expert_begin, expert_end, active_ids,
+        miss_ids, active_count, miss_count, nullptr);
+    cuda_synchronize();
+
+    int failures = 0;
+    const auto require = [&](bool condition, const std::string& message) {
+        if (!condition) {
+            std::cerr << label << ": " << message << "\n";
+            ++failures;
+        }
+    };
+    require(*active_count == static_cast<std::int32_t>(reference.active.size()),
+            "probe active count disagrees with the host dedup");
+    require(*miss_count == static_cast<std::int32_t>(reference.miss.size()),
+            "probe miss count disagrees with the host dedup");
+    for (std::size_t i = 0; i < reference.active.size(); ++i) {
+        require(active_ids[i] == reference.active[i], "probe active order disagrees");
+    }
+    for (std::size_t i = 0; i < reference.miss.size(); ++i) {
+        require(miss_ids[i] == reference.miss[i], "probe miss set disagrees");
+    }
+    cuda_check(cudaFreeHost(host), "cudaFreeHost probe");
+    return failures;
+}
+
+int run_probe_cases() {
+    std::vector<std::int32_t> lookup(kExperts, -1);
+    for (std::int32_t expert = 0; expert < kExperts; ++expert) {
+        if (expert % 3 == 0) { lookup[static_cast<std::size_t>(expert)] = expert % 5; }
+    }
+    int failures = 0;
+    failures += run_probe_case(
+        "probe mixed",
+        {100, 100, 150, 99, 200, 100, 150, 101, 101, 101, 300, 150, 199, 102, 102},
+        lookup, 100, 200);
+    failures += run_probe_case("probe empty", {}, lookup, 100, 200);
+    failures += run_probe_case("probe all miss", {101, 104, 107, 101}, lookup, 100, 200);
+    failures += run_probe_case("probe all hit", {102, 105, 108, 102}, lookup, 100, 200);
+    failures += run_probe_case("probe out of range", {-1, 0, 64, 511, 512, 1000},
+                               lookup, 0, 512);
+    bool threw = false;
+    try {
+        ops::detail::moe_nvfp4_route_probe_launch(nullptr, kExperts + 1, nullptr, 0, 0, nullptr,
+                                                  nullptr, nullptr, nullptr, nullptr);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    if (!threw) {
+        std::cerr << "probe: entries above the expert count was accepted\n";
+        ++failures;
+    }
+    return failures;
+}
+
 int run_cached_bitwise_case(const BatchedFixture& gate_up, const BatchedFixture& down,
                             const MoeNvfp4Weights& full_weights,
                             const std::vector<float>& activation_values, DType dtype,
@@ -1213,6 +1312,7 @@ int main() {
                                         "moe_nvfp4 shared bf16");
     failures += run_shared_bitwise_case(weights_f16, inputs.activation[2], DType::FP16,
                                         "moe_nvfp4 shared f16");
+    failures += run_probe_cases();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " moe_nvfp4 correctness\n";
     return failures == 0 ? 0 : 1;

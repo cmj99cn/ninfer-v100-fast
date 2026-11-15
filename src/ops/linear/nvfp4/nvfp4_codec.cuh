@@ -12,15 +12,42 @@
 namespace ninfer::ops::detail {
 
 __device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     __nv_fp4x2_e2m1 value;
     value.__x = storage;
     return static_cast<float2>(value);
+#else
+    const auto magnitude = [](unsigned code) {
+        const unsigned exponent = code >> 1;
+        const unsigned mantissa = code & 1U;
+        const unsigned bits =
+            exponent == 0 ? (0x3F000000U * mantissa)
+                          : (((126U + exponent) << 23) | (mantissa << 22));
+        return bits;
+    };
+    const unsigned low  = storage & 0x0FU;
+    const unsigned high = storage >> 4;
+    float2 result;
+    result.x = __uint_as_float(magnitude(low & 7U) | ((low & 8U) << 28));
+    result.y = __uint_as_float(magnitude(high & 7U) | ((high & 8U) << 28));
+    return result;
+#endif
 }
 
 __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     __nv_fp8x2_e4m3 value;
     value.__x = static_cast<std::uint16_t>(storage) | (static_cast<std::uint16_t>(storage) << 8);
     return static_cast<float2>(value).x;
+#else
+    const unsigned exponent = (storage >> 3) & 0x0FU;
+    const unsigned mantissa = storage & 0x07U;
+    unsigned bits = (exponent == 0)
+                        ? __float_as_uint(static_cast<float>(mantissa) * 0.001953125F)
+                        : (((exponent + 120U) << 23) | (mantissa << 20));
+    bits |= static_cast<unsigned>(storage & 0x80U) << 24;
+    return __uint_as_float(bits);
+#endif
 }
 
 struct alignas(8) Nvfp4QuantizedK16 {

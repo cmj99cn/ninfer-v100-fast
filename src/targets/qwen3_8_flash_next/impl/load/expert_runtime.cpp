@@ -47,6 +47,7 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
     activation_scratch_ = DeviceBuffer(
         static_cast<std::size_t>(kTopK) *
         static_cast<std::size_t>(TextConfig::expert_intermediate) * sizeof(float));
+    rollback_ = DeviceBuffer(static_cast<std::size_t>(TextConfig::hidden) * sizeof(std::uint16_t));
     lookup_host_ = std::make_unique<PinnedHostBuffer>(kLookupEntries * 4);
     CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&probe_host_), kProbeBytes,
                              cudaHostAllocMapped | cudaHostAllocPortable));
@@ -135,15 +136,35 @@ void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
     const std::int32_t expert_end   = expert_begin + static_cast<std::int32_t>(kRankExperts);
     const auto* table_row = static_cast<const std::int32_t*>(lookup_.p) +
                             static_cast<std::size_t>(layer) * kExperts;
+    const ops::detail::MoeNvfp4RouteOutputs outputs{
+        static_cast<std::int32_t*>(route.expert_ids.data),
+        static_cast<float*>(route.coefficients.data),
+        static_cast<float*>(route.shared_gate.data)};
+    const ops::MoeNvfp4ExpertScratch scratch{.activation = activation_scratch()};
+    const ops::detail::MoeNvfp4Scratch detail_scratch{.activation = activation_scratch()};
 
     std::vector<std::pair<std::uint32_t, std::int32_t>> needed;
     bool any_missing = false;
     if (tokens == 1) {
-        ops::detail::moe_nvfp4_route_probe_launch(
-            static_cast<const std::int32_t*>(route.expert_ids.data), kTopK, table_row,
-            expert_begin, expert_end, probe_active_ids_dev_, probe_miss_ids_dev_,
-            probe_active_count_dev_, probe_miss_count_dev_, stream);
+        const ops::detail::MoeNvfp4Probe probe{
+            .active_ids   = probe_active_ids_dev_,
+            .miss_ids     = probe_miss_ids_dev_,
+            .active_count = probe_active_count_dev_,
+            .miss_count   = probe_miss_count_dev_,
+            .expert_begin = expert_begin,
+            .expert_end   = expert_end,
+        };
+        ops::detail::moe_nvfp4_cached_gate_up_launch(
+            x, static_cast<const std::uint8_t*>(slab_.p), kPairBytes, table_row,
+            static_cast<const float*>(divisors_.p), detail_scratch, outputs, &probe, stream);
         CUDA_CHECK(cudaEventRecord(probe_done_, stream));
+        CUDA_CHECK(cudaMemcpyAsync(rollback_.p, destination.data,
+                                   static_cast<std::size_t>(TextConfig::hidden) *
+                                       sizeof(std::uint16_t),
+                                   cudaMemcpyDeviceToDevice, stream));
+        ops::detail::moe_nvfp4_cached_down_launch(
+            static_cast<const std::uint8_t*>(slab_.p), kPairBytes, table_row,
+            static_cast<const float*>(divisors_.p), detail_scratch, outputs, destination, stream);
         CUDA_CHECK(cudaEventSynchronize(probe_done_));
         const std::int32_t active_count = *probe_active_count_;
         if (*probe_miss_count_ == 0) {
@@ -151,9 +172,14 @@ void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
         } else {
             any_missing = true;
             needed.reserve(static_cast<std::size_t>(active_count));
+            for (std::int32_t index = 0; index < *probe_miss_count_; ++index) {
+                const std::int32_t global = probe_miss_ids_[index];
+                needed.emplace_back(static_cast<std::uint32_t>(global - expert_begin), global);
+            }
             for (std::int32_t index = 0; index < active_count; ++index) {
                 const std::int32_t global = probe_active_ids_[index];
-                needed.emplace_back(static_cast<std::uint32_t>(global - expert_begin), global);
+                const auto local = static_cast<std::uint32_t>(global - expert_begin);
+                if (cache_.resident_slot(layer, local) >= 0) { needed.emplace_back(local, global); }
             }
         }
     } else {
@@ -180,7 +206,6 @@ void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
         }
     }
 
-    bool copied = false;
     if (any_missing) {
         if (needed.size() > cache_.slots()) {
             throw std::logic_error("one layer selected more experts than the cache can hold");
@@ -205,21 +230,33 @@ void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
             }
         }
         refresh_lookup();
-        copied = true;
+        CUDA_CHECK(cudaStreamWaitEvent(stream, copy_done_, 0));
+        if (tokens == 1) {
+            CUDA_CHECK(cudaMemcpyAsync(destination.data, rollback_.p,
+                                       static_cast<std::size_t>(TextConfig::hidden) *
+                                           sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
     }
-    if (copied) { CUDA_CHECK(cudaStreamWaitEvent(stream, copy_done_, 0)); }
 
-    const ops::MoeNvfp4ExpertSlots bank{
-        .payload    = static_cast<const std::uint8_t*>(slab_.p),
-        .slot_bytes = kPairBytes,
-        .slot_count = static_cast<std::int32_t>(cache_.slots()),
-        .lookup     = table_row,
-        .divisors   = static_cast<const float*>(divisors_.p),
-    };
-    const ops::MoeNvfp4ExpertScratch scratch{
-        .activation = static_cast<float*>(activation_scratch_.p),
-    };
-    ops::moe_routed_nvfp4_cached(x, bank, scratch, route, destination, stream);
+    if (tokens == 1) {
+        if (!any_missing) { return; }
+        ops::detail::moe_nvfp4_cached_gate_up_launch(
+            x, static_cast<const std::uint8_t*>(slab_.p), kPairBytes, table_row,
+            static_cast<const float*>(divisors_.p), detail_scratch, outputs, nullptr, stream);
+        ops::detail::moe_nvfp4_cached_down_launch(
+            static_cast<const std::uint8_t*>(slab_.p), kPairBytes, table_row,
+            static_cast<const float*>(divisors_.p), detail_scratch, outputs, destination, stream);
+    } else {
+        const ops::MoeNvfp4ExpertSlots bank{
+            .payload    = static_cast<const std::uint8_t*>(slab_.p),
+            .slot_bytes = kPairBytes,
+            .slot_count = static_cast<std::int32_t>(cache_.slots()),
+            .lookup     = table_row,
+            .divisors   = static_cast<const float*>(divisors_.p),
+        };
+        ops::moe_routed_nvfp4_cached(x, bank, scratch, route, destination, stream);
+    }
 
     if (stats_ != nullptr) {
         const CacheStats stats = cache_.stats();

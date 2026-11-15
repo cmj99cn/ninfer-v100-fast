@@ -621,6 +621,9 @@ ninfer_add_op_test(ninfer_sparse_moe_test
 ninfer_add_op_test(ninfer_moe_nvfp4_test
   SOURCES ops/moe_nvfp4_test.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_fp16_volta_schedule_test
+  SOURCES ops/test_fp16_volta_schedule.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_ple_test
   SOURCES ops/ple_test.cpp
   LIBRARIES ninfer_ops ninfer_artifact)

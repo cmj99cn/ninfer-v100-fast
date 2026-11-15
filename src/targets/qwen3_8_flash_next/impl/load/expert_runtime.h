@@ -69,6 +69,7 @@ private:
     DeviceBuffer lookup_;
     DeviceBuffer divisors_;
     DeviceBuffer activation_scratch_;
+    DeviceBuffer rollback_;
     std::unique_ptr<PinnedHostBuffer> lookup_host_;
     std::vector<std::int32_t> host_ids_;
     std::int32_t* probe_host_          = nullptr;

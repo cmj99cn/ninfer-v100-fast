@@ -17,7 +17,20 @@ void hc_grouped_rmsnorm_launch(const Tensor& residual, const Tensor& norm_weight
 void hc_combine_launch(const Tensor& residual, const Tensor& block_output, const Tensor& injection,
                        Tensor& updated_residual, cudaStream_t stream);
 
+void hc_combine_norm_launch(const Tensor& residual, const Tensor& block_output,
+                            const Tensor& injection, const Tensor& next_norm_weight, float epsilon,
+                            Tensor& updated_residual, Tensor& normalized, cudaStream_t stream);
+
 void hc_mix_silu_launch(Tensor& values, std::int32_t streams, cudaStream_t stream);
+
+void hc_mix_up_gate_launch(const void* weight, std::int32_t rank, const void* activation,
+                            const Tensor& normalized, Tensor& block_input, std::int32_t hidden,
+                            std::int32_t streams, cudaStream_t stream);
+
+void hc_mix_down_silu_launch(const void* weight, std::int32_t rows, std::int32_t depth,
+                             const void* activation, Tensor& output, const void* injection_rows,
+                             DType weight_dtype, Tensor* injection, std::int32_t streams,
+                             cudaStream_t stream);
 
 void hc_project_gemv_launch(const void* weight, std::int32_t rows, std::int32_t depth,
                             const void* activation, Tensor& output, cudaStream_t stream);

@@ -239,9 +239,8 @@ void hc_combine_norm(const Tensor& residual, const Tensor& block_output, const T
     require_disjoint(normalized, injection, "normalized");
     require_disjoint(normalized, next_norm_weight, "normalized");
     require_disjoint(normalized, updated_residual, "normalized");
-    detail::hc_combine_launch(residual, block_output, injection, updated_residual, stream);
-    detail::hc_grouped_rmsnorm_launch(updated_residual, next_norm_weight, epsilon, normalized,
-                                      stream);
+    detail::hc_combine_norm_launch(residual, block_output, injection, next_norm_weight, epsilon,
+                                   updated_residual, normalized, stream);
 }
 
 void hc_mix(const Tensor& normalized, const HcMixWeights& weights, WorkspaceArena& workspace,
@@ -277,23 +276,33 @@ void hc_mix(const Tensor& normalized, const HcMixWeights& weights, WorkspaceAren
     down.padded_shape[0] = rank;
     down.payload_bytes   = static_cast<std::uint64_t>(rank) * channels * 2;
 
-    if (columns == 1 && normalized.dtype == DType::BF16) {
-        detail::hc_project_gemv_launch(down.qdata, rank, channels, flattened.data, low, stream);
-        detail::hc_mix_silu_launch(low, streams, stream);
-        detail::hc_project_gemv_launch(weights.up.qdata, channels, rank, low.data, gates, stream);
-    } else {
-        linear(flattened, down, low, stream);
-        detail::hc_mix_silu_launch(low, streams, stream);
-        linear(low, weights.up, gates, stream);
-    }
-    detail::hc_mix_gate_launch(gates, normalized, block_input, hidden, streams, stream);
-
     const auto* injection_rows = static_cast<const std::uint8_t*>(weights.down_injection.qdata) +
                                   static_cast<std::size_t>(rank) * channels * 2;
-    detail::hc_mix_injection_launch(injection_rows,
-                                    weights.down_injection.qtype == QType::FP16_CTRL ? DType::FP16
-                                                                                     : DType::BF16,
-                                    flattened, channels, streams, injection, stream);
+    const DType weight_dtype = weights.down_injection.qtype == QType::FP16_CTRL ? DType::FP16
+                                                                                : DType::BF16;
+    const bool fused = columns == 1 && normalized.dtype == DType::BF16 && streams == 4 &&
+                       (rank % 8) == 0 && rank / 8 <= 64;
+    if (fused) {
+        detail::hc_mix_down_silu_launch(down.qdata, rank, channels, flattened.data, low,
+                                        injection_rows, weight_dtype, &injection, streams, stream);
+        detail::hc_mix_up_gate_launch(weights.up.qdata, rank, low.data, normalized, block_input,
+                                      hidden, streams, stream);
+    } else {
+        if (columns == 1 && normalized.dtype == DType::BF16) {
+            detail::hc_mix_down_silu_launch(down.qdata, rank, channels, flattened.data, low,
+                                            injection_rows, weight_dtype, &injection, streams,
+                                            stream);
+            detail::hc_project_gemv_launch(weights.up.qdata, channels, rank, low.data, gates,
+                                           stream);
+        } else {
+            linear(flattened, down, low, stream);
+            detail::hc_mix_silu_launch(low, streams, stream);
+            linear(low, weights.up, gates, stream);
+            detail::hc_mix_injection_launch(injection_rows, weight_dtype, flattened, channels,
+                                            streams, injection, stream);
+        }
+        detail::hc_mix_gate_launch(gates, normalized, block_input, hidden, streams, stream);
+    }
 }
 
 void hc_final_mix(const Tensor& normalized, const HcFinalMixWeights& weights,
@@ -319,17 +328,26 @@ void hc_final_mix(const Tensor& normalized, const HcFinalMixWeights& weights,
     Tensor gates      = workspace.alloc(normalized.dtype, {channels, columns});
     const Tensor flattened = normalized.view({channels, columns});
 
-    if (columns == 1 && normalized.dtype == DType::BF16) {
-        detail::hc_project_gemv_launch(weights.down.qdata, rank, channels, flattened.data, low,
-                                        stream);
-        detail::hc_mix_silu_launch(low, streams, stream);
-        detail::hc_project_gemv_launch(weights.up.qdata, channels, rank, low.data, gates, stream);
+    const bool fused = columns == 1 && normalized.dtype == DType::BF16 && streams == 4 &&
+                       (rank % 8) == 0 && rank / 8 <= 64;
+    if (fused) {
+        detail::hc_mix_down_silu_launch(weights.down.qdata, rank, channels, flattened.data, low,
+                                        nullptr, DType::BF16, nullptr, streams, stream);
+        detail::hc_mix_up_gate_launch(weights.up.qdata, rank, low.data, normalized, sample_hidden,
+                                      hidden, streams, stream);
     } else {
-        linear(flattened, weights.down, low, stream);
-        detail::hc_mix_silu_launch(low, streams, stream);
-        linear(low, weights.up, gates, stream);
+        if (columns == 1 && normalized.dtype == DType::BF16) {
+            detail::hc_mix_down_silu_launch(weights.down.qdata, rank, channels, flattened.data, low,
+                                            nullptr, DType::BF16, nullptr, streams, stream);
+            detail::hc_project_gemv_launch(weights.up.qdata, channels, rank, low.data, gates,
+                                           stream);
+        } else {
+            linear(flattened, weights.down, low, stream);
+            detail::hc_mix_silu_launch(low, streams, stream);
+            linear(low, weights.up, gates, stream);
+        }
+        detail::hc_mix_gate_launch(gates, normalized, sample_hidden, hidden, streams, stream);
     }
-    detail::hc_mix_gate_launch(gates, normalized, sample_hidden, hidden, streams, stream);
 }
 
 std::size_t hc_mix_workspace_capacity_bytes(const HcMixWeights& weights, std::int32_t min_tokens,
