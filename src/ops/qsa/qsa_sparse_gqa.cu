@@ -101,16 +101,32 @@ __global__ void sparse_gqa_kernel(const A* query, const A* output_gate,
                                                 static_cast<std::int64_t>(kv_heads) * physical));
     };
 
-    for (int j = 0; j < count_j; ++j) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warps = blockDim.x >> 5;
+    for (int j = warp; j < count_j; j += warps) {
         const int token = token_of(j);
         const std::int64_t cache_base = key_offset(token);
-        float dot = 0.0F;
-        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-            dot += QsaAct<A>::to_float(query[output_base + d]) *
-                   __bfloat162float(k_pages[cache_base + d]);
+        float partial[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int d = lane + 32 * k;
+            partial[k] = QsaAct<A>::to_float(query[output_base + d]) *
+                         __bfloat162float(k_pages[cache_base + d]);
         }
-        const float total = block_reduce_sum(reduce, dot);
-        if (threadIdx.x == 0) { probabilities[j] = total * scale; }
+        partial[0] += partial[4];
+        partial[1] += partial[5];
+        partial[2] += partial[6];
+        partial[3] += partial[7];
+        partial[0] += partial[2];
+        partial[1] += partial[3];
+        float total = partial[0] + partial[1];
+        total += __shfl_down_sync(0xffffffffU, total, 16);
+        total += __shfl_down_sync(0xffffffffU, total, 8);
+        total += __shfl_down_sync(0xffffffffU, total, 4);
+        total += __shfl_down_sync(0xffffffffU, total, 2);
+        total += __shfl_down_sync(0xffffffffU, total, 1);
+        if (lane == 0) { probabilities[j] = total * scale; }
     }
     __syncthreads();
 
