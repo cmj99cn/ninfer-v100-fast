@@ -358,7 +358,8 @@ void moe_shared_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights,
     require_shared_down(weights.shared_down, ranges);
     if (parallel) {
         ranges.push_back(address_range(
-            scratch.activation, static_cast<std::size_t>(kIntermediate) * sizeof(float),
+            scratch.activation,
+            static_cast<std::size_t>(kTopK) * kIntermediate * sizeof(float),
             "activation scratch"));
     }
     require_disjoint(ranges);

@@ -194,6 +194,7 @@ Json memory_json(const MemorySummary& memory) {
         {"kv_payload_bytes", memory.kv_payload_bytes},
         {"gdn_state_bytes", memory.gdn_state_bytes},
         {"expert_cache_bytes", memory.expert_cache_bytes},
+        {"expert_scratch_bytes", memory.expert_scratch_bytes},
         {"expert_cache_pairs", memory.expert_cache_pairs},
         {"expert_host_bytes", memory.expert_host_bytes},
         {"host_resident_bytes", memory.host_resident_bytes},

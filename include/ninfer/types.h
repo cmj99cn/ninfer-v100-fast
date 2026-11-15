@@ -597,6 +597,9 @@ struct MemorySummary {
     // The resident expert cache on THIS device: its slot payload bytes and the routing lookups it
     // has served. `expert_cache_miss_bytes` is the host bytes the miss path has read at least once.
     std::size_t expert_cache_bytes = 0;
+    // The call-local decode scratch the resident slot bank stages its activation through. It is
+    // device residency owned by the expert path, separate from the slot payload.
+    std::size_t expert_scratch_bytes = 0;
     std::size_t expert_cache_pairs = 0;
     std::uint64_t expert_cache_hits = 0;
     std::uint64_t expert_cache_misses = 0;

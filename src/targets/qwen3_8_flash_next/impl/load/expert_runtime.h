@@ -35,9 +35,11 @@ public:
     [[nodiscard]] float* activation_scratch() const noexcept {
         return static_cast<float*>(activation_scratch_.p);
     }
-    [[nodiscard]] std::uint64_t device_bytes() const noexcept {
-        return static_cast<std::uint64_t>(slab_.bytes + lookup_.bytes + divisors_.bytes +
-                                          activation_scratch_.bytes);
+    [[nodiscard]] std::uint64_t cache_bytes() const noexcept {
+        return static_cast<std::uint64_t>(slab_.bytes + lookup_.bytes + divisors_.bytes);
+    }
+    [[nodiscard]] std::uint64_t scratch_bytes() const noexcept {
+        return static_cast<std::uint64_t>(activation_scratch_.bytes);
     }
     [[nodiscard]] std::uint64_t host_bytes() const noexcept {
         return static_cast<std::uint64_t>(kCopyStages) * kPairBytes;

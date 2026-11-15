@@ -53,7 +53,8 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
     CUDA_CHECK(cudaEventCreateWithFlags(&copy_done_, cudaEventDisableTiming));
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
     if (stats_ != nullptr) {
-        stats_->expert_cache_bytes = device_bytes();
+        stats_->expert_cache_bytes = cache_bytes();
+        stats_->expert_scratch_bytes = scratch_bytes();
         stats_->expert_cache_pairs = cache_.plan().pairs;
         stats_->expert_host_bytes  = host_bytes();
     }

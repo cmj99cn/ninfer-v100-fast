@@ -406,6 +406,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
                                          static_cast<std::size_t>(resident->weights_used_bytes),
                                          static_cast<std::size_t>(resident->weights_used_bytes)};
         out.expert_cache_bytes     = static_cast<std::size_t>(resident->expert_cache_bytes);
+        out.expert_scratch_bytes   = static_cast<std::size_t>(resident->expert_scratch_bytes);
         out.expert_cache_pairs     = static_cast<std::size_t>(resident->expert_cache_pairs);
         out.expert_cache_hits      = resident->expert_cache_hits;
         out.expert_cache_misses    = resident->expert_cache_misses;

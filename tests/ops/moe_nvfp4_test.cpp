@@ -593,6 +593,10 @@ SlotBank make_slot_bank(const BatchedFixture& gate_up, const BatchedFixture& dow
     constexpr std::size_t kHalfCode  = static_cast<std::size_t>(kIntermediate) * kHidden / 2U;
     constexpr std::size_t kHalfScale = static_cast<std::size_t>(kIntermediate) * kHidden / 16U;
     constexpr std::size_t kSlotBytes = 3U * (kHalfCode + kHalfScale);
+    constexpr std::size_t kGateScales = kHalfCode;
+    constexpr std::size_t kUpCodes    = kHalfCode + kHalfScale;
+    constexpr std::size_t kUpScales   = 2U * kHalfCode + kHalfScale;
+    constexpr std::size_t kDownCodes  = 2U * (kHalfCode + kHalfScale);
     const std::size_t gate_up_code  = static_cast<std::size_t>(kGateUpRows) * kHidden / 2U;
     const std::size_t gate_up_scale = static_cast<std::size_t>(kGateUpRows) * kHidden / 16U;
     const std::size_t down_code     = static_cast<std::size_t>(kDownRows) * kIntermediate / 2U;
@@ -610,16 +614,14 @@ SlotBank make_slot_bank(const BatchedFixture& gate_up, const BatchedFixture& dow
         const std::uint8_t* source = gate_up.payload.data();
         std::copy_n(source + expert * gate_up_code, kHalfCode, base);
         std::copy_n(source + gate_up.scale_plane_offset + expert * gate_up_scale, kHalfScale,
-                    base + kHalfCode);
-        std::copy_n(source + expert * gate_up_code + kHalfCode, kHalfCode,
-                    base + kHalfCode + kHalfScale);
+                    base + kGateScales);
+        std::copy_n(source + expert * gate_up_code + kHalfCode, kHalfCode, base + kUpCodes);
         std::copy_n(source + gate_up.scale_plane_offset + expert * gate_up_scale + kHalfScale,
-                    kHalfScale, base + 2U * (kHalfCode + kHalfScale));
+                    kHalfScale, base + kUpScales);
         const std::uint8_t* down_source = down.payload.data();
-        std::copy_n(down_source + expert * down_code, down_code,
-                    base + 2U * (kHalfCode + kHalfScale));
+        std::copy_n(down_source + expert * down_code, down_code, base + kDownCodes);
         std::copy_n(down_source + down.scale_plane_offset + expert * down_scale, down_scale,
-                    base + 2U * (kHalfCode + kHalfScale) + down_code);
+                    base + kDownCodes + down_code);
 
         const float up_divisor = gate_up.divisors[expert];
         bank.divisors[3U * slot + 0U] = up_divisor;
@@ -630,13 +632,12 @@ SlotBank make_slot_bank(const BatchedFixture& gate_up, const BatchedFixture& dow
     return bank;
 }
 
-int run_cached_bitwise_case(const BatchedFixture& gate_up, const BatchedFixture& down,
-                            const MoeNvfp4Weights& full_weights,
-                            const std::vector<float>& activation_values, DType dtype,
-                            const std::string& label) {
+void build_token_words(const std::vector<float>& activation_values, DType dtype,
+                       std::vector<std::uint16_t>& activation_words,
+                       std::vector<std::uint16_t>& residual_words) {
     const bool fp16 = dtype == DType::FP16;
-    std::vector<std::uint16_t> activation_words(kHidden);
-    std::vector<std::uint16_t> residual_words(kHidden);
+    activation_words.resize(kHidden);
+    residual_words.resize(kHidden);
     for (std::int32_t row = 0; row < kHidden; ++row) {
         const float value = activation_values[static_cast<std::size_t>(row)];
         activation_words[static_cast<std::size_t>(row)] = fp16 ? f32_to_f16(value) : f32_to_bf16(value);
@@ -645,6 +646,24 @@ int run_cached_bitwise_case(const BatchedFixture& gate_up, const BatchedFixture&
                                (1.0F / 2048.0F);
         residual_words[static_cast<std::size_t>(row)] = fp16 ? f32_to_f16(residual) : f32_to_bf16(residual);
     }
+}
+
+std::size_t changed_rows(const std::vector<std::uint16_t>& got,
+                         const std::vector<std::uint16_t>& residual) {
+    std::size_t changed = 0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        if (got[i] != residual[i]) { ++changed; }
+    }
+    return changed;
+}
+
+int run_cached_bitwise_case(const BatchedFixture& gate_up, const BatchedFixture& down,
+                            const MoeNvfp4Weights& full_weights,
+                            const std::vector<float>& activation_values, DType dtype,
+                            const std::string& label) {
+    std::vector<std::uint16_t> activation_words;
+    std::vector<std::uint16_t> residual_words;
+    build_token_words(activation_values, dtype, activation_words, residual_words);
 
     DeviceBuffer device_x = to_device(activation_words);
     GuardedDeviceBuffer ids_buffer(kTopK * sizeof(std::int32_t));
@@ -693,9 +712,67 @@ int run_cached_bitwise_case(const BatchedFixture& gate_up, const BatchedFixture&
         from_device<std::uint16_t>(serial.data(), kHidden);
 
     int failures = 0;
+    if (changed_rows(got_serial, residual_words) < kHidden / 2U) {
+        std::cerr << label << ": the slot fixture produced almost no routed contribution\n";
+        ++failures;
+    }
     if (got_parallel != got_serial) {
         std::cerr << label << ": the multi-CTA slot path is not bitwise identical to the "
                              "single-CTA slot path\n";
+        ++failures;
+    }
+    failures += parallel.verify_guards(label + " parallel guard");
+    failures += serial.verify_guards(label + " serial guard");
+    return failures;
+}
+
+int run_shared_bitwise_case(const MoeNvfp4Weights& full_weights,
+                            const std::vector<float>& activation_values, DType dtype,
+                            const std::string& label) {
+    std::vector<std::uint16_t> activation_words;
+    std::vector<std::uint16_t> residual_words;
+    build_token_words(activation_values, dtype, activation_words, residual_words);
+
+    DeviceBuffer device_x = to_device(activation_words);
+    GuardedDeviceBuffer ids_buffer(kTopK * sizeof(std::int32_t));
+    GuardedDeviceBuffer coefficients_buffer(kTopK * sizeof(float));
+    GuardedDeviceBuffer shared_gate_buffer(sizeof(float));
+    Tensor x{device_x.p, dtype, {kHidden, 1}};
+    Tensor ids{ids_buffer.data(), DType::I32, {kTopK, 1}};
+    Tensor coefficients{coefficients_buffer.data(), DType::FP32, {kTopK, 1}};
+    Tensor shared_gate{shared_gate_buffer.data(), DType::FP32, {1, 1}};
+    ops::moe_nvfp4_route(x, full_weights, ids, coefficients, shared_gate, 0);
+    cuda_synchronize();
+
+    const MoeNvfp4RouteView route{ids, coefficients, shared_gate};
+    DeviceBuffer scratch(kTopK * kIntermediate * sizeof(float));
+    const MoeNvfp4ExpertScratch scratch_view{static_cast<float*>(scratch.p)};
+
+    const std::size_t destination_bytes = static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t);
+    GuardedDeviceBuffer parallel(destination_bytes);
+    GuardedDeviceBuffer serial(destination_bytes);
+    parallel.copy_from_host(residual_words.data(), destination_bytes);
+    serial.copy_from_host(residual_words.data(), destination_bytes);
+    Tensor parallel_destination{parallel.data(), dtype, {kHidden, 1}};
+    Tensor serial_destination{serial.data(), dtype, {kHidden, 1}};
+
+    ops::moe_shared_nvfp4(x, full_weights, scratch_view, route, parallel_destination, 0);
+    ops::moe_shared_nvfp4(x, full_weights, MoeNvfp4ExpertScratch{}, route, serial_destination, 0);
+    cuda_synchronize();
+
+    const std::vector<std::uint16_t> got_parallel =
+        from_device<std::uint16_t>(parallel.data(), kHidden);
+    const std::vector<std::uint16_t> got_serial =
+        from_device<std::uint16_t>(serial.data(), kHidden);
+
+    int failures = 0;
+    if (changed_rows(got_serial, residual_words) < kHidden / 2U) {
+        std::cerr << label << ": the shared fixture produced almost no contribution\n";
+        ++failures;
+    }
+    if (got_parallel != got_serial) {
+        std::cerr << label << ": the multi-CTA shared path is not bitwise identical to the "
+                             "single-CTA shared path\n";
         ++failures;
     }
     failures += parallel.verify_guards(label + " parallel guard");
@@ -1098,9 +1175,13 @@ int main() {
     failures += local_destination_buffer.verify_guards("moe_nvfp4 local destination guard");
 
     failures += run_cached_bitwise_case(inputs.gate_up, inputs.down, weights,
-                                        inputs.activation[0], DType::BF16, "moe_nvfp4 cached bf16");
+                                        inputs.activation[1], DType::BF16, "moe_nvfp4 cached bf16");
     failures += run_cached_bitwise_case(gate_up_f16, down_f16, weights_f16,
-                                        inputs.activation[0], DType::FP16, "moe_nvfp4 cached f16");
+                                        inputs.activation[2], DType::FP16, "moe_nvfp4 cached f16");
+    failures += run_shared_bitwise_case(weights, inputs.activation[1], DType::BF16,
+                                        "moe_nvfp4 shared bf16");
+    failures += run_shared_bitwise_case(weights_f16, inputs.activation[2], DType::FP16,
+                                        "moe_nvfp4 shared f16");
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " moe_nvfp4 correctness\n";
     return failures == 0 ? 0 : 1;

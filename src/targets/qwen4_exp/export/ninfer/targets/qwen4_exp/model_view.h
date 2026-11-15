@@ -53,6 +53,7 @@ struct TextResidentStats {
     std::uint64_t weights_capacity_bytes = 0;
     std::uint64_t weights_used_bytes     = 0;
     std::uint64_t expert_cache_bytes     = 0;
+    std::uint64_t expert_scratch_bytes   = 0;
     std::uint64_t expert_cache_pairs     = 0;
     std::uint64_t expert_cache_hits      = 0;
     std::uint64_t expert_cache_misses    = 0;

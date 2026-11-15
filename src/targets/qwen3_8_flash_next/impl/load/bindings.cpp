@@ -1475,7 +1475,7 @@ std::uint64_t LoadedModelData::expert_cache_bytes(int rank) const {
     if (rank < 0 || rank >= static_cast<int>(kMaximumDevices) || experts_[static_cast<std::size_t>(rank)] == nullptr) {
         return 0;
     }
-    return experts_[static_cast<std::size_t>(rank)]->device_bytes();
+    return experts_[static_cast<std::size_t>(rank)]->cache_bytes();
 }
 
 std::uint64_t LoadedModelData::expert_host_bytes(int rank) const {
