@@ -56,6 +56,10 @@
 #define NINFER_QWEN4EXP_EXPERT_READ_END(layer)
 #endif
 
+#ifndef NINFER_QWEN4EXP_DIAG_MARK
+#define NINFER_QWEN4EXP_DIAG_MARK(label)
+#endif
+
 namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
 
 inline constexpr std::int32_t kHidden   = TextConfig::hidden;
@@ -508,6 +512,7 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
         Tensor beta = activations_[slot]->alloc(DType::FP32, {TextConfig::gdn_value_heads, T});
         Variant::gdn_projection_control(block_input[slot], weights, q, k, v, z, g, beta, workspace_,
                                         stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("gdn_proj");
 
         Tensor conv_in  = activations_[slot]->alloc(kTextActivationDtype, {conv_channels, T});
         Tensor conv_out = activations_[slot]->alloc(kTextActivationDtype, {conv_channels, T});
@@ -531,6 +536,7 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
         const Tensor conv_kernel = state.gdn_conv_kernel(layer);
         ops::causal_conv1d_silu(conv_in, conv_kernel, conv_state, conv_state, conv_out,
                                 stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("gdn_conv");
 
         ops::extract_bf16_columns(conv_out, 0, q, stream_for(rank));
         ops::extract_bf16_columns(conv_out, key_width, k, stream_for(rank));
@@ -562,9 +568,11 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
             cudaMemcpyDeviceToDevice, stream_for(rank)));
         ops::gated_delta_net(q_recurrent, k_recurrent, v_recurrent, g_rank, beta_rank, kGdnScale,
                              true, workspace_, recurrent_state, o_recurrent, stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("gdn_recurrent");
         ops::gated_rmsnorm(o_recurrent, weights.norm,
                            z.view({128, state.gdn_value_heads(), T}), TextConfig::rms_epsilon,
                            o_normalized, stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("gdn_norm");
         projected[slot] = on.view({value_width, T});
         output_weight[slot] = weights.output;
         arena_ptrs[slot] = workspaces_[slot];
@@ -611,6 +619,7 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
         Variant::attention_projection(block_input[slot], weights, query_flat, output_gate_flat,
                                       key_flat, value_flat, index_query_flat, index_key_flat,
                                       workspace_, stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("qsa_proj");
 
         Tensor rotated_query =
             activations_[slot]->alloc(kTextActivationDtype, {kHeadDim, query_heads, T, kBatch});
@@ -636,6 +645,7 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
         ops::qsa_prepare(ops::QsaProjectionView{query, key, value, index_query, index_key},
                          parameters, batch, state.before_tail(qsa_slot), cache, workspace_, records,
                          rotated_query, rotated_index_query, stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("qsa_prep");
 
         ops::QsaBlockSelection selected{
             .selection = activations_[slot]->alloc(DType::I32,
@@ -645,6 +655,7 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
         ops::qsa_indexer(rotated_index_query,
                          ops::ConstQsaIndexCacheView{cache.index_k_pages, cache.page_table}, batch,
                          static_cast<std::uint32_t>(T), workspace_, selected, stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("qsa_index");
 #ifdef NINFER_QWEN4EXP_LAYER_DUMP
         NINFER_QWEN4EXP_LAYER_DUMP("index_query", layer, rotated_index_query);
         NINFER_QWEN4EXP_LAYER_DUMP("index_keys", layer, cache.index_k_pages);
@@ -654,12 +665,14 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
             activations_[slot]->alloc(kTextActivationDtype, {kHeadDim, query_heads, T, kBatch});
         ops::qsa_sparse_gqa(rotated_query, output_gate, cache, batch, selected,
                             static_cast<std::uint32_t>(T), workspace_, attention, stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("qsa_attn");
 
         const ops::QsaRawRecordReadView read_records{records.raw_keys, records.rope_positions};
         ops::QsaTailStateView after = state.tail(qsa_slot);
         ops::qsa_tail_extract(state.const_tail(qsa_slot), read_records, records.base_positions,
                               valid_columns[slot], after, stream_for(rank));
         state.publish_tail(qsa_slot);
+        NINFER_QWEN4EXP_DIAG_MARK("qsa_tail");
 
         projected[slot] = attention.view({query_width, T});
         output_weight[slot] = weights.output;
@@ -684,6 +697,7 @@ inline void TextTrunk::run_ple(std::int32_t T,
         ops::ple_lookup_rows(state.ple_table(), state.ple_rows(),
                              static_cast<std::size_t>(entries), state.ple_staged_rows(), embedding,
                              stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("ple_lookup");
 
         Tensor projected_key   = activations_[slot]->alloc(kTextActivationDtype, {kChannels, T, kBatch});
         Tensor projected_value = activations_[slot]->alloc(kTextActivationDtype, {kHidden, T, kBatch});
@@ -691,6 +705,7 @@ inline void TextTrunk::run_ple(std::int32_t T,
                     stream_for(rank));
         ops::linear(embedding, ple.value, projected_value, ops::LinearPolicy::A16Only, workspace_,
                     stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("ple_proj");
 
         Tensor gated_value     = activations_[slot]->alloc(kTextActivationDtype, {kChannels, T, kBatch});
         Tensor normalized_conv = activations_[slot]->alloc(kTextActivationDtype, {kChannels, T, kBatch});
@@ -706,6 +721,7 @@ inline void TextTrunk::run_ple(std::int32_t T,
         ops::ple_gate(projected_key, projected_value, residual[slot], ple.norm_key, ple.norm_query,
                       ple.norm_conv, TextConfig::rms_epsilon, gated_value, normalized_conv,
                       stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("ple_gate");
 
         const Tensor next_norm =
             models_[slot]->layers[TextConfig::ple_layer].attention_hc.norm.view({kChannels});
@@ -721,6 +737,7 @@ inline void TextTrunk::run_ple(std::int32_t T,
             state.ple_history().data, after_history.data,
             static_cast<std::size_t>(kChannels) * ops::kPleConvWindow * kBatch * 2,
             cudaMemcpyDeviceToDevice, stream_for(rank)));
+        NINFER_QWEN4EXP_DIAG_MARK("ple_conv");
     });
 }
 
@@ -765,6 +782,7 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
     for_each_rank([&](int rank) {
         const auto slot = static_cast<std::size_t>(rank);
         cudaStream_t stream = stream_for(rank);
+        NINFER_QWEN4EXP_DIAG_MARK("round_begin");
         ids[slot] = activations_[slot]->alloc(DType::I32, {T});
         CUDA_CHECK(cudaMemcpyAsync(ids[slot].data, tokens.data(), static_cast<std::size_t>(T) * 4,
                                    cudaMemcpyHostToDevice, stream));
@@ -796,6 +814,7 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
         ops::hc_expand_norm(embedding_out[slot],
                             models_[slot]->layers[0].attention_hc.norm, TextConfig::rms_epsilon,
                             residual[slot], normalized[slot], stream);
+        NINFER_QWEN4EXP_DIAG_MARK("stem");
     });
 
     std::array<WorkspaceArena*, kMaximumDevices> workspace_ptrs{};
@@ -822,6 +841,7 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
             ops::hc_mix(normalized[slot],
                         ops::HcMixWeights{attention_hc.down_injection, attention_hc.up},
                         *workspaces_[slot], block_input[slot], injection[slot], stream_for(rank));
+            NINFER_QWEN4EXP_DIAG_MARK("attn_hc");
             });
 #ifdef NINFER_QWEN4EXP_LAYER_DUMP
         NINFER_QWEN4EXP_LAYER_DUMP("attention_block", layer, block_input[0]);
@@ -837,6 +857,7 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
 #endif
         for_each_rank([&](int rank) {
             const auto slot = static_cast<std::size_t>(rank);
+            NINFER_QWEN4EXP_DIAG_MARK("mixer");
             const auto& moe_hc = models_[slot]->layers[layer].moe_hc;
             ops::hc_combine_norm(residual[slot], mixer_out[slot], injection[slot], moe_hc.norm,
                                  TextConfig::rms_epsilon, stage[slot], normalized[slot],
@@ -846,6 +867,7 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
                         block_input[slot], injection[slot], stream_for(rank));
             CUDA_CHECK(cudaMemsetAsync(moe_out[slot].data, 0, moe_out[slot].bytes(),
                                        stream_for(rank)));
+            NINFER_QWEN4EXP_DIAG_MARK("moe_hc");
         });
 #ifdef NINFER_QWEN4EXP_LAYER_DUMP
         NINFER_QWEN4EXP_LAYER_DUMP("stage", layer, stage[0]);
@@ -863,19 +885,23 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
             Tensor route_gate = activations_[slot]->alloc(DType::FP32, {T});
             ops::moe_nvfp4_route(block_input[slot], models_[slot]->layers[layer].post_mixer,
                                  route_ids, route_coefficients, route_gate, stream_for(rank));
+            NINFER_QWEN4EXP_DIAG_MARK("route");
             routes[slot] = ops::MoeNvfp4RouteView{route_ids, route_coefficients, route_gate};
             NINFER_QWEN4EXP_EXPERT_READ_BEGIN(layer);
             Variant::post_mixer_routed(block_input[slot],
                                        models_[slot]->layers[layer].post_mixer, routes[slot],
                                        moe_out[slot], stream_for(rank));
             NINFER_QWEN4EXP_EXPERT_READ_END(layer);
+            NINFER_QWEN4EXP_DIAG_MARK("routed");
         });
         reduce_rows(moe_out, staging);
         for_each_rank([&](int rank) {
             const auto slot = static_cast<std::size_t>(rank);
+            NINFER_QWEN4EXP_DIAG_MARK("moe_reduce");
             Variant::post_mixer_shared(block_input[slot],
                                        models_[slot]->layers[layer].post_mixer, routes[slot],
                                        moe_out[slot], stream_for(rank));
+            NINFER_QWEN4EXP_DIAG_MARK("moe_shared");
         });
 #ifdef NINFER_QWEN4EXP_LAYER_DUMP
         NINFER_QWEN4EXP_LAYER_DUMP("moe", layer, moe_out[0]);
@@ -884,11 +910,13 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
         if (layer + 1 == static_cast<std::size_t>(TextConfig::ple_layer)) {
             for_each_rank([&](int rank) {
                 states_[static_cast<std::size_t>(rank)]->await_ple_rows();
+                NINFER_QWEN4EXP_DIAG_MARK("ple_await");
             });
             for_each_rank([&](int rank) {
                 const auto slot = static_cast<std::size_t>(rank);
                 ops::hc_combine(stage[slot], moe_out[slot], injection[slot], residual[slot],
                                 stream_for(rank));
+                NINFER_QWEN4EXP_DIAG_MARK("pre_ple");
             });
             run_ple(T, residual, stage, normalized);
             for (int rank = 0; rank < tp_; ++rank) {
@@ -905,6 +933,7 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
                 ops::hc_combine_norm(stage[slot], moe_out[slot], injection[slot], next_norm,
                                      TextConfig::rms_epsilon, residual[slot], normalized[slot],
                                      stream_for(rank));
+                NINFER_QWEN4EXP_DIAG_MARK("layer_end");
             });
         }
 #ifdef NINFER_QWEN4EXP_LAYER_DUMP
@@ -921,9 +950,11 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
                           ops::HcFinalMixWeights{models_[slot]->final_hc.down_injection,
                                                  models_[slot]->final_hc.up},
                           *workspaces_[slot], sample[slot], stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("head_mix");
         head[slot] = models_[slot]->output_head;
         ops::linear(sample[slot], head[slot], logits_part[slot], ops::LinearPolicy::A16Only,
                     *workspaces_[slot], stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("head_linear");
     });
     if (tp_ > 1) {
         const std::int32_t vocab = TextConfig::vocab;
@@ -946,9 +977,11 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
     }
     for_each_rank([&](int rank) {
         const auto slot = static_cast<std::size_t>(rank);
+        NINFER_QWEN4EXP_DIAG_MARK("head_gather");
         NINFER_QWEN4EXP_LAST_STAGE(sample[slot], logits[slot]);
         winner[slot] = activations_[slot]->alloc(DType::I32, {T});
         ops::argmax(logits[slot], winner[slot], TextConfig::vocab, stream_for(rank));
+        NINFER_QWEN4EXP_DIAG_MARK("argmax");
     });
 
     CUDA_CHECK(cudaSetDevice(states_[0]->device_id()));

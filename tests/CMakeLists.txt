@@ -165,6 +165,15 @@ target_include_directories(ninfer_flash_next_engine_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party
   ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(ninfer_flash_next_engine_bench PRIVATE ninfer_engine CUDA::cudart)
+
+add_executable(ninfer_flash_next_phase_profile
+  ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_phase_profile.cpp)
+target_include_directories(ninfer_flash_next_phase_profile PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party
+  ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(ninfer_flash_next_phase_profile PRIVATE ninfer_flash_next_package CUDA::cudart)
 # Host-only: no artifact, no device. Byte-level TP2 shard slice geometry per storage layout.
 ninfer_add_test(ninfer_tensor_slice_test
   SOURCES test_tensor_slice.cpp
