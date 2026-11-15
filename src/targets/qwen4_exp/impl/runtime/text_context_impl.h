@@ -28,7 +28,8 @@
 #include <vector>
 
 #ifndef NINFER_QWEN4EXP_LAST_STAGE
-#define NINFER_QWEN4EXP_LAST_STAGE(sample, logits)
+#define NINFER_QWEN4EXP_LAST_STAGE(sample, logits) \
+    capture_last_stage((logits), stream_for(rank))
 #endif
 
 #ifndef NINFER_QWEN4EXP_PLE_PREFETCH_LAUNCH
@@ -76,6 +77,14 @@ inline TextState::TextState(DeviceContext& device, const ModelView& model,
                             std::uint32_t kv_capacity_tokens, std::uint32_t forward_tokens)
     : TextState(device, model, kv_capacity_tokens, forward_tokens, 1, 0) {}
 
+inline std::int32_t count_qsa_layers(std::size_t layers) {
+    std::int32_t count = 0;
+    for (std::size_t layer = 0; layer < layers; ++layer) {
+        if (TextConfig::is_qsa_layer(static_cast<int>(layer))) { ++count; }
+    }
+    return count;
+}
+
 inline TextState::TextState(DeviceContext& device, const ModelView& model,
                             std::uint32_t kv_capacity_tokens, std::uint32_t forward_tokens,
                             int tp, int rank)
@@ -88,18 +97,24 @@ inline TextState::TextState(DeviceContext& device, const ModelView& model,
       conv_channels_(2 * gdn_key_heads_ * TextConfig::gdn_head_dim +
                      gdn_value_heads_ * TextConfig::gdn_head_dim),
       gdn_layers_(layers_), gdn_index_(layers_),
+      qsa_layers_(std::max<std::int32_t>(1, count_qsa_layers(layers_))),
+      qsa_slot_of_(layers_, -1),
+      qsa_page_bytes_(static_cast<std::size_t>(kHeadDim) * 64 * kv_heads_ * pages_ * 2),
+      qsa_index_page_bytes_(static_cast<std::size_t>(TextConfig::index_head_dim) * 16 *
+                            TextConfig::index_kv_heads * pages_ * 2),
+      qsa_tail_bytes_(static_cast<std::size_t>(TextConfig::index_head_dim) * 4 * kBatch * 2),
+      qsa_tail_rope_bytes_(3 * kBatch * 4),
       conv_kernels_(layers_ * static_cast<std::size_t>(conv_channels_) * 4 * 2),
       conv_states_(layers_ * static_cast<std::size_t>(conv_channels_) * 3 * 2),
       recurrent_states_(layers_ * 128 * 128 * static_cast<std::size_t>(gdn_value_heads_) * 4),
-      k_pages_(static_cast<std::size_t>(kHeadDim) * 64 * kv_heads_ * pages_ * 2),
-      v_pages_(static_cast<std::size_t>(kHeadDim) * 64 * kv_heads_ * pages_ * 2),
-      index_k_pages_(static_cast<std::size_t>(TextConfig::index_head_dim) * 16 *
-                     TextConfig::index_kv_heads * pages_ * 2),
+      k_pages_(qsa_page_bytes_ * static_cast<std::size_t>(qsa_layers_)),
+      v_pages_(qsa_page_bytes_ * static_cast<std::size_t>(qsa_layers_)),
+      index_k_pages_(qsa_index_page_bytes_ * static_cast<std::size_t>(qsa_layers_)),
       page_table_(pages_ * 4),
-      tail_raw_keys_(static_cast<std::size_t>(TextConfig::index_head_dim) * 4 * kBatch * 2),
-      tail_first_rope_(3 * kBatch * 4),
-      after_raw_keys_(static_cast<std::size_t>(TextConfig::index_head_dim) * 4 * kBatch * 2),
-      after_first_rope_(3 * kBatch * 4),
+      tail_raw_keys_(qsa_tail_bytes_ * static_cast<std::size_t>(qsa_layers_)),
+      tail_first_rope_(qsa_tail_rope_bytes_ * static_cast<std::size_t>(qsa_layers_)),
+      after_raw_keys_(qsa_tail_bytes_),
+      after_first_rope_(qsa_tail_rope_bytes_),
       record_raw_keys_(static_cast<std::size_t>(TextConfig::index_head_dim) * forward_tokens_ *
                        kBatch * 2),
       record_rope_positions_(3 * forward_tokens_ * kBatch * 4),
@@ -137,9 +152,11 @@ inline TextState::TextState(DeviceContext& device, const ModelView& model,
     const std::int32_t value_width = gdn_value_heads_ * TextConfig::gdn_head_dim;
     auto* conv_kernel_base = static_cast<std::byte*>(conv_kernels_.p);
     std::size_t gdn = 0;
+    std::int32_t qsa = 0;
     for (std::size_t layer_index = 0; layer_index < layers_; ++layer_index) {
         if (TextConfig::is_qsa_layer(static_cast<int>(layer_index))) {
             gdn_index_[layer_index] = std::nullopt;
+            qsa_slot_of_[layer_index] = qsa++;
             continue;
         }
         gdn_index_[layer_index] = gdn;
@@ -322,35 +339,55 @@ inline std::uint64_t TextState::reserved_bytes() const noexcept {
            ple_staged_rows_.bytes + ple_divisors_.bytes;
 }
 
-inline ops::QsaCacheView TextState::cache() const {
+inline std::int32_t TextState::qsa_slot(std::size_t layer) const {
+    if (layer >= qsa_slot_of_.size() || qsa_slot_of_[layer] < 0) {
+        throw std::invalid_argument("the requested layer is not a QSA layer");
+    }
+    return qsa_slot_of_[layer];
+}
+
+inline ops::QsaCacheView TextState::cache(std::int32_t slot) const {
     const std::int32_t pages = static_cast<std::int32_t>(pages_);
+    const std::size_t base = static_cast<std::size_t>(slot) * qsa_page_bytes_;
+    const std::size_t index_base = static_cast<std::size_t>(slot) * qsa_index_page_bytes_;
     return ops::QsaCacheView{
-        .k_pages       = Tensor(k_pages_.p, DType::BF16, {kHeadDim, 64, kv_heads_, pages}),
-        .v_pages       = Tensor(v_pages_.p, DType::FP16, {kHeadDim, 64, kv_heads_, pages}),
-        .index_k_pages = Tensor(index_k_pages_.p, DType::BF16,
+        .k_pages       = Tensor(static_cast<std::byte*>(k_pages_.p) + base, DType::BF16,
+                                {kHeadDim, 64, kv_heads_, pages}),
+        .v_pages       = Tensor(static_cast<std::byte*>(v_pages_.p) + base, DType::FP16,
+                                {kHeadDim, 64, kv_heads_, pages}),
+        .index_k_pages = Tensor(static_cast<std::byte*>(index_k_pages_.p) + index_base,
+                                DType::BF16,
                                 {TextConfig::index_head_dim, 16, TextConfig::index_kv_heads, pages}),
         .page_table    = Tensor(page_table_.p, DType::I32, {pages, kBatch}),
     };
 }
 
-inline ops::QsaTailStateView TextState::tail() const {
+inline ops::QsaTailStateView TextState::tail(std::int32_t) const {
     return ops::QsaTailStateView{
         .raw_keys   = Tensor(after_raw_keys_.p, DType::BF16, {TextConfig::index_head_dim, 4, kBatch}),
         .first_rope = Tensor(after_first_rope_.p, DType::I32, {3, kBatch}),
     };
 }
 
-inline ops::ConstQsaTailStateView TextState::const_tail() const {
+inline ops::ConstQsaTailStateView TextState::const_tail(std::int32_t slot) const {
+    const std::size_t base = static_cast<std::size_t>(slot) * qsa_tail_bytes_;
+    const std::size_t rope_base = static_cast<std::size_t>(slot) * qsa_tail_rope_bytes_;
     return ops::ConstQsaTailStateView{
-        .raw_keys   = Tensor(tail_raw_keys_.p, DType::BF16, {TextConfig::index_head_dim, 4, kBatch}),
-        .first_rope = Tensor(tail_first_rope_.p, DType::I32, {3, kBatch}),
+        .raw_keys   = Tensor(static_cast<std::byte*>(tail_raw_keys_.p) + base, DType::BF16,
+                             {TextConfig::index_head_dim, 4, kBatch}),
+        .first_rope = Tensor(static_cast<std::byte*>(tail_first_rope_.p) + rope_base, DType::I32,
+                             {3, kBatch}),
     };
 }
 
-inline ops::QsaTailStateView TextState::before_tail() const {
+inline ops::QsaTailStateView TextState::before_tail(std::int32_t slot) const {
+    const std::size_t base = static_cast<std::size_t>(slot) * qsa_tail_bytes_;
+    const std::size_t rope_base = static_cast<std::size_t>(slot) * qsa_tail_rope_bytes_;
     return ops::QsaTailStateView{
-        .raw_keys   = Tensor(tail_raw_keys_.p, DType::BF16, {TextConfig::index_head_dim, 4, kBatch}),
-        .first_rope = Tensor(tail_first_rope_.p, DType::I32, {3, kBatch}),
+        .raw_keys   = Tensor(static_cast<std::byte*>(tail_raw_keys_.p) + base, DType::BF16,
+                             {TextConfig::index_head_dim, 4, kBatch}),
+        .first_rope = Tensor(static_cast<std::byte*>(tail_first_rope_.p) + rope_base, DType::I32,
+                             {3, kBatch}),
     };
 }
 
@@ -379,13 +416,16 @@ inline const std::uint8_t* TextState::ple_staged_rows() const noexcept {
 
 inline const ops::PleNf4Table& TextState::ple_table() const noexcept { return ple_table_; }
 
-inline void TextState::publish_tail() {
+inline void TextState::publish_tail(std::int32_t slot) {
     DeviceScope scope(device_);
-    CUDA_CHECK(cudaMemcpyAsync(tail_raw_keys_.p, after_raw_keys_.p,
-                               static_cast<std::size_t>(TextConfig::index_head_dim) * 4 * kBatch * 2,
-                               cudaMemcpyDeviceToDevice, stream_));
-    CUDA_CHECK(cudaMemcpyAsync(tail_first_rope_.p, after_first_rope_.p, 3 * kBatch * 4,
-                               cudaMemcpyDeviceToDevice, stream_));
+    const std::size_t base = static_cast<std::size_t>(slot) * qsa_tail_bytes_;
+    const std::size_t rope_base = static_cast<std::size_t>(slot) * qsa_tail_rope_bytes_;
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(tail_raw_keys_.p) + base,
+                               after_raw_keys_.p, qsa_tail_bytes_, cudaMemcpyDeviceToDevice,
+                               stream_));
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(tail_first_rope_.p) + rope_base,
+                               after_first_rope_.p, qsa_tail_rope_bytes_, cudaMemcpyDeviceToDevice,
+                               stream_));
 }
 
 inline TextTrunk::TextTrunk(const ModelView& model, TextState& state, WorkspaceArena& activations,
@@ -590,10 +630,11 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
                                       .valid_columns = valid_columns[slot],
                                       .table_rows = table_rows[slot]};
         ops::QsaRawRecordWriteView records = state.records(static_cast<std::size_t>(T));
-        const ops::QsaCacheView cache = state.cache();
+        const std::int32_t qsa_slot = state.qsa_slot(layer);
+        const ops::QsaCacheView cache = state.cache(qsa_slot);
 
         ops::qsa_prepare(ops::QsaProjectionView{query, key, value, index_query, index_key},
-                         parameters, batch, state.before_tail(), cache, workspace_, records,
+                         parameters, batch, state.before_tail(qsa_slot), cache, workspace_, records,
                          rotated_query, rotated_index_query, stream_for(rank));
 
         ops::QsaBlockSelection selected{
@@ -615,10 +656,10 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
                             static_cast<std::uint32_t>(T), workspace_, attention, stream_for(rank));
 
         const ops::QsaRawRecordReadView read_records{records.raw_keys, records.rope_positions};
-        ops::QsaTailStateView after = state.tail();
-        ops::qsa_tail_extract(state.const_tail(), read_records, records.base_positions,
+        ops::QsaTailStateView after = state.tail(qsa_slot);
+        ops::qsa_tail_extract(state.const_tail(qsa_slot), read_records, records.base_positions,
                               valid_columns[slot], after, stream_for(rank));
-        state.publish_tail();
+        state.publish_tail(qsa_slot);
 
         projected[slot] = attention.view({query_width, T});
         output_weight[slot] = weights.output;

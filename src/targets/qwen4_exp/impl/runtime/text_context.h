@@ -23,6 +23,30 @@
 
 namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
 
+struct LastStageCapture {
+    bool enabled = false;
+    std::vector<std::uint16_t> words;
+};
+
+inline LastStageCapture*& last_stage_capture() noexcept {
+    static thread_local LastStageCapture* capture = nullptr;
+    return capture;
+}
+
+inline void capture_last_stage(const Tensor& logits, cudaStream_t stream) {
+    LastStageCapture* capture = last_stage_capture();
+    if (capture == nullptr || !capture->enabled) { return; }
+    const std::int32_t vocab = TextConfig::vocab;
+    const std::int32_t tokens = logits.ne[1];
+    capture->words.resize(static_cast<std::size_t>(vocab));
+    CUDA_CHECK(cudaMemcpyAsync(
+        capture->words.data(),
+        static_cast<const std::byte*>(logits.data) +
+            static_cast<std::size_t>(tokens - 1) * static_cast<std::size_t>(vocab) * 2,
+        static_cast<std::size_t>(vocab) * 2, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 struct TextLaneContext {
     std::vector<TokenId> prompt_tokens;
     std::uint32_t processed_prompt_tokens = 0;
@@ -54,6 +78,13 @@ public:
     [[nodiscard]] int device_id() const noexcept { return device_; }
     [[nodiscard]] cudaStream_t stream() const noexcept { return stream_; }
     [[nodiscard]] Tensor gdn_conv_kernel(std::size_t layer) const;
+
+    [[nodiscard]] std::int32_t qsa_slot(std::size_t layer) const;
+    [[nodiscard]] ops::QsaCacheView cache(std::int32_t slot) const;
+    [[nodiscard]] ops::QsaTailStateView tail(std::int32_t slot) const;
+    [[nodiscard]] ops::ConstQsaTailStateView const_tail(std::int32_t slot) const;
+    [[nodiscard]] ops::QsaTailStateView before_tail(std::int32_t slot) const;
+    void publish_tail(std::int32_t slot);
 
     [[nodiscard]] std::int32_t kv_heads() const noexcept { return kv_heads_; }
     [[nodiscard]] std::int32_t gdn_key_heads() const noexcept { return gdn_key_heads_; }
@@ -113,6 +144,12 @@ private:
     std::int32_t conv_channels_  = 0;
     std::vector<std::size_t> gdn_layers_;
     std::vector<std::optional<std::size_t>> gdn_index_;
+    std::int32_t qsa_layers_ = 1;
+    std::vector<std::int32_t> qsa_slot_of_;
+    std::size_t qsa_page_bytes_ = 0;
+    std::size_t qsa_index_page_bytes_ = 0;
+    std::size_t qsa_tail_bytes_ = 0;
+    std::size_t qsa_tail_rope_bytes_ = 0;
     std::unique_ptr<PinnedHostBuffer> ple_rows_host_;
     std::unique_ptr<PinnedHostBuffer> ple_staged_host_;
     cudaStream_t ple_stream_ = nullptr;

@@ -95,7 +95,7 @@ public:
     void reset_memory_peaks() noexcept;
 
     [[nodiscard]] std::span<const std::uint16_t> last_round_logits_bf16() const noexcept {
-        return {};
+        return {logits_capture_.words.data(), logits_capture_.words.size()};
     }
     void enable_logits_capture(bool enabled);
     void enable_peer_egress_check(bool enabled) noexcept { (void)enabled; }
@@ -130,6 +130,7 @@ private:
     std::array<WorkspaceArena*, kMaximumDevices> workspace_ptrs_{};
     std::unique_ptr<ops::CollectiveComms> comms_;
     std::unique_ptr<TextTrunk> trunk_;
+    LastStageCapture logits_capture_;
     std::vector<TokenId> round_tokens_;
     std::vector<std::int32_t> round_row_counts_;
     std::uint64_t last_prefill_tokens_ = 0;

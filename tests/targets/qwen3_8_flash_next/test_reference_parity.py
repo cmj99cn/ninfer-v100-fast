@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import struct
 import subprocess
@@ -22,7 +23,11 @@ BUDGET_TOKENS = 2100
 LONG_PROMPT = [1024 + (index * 7) % 200000 for index in range(LONG_TOKENS)]
 BUDGET_PROMPT = [1024 + (index * 7) % 200000 for index in range(BUDGET_TOKENS)]
 BINARY = ROOT / "build" / "tests" / "ninfer_flash_next_text_forward_test"
+ENGINE_PROBE = ROOT / "build" / "tests" / "ninfer_flash_next_engine_bench"
 NCCL = "/home/cmj/nccl-lib/whl/nvidia/nccl/lib"
+FULL_TOKENS = 8
+NLL_BOUND = 1.0
+TOKEN_MARGIN_BOUND = 0.8
 
 
 def skip(message):
@@ -89,6 +94,54 @@ def run_binary(environment, extra):
     merged.update(extra)
     merged["LD_LIBRARY_PATH"] = NCCL + ":" + merged.get("LD_LIBRARY_PATH", "")
     return subprocess.run([str(BINARY)], capture_output=True, text=True, env=merged)
+
+
+def log_softmax_nll(logits, token):
+    values = np.asarray(logits, dtype=np.float64)
+    maximum = float(np.max(values))
+    log_partition = maximum + float(np.log(np.sum(np.exp(values - maximum))))
+    return log_partition - float(values[int(token)])
+
+
+def run_full_reference(artifact):
+    from tools.reference.qwen3_8_flash_next.config import FlashNextConfig
+    from tools.reference.qwen3_8_flash_next.model import RefModel
+
+    started = time.perf_counter()
+    with RefModel(artifact, config=FlashNextConfig.full()) as model:
+        sequence = list(PROMPT)
+        tokens = []
+        nll = []
+        margins = []
+        for _ in range(FULL_TOKENS):
+            result = model.forward(sequence)
+            logits = result["logits"]
+            order = np.argsort(-logits, kind="stable")[:2]
+            token = int(order[0])
+            nll.append(log_softmax_nll(logits, token))
+            margins.append(float(logits[order[0]] - logits[order[1]]))
+            tokens.append(token)
+            sequence.append(token)
+    return tokens, nll, margins, time.perf_counter() - started
+
+
+def run_engine_probe(artifact, environment, targets=None):
+    if not ENGINE_PROBE.is_file():
+        raise RuntimeError("the C++ Engine probe is missing: " + str(ENGINE_PROBE))
+    merged = dict(environment)
+    merged["NINFER_FLASH_NEXT_ARTIFACT"] = artifact
+    merged["LD_LIBRARY_PATH"] = NCCL + ":" + merged.get("LD_LIBRARY_PATH", "")
+    command = [str(ENGINE_PROBE), "--probe", "--prompt-ids",
+               " ".join(str(token) for token in PROMPT)]
+    if targets is not None:
+        command.extend(["--target-tokens", " ".join(str(token) for token in targets)])
+    result = subprocess.run(command, capture_output=True, text=True, env=merged)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "the C++ Engine probe exited " + str(result.returncode) + "\n"
+            + result.stdout + "\n" + result.stderr
+        )
+    return json.loads(result.stdout)
 
 
 def main():
@@ -286,9 +339,47 @@ def main():
     if long_margin < 1.0e-3:
         print("WARNING: the long top two logits are nearly tied (margin < 1e-3)")
 
+    try:
+        full_tokens, full_nll, full_margins, full_seconds = run_full_reference(artifact)
+        probe = run_engine_probe(artifact, environment, full_tokens)
+    except Exception as error:
+        print("FAIL: the full 48-layer measurement failed: " + str(error))
+        return 1
+    engine_tokens = [int(value) for value in probe["tokens"]]
+    engine_nll = [float(value) for value in probe["nll"]]
+    engine_argmax = [int(step["argmax"]) for step in probe["steps"]]
+    full_boundary_mismatches = [
+        index for index in range(FULL_TOKENS)
+        if engine_tokens[index] != full_tokens[index] and full_margins[index] < TOKEN_MARGIN_BOUND
+    ]
+    full_token_mismatches = [
+        index for index in range(FULL_TOKENS)
+        if engine_tokens[index] != full_tokens[index] and full_margins[index] >= TOKEN_MARGIN_BOUND
+    ]
+    full_nll_differences = [
+        abs(full_nll[index] - engine_nll[index]) for index in range(FULL_TOKENS)
+    ]
+    full_nll_mismatches = [
+        index for index in range(FULL_TOKENS) if full_nll_differences[index] > NLL_BOUND
+    ]
+    print("full reference tokens " + " ".join(str(token) for token in full_tokens))
+    print("full reference nll " + " ".join(format(value, ".9g") for value in full_nll))
+    print("full reference margins " + " ".join(format(value, ".9g") for value in full_margins))
+    print("full reference mean nll " + format(float(np.mean(full_nll)), ".9g"))
+    print("full reference time " + format(full_seconds, ".3f") + " s")
+    print("full engine tokens " + " ".join(str(token) for token in engine_tokens))
+    print("full engine argmax " + " ".join(str(token) for token in engine_argmax))
+    print("full engine nll " + " ".join(format(value, ".9g") for value in engine_nll))
+    print("full engine mean nll " + format(float(np.mean(engine_nll)), ".9g"))
+    print("full engine prefill time " + format(probe["timings"]["prefill_seconds"], ".6f") + " s")
+    print("full token parity " + ("OK" if not full_token_mismatches else "FAIL " + str(full_token_mismatches)))
+    print("full boundary divergences " + (str(full_boundary_mismatches) if full_boundary_mismatches else "none"))
+    print("full nll max difference " + format(max(full_nll_differences), ".9g")
+          + " bound " + format(NLL_BOUND, ".9g"))
+
     if (row_mismatches or long_row_mismatches or budget_row_mismatches or short_block_mismatches
             or long_block_mismatches or model_long_mismatches or not pruned or budget_mismatches
-            or not budget_pruned):
+            or not budget_pruned or full_token_mismatches or full_nll_mismatches):
         return 1
     return 0
 

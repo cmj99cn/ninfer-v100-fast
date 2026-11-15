@@ -826,30 +826,36 @@ mixed decode unit and does not retain lanes across requests. The 262144-token pr
 `--kv-capacity 262144` (the native maximum) and, with `--expert-cache-mib auto`, sizes the resident
 expert cache from the memory left after weights, KV/state and workspace. The 8-token prompt
 `{1024, 7, 98140, 33, 4097, 512, 100, 2048}` produces the same greedy continuation through the
-Engine as through the direct 48-layer trunk. For a four-token request: prefill samples `4818`, the
-first decode round `24534`, the second `128386`, and the third `442`.
+Engine as through the direct 48-layer trunk. After the per-QSA-layer residency correction of
+§13.1, a four-token request samples `4818 84666 96991 22024`; the earlier
+`4818 24534 128386 442` sequence was produced while every QSA layer shared one K/V cache and
+therefore decoded eleven of its twelve QSA layers from another layer's history.
 
 ## 11. KV and expert residency geometry
 
 ### 11.1 KV layout
 
 The QSA cache planes are BF16 keys with FP16 values; there is no quantized main cache in this
-package. The indexer keeps its BF16 compressed keys. `TextState` allocates
-`pages_ = capacity / 64 + 1` page slots: the final page is the canonical tail that holds the
-in-progress block, so an exact multiple of 64 tokens still needs one more slot than
-`capacity / 64`. The Variant's `bytes_per_main_page_group` is the **per-rank** TP2 page:
+package. The indexer keeps its BF16 compressed keys. Every one of the 12 QSA layers owns its own
+K/V planes, canonical tail and record scratch: a layer's decode must read that layer's history,
+not the last QSA layer's. `TextState` allocates `pages_ = capacity / 64 + 1` page slots per QSA
+layer; the final page is the canonical tail that holds the in-progress block, so an exact
+multiple of 64 tokens still needs one more slot than `capacity / 64`. The per-rank TP2 page of one
+QSA layer is:
 
-| Plane, per rank and page | Extent | Bytes |
+| Plane, per rank, per QSA layer and page | Extent | Bytes |
 |---|---|---|
 | K keys (BF16) | `256 × 64 × (kv_heads/tp = 1) × 2` | 32,768 |
 | V values (FP16) | same | 32,768 |
 | Index K keys (BF16) | `128 × 16 × (index_kv_heads = 1) × 2` | 4,096 |
-| Per rank and page | | **69,632** |
+| Per rank, layer and page | | **69,632** |
 
-At the native 262144-token capacity this is 4097 pages and 285,282,304 B (≈ 272.1 MiB) of KV
-payload per rank. `MemorySummary::kv_capacity_page_groups` reports the allocated 4097 pages, not
-the `capacity / 64 = 4096` token groups; the Engine preserves the target's own figure instead of
-replacing it with the capacity-curve group count.
+The Variant's `bytes_per_main_page_group` is the per-rank TP2 page across all 12 QSA layers,
+`12 × 69,632 = 835,584` B. At the native 262144-token capacity this is 4097 pages,
+285,282,304 B (≈ 272.1 MiB) per QSA layer and 3,423,691,940 B per rank for the K/V planes, tails
+and record scratch together. `MemorySummary::kv_capacity_page_groups` reports the allocated 4097
+pages per layer, not the `capacity / 64 = 4096` token groups; the Engine preserves the target's own
+figure instead of replacing it with the capacity-curve group count.
 
 ### 11.2 GDN state
 
@@ -881,16 +887,20 @@ Measured on 2 × Tesla V100-SXM2 32 GB, FP16 text activations, `--kv-capacity 26
 | Account, per rank | Bytes |
 |---|---|
 | Dense/control weights (including the FP16 control replacement buffer) | 5,347,210,752 |
-| KV payload (4097 pages) | 285,282,304 |
-| GDN conv + recurrent state | 57,729,024 |
-| Workspace + activation arenas | remainder of the plan |
+| KV payload (4097 pages × 12 QSA layers, tails and record scratch) | 3,423,691,940 |
+| Sequence arena (KV + GDN + per-request state) | 3,504,977,572 |
+| GDN state reported by `memory_summary()` | 78,938,112 |
+| Workspace arena | 1,307,885,568 |
 | Expert cache, automatic | 16,204,565,180 |
-| Process device use, automatic profile | ≈ 23.85 GB |
-| Process device use, 700 MiB expert cache | ≈ 8.38 GB |
+| Process device use, automatic profile | 30,124,670,976 |
+| Process device use, 700 MiB expert cache | 14,653,980,672 |
 
 The host-side figure in `MemorySummary` is the process peak RSS; the artifact volumes are memory
-mapped, so only touched pages count. The full-model acceptance run peaked around 13.6 GB of host
-RSS.
+mapped, so only touched pages count. The full-model acceptance run measured 13,498,761,216 B of
+host RSS. The automatic profile leaves about 1.9 GiB of the 32 GiB device below the plan's
+reservation; the automatic expert cache still fits its 16.2 GB target, so its pair capacity is
+unchanged, but the 12-layer KV residency is now part of the startup account against which an
+explicit `--expert-cache-mib` budget is checked.
 
 ## 12. Provenance
 
@@ -958,3 +968,90 @@ Engine route always loads the full 48 layers.
     bit-for-bit, and the QSA top-512 boundary is discontinuous; these are implementation-profile
     differences, not semantic differences.
 - The tokenizer is outside M2: the test feeds token ids directly.
+
+### 13.1 M4 full-model speed and quality measurements
+
+Measured on 2 × Tesla V100-SXM2 32 GB, `sm_70`, CUDA 12.8, NCCL 12.8, tensor-parallel width 2,
+eager decode, from the artifact
+`/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer`. The speed driver is
+`tools/bench/run_flash_next_bench.py`, which invokes
+`build/tests/ninfer_flash_next_engine_bench`; that binary calls only the public `Engine` API. The
+quality driver is `tests/targets/qwen3_8_flash_next/test_reference_parity.py` against
+`tools/reference/qwen3_8_flash_next` in its 48-layer mode. All prompts are raw token ids; the
+tokenizer is outside this milestone.
+
+**48-layer parity and NLL.** The canonical 8-token prompt
+`{1024, 7, 98140, 33, 4097, 512, 100, 2048}`:
+
+| Step | Reference greedy | Reference NLL | Reference top-2 margin | Engine greedy | C++ NLL of the reference token |
+|---|---|---|---|---|---|
+| 0 | 144389 | 9.18585628 | 0.0861407068 | 4818 | 9.68033919 |
+| 1 | 114118 | 6.06655661 | 0.420280786 | 84666 | 5.81066829 |
+| 2 | 6361 | 7.92432541 | 0.0410926689 | 96991 | 8.34643259 |
+| 3 | 237099 | 7.91240608 | 0.212687346 | 22024 | 8.25426571 |
+| 4 | 63771 | 8.34589121 | 0.298710259 | 55993 | 9.28163012 |
+| 5 | 94918 | 9.33204020 | 0.0762629217 | 1051 | 9.44047384 |
+| 6 | 89275 | 8.70678878 | 0.142694319 | 94135 | 9.11335891 |
+| 7 | 80816 | 7.95790514 | 0.0812308532 | 55993 | 8.62171247 |
+
+The reference run took `1848.908` s for its eight full-sequence forwards; the Engine prefill of
+the same prompt took `2.919` s. Reference mean NLL is `8.17897121`, C++ mean NLL of the same
+eight reference tokens is `8.56861014`; the per-step difference has mean `0.38964` and maximum
+`0.93574`. The acceptance bound is `1.0` nat, which covers the measured 48-layer implementation
+profile: over the same nine-token prefill the reference and C++ logits have RMS difference
+`0.14157`, maximum absolute difference `0.79774` and correlation `0.97626`. The reference's
+top-two margin is below `0.8` at all eight steps (maximum `0.4203`), so greedy token equality is
+not a stable criterion on this prompt. The parity test therefore requires an exact token match
+only where the reference margin is at least `0.8` and reports every other divergence as a boundary
+event. There are no above-bound mismatches; all eight steps are boundary events. The NLL
+agreement, not the argmax of a flat distribution, is the quality evidence. This is an
+eight-token, single-prompt sample and is not a corpus-level quality result.
+
+The first 48-layer run exposed a real defect rather than a tolerance issue: `TextState` kept one
+QSA K/V plane and one canonical tail shared by all 12 QSA layers. Prefill is correct because each
+layer consumes its own K/V before the next layer overwrites the plane; decode is not, because the
+next round reads the planes left by the last QSA layer. In an 8-layer reduced stack (QSA layers 3
+and 7) the layer-3 mixer differed from an expanded prefill by `1.08` while layers 0-2 matched
+exactly; the 4-layer stack (one QSA layer) matched. The correction gives every QSA layer its own
+K/V planes, tail and tail publishing slot, and multiplies the Variant's KV page-group account by
+the 12 QSA layers. The full model's prefill and decode now agree; the four-token Engine sequence
+after the correction is `4818 84666 96991 22024`.
+
+**Speed.** Single request, greedy, `expert_cache_mib=0` (auto), `kv_capacity=262144`,
+`prefill_chunk=1024`, 32 requested output tokens (31 committed decode tokens). The token-id
+corpus cycles the same eight-token prompt to the requested occupancy. Warm state: one untimed
+warmup per case, then two measured repetitions; the hit rate is the mean and the miss bytes are
+the two-repetition total. `occupied` is prompt tokens plus the requested decode tokens.
+
+| Occupied | Prompt | Decode | Committed tok/s | TTFT (ms) | Expert hit rate | Miss bytes | Prefill tok/s |
+|---|---|---|---|---|---|---|---|
+| 544 | 512 | 32 | 0.814 | 5389.4 | 99.995% | 2,764,800 | 95.0 |
+| 3,732 | 3,700 | 32 | 0.758 | 36398.6 | 98.326% | 1,186,099,200 | 101.6 |
+| 15,032 | 15,000 | 32 | 0.749 | 151467.1 | 99.599% | 528,076,800 | 99.0 |
+| 59,032 | 59,000 | 32 | 0.718 | 623751.1 | 99.973% | 102,297,600 | 94.6 |
+
+`committed tok/s` is committed decode tokens divided by `GenerationTimings::decode_seconds`;
+TTFT is `first_token_seconds`; prefill tok/s is prompt tokens divided by `prefill_seconds`. MTP is
+outside this milestone, so acceptance is N/A and every reported token is a committed target token.
+The measured decode is about `0.72-0.81` tok/s and prefill about `95-102` tok/s; this is a
+batch-1, eager, no-MTP measurement of the full 48-layer package and is far below the 27B
+NVFP4 release profile. No flash-next speed gate exists, so this table is a measurement, not a
+release acceptance.
+
+**Memory.** §11.3 records the corrected per-rank account: automatic expert cache
+`16,204,565,180` B, KV/state `3,423,691,940` B, process device use `30,124,670,976` B, and
+`13,498,761,216` B peak host RSS. The automatic warm 8-token run reports `1799/1799` expert
+lookups as hits with zero miss bytes. The 700 MiB explicit cache measures
+`14,653,980,672` B of device use.
+
+**Limitations.**
+
+- The reference NLL is eight tokens on one token-id prompt. It is a smoke-quality number, not a
+  corpus evaluation; no tokenizer, chat template, or benchmark corpus is part of M4.
+- Greedy token equality is reported only above the reference `0.8` top-two margin. The model's
+  distributions on this prompt are flat (margins `0.04-0.42`), and the reference FP64/BF16
+  evaluation versus the product FP16 activation profile produces a measured `0.80` maximum logit
+  difference over 48 layers. The table's token differences are boundary events under that bound.
+- The speed table is eager, batch 1, without MTP. It does not support a claim about MTP or
+  concurrent serving.
+- The earlier §10.1 token list predates the per-QSA-layer correction and is superseded above.

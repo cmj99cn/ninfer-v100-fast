@@ -43,6 +43,14 @@ class FlashNextConfig:
     ple_gate_floor: float = 1.0e-6
     eos_token_id: int = 248044
 
+    @classmethod
+    def full(cls) -> "FlashNextConfig":
+        return cls(layers=cls.full_layers)
+
+    @property
+    def is_full(self) -> bool:
+        return self.layers == self.full_layers
+
     @property
     def residual_width(self) -> int:
         return self.hidden * self.hc_streams

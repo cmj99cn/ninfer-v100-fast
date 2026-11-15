@@ -278,7 +278,7 @@ std::size_t gdn_state_signature(const rt::TextState& state) {
 }
 
 std::size_t tail_signature(const rt::TextState& state) {
-    const ops::ConstQsaTailStateView tail = state.const_tail();
+    const ops::ConstQsaTailStateView tail = state.const_tail(0);
     std::vector<std::byte> keys(tail.raw_keys.bytes());
     std::vector<std::byte> rope(tail.first_rope.bytes());
     CUDA_CHECK(cudaMemcpy(keys.data(), tail.raw_keys.data, keys.size(), cudaMemcpyDeviceToHost));

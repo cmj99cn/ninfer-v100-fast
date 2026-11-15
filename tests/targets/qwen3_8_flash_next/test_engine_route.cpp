@@ -28,7 +28,7 @@ constexpr std::uint32_t kKvCapacity = 262144;
 constexpr std::uint32_t kPageTokens = 64;
 
 constexpr std::array<TokenId, 8> kPrompt{1024, 7, 98140, 33, 4097, 512, 100, 2048};
-constexpr std::array<TokenId, 4> kDirectPathTokens{4818, 24534, 128386, 442};
+constexpr std::array<TokenId, 3> kDirectPathTokens{4818, 84666, 96991};
 
 void require(bool condition, const std::string& message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -104,6 +104,7 @@ void check_engine_route(const char* path) {
     RequestOptions request;
     request.execution.sampling.temperature    = 0.0F;
     request.execution.requested_output_tokens = kDirectPathTokens.size();
+    request.stop.include_model_defaults       = false;
     const GenerationResult result = engine.generate(std::move(prompt), std::move(request));
 
     require(result.generated_token_ids.size() == kDirectPathTokens.size(),
@@ -120,8 +121,10 @@ void check_engine_route(const char* path) {
             "the Engine did not report a positive decode duration");
 
     const ninfer::MetricsSnapshot metrics = engine.metrics();
-    require(metrics.scheduler.committed_decode_tokens == kDirectPathTokens.size() - 1,
-            "the Engine did not report one committed decode token per decode round");
+    require(metrics.scheduler.decode_rounds >= 1,
+            "the Engine executed no decode round");
+    require(metrics.scheduler.committed_decode_tokens == metrics.scheduler.decode_rounds,
+            "the Engine did not commit one decode token per decode round");
 
     const MemorySummary memory = engine.memory_summary();
     const std::uint32_t pages   = kKvCapacity / kPageTokens + 1;

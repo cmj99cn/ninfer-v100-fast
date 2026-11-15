@@ -111,6 +111,7 @@ void ProgramImplCore::clear_lane(std::uint32_t lane) noexcept {
 
 void ProgramImplCore::prefill_chunk(LaneState& state, std::uint32_t begin, std::uint32_t count) {
     const std::span<const TokenId> chunk{state.context.prompt_tokens.data() + begin, count};
+    last_stage_capture() = &logits_capture_;
     const TokenId sampled = trunk_->prefill(chunk);
     if (begin + count == state.context.prompt_tokens.size()) {
         state.context.next_input = sampled;
@@ -209,6 +210,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     const std::uint32_t chunk = std::min(plan_->prefill_chunk,
                                          static_cast<std::uint32_t>(tokens.size()));
     const auto prefill_start = std::chrono::steady_clock::now();
+    last_stage_capture() = &logits_capture_;
     const TokenId sampled = trunk_->prefill(std::span<const TokenId>{tokens.data(), chunk});
     const double prefill_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_start).count();
@@ -295,6 +297,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
     for (const std::uint32_t lane : lanes) {
         LaneState& state         = lanes_[lane];
         const auto decode_start  = std::chrono::steady_clock::now();
+        last_stage_capture() = &logits_capture_;
         const TokenId token      = trunk_->decode(state.context.next_input);
         state.timings.decode_seconds +=
             std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
@@ -483,10 +486,8 @@ CapacitySnapshot ProgramImplCore::capacity_snapshot() const noexcept {
 }
 
 void ProgramImplCore::enable_logits_capture(bool enabled) {
-    if (enabled) {
-        throw std::logic_error(
-            "qwen4_exp text state does not implement logits capture");
-    }
+    logits_capture_.enabled = enabled;
+    if (!enabled) { logits_capture_.words.clear(); }
 }
 
 void ProgramImplCore::reset_memory_peaks() noexcept {}

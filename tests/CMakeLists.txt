@@ -153,6 +153,18 @@ target_include_directories(ninfer_flash_next_engine_route_test PRIVATE
   ${PROJECT_SOURCE_DIR}/apps/cli)
 target_link_libraries(ninfer_flash_next_engine_route_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_flash_next_engine_route_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Public-Engine probe and speed driver for the full-model measurements. It is a re-runnable host
+# tool rather than a ctest case: the quality probe is launched by the reference parity script and
+# the speed cases by tools/bench/run_flash_next_bench.py.
+add_executable(ninfer_flash_next_engine_bench
+  ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_engine_bench.cpp)
+target_include_directories(ninfer_flash_next_engine_bench PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party
+  ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(ninfer_flash_next_engine_bench PRIVATE ninfer_engine CUDA::cudart)
 # Host-only: no artifact, no device. Byte-level TP2 shard slice geometry per storage layout.
 ninfer_add_test(ninfer_tensor_slice_test
   SOURCES test_tensor_slice.cpp

@@ -131,7 +131,7 @@ namespace {
 
 namespace rt = ninfer::targets::qwen4_exp::detail::flash_next_full_model_test_runtime;
 
-static_assert(detail::Variant::bytes_per_main_page_group == 69632);
+static_assert(detail::Variant::bytes_per_main_page_group == 835584);
 
 struct RunOutput {
     std::array<TokenId, 3> tokens{};
