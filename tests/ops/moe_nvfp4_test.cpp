@@ -527,7 +527,8 @@ int run_route_case(const Case& inputs, std::size_t token, const std::string& lab
     GuardedDeviceBuffer coefficients_buffer(kTopK * sizeof(float));
     GuardedDeviceBuffer shared_gate_buffer(sizeof(float));
 
-    Tensor x{to_device_bf16(inputs.activation[token]).p, DType::BF16, {kHidden, 1}};
+    DeviceBuffer device_x = to_device_bf16(inputs.activation[token]);
+    Tensor x{device_x.p, DType::BF16, {kHidden, 1}};
     Tensor ids{ids_buffer.data(), DType::I32, {kTopK, 1}};
     Tensor coefficients{coefficients_buffer.data(), DType::FP32, {kTopK, 1}};
     Tensor shared_gate{shared_gate_buffer.data(), DType::FP32, {1, 1}};
@@ -541,7 +542,37 @@ int run_route_case(const Case& inputs, std::size_t token, const std::string& lab
     ops::moe_nvfp4_route(x, weights, ids, coefficients, shared_gate, 0);
     cuda_synchronize();
 
+    GuardedDeviceBuffer split_ids_buffer(kTopK * sizeof(std::int32_t));
+    GuardedDeviceBuffer split_coefficients_buffer(kTopK * sizeof(float));
+    GuardedDeviceBuffer split_shared_gate_buffer(sizeof(float));
+    DeviceBuffer split_logits((kExperts + 1) * sizeof(float));
+    Tensor split_ids{split_ids_buffer.data(), DType::I32, {kTopK, 1}};
+    Tensor split_coefficients{split_coefficients_buffer.data(), DType::FP32, {kTopK, 1}};
+    Tensor split_shared_gate{split_shared_gate_buffer.data(), DType::FP32, {1, 1}};
+    ops::moe_nvfp4_route(x, weights, split_ids, split_coefficients, split_shared_gate, 0,
+                         static_cast<float*>(split_logits.p));
+    cuda_synchronize();
+
     int failures = 0;
+    if (from_device<std::uint32_t>(ids_buffer.data(), kTopK) !=
+        from_device<std::uint32_t>(split_ids_buffer.data(), kTopK)) {
+        std::cerr << label << ": the row-split route ids are not bitwise identical\n";
+        ++failures;
+    }
+    if (from_device<std::uint32_t>(coefficients_buffer.data(), kTopK) !=
+        from_device<std::uint32_t>(split_coefficients_buffer.data(), kTopK)) {
+        std::cerr << label << ": the row-split route coefficients are not bitwise identical\n";
+        ++failures;
+    }
+    if (from_device<std::uint32_t>(shared_gate_buffer.data(), 1) !=
+        from_device<std::uint32_t>(split_shared_gate_buffer.data(), 1)) {
+        std::cerr << label << ": the row-split shared gate is not bitwise identical\n";
+        ++failures;
+    }
+    failures += split_ids_buffer.verify_guards(label + " split ids guard");
+    failures += split_coefficients_buffer.verify_guards(label + " split coefficients guard");
+    failures += split_shared_gate_buffer.verify_guards(label + " split shared gate guard");
+
     const std::vector<std::int32_t> got_ids = from_device<std::int32_t>(ids_buffer.data(), kTopK);
     for (std::int32_t rank = 0; rank < kTopK; ++rank) {
         if (got_ids[static_cast<std::size_t>(rank)] != oracle.ids[static_cast<std::size_t>(rank)]) {

@@ -218,7 +218,8 @@ std::size_t moe_nvfp4_workspace_capacity_bytes(std::int32_t min_tokens, std::int
 }
 
 void moe_nvfp4_route(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& expert_ids,
-                     Tensor& coefficients, Tensor& shared_gate, cudaStream_t stream) {
+                     Tensor& coefficients, Tensor& shared_gate, cudaStream_t stream,
+                     float* route_logits) {
     const std::int32_t tokens = require_tokens(x, "x");
     require_output(expert_ids, DType::I32, kTopK, tokens, "expert_ids");
     require_output(coefficients, DType::FP32, kTopK, tokens, "coefficients");
@@ -237,7 +238,7 @@ void moe_nvfp4_route(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& ex
         static_cast<std::int32_t*>(expert_ids.data),
         static_cast<float*>(coefficients.data),
         static_cast<float*>(shared_gate.data)};
-    detail::moe_nvfp4_route_launch(x, weights.router_shared.qdata, outputs, stream);
+    detail::moe_nvfp4_route_launch(x, weights.router_shared.qdata, outputs, route_logits, stream);
 }
 
 void moe_routed_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& destination,
@@ -263,7 +264,7 @@ void moe_routed_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& d
     const DeviceSpan span = workspace.alloc_bytes(required, 256);
     const detail::MoeNvfp4RouteOutputs outputs = route_outputs(static_cast<std::uint8_t*>(span.data), tokens);
 
-    detail::moe_nvfp4_route_launch(x, weights.router_shared.qdata, outputs, stream);
+    detail::moe_nvfp4_route_launch(x, weights.router_shared.qdata, outputs, nullptr, stream);
     detail::moe_nvfp4_grouped_launch(x, planes_of(weights.routed_gate_up),
                                      planes_of(weights.routed_down), outputs,
                                      weights.routed_gate_up.expert_begin,

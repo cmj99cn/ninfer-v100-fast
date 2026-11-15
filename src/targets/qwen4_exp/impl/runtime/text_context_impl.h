@@ -883,10 +883,17 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
             Tensor route_ids = activations_[slot]->alloc(DType::I32, {top_k, T});
             Tensor route_coefficients = activations_[slot]->alloc(DType::FP32, {top_k, T});
             Tensor route_gate = activations_[slot]->alloc(DType::FP32, {T});
+            Tensor route_logits =
+                T == 1 ? activations_[slot]->alloc(DType::FP32, {TextConfig::experts + 1, T})
+                       : Tensor{};
             ops::moe_nvfp4_route(block_input[slot], models_[slot]->layers[layer].post_mixer,
-                                 route_ids, route_coefficients, route_gate, stream_for(rank));
+                                 route_ids, route_coefficients, route_gate, stream_for(rank),
+                                 T == 1 ? static_cast<float*>(route_logits.data) : nullptr);
             NINFER_QWEN4EXP_DIAG_MARK("route");
             routes[slot] = ops::MoeNvfp4RouteView{route_ids, route_coefficients, route_gate};
+        });
+        for_each_rank([&](int rank) {
+            const auto slot = static_cast<std::size_t>(rank);
             NINFER_QWEN4EXP_EXPERT_READ_BEGIN(layer);
             Variant::post_mixer_routed(block_input[slot],
                                        models_[slot]->layers[layer].post_mixer, routes[slot],

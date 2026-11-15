@@ -178,7 +178,7 @@ namespace {
 
 namespace rt = ninfer::targets::qwen4_exp::detail::flash_next_phase_profile_runtime;
 
-void run(const char* path, std::uint32_t prompt_tokens) {
+void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tokens) {
     ExecutionContext execution({0, 1});
     artifact::Reader reader(path);
     artifact::Binder binder(reader, 2);
@@ -240,6 +240,8 @@ void run(const char* path, std::uint32_t prompt_tokens) {
     }
     for (std::uint32_t rank = 0; rank < kRanks; ++rank) { execution.dev[rank]->synchronize(); }
     const double prefill_ms = static_cast<double>(now_ns() - prefill_begin) / 1.0e6;
+    for (std::uint32_t index = 0; index < warmup_tokens; ++index) { token = trunk.decode(token); }
+    for (std::uint32_t rank = 0; rank < kRanks; ++rank) { execution.dev[rank]->synchronize(); }
     const detail::CacheStats warm = data.expert_cache_stats(0);
 
     init_pools();
@@ -268,6 +270,7 @@ void run(const char* path, std::uint32_t prompt_tokens) {
     std::cout << "  \"artifact\": \"" << path << "\",\n";
     std::cout << "  \"prompt_tokens\": " << prompt_tokens << ",\n";
     std::cout << "  \"decode_tokens\": " << kDecodeTokens << ",\n";
+    std::cout << "  \"warmup_tokens\": " << warmup_tokens << ",\n";
     std::cout << "  \"prefill_ms\": " << prefill_ms << ",\n";
     std::cout << "  \"cold_misses\": " << (warm.miss_count - cold.miss_count) << ",\n";
     std::cout << "  \"tokens\": [\n";
@@ -323,8 +326,10 @@ int main(int argc, char** argv) {
     }
     std::uint32_t prompt_tokens = kForwardTokens;
     if (argc > 2) { prompt_tokens = static_cast<std::uint32_t>(std::stoul(argv[2])); }
+    std::uint32_t warmup_tokens = 0;
+    if (argc > 3) { warmup_tokens = static_cast<std::uint32_t>(std::stoul(argv[3])); }
     try {
-        run(path, prompt_tokens);
+        run(path, prompt_tokens, warmup_tokens);
     } catch (const std::exception& error) {
         std::cerr << "flash_next_phase_profile: " << error.what() << '\n';
         return 1;

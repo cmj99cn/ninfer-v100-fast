@@ -1,6 +1,7 @@
 #include "targets/qwen3_8_flash_next/impl/load/expert_runtime.h"
 
 #include "core/device.h"
+#include "ops/moe_nvfp4/moe_nvfp4_launch.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -27,6 +28,10 @@ private:
     int previous_ = 0;
 };
 
+constexpr std::int32_t kExperts      = TextConfig::experts;
+constexpr std::int32_t kTopK         = TextConfig::experts_per_token;
+constexpr std::size_t kLookupEntries = static_cast<std::size_t>(kTextLayers) * kExperts;
+
 } // namespace
 
 ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int device,
@@ -34,16 +39,22 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
                              std::uint64_t available_bytes, qwen4_exp::TextResidentStats* stats)
     : device_(device), expert_begin_(expert_begin), stats_(stats),
       source_(artifact_path, kPairBytes),
-      cache_(options, kPairBytes, available_bytes, source_),
-      host_lookup_(static_cast<std::size_t>(TextConfig::experts), -1),
-      host_divisors_(static_cast<std::size_t>(cache_.slots()) * 3, 0.0F) {
+      cache_(options, kPairBytes, available_bytes, source_) {
     const ScopedDevice scope(device_);
     slab_    = DeviceBuffer(static_cast<std::size_t>(cache_.plan().bytes));
-    lookup_  = DeviceBuffer(static_cast<std::size_t>(TextConfig::experts) * 4);
+    lookup_  = DeviceBuffer(kLookupEntries * 4);
     divisors_ = DeviceBuffer(static_cast<std::size_t>(cache_.slots()) * 3 * 4);
     activation_scratch_ = DeviceBuffer(
-        static_cast<std::size_t>(TextConfig::experts_per_token) *
+        static_cast<std::size_t>(kTopK) *
         static_cast<std::size_t>(TextConfig::expert_intermediate) * sizeof(float));
+    lookup_host_ = std::make_unique<PinnedHostBuffer>(kLookupEntries * 4);
+    probe_host_  = std::make_unique<PinnedHostBuffer>((static_cast<std::size_t>(kExperts) + 1) * 4);
+    probe_ids_host_   = static_cast<std::int32_t*>(probe_host_->data());
+    probe_count_host_ = probe_ids_host_ + kExperts;
+    void* probe_dev = nullptr;
+    CUDA_CHECK(cudaHostGetDevicePointer(&probe_dev, probe_host_->data(), 0));
+    probe_ids_dev_   = static_cast<std::int32_t*>(probe_dev);
+    probe_count_dev_ = probe_ids_dev_ + kExperts;
     for (auto& staging : staging_) {
         staging = std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(kPairBytes));
     }
@@ -51,7 +62,10 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
         CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     }
     CUDA_CHECK(cudaEventCreateWithFlags(&copy_done_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&probe_done_, cudaEventDisableTiming));
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
+    refresh_lookup();
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
     if (stats_ != nullptr) {
         stats_->expert_cache_bytes = cache_bytes();
         stats_->expert_scratch_bytes = scratch_bytes();
@@ -63,6 +77,7 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
 ExpertRuntime::~ExpertRuntime() {
     const ScopedDevice scope(device_);
     if (copy_stream_ != nullptr) { (void)cudaStreamDestroy(copy_stream_); }
+    if (probe_done_ != nullptr) { (void)cudaEventDestroy(probe_done_); }
     if (copy_done_ != nullptr) { (void)cudaEventDestroy(copy_done_); }
     for (cudaEvent_t& event : stage_ready_) {
         if (event != nullptr) { (void)cudaEventDestroy(event); }
@@ -81,11 +96,24 @@ void ExpertRuntime::launch_pull(std::uint32_t layer, std::uint32_t expert, std::
                                staging.data(), kPairBytes, cudaMemcpyHostToDevice, copy_stream_));
     float divisors[3]{};
     source_.read_divisors(layer, global, divisors);
-    std::memcpy(host_divisors_.data() + static_cast<std::size_t>(slot) * 3, divisors,
-                sizeof(divisors));
     CUDA_CHECK(cudaMemcpyAsync(static_cast<float*>(divisors_.p) + static_cast<std::size_t>(slot) * 3,
                                divisors, sizeof(divisors), cudaMemcpyHostToDevice, copy_stream_));
     CUDA_CHECK(cudaEventRecord(stage_ready_[stage], copy_stream_));
+    CUDA_CHECK(cudaEventRecord(copy_done_, copy_stream_));
+}
+
+void ExpertRuntime::refresh_lookup() {
+    auto* table = static_cast<std::int32_t*>(lookup_host_->data());
+    std::fill(table, table + kLookupEntries, -1);
+    for (std::uint32_t layer = 0; layer < kTextLayers; ++layer) {
+        std::int32_t* row = table + static_cast<std::size_t>(layer) * kExperts + expert_begin_;
+        for (std::uint32_t expert = 0; expert < kRankExperts; ++expert) {
+            const std::int32_t slot = cache_.resident_slot(layer, expert);
+            if (slot >= 0) { row[expert] = slot; }
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(lookup_.p, table, kLookupEntries * 4, cudaMemcpyHostToDevice,
+                               copy_stream_));
     CUDA_CHECK(cudaEventRecord(copy_done_, copy_stream_));
 }
 
@@ -93,66 +121,67 @@ void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
                            const ops::MoeNvfp4RouteView& route, Tensor& destination,
                            cudaStream_t stream) {
     const ScopedDevice scope(device_);
-    const std::int32_t top_k  = TextConfig::experts_per_token;
     const std::int32_t tokens = route.expert_ids.ne[1];
     if (tokens < 1) { return; }
 
-    host_ids_.resize(static_cast<std::size_t>(top_k) * tokens);
-    CUDA_CHECK(cudaMemcpyAsync(host_ids_.data(), route.expert_ids.data,
-                               host_ids_.size() * 4, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::vector<std::pair<std::uint32_t, std::int32_t>> needed;
-    std::vector<bool> seen(static_cast<std::size_t>(kRankExperts), false);
     const std::int32_t expert_begin = static_cast<std::int32_t>(expert_begin_);
     const std::int32_t expert_end   = expert_begin + static_cast<std::int32_t>(kRankExperts);
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        for (std::int32_t slot = 0; slot < top_k; ++slot) {
-            const std::int32_t global = host_ids_[static_cast<std::size_t>(slot) + top_k * token];
-            if (global < expert_begin || global >= expert_end) { continue; }
-            const auto local = static_cast<std::uint32_t>(global - expert_begin);
-            if (seen[local]) { continue; }
-            seen[local] = true;
-            needed.emplace_back(local, global);
-        }
+    const auto* table_row = static_cast<const std::int32_t*>(lookup_.p) +
+                            static_cast<std::size_t>(layer) * kExperts;
+
+    ops::detail::moe_nvfp4_route_unique_launch(
+        static_cast<const std::int32_t*>(route.expert_ids.data), kTopK * tokens, probe_ids_dev_,
+        probe_count_dev_, stream);
+    CUDA_CHECK(cudaEventRecord(probe_done_, stream));
+    CUDA_CHECK(cudaEventSynchronize(probe_done_));
+
+    const std::int32_t active_count = *probe_count_host_;
+    std::vector<std::pair<std::uint32_t, std::int32_t>> needed;
+    bool any_missing = false;
+    for (std::int32_t index = 0; index < active_count; ++index) {
+        const std::int32_t global = probe_ids_host_[index];
+        if (global < expert_begin || global >= expert_end) { continue; }
+        const auto local = static_cast<std::uint32_t>(global - expert_begin);
+        needed.emplace_back(local, global);
+        if (cache_.resident_slot(layer, local) < 0) { any_missing = true; }
     }
 
-    const std::uint32_t slots = cache_.slots();
-    if (needed.size() > slots) {
-        throw std::logic_error("one layer selected more experts than the cache can hold");
-    }
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> protected_pairs;
-    std::uint32_t missing = 0;
-    for (const auto& [local, global] : needed) {
-        if (cache_.resident_slot(layer, local) >= 0) {
-            protected_pairs.emplace_back(layer, local);
-        } else {
-            ++missing;
-        }
-    }
-    cache_.reserve(missing, protected_pairs);
-
-    std::fill(host_lookup_.begin(), host_lookup_.end(), -1);
     bool copied = false;
-    for (const auto& [local, global] : needed) {
-        std::int32_t slot = cache_.resident_slot(layer, local);
-        if (slot < 0) {
-            slot = static_cast<std::int32_t>(cache_.load(layer, local));
-            launch_pull(layer, local, static_cast<std::uint32_t>(slot));
-            copied = true;
-        } else {
-            (void)cache_.find(layer, local);
+    if (!any_missing) {
+        cache_.record_resident_lookups(static_cast<std::uint64_t>(needed.size()));
+    } else {
+        if (needed.size() > cache_.slots()) {
+            throw std::logic_error("one layer selected more experts than the cache can hold");
         }
-        host_lookup_[static_cast<std::size_t>(global)] = slot;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> protected_pairs;
+        std::uint32_t missing = 0;
+        for (const auto& [local, global] : needed) {
+            if (cache_.resident_slot(layer, local) >= 0) {
+                protected_pairs.emplace_back(layer, local);
+            } else {
+                ++missing;
+            }
+        }
+        cache_.reserve(missing, protected_pairs);
+        for (const auto& [local, global] : needed) {
+            std::int32_t slot = cache_.resident_slot(layer, local);
+            if (slot < 0) {
+                slot = static_cast<std::int32_t>(cache_.load(layer, local));
+                launch_pull(layer, local, static_cast<std::uint32_t>(slot));
+            } else {
+                (void)cache_.find(layer, local);
+            }
+        }
+        refresh_lookup();
+        copied = true;
     }
     if (copied) { CUDA_CHECK(cudaStreamWaitEvent(stream, copy_done_, 0)); }
-    CUDA_CHECK(cudaMemcpyAsync(lookup_.p, host_lookup_.data(), host_lookup_.size() * 4,
-                               cudaMemcpyHostToDevice, stream));
+
     const ops::MoeNvfp4ExpertSlots bank{
         .payload    = static_cast<const std::uint8_t*>(slab_.p),
         .slot_bytes = kPairBytes,
         .slot_count = static_cast<std::int32_t>(cache_.slots()),
-        .lookup     = static_cast<const std::int32_t*>(lookup_.p),
+        .lookup     = table_row,
         .divisors   = static_cast<const float*>(divisors_.p),
     };
     const ops::MoeNvfp4ExpertScratch scratch{

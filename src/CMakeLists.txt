@@ -251,6 +251,7 @@ add_library(ninfer_ops STATIC
   ops/moe_nvfp4/route.cu
   ops/moe_nvfp4/grouped.cu
   ops/moe_nvfp4/shared.cu
+  ops/moe_nvfp4/route_unique.cu
   ops/moe_nvfp4/moe_nvfp4.cpp
   ops/ple/hash.cpp
   ops/ple/lookup.cu

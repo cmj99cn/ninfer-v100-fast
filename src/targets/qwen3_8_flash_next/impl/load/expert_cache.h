@@ -98,6 +98,7 @@ public:
 
     [[nodiscard]] std::optional<std::uint32_t> find(std::uint32_t layer, std::uint32_t expert) noexcept;
     [[nodiscard]] std::int32_t resident_slot(std::uint32_t layer, std::uint32_t expert) const noexcept;
+    void record_resident_lookups(std::uint64_t count) noexcept;
     void reserve(std::uint32_t count,
                  const std::vector<std::pair<std::uint32_t, std::uint32_t>>& protected_pairs);
     [[nodiscard]] std::uint32_t load(std::uint32_t layer, std::uint32_t expert);

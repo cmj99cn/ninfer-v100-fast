@@ -154,8 +154,9 @@ inline void flash_next_tp2_record_qsa(const Tensor& index_query,
 
 inline void flash_next_tp2_record_route(const Tensor& x, const MoeNvfp4Weights& weights,
                                         Tensor& expert_ids, Tensor& coefficients,
-                                        Tensor& shared_gate, cudaStream_t stream) {
-    moe_nvfp4_route(x, weights, expert_ids, coefficients, shared_gate, stream);
+                                        Tensor& shared_gate, cudaStream_t stream,
+                                        float* route_logits = nullptr) {
+    moe_nvfp4_route(x, weights, expert_ids, coefficients, shared_gate, stream, route_logits);
     if (!::g_recording) { return; }
     const int device = ::current_device();
     if (cudaStreamSynchronize(stream) != cudaSuccess) {

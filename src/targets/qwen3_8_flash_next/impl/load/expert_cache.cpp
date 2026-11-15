@@ -314,6 +314,11 @@ void ExpertCache::reserve(
     }
 }
 
+void ExpertCache::record_resident_lookups(std::uint64_t count) noexcept {
+    stats_.lookups += count;
+    stats_.hits += count;
+}
+
 std::optional<std::uint32_t> ExpertCache::find(std::uint32_t layer, std::uint32_t expert) noexcept {
     ++stats_.lookups;
     const auto slot = slot_of_[key(layer, expert)];
