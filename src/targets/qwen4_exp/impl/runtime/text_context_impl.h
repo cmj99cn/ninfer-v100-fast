@@ -822,6 +822,13 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
         workspace_ptrs[static_cast<std::size_t>(rank)] = workspaces_[static_cast<std::size_t>(rank)];
     }
 
+    if (T == 1) {
+        for_each_rank([&](int rank) {
+            const auto slot = static_cast<std::size_t>(rank);
+            Variant::post_mixer_prefetch(models_[slot]->layers[0].post_mixer, stream_for(rank));
+        });
+    }
+
     for (std::uint32_t layer = 0;
          layer < static_cast<std::uint32_t>(models_[0]->loaded_layers); ++layer) {
         std::array<std::optional<DeviceArena::Scope>, kMaximumDevices> layer_activation_scopes;

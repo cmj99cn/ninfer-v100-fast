@@ -60,6 +60,7 @@ struct PostMixerLeaf {
     static void routed(const Tensor& hidden, const MoeWeights& weights,
                        const ops::MoeNvfp4RouteView& route, Tensor& destination,
                        cudaStream_t stream);
+    static void prefetch(const MoeWeights& weights, cudaStream_t stream);
     static void shared(const Tensor& hidden, const MoeWeights& weights,
                        const ops::MoeNvfp4RouteView& route, Tensor& destination,
                        cudaStream_t stream);

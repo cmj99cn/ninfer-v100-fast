@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/host_worker_pool.h"
 #include "core/tensor.h"
 #include "ninfer/ops/moe_nvfp4.h"
 #include "targets/qwen3_8_flash_next/impl/load/expert_cache.h"
@@ -9,9 +10,13 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <memory>
+#include <mutex>
+#include <utility>
 #include <vector>
 
 namespace ninfer::targets::qwen3_8_flash_next::detail {
@@ -30,6 +35,7 @@ public:
 
     void routed(std::uint32_t layer, const Tensor& x, const ops::MoeNvfp4RouteView& route,
                 Tensor& destination, cudaStream_t stream);
+    void prefetch_previous_round(cudaStream_t stream);
 
     [[nodiscard]] const ExpertCache& cache() const noexcept { return cache_; }
     [[nodiscard]] float* activation_scratch() const noexcept {
@@ -42,17 +48,33 @@ public:
         return static_cast<std::uint64_t>(activation_scratch_.bytes);
     }
     [[nodiscard]] std::uint64_t host_bytes() const noexcept {
-        return static_cast<std::uint64_t>(kCopyStages) * kPairBytes + lookup_host_->size() +
-               kProbeBytes;
+        return static_cast<std::uint64_t>(kCopyStages + kPrefetchStages) * kPairBytes +
+               lookup_host_->size() + route_history_host_->size() + kProbeBytes;
     }
 
 private:
-    static constexpr std::uint32_t kCopyStages = 3;
+    struct PrefetchJob {
+        std::uint32_t layer;
+        std::uint32_t expert;
+        std::uint32_t slot;
+    };
+
+    static constexpr std::uint32_t kCopyStages     = 3;
+    static constexpr std::uint32_t kPrefetchStages = 3;
     static constexpr std::size_t kProbeBytes =
         (2 + 2 * static_cast<std::size_t>(TextConfig::experts)) * sizeof(std::int32_t);
+    static constexpr std::size_t kRouteHistoryBytes =
+        static_cast<std::size_t>(kTextLayers) * TextConfig::experts_per_token *
+        sizeof(std::int32_t);
 
     void launch_pull(std::uint32_t layer, std::uint32_t expert, std::uint32_t slot);
     void refresh_lookup();
+    void build_lookup();
+    void record_route(std::uint32_t layer, const ops::MoeNvfp4RouteView& route,
+                      cudaStream_t stream);
+    void publish_prefetch(std::uint32_t layer, cudaStream_t stream);
+    void run_prefetch(std::vector<PrefetchJob> jobs);
+    void run_prefetch_jobs(std::vector<PrefetchJob> jobs);
 
     int device_                              = 0;
     std::uint32_t expert_begin_              = 0;
@@ -72,6 +94,22 @@ private:
     DeviceBuffer activation_scratch_;
     DeviceBuffer rollback_;
     std::unique_ptr<PinnedHostBuffer> lookup_host_;
+    DeviceBuffer route_history_;
+    std::unique_ptr<PinnedHostBuffer> route_history_host_;
+    std::array<std::unique_ptr<PinnedHostBuffer>, kPrefetchStages> prefetch_staging_;
+    std::array<cudaEvent_t, kPrefetchStages> prefetch_stage_ready_{};
+    std::uint32_t prefetch_stage_cursor_ = 0;
+    std::array<cudaEvent_t, kTextLayers> prefetch_layer_event_{};
+    std::array<bool, kTextLayers> prefetch_pending_{};
+    std::array<bool, kTextLayers> prefetch_recorded_{};
+    std::array<std::vector<std::pair<std::uint32_t, std::uint32_t>>, kTextLayers>
+        prefetch_pairs_;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> prefetch_predicted_;
+    std::unique_ptr<HostWorkerPool> prefetch_workers_;
+    std::future<void> prefetch_future_;
+    std::mutex prefetch_mutex_;
+    std::condition_variable prefetch_recorded_cv_;
+    bool prefetch_failed_ = false;
     std::vector<std::int32_t> host_ids_;
     std::int32_t* probe_host_          = nullptr;
     std::int32_t* probe_miss_count_    = nullptr;

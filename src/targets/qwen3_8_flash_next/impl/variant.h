@@ -65,6 +65,10 @@ struct Variant {
                                   cudaStream_t stream) {
         PostMixerLeaf::shared(hidden, weights, route, destination, stream);
     }
+
+    static void post_mixer_prefetch(const MoeWeights& weights, cudaStream_t stream) {
+        PostMixerLeaf::prefetch(weights, stream);
+    }
 };
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

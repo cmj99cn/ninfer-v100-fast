@@ -253,6 +253,9 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
     std::vector<TokenReport> tokens;
     std::array<std::uint64_t, kDecodeTokens> hits{};
     std::array<std::uint64_t, kDecodeTokens> misses{};
+    std::array<std::uint64_t, kDecodeTokens> prefetched{};
+    std::array<std::uint64_t, kDecodeTokens> prefetch_hits{};
+    std::array<std::uint64_t, kDecodeTokens> prefetch_waste{};
     for (std::uint32_t index = 0; index < kDecodeTokens; ++index) {
         const detail::CacheStats before = data.expert_cache_stats(0);
         begin_round();
@@ -265,8 +268,12 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
         const detail::CacheStats after = data.expert_cache_stats(0);
         hits[index]   = after.hits - before.hits;
         misses[index] = after.miss_count - before.miss_count;
+        prefetched[index]     = after.prefetch_pairs - before.prefetch_pairs;
+        prefetch_hits[index]  = after.prefetch_hits - before.prefetch_hits;
+        prefetch_waste[index] = after.prefetch_waste - before.prefetch_waste;
         tokens.push_back(collect_token(decode_ms));
     }
+    const detail::CacheStats final = data.expert_cache_stats(0);
     g_enabled = false;
 
     std::cout << "{\n";
@@ -276,6 +283,11 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
     std::cout << "  \"warmup_tokens\": " << warmup_tokens << ",\n";
     std::cout << "  \"prefill_ms\": " << prefill_ms << ",\n";
     std::cout << "  \"cold_misses\": " << (warm.miss_count - cold.miss_count) << ",\n";
+    std::cout << "  \"prefetch_pairs\": " << (final.prefetch_pairs - warm.prefetch_pairs)
+              << ",\n";
+    std::cout << "  \"prefetch_hits\": " << (final.prefetch_hits - warm.prefetch_hits) << ",\n";
+    std::cout << "  \"prefetch_waste\": " << (final.prefetch_waste - warm.prefetch_waste)
+              << ",\n";
     std::cout << "  \"tokens\": [\n";
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const TokenReport& report = tokens[index];
@@ -284,6 +296,9 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
                   << ", \"anchored_host_ms\": " << report.anchored_host_ms
                   << ", \"ranks\": [" << report.marks[0] << ", " << report.marks[1] << "]"
                   << ", \"hits\": " << hits[index] << ", \"misses\": " << misses[index]
+                  << ", \"prefetch_pairs\": " << prefetched[index]
+                  << ", \"prefetch_hits\": " << prefetch_hits[index]
+                  << ", \"prefetch_waste\": " << prefetch_waste[index]
                   << ", \"phases\": {";
         bool first = true;
         for (const auto& [tag, aggregate] : report.phases) {

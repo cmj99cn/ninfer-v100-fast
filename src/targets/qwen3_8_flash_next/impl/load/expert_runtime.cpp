@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -49,6 +50,10 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
         static_cast<std::size_t>(TextConfig::expert_intermediate) * sizeof(float));
     rollback_ = DeviceBuffer(static_cast<std::size_t>(TextConfig::hidden) * sizeof(std::uint16_t));
     lookup_host_ = std::make_unique<PinnedHostBuffer>(kLookupEntries * 4);
+    route_history_ = DeviceBuffer(kRouteHistoryBytes);
+    route_history_.fill(0xFF);
+    route_history_host_ = std::make_unique<PinnedHostBuffer>(kRouteHistoryBytes);
+    std::memset(route_history_host_->data(), 0xFF, kRouteHistoryBytes);
     CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&probe_host_), kProbeBytes,
                              cudaHostAllocMapped | cudaHostAllocPortable));
     std::memset(probe_host_, 0, kProbeBytes);
@@ -65,13 +70,23 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
     for (auto& staging : staging_) {
         staging = std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(kPairBytes));
     }
+    for (auto& staging : prefetch_staging_) {
+        staging = std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(kPairBytes));
+    }
     for (auto& event : stage_ready_) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    }
+    for (auto& event : prefetch_stage_ready_) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    }
+    for (auto& event : prefetch_layer_event_) {
         CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     }
     CUDA_CHECK(cudaEventCreateWithFlags(&copy_done_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&probe_done_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&down_done_, cudaEventDisableTiming));
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
+    prefetch_workers_ = std::make_unique<HostWorkerPool>(1, 2);
     refresh_lookup();
     CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
     if (stats_ != nullptr) {
@@ -84,12 +99,20 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
 
 ExpertRuntime::~ExpertRuntime() {
     const ScopedDevice scope(device_);
+    if (prefetch_future_.valid()) { prefetch_future_.get(); }
+    prefetch_workers_.reset();
     if (probe_host_ != nullptr) { (void)cudaFreeHost(probe_host_); }
     if (copy_stream_ != nullptr) { (void)cudaStreamDestroy(copy_stream_); }
     if (probe_done_ != nullptr) { (void)cudaEventDestroy(probe_done_); }
     if (down_done_ != nullptr) { (void)cudaEventDestroy(down_done_); }
     if (copy_done_ != nullptr) { (void)cudaEventDestroy(copy_done_); }
     for (cudaEvent_t& event : stage_ready_) {
+        if (event != nullptr) { (void)cudaEventDestroy(event); }
+    }
+    for (cudaEvent_t& event : prefetch_stage_ready_) {
+        if (event != nullptr) { (void)cudaEventDestroy(event); }
+    }
+    for (cudaEvent_t& event : prefetch_layer_event_) {
         if (event != nullptr) { (void)cudaEventDestroy(event); }
     }
 }
@@ -112,19 +135,171 @@ void ExpertRuntime::launch_pull(std::uint32_t layer, std::uint32_t expert, std::
     CUDA_CHECK(cudaEventRecord(copy_done_, copy_stream_));
 }
 
-void ExpertRuntime::refresh_lookup() {
+void ExpertRuntime::build_lookup() {
     auto* table = static_cast<std::int32_t*>(lookup_host_->data());
     std::fill(table, table + kLookupEntries, -1);
     for (std::uint32_t layer = 0; layer < kTextLayers; ++layer) {
         std::int32_t* row = table + static_cast<std::size_t>(layer) * kExperts + expert_begin_;
         for (std::uint32_t expert = 0; expert < kRankExperts; ++expert) {
-            const std::int32_t slot = cache_.resident_slot(layer, expert);
+            const std::int32_t slot = cache_.ready_slot(layer, expert);
             if (slot >= 0) { row[expert] = slot; }
         }
     }
-    CUDA_CHECK(cudaMemcpyAsync(lookup_.p, table, kLookupEntries * 4, cudaMemcpyHostToDevice,
-                               copy_stream_));
+}
+
+void ExpertRuntime::refresh_lookup() {
+    build_lookup();
+    CUDA_CHECK(cudaMemcpyAsync(lookup_.p, lookup_host_->data(), kLookupEntries * 4,
+                               cudaMemcpyHostToDevice, copy_stream_));
     CUDA_CHECK(cudaEventRecord(copy_done_, copy_stream_));
+}
+
+void ExpertRuntime::record_route(std::uint32_t layer, const ops::MoeNvfp4RouteView& route,
+                                 cudaStream_t stream) {
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(route_history_.p) +
+                                   static_cast<std::size_t>(layer) * kTopK * 4,
+                               route.expert_ids.data, kTopK * 4, cudaMemcpyDeviceToDevice,
+                               stream));
+}
+
+void ExpertRuntime::prefetch_previous_round(cudaStream_t stream) {
+    const ScopedDevice scope(device_);
+    if (prefetch_future_.valid()) { prefetch_future_.get(); }
+    CUDA_CHECK(cudaMemcpyAsync(route_history_host_->data(), route_history_.p, kRouteHistoryBytes,
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const auto* history = static_cast<const std::int32_t*>(route_history_host_->data());
+    for (const auto& [layer, local] : prefetch_predicted_) {
+        bool used = false;
+        for (std::int32_t index = 0; index < kTopK; ++index) {
+            if (history[static_cast<std::size_t>(layer) * kTopK + index] ==
+                static_cast<std::int32_t>(expert_begin_ + local)) {
+                used = true;
+                break;
+            }
+        }
+        cache_.note_prefetch_result(used);
+    }
+    prefetch_predicted_.clear();
+
+    std::vector<PrefetchJob> jobs;
+    for (std::uint32_t layer = 0; layer < kTextLayers; ++layer) {
+        std::array<bool, kRankExperts> seen{};
+        for (std::int32_t index = 0; index < kTopK; ++index) {
+            const std::int32_t global =
+                history[static_cast<std::size_t>(layer) * kTopK + index];
+            if (global < static_cast<std::int32_t>(expert_begin_) ||
+                global >= static_cast<std::int32_t>(expert_begin_ + kRankExperts)) {
+                continue;
+            }
+            const auto local = static_cast<std::uint32_t>(global - expert_begin_);
+            if (seen[local]) { continue; }
+            seen[local] = true;
+            if (cache_.resident_slot(layer, local) >= 0) { continue; }
+            const std::uint32_t slot = cache_.prefetch_place(layer, local);
+            jobs.push_back(PrefetchJob{layer, local, slot});
+            prefetch_pairs_[layer].emplace_back(local, slot);
+            prefetch_pending_[layer] = true;
+            prefetch_predicted_.emplace_back(layer, local);
+        }
+    }
+    if (jobs.empty()) { return; }
+
+    build_lookup();
+    CUDA_CHECK(cudaMemcpyAsync(lookup_.p, lookup_host_->data(), kLookupEntries * 4,
+                               cudaMemcpyHostToDevice, stream));
+    {
+        std::lock_guard lock(prefetch_mutex_);
+        for (std::uint32_t layer = 0; layer < kTextLayers; ++layer) {
+            prefetch_recorded_[layer] = !prefetch_pending_[layer];
+        }
+    }
+    prefetch_future_ =
+        prefetch_workers_->submit([this, jobs = std::move(jobs)]() mutable {
+            run_prefetch(std::move(jobs));
+        });
+}
+
+void ExpertRuntime::run_prefetch(std::vector<PrefetchJob> jobs) {
+    try {
+        run_prefetch_jobs(std::move(jobs));
+    } catch (...) {
+        {
+            std::lock_guard lock(prefetch_mutex_);
+            prefetch_failed_ = true;
+            for (bool& recorded : prefetch_recorded_) { recorded = true; }
+        }
+        prefetch_recorded_cv_.notify_all();
+        throw;
+    }
+}
+
+void ExpertRuntime::run_prefetch_jobs(std::vector<PrefetchJob> jobs) {
+    CUDA_CHECK(cudaSetDevice(device_));
+    const std::uint32_t finish = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t active       = finish;
+    for (const PrefetchJob& job : jobs) {
+        if (job.layer != active) {
+            if (active != finish) {
+                CUDA_CHECK(cudaEventRecord(prefetch_layer_event_[active], copy_stream_));
+                {
+                    std::lock_guard lock(prefetch_mutex_);
+                    prefetch_recorded_[active] = true;
+                }
+                prefetch_recorded_cv_.notify_all();
+            }
+            active = job.layer;
+        }
+        const std::uint32_t stage = prefetch_stage_cursor_;
+        prefetch_stage_cursor_    = (prefetch_stage_cursor_ + 1) % kPrefetchStages;
+        CUDA_CHECK(cudaEventSynchronize(prefetch_stage_ready_[stage]));
+        PinnedHostBuffer& staging = *prefetch_staging_[stage];
+        const std::uint32_t global = expert_begin_ + job.expert;
+        source_.read(job.layer, global,
+                     std::span<std::byte>(static_cast<std::byte*>(staging.data()), kPairBytes));
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(slab_.p) +
+                                       static_cast<std::size_t>(job.slot) * kPairBytes,
+                                   staging.data(), kPairBytes, cudaMemcpyHostToDevice,
+                                   copy_stream_));
+        float divisors[3]{};
+        source_.read_divisors(job.layer, global, divisors);
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<float*>(divisors_.p) +
+                                       static_cast<std::size_t>(job.slot) * 3,
+                                   divisors, sizeof(divisors), cudaMemcpyHostToDevice,
+                                   copy_stream_));
+        CUDA_CHECK(cudaEventRecord(prefetch_stage_ready_[stage], copy_stream_));
+    }
+    if (active != finish) {
+        CUDA_CHECK(cudaEventRecord(prefetch_layer_event_[active], copy_stream_));
+        {
+            std::lock_guard lock(prefetch_mutex_);
+            prefetch_recorded_[active] = true;
+        }
+        prefetch_recorded_cv_.notify_all();
+    }
+}
+
+void ExpertRuntime::publish_prefetch(std::uint32_t layer, cudaStream_t stream) {
+    if (!prefetch_pending_[layer]) { return; }
+    {
+        std::unique_lock lock(prefetch_mutex_);
+        prefetch_recorded_cv_.wait(lock, [&] { return prefetch_recorded_[layer]; });
+        if (prefetch_failed_) { throw std::runtime_error("the expert prefetch worker failed"); }
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(stream, prefetch_layer_event_[layer], 0));
+    auto* base = static_cast<std::int32_t*>(lookup_.p) +
+                 static_cast<std::size_t>(layer) * kExperts + expert_begin_;
+    auto* host = static_cast<std::int32_t*>(lookup_host_->data()) +
+                 static_cast<std::size_t>(layer) * kExperts + expert_begin_;
+    for (const auto& [local, slot] : prefetch_pairs_[layer]) {
+        if (cache_.resident_slot(layer, local) != static_cast<std::int32_t>(slot)) { continue; }
+        cache_.release_prefetch(slot);
+        host[local] = static_cast<std::int32_t>(slot);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(base, host, kRankExperts * 4, cudaMemcpyHostToDevice, stream));
+    prefetch_pairs_[layer].clear();
+    prefetch_pending_[layer] = false;
 }
 
 void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
@@ -133,6 +308,9 @@ void ExpertRuntime::routed(std::uint32_t layer, const Tensor& x,
     const ScopedDevice scope(device_);
     const std::int32_t tokens = route.expert_ids.ne[1];
     if (tokens < 1) { return; }
+
+    publish_prefetch(layer, stream);
+    if (tokens == 1) { record_route(layer, route, stream); }
 
     const std::int32_t expert_begin = static_cast<std::int32_t>(expert_begin_);
     const std::int32_t expert_end   = expert_begin + static_cast<std::int32_t>(kRankExperts);

@@ -54,12 +54,15 @@ struct ExpertCacheOptions {
 };
 
 struct CacheStats {
-    std::uint64_t lookups    = 0;
-    std::uint64_t hits       = 0;
-    std::uint64_t miss_count = 0;
-    std::uint64_t insertions = 0;
-    std::uint64_t evictions  = 0;
-    std::uint32_t residency  = 0;
+    std::uint64_t lookups         = 0;
+    std::uint64_t hits            = 0;
+    std::uint64_t miss_count      = 0;
+    std::uint64_t insertions      = 0;
+    std::uint64_t evictions       = 0;
+    std::uint64_t prefetch_pairs  = 0;
+    std::uint64_t prefetch_hits   = 0;
+    std::uint64_t prefetch_waste  = 0;
+    std::uint32_t residency       = 0;
 };
 class HostPairSource {
 public:
@@ -98,10 +101,14 @@ public:
 
     [[nodiscard]] std::optional<std::uint32_t> find(std::uint32_t layer, std::uint32_t expert) noexcept;
     [[nodiscard]] std::int32_t resident_slot(std::uint32_t layer, std::uint32_t expert) const noexcept;
+    [[nodiscard]] std::int32_t ready_slot(std::uint32_t layer, std::uint32_t expert) const noexcept;
     void record_resident_lookups(std::uint64_t count) noexcept;
     void reserve(std::uint32_t count,
                  const std::vector<std::pair<std::uint32_t, std::uint32_t>>& protected_pairs);
     [[nodiscard]] std::uint32_t load(std::uint32_t layer, std::uint32_t expert);
+    [[nodiscard]] std::uint32_t prefetch_place(std::uint32_t layer, std::uint32_t expert);
+    void release_prefetch(std::uint32_t slot) noexcept;
+    void note_prefetch_result(bool used) noexcept;
 
     [[nodiscard]] std::uint64_t slot_offset(std::uint32_t slot) const noexcept;
     [[nodiscard]] std::uint32_t slots() const noexcept;
@@ -122,6 +129,7 @@ private:
     std::vector<std::int32_t> slot_of_;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> resident_;
     std::vector<std::uint8_t> reference_;
+    std::vector<std::uint8_t> prefetch_hold_;
     std::vector<std::uint32_t> spare_;
     std::vector<std::uint8_t> spare_mark_;
     std::uint32_t hand_      = 0;

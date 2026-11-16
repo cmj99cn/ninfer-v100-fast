@@ -184,6 +184,7 @@ ExpertCache::ExpertCache(const ExpertCacheOptions& options, std::uint64_t pair_b
     slot_of_.assign(static_cast<std::size_t>(kRankPairs), -1);
     resident_.assign(static_cast<std::size_t>(plan_.pairs), {0, 0});
     reference_.assign(static_cast<std::size_t>(plan_.pairs), 0);
+    prefetch_hold_.assign(static_cast<std::size_t>(plan_.pairs), 0);
     spare_mark_.assign(static_cast<std::size_t>(plan_.pairs), 0);
 
     if (options.profile.has_value()) { seed(*options.profile); }
@@ -197,6 +198,7 @@ void ExpertCache::assign(std::uint32_t slot, std::uint32_t layer, std::uint32_t 
     slot_of_[key(layer, expert)] = static_cast<std::int32_t>(slot);
     resident_[slot]              = {layer, expert};
     reference_[slot]             = 1;
+    prefetch_hold_[slot]         = 0;
 }
 
 std::uint32_t ExpertCache::place(std::uint32_t layer, std::uint32_t expert) {
@@ -221,7 +223,15 @@ std::uint32_t ExpertCache::place(std::uint32_t layer, std::uint32_t expert) {
         return slot;
     }
 
-    while (reference_[hand_]) {
+    for (std::uint32_t step = 0;; ++step) {
+        if (step >= 2 * slots) {
+            throw std::logic_error("the expert cache holds every slot in prefetch");
+        }
+        if (prefetch_hold_[hand_]) {
+            hand_ = (hand_ + 1) % slots;
+            continue;
+        }
+        if (!reference_[hand_]) { break; }
         reference_[hand_] = 0;
         hand_ = (hand_ + 1) % slots;
     }
@@ -271,6 +281,31 @@ std::int32_t ExpertCache::resident_slot(std::uint32_t layer, std::uint32_t exper
     return slot_of_[key(layer, expert)];
 }
 
+std::int32_t ExpertCache::ready_slot(std::uint32_t layer, std::uint32_t expert) const noexcept {
+    const auto slot = slot_of_[key(layer, expert)];
+    if (slot < 0 || prefetch_hold_[slot]) { return -1; }
+    return slot;
+}
+
+std::uint32_t ExpertCache::prefetch_place(std::uint32_t layer, std::uint32_t expert) {
+    const std::uint32_t slot = place(layer, expert);
+    prefetch_hold_[slot] = 1;
+    ++stats_.prefetch_pairs;
+    return slot;
+}
+
+void ExpertCache::release_prefetch(std::uint32_t slot) noexcept {
+    prefetch_hold_[slot] = 0;
+}
+
+void ExpertCache::note_prefetch_result(bool used) noexcept {
+    if (used) {
+        ++stats_.prefetch_hits;
+    } else {
+        ++stats_.prefetch_waste;
+    }
+}
+
 void ExpertCache::reserve(
     std::uint32_t count,
     const std::vector<std::pair<std::uint32_t, std::uint32_t>>& protected_pairs) {
@@ -293,6 +328,7 @@ void ExpertCache::reserve(
             if (slot >= next_free_) { continue; }
             if (spare_mark_[slot] != 0) { continue; }
             if (protected_slot[slot]) { continue; }
+            if (prefetch_hold_[slot]) { continue; }
             if (reference_[slot]) {
                 reference_[slot] = 0;
                 continue;

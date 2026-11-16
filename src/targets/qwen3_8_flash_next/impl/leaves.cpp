@@ -124,6 +124,10 @@ void PostMixerLeaf::routed(const Tensor& hidden, const MoeWeights& weights,
     ops::moe_routed_nvfp4_partial(hidden, weights, route, destination, stream);
 }
 
+void PostMixerLeaf::prefetch(const MoeWeights& weights, cudaStream_t stream) {
+    if (weights.cache != nullptr) { weights.cache->prefetch_previous_round(stream); }
+}
+
 void PostMixerLeaf::shared(const Tensor& hidden, const MoeWeights& weights,
                            const ops::MoeNvfp4RouteView& route, Tensor& destination,
                            cudaStream_t stream) {
