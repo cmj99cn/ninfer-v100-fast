@@ -1102,7 +1102,9 @@ waits on work that is already in flight and does not serialize the two ranks' la
 **Re-baselined golden.** The canonical three-token public-Engine route changed from
 `4818 84666 96991` to `4818 84666 5396`. Turning the FP16 HC fused route off restores the old
 token, so the arithmetic cause is the HC down/up reduction association, not the router merge or
-the routed-decode LUTs. The eight-token free-running sequences on the same prompt are:
+the routed-decode LUTs. This is the R56 record: (i) the old and new three-token sequences above,
+(ii) the reference-side greedy sequence with mean NLL `8.17897121` below, and (iii) the stated
+arithmetic cause. The eight-token free-running sequences on the same prompt are:
 
 | Build | Greedy sequence |
 |---|---|
@@ -1115,12 +1117,32 @@ are no above-bound token mismatches: all eight reference margins are below `0.8`
 (`0.0411-0.4203`), so every divergence is a boundary event. The teacher-forced engine NLL of the
 reference tokens is `9.70574755 5.78262217 8.30359973 8.56040057 9.37088178 9.47056456
 9.16131647 8.76614705` (mean `8.64015999`); the maximum per-step difference from the reference is
-`1.02499057`. The teacher-forced NLL is identical with the HC fused route enabled and disabled in
-the current build, so this R55 HC change does not move the NLL; the `1.02499` value is the
-current router/prefetch profile already present at HEAD and marginally exceeds the historical
-`1.0` smoke bound (the §13.1 M4 build measured `0.93574`). `test_reference_parity.py` reports
-short/long/budget PLE-row and QSA-block parity `OK`, full token parity `OK`, and the NLL line
-`full nll max difference 1.02499057 bound 1`.
+`1.02499057`. The teacher-forced NLL of the eight reference tokens rounds to the same value with the
+HC fused route enabled and disabled, so that sample does not resolve a NLL movement; the `1.02499`
+value is the current router/prefetch profile already present at HEAD and marginally exceeds the
+historical `1.0` smoke bound (the §13.1 M4 build measured `0.93574`). `test_reference_parity.py`
+reports short/long/budget PLE-row and QSA-block parity `OK`, full token parity `OK`, and the NLL
+line `full nll max difference 1.02499057 bound 1`.
+
+**R57 real-text NLL differential.** Two 320-token corpora are encoded from this document with the
+artifact's own `resource/text/tokenizer.json` BPE by `tools/bench/flash_next_text_corpus.py`
+(corpus A: `--start-char 1129 --chars 4000 --tokens 320`, the §1 text; corpus B:
+`--start-char 27423 --chars 4000 --tokens 320`, the §6 text). `tools/bench/flash_next_text_nll.cpp`
+teacher-forces all 319 within-corpus positions in one 48-layer TP2 FP16 prefill, with
+`expert_cache_mib=14000`, greedy, eager, one warm prefill, and `allow_prefix_reuse=false`. The two
+builds differ only in the `hc_mix`/`hc_final_mix` FP16 fused condition: "new" is the current HEAD
+profile and "old" is the BF16-only fused condition, which is also the switch that restores the
+`4818 84666 96991` golden. Two independent runs per build and corpus:
+
+| Corpus | New mean NLL | Old mean NLL | ΔNLL (new − old, run means) |
+|---|---|---|---|
+| A (§1) | `13.8013721441`, `13.8012846936` | `13.8014279599`, `13.8007866598` | `+2.2e-4` |
+| B (§6) | `13.3907188555`, `13.3907801998` | `13.3906113347`, `13.3908401637` | `+2.4e-5` |
+
+The run-to-run spread is at most `6.4e-4` nat, so both differences sit at the measurement noise
+floor and at least 40 times below the R57 `0.01`-nat neutral bound. Ruling: the HC
+reduction-association change is neutral on real text; the new profile is accepted and
+`4818 84666 5396` remains the golden.
 
 **512-token 0-miss measurement.** Two-rank, 512-token prompt, `expert_cache_mib=14000`, 192 warm
 decode tokens, greedy, eager. The 0-miss decode token measured `24.45 ms` and `24.58 ms` in two
