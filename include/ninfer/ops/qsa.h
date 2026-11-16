@@ -18,6 +18,12 @@ inline constexpr std::int32_t kQsaIndexBlockPageSize  = 16;
 inline constexpr std::int32_t kQsaIndexCompress       = 4;
 inline constexpr std::int32_t kQsaSelectionCapacity   = 512;
 
+// The block selection scores the candidate blocks of the rows it selects in one wave and keeps
+// those scores in workspace scratch until the selection resolves. The scratch of one wave is at
+// most this many bytes; the wave widens with the free workspace bytes and the block count of the
+// index key cache.
+inline constexpr std::size_t kQsaIndexerScoreWaveBytes = 4U << 20;
+
 /**
  * The five projected QSA tensors. All are contiguous and share one activation dtype (BF16 or
  * FP16), dimension 0 fastest.
@@ -231,7 +237,8 @@ void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters&
  *   counts zero. The cache and index_query are read-only.
  *
  * Workspace:
- *   None.
+ *   A transient float score buffer for the scored blocks of the rows it selects in one wave. The
+ *   wave width follows the free workspace bytes and the block count of the index key cache.
  *
  * Execution:
  *   Enqueues on the given stream, allocates no device memory, keeps no persistent state and

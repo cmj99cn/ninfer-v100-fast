@@ -439,7 +439,7 @@ int run_indexer(const IndexerCase& c, cudaStream_t stream, WorkspaceArena& arena
     const std::size_t selection_count = static_cast<std::size_t>(kCapacity) * c.T * c.B;
 
     std::vector<std::int32_t> ref_counts(counts_count, 0);
-    std::vector<std::int32_t> ref_selection(selection_count, kSentinelI32);
+    std::vector<std::int32_t> ref_selection(selection_count, -1);
 
     for (std::int32_t b = 0; b < c.B; ++b) {
         for (std::int32_t t = 0; t < c.T; ++t) {
@@ -500,9 +500,9 @@ int run_indexer(const IndexerCase& c, cudaStream_t stream, WorkspaceArena& arena
     DeviceBuffer d_table_rows = to_device_i32(c.table_rows);
     DeviceBuffer d_page_table = to_device_i32(c.page_table);
     DeviceBuffer d_selection(selection_count * 4);
-    d_selection.copy_from_host(ref_selection.data(), selection_count * 4);
+    d_selection.fill(0xFF);
     DeviceBuffer d_counts(counts_count * 4);
-    d_counts.copy_from_host(ref_counts.data(), counts_count * 4);
+    d_counts.fill(0xFF);
 
     ConstQsaIndexCacheView cache{
         tensor(d_index_keys.p, DType::BF16, {kIndexDim, kQsaIndexBlockPageSize, 1, c.index_pages}),
@@ -903,9 +903,43 @@ int run_indexer_cases(cudaStream_t stream, WorkspaceArena& arena) {
     failures += run_indexer(i5, stream, arena);
     failures += run_indexer(fp16_indexer(i5), stream, arena);
 
+    IndexerCase i6;
+    i6.label = "qsa_indexer scored rows";
+    i6.T = 2;
+    i6.B = 1;
+    i6.axes = 1;
+    i6.logical_pages = 64;
+    i6.index_pages = 64;
+    i6.valid = {2};
+    i6.table_rows = {0};
+    i6.positions = {2051, 2052};
+    i6.page_table.resize(64);
+    for (std::int32_t page = 0; page < 64; ++page) i6.page_table[static_cast<std::size_t>(page)] = page;
+    i6.index_query = integer_inputs(static_cast<std::size_t>(kIndexDim) * kIndexHeads * 2, 61U);
+    i6.index_keys = integer_inputs(static_cast<std::size_t>(kIndexDim) * kQsaIndexBlockPageSize * 64, 62U);
+    failures += run_indexer(i6, stream, arena);
+    failures += run_indexer(fp16_indexer(i6), stream, arena);
+
+    IndexerCase i7;
+    i7.label = "qsa_indexer uniform scores";
+    i7.T = 1;
+    i7.B = 1;
+    i7.axes = 1;
+    i7.logical_pages = 64;
+    i7.index_pages = 64;
+    i7.valid = {1};
+    i7.table_rows = {0};
+    i7.positions = {2051};
+    i7.page_table.resize(64);
+    for (std::int32_t page = 0; page < 64; ++page) i7.page_table[static_cast<std::size_t>(page)] = page;
+    i7.index_query.assign(static_cast<std::size_t>(kIndexDim) * kIndexHeads, double_bf16(1.0));
+    i7.index_keys.assign(static_cast<std::size_t>(kIndexDim) * kQsaIndexBlockPageSize * 64,
+                         double_bf16(0.0));
+    failures += run_indexer(i7, stream, arena);
+    failures += run_indexer(fp16_indexer(i7), stream, arena);
+
     IndexerCase i4;
-    i4.label = "qsa_indexer invalid row";
-    i4.T = 2;
+    i4.label = "qsa_indexer invalid row";    i4.T = 2;
     i4.B = 1;
     i4.axes = 1;
     i4.logical_pages = 64;
@@ -1094,7 +1128,7 @@ int main() {
 
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreate(&stream), "cudaStreamCreate");
-    DeviceArena arena(1024);
+    DeviceArena arena(1U << 20);
 
     int failures = 0;
     failures += run_prepare_cases(stream, arena);

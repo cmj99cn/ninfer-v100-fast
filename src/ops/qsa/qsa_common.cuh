@@ -37,8 +37,12 @@ struct QsaAct;
 
 template <>
 struct QsaAct<__nv_bfloat16> {
+    using pair = __nv_bfloat162;
     __device__ __forceinline__ static float to_float(__nv_bfloat16 value) {
         return __bfloat162float(value);
+    }
+    __device__ __forceinline__ static float2 to_float2(pair value) {
+        return __bfloat1622float2(value);
     }
     __device__ __forceinline__ static __nv_bfloat16 from_float(float value) {
         return __float2bfloat16_rn(value);
@@ -47,7 +51,9 @@ struct QsaAct<__nv_bfloat16> {
 
 template <>
 struct QsaAct<__half> {
+    using pair = __half2;
     __device__ __forceinline__ static float to_float(__half value) { return __half2float(value); }
+    __device__ __forceinline__ static float2 to_float2(pair value) { return __half22float2(value); }
     __device__ __forceinline__ static __half from_float(float value) {
         return __float2half_rn(value);
     }

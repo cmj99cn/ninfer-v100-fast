@@ -3,6 +3,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/moe_nvfp4.h"
 #include "ninfer/ops/ple.h"
+#include "ninfer/ops/qsa.h"
 
 #include "targets/qwen4_exp/impl/runtime/instance.h"
 
@@ -42,7 +43,8 @@ struct WorkspaceRecipe {
     const std::size_t lane = align_up(
         text_op_scratch_bytes(prefill_chunk) +
             static_cast<std::size_t>(TextConfig::hidden) * (prefill_chunk == 0 ? 1 : prefill_chunk) *
-                kBf16Bytes,
+                kBf16Bytes +
+            ops::kQsaIndexerScoreWaveBytes,
         256);
     const std::size_t ple = align_up(
         static_cast<std::size_t>(TextConfig::ple_heads) * TextConfig::ple_head_width *
