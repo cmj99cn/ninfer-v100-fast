@@ -938,6 +938,68 @@ int run_indexer_cases(cudaStream_t stream, WorkspaceArena& arena) {
     failures += run_indexer(i7, stream, arena);
     failures += run_indexer(fp16_indexer(i7), stream, arena);
 
+    // A wave width smaller than the token grid exercises the multi-wave scratch offset: the score
+    // and select kernels must index the wave-local scratch with (tb - token_base), not the global
+    // token index. With the default 1 MiB arena the 4 MiB wave cap always covers a small grid, so
+    // this case builds an arena sized for exactly two tokens.
+    {
+        IndexerCase i8;
+        i8.label = "qsa_indexer multi-wave";
+        i8.T = 64;
+        i8.B = 1;
+        i8.axes = 1;
+        i8.logical_pages = 64;
+        i8.index_pages = 64;
+        i8.valid = {64};
+        i8.table_rows = {0};
+        i8.positions.resize(64);
+        for (std::int32_t t = 0; t < 64; ++t) { i8.positions[static_cast<std::size_t>(t)] = 2051 + t; }
+        i8.page_table.resize(64);
+        for (std::int32_t page = 0; page < 64; ++page) i8.page_table[static_cast<std::size_t>(page)] = page;
+        i8.index_query = integer_inputs(static_cast<std::size_t>(kIndexDim) * kIndexHeads * 64, 71U);
+        i8.index_keys = integer_inputs(
+            static_cast<std::size_t>(kIndexDim) * kQsaIndexBlockPageSize * 64, 72U);
+        const std::size_t score_bytes =
+            static_cast<std::size_t>(i8.index_pages * kQsaIndexBlockPageSize) * sizeof(float);
+        // The wave scratch is exactly two tokens wide; the remaining address space is a guard so a
+        // regression that indexes the scratch with the global token (rather than tb - token_base)
+        // is caught even when the score and select kernels agree with each other.
+        DeviceBuffer guard(score_bytes * 64);
+        guard.fill(0x7f);
+        DeviceArena wave_arena(DeviceSpan{guard.p, score_bytes * 2});
+        failures += run_indexer(i8, stream, wave_arena);
+        failures += run_indexer(fp16_indexer(i8), stream, wave_arena);
+        const auto untouched = from_device<std::uint8_t>(
+            static_cast<const std::uint8_t*>(guard.p) + score_bytes * 2,
+            guard.bytes - score_bytes * 2);
+        if (std::any_of(untouched.begin(), untouched.end(),
+                        [](std::uint8_t value) { return value != 0x7f; })) {
+            std::cerr << "qsa_indexer multi-wave: the score scratch escaped its wave window\n";
+            ++failures;
+        }
+    }
+
+    // More than 2^17 block groups: the selection key must keep the whole 20-bit block field, and
+    // the score/select wave path must survive a grid larger than one wave.
+    {
+        IndexerCase i9;
+        i9.label = "qsa_indexer 20-bit key";
+        i9.T = 1;
+        i9.B = 1;
+        i9.axes = 1;
+        i9.logical_pages = 8750;
+        i9.index_pages = 8750;
+        i9.valid = {1};
+        i9.table_rows = {0};
+        i9.positions = {559999};
+        i9.page_table.resize(8750);
+        for (std::int32_t page = 0; page < 8750; ++page) i9.page_table[static_cast<std::size_t>(page)] = page;
+        i9.index_query = integer_inputs(static_cast<std::size_t>(kIndexDim) * kIndexHeads, 81U);
+        i9.index_keys = integer_inputs(
+            static_cast<std::size_t>(kIndexDim) * kQsaIndexBlockPageSize * 8750, 82U);
+        failures += run_indexer(i9, stream, arena);
+    }
+
     IndexerCase i4;
     i4.label = "qsa_indexer invalid row";    i4.T = 2;
     i4.B = 1;
