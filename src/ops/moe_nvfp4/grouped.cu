@@ -143,10 +143,10 @@ __global__ __launch_bounds__(256) void moe_nvfp4_cached_kernel(
     }
 }
 
-inline constexpr int kMoeDecodeThreads    = 1024;
+inline constexpr int kMoeDecodeThreads    = 128;
 inline constexpr int kMoeDecodeWarps      = kMoeDecodeThreads / 32;
-inline constexpr int kMoeDecodeGateUpTile = kMoeDecodeWarps;
-inline constexpr int kMoeDecodeDownTile   = kMoeDecodeWarps;
+inline constexpr int kMoeDecodeGateUpTile = 2 * kMoeDecodeWarps;
+inline constexpr int kMoeDecodeDownTile   = 2 * kMoeDecodeWarps;
 static_assert(kMoeIntermediate % kMoeDecodeGateUpTile == 0);
 static_assert(kMoeHidden % kMoeDecodeDownTile == 0);
 

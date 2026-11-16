@@ -54,6 +54,7 @@ __global__ void sparse_gqa_kernel(const A* query, const A* output_gate,
                                   const int* selection, const int* counts, A* out) {
     __shared__ float reduce[256];
     __shared__ float probabilities[4 * kQsaSelectionCapacity + 3];
+    __shared__ std::int64_t cache_offsets[4 * kQsaSelectionCapacity + 3];
 
     const int index = blockIdx.x;
     const int h     = index % q_heads;
@@ -105,12 +106,16 @@ __global__ void sparse_gqa_kernel(const A* query, const A* output_gate,
                                                 static_cast<std::int64_t>(kv_heads) * physical));
     };
 
+    for (int j = threadIdx.x; j < count_j; j += blockDim.x) {
+        cache_offsets[j] = key_offset(token_of(j));
+    }
+    __syncthreads();
+
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int warps = blockDim.x >> 5;
     for (int j = warp; j < count_j; j += warps) {
-        const int token = token_of(j);
-        const std::int64_t cache_base = key_offset(token);
+        const std::int64_t cache_base = cache_offsets[j];
         float partial[kScoreWarpLanes];
 #pragma unroll
         for (int k = 0; k < kScoreWarpLanes; ++k) {
@@ -142,20 +147,19 @@ __global__ void sparse_gqa_kernel(const A* query, const A* output_gate,
 
     float sum = 0.0F;
     for (int j = threadIdx.x; j < count_j; j += blockDim.x) {
-        sum += expf(probabilities[j] - maximum);
+        probabilities[j] = expf(probabilities[j] - maximum);
+        sum += probabilities[j];
     }
     const float denominator = block_reduce_sum(reduce, sum);
     for (int j = threadIdx.x; j < count_j; j += blockDim.x) {
-        probabilities[j] = expf(probabilities[j] - maximum) / denominator;
+        probabilities[j] = probabilities[j] / denominator;
     }
     __syncthreads();
 
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float attention = 0.0F;
         for (int j = 0; j < count_j; ++j) {
-            const int token = token_of(j);
-            const std::int64_t cache_base = key_offset(token);
-            attention += probabilities[j] * __half2float(v_pages[cache_base + d]);
+            attention += probabilities[j] * __half2float(v_pages[cache_offsets[j] + d]);
         }
         const float gate = QsaAct<A>::to_float(output_gate[output_base + d]);
         const float sigmoid = 1.0F / (1.0F + expf(-gate));
