@@ -1055,3 +1055,102 @@ lookups as hits with zero miss bytes. The 700 MiB explicit cache measures
 - The speed table is eager, batch 1, without MTP. It does not support a claim about MTP or
   concurrent serving.
 - The earlier §10.1 token list predates the per-QSA-layer correction and is superseded above.
+
+### 13.2 M5-9 implementation-profile changes under the R55 oracle criterion
+
+R55 replaces the development-time bit-exact gate for kernel performance work with (a) the
+independent FP64 oracle and (b) behavioral equivalence on the fixed parity sample. The oracle
+criteria are `moe_nvfp4_test` (top-K ids exact, coefficients and shared gate within the declared
+FP32 tolerance), `gated_residual_test` (FP64 block-input and injection oracle), `qsa_test`,
+`qsa_reduction_order_test`, and `tp2_equivalence_test` (both ranks choose the same route). A
+change that keeps the arithmetic unchanged, such as a hoist, tiling or launch merge, still has to
+be bit-exact; a change that deliberately reassociates a reduction has to pass the oracle and
+record the new behavioral sample here.
+
+**Router.** `moe_nvfp4_route` now has a single-launch `T == 1` evaluator. The 65 row tiles write
+the same row logits as before; a device-wide fence plus an atomic counter lets the last tile
+perform the top-10 selection and softmax, and reset the counter. The selection is one warp over
+16 per-lane logits instead of a 512-thread CTA with ten `__syncthreads` rounds. The accumulation
+of each row is unchanged, and the ranking and softmax still consume the published logits, so the
+route ids, coefficients and shared gate are unchanged (the engine golden was unchanged by this
+step; it was re-baselined later by the HC change below). The standalone selection kernel measured
+`0.0205 ms` per rank-layer before the rewrite and is no longer a separate launch.
+
+**HC down/up.** The registered FP16 text profile previously sent the `320 x 10240` HC down
+projection through `Fp16VoltaMmaDecodeSchedule`: one warp per eight rows, 40 warps in total, with
+K serialized inside each warp. `hc_mix`/`hc_final_mix` now take the BF16 fused route for FP16 as
+well: one CTA per output row, eight warps split the 10240-element contraction, each warp reduces
+in FP32 and the warps' partials are summed in FP32. The up projection and the four stream gates
+stay in the fused `hc_mix_up_gate` kernel. The Qwen3.8 Flash-Next weights bind as `FP16_CTRL`
+under the FP16 text profile, so no weight is repacked at runtime. This is a reduction-association
+change: the FP64 `gated_residual_test` passes the FP16 `M=1` block input with relative L2
+`2.38e-4` (criterion `9.77e-4`) and the injection with the FP32 criterion. The BF16 route is the
+same code with the same BF16 un-pack and is numerically unchanged. `attn_hc + moe_hc` fell from
+`12.18 ms` to `6.70 ms` for the two-rank decode round.
+
+**Routed decode.** The single-token slot-bank kernels decode NVFP4 with two shared-memory LUTs
+(256 E2M1x2 pairs and 256 E4M3 scales) instead of the Volta bit-synthesis path, load the FP32
+down activation as `float4` vectors, and use one row per warp for gate/up and two rows per warp
+for down. The per-row FMA order and the warp reduction are unchanged; only the tile grouping and
+the decode instruction sequence change, so the routed destination is bit-identical to the prior
+slot-bank implementation. The isolated ten-expert kernel time is `0.0315 ms` gate/up plus
+`0.0296 ms` down (was `0.0510 + 0.0585 ms` before the R55 work). `ExpertRuntime` also splits the
+routed call into `routed_launch`/`routed_finish`: both ranks enqueue the gate/up and down kernels
+before either probe is synchronized, so the per-layer `cudaEventSynchronize(probe_done_)` now
+waits on work that is already in flight and does not serialize the two ranks' launches.
+
+**Re-baselined golden.** The canonical three-token public-Engine route changed from
+`4818 84666 96991` to `4818 84666 5396`. Turning the FP16 HC fused route off restores the old
+token, so the arithmetic cause is the HC down/up reduction association, not the router merge or
+the routed-decode LUTs. The eight-token free-running sequences on the same prompt are:
+
+| Build | Greedy sequence |
+|---|---|
+| prior (M4/M5 bit-exact HC) | `4818 84666 96991 22024 55993 1051 94135 55993` |
+| R55 HC profile | `4818 84666 5396 136059 96578 50547 29160 233261` |
+
+The reference greedy sequence on the same eight-token prompt is
+`144389 114118 6361 237099 63771 94918 89275 80816` with mean reference NLL `8.17897121`. There
+are no above-bound token mismatches: all eight reference margins are below `0.8`
+(`0.0411-0.4203`), so every divergence is a boundary event. The teacher-forced engine NLL of the
+reference tokens is `9.70574755 5.78262217 8.30359973 8.56040057 9.37088178 9.47056456
+9.16131647 8.76614705` (mean `8.64015999`); the maximum per-step difference from the reference is
+`1.02499057`. The teacher-forced NLL is identical with the HC fused route enabled and disabled in
+the current build, so this R55 HC change does not move the NLL; the `1.02499` value is the
+current router/prefetch profile already present at HEAD and marginally exceeds the historical
+`1.0` smoke bound (the §13.1 M4 build measured `0.93574`). `test_reference_parity.py` reports
+short/long/budget PLE-row and QSA-block parity `OK`, full token parity `OK`, and the NLL line
+`full nll max difference 1.02499057 bound 1`.
+
+**512-token 0-miss measurement.** Two-rank, 512-token prompt, `expert_cache_mib=14000`, 192 warm
+decode tokens, greedy, eager. The 0-miss decode token measured `24.45 ms` and `24.58 ms` in two
+runs (mean `24.52 ms`, `40.8 tok/s`); `ple_await` was zero in both. The per-phase device spans
+(two-rank sum) for the `24.45 ms` token are: routed `7.51`, gdn_proj `7.64`, moe_hc `3.87`,
+head_linear `3.71`, moe_reduce `3.70`, mixer `4.08`, qsa_attn `2.96`, attn_hc `2.83`, qsa_proj
+`2.53`, moe_shared `2.49`, route `2.08`, gdn_recurrent `1.20`, layer_end `1.05`, gdn_conv
+`0.93`, qsa_prep `0.54`; the remaining `ple_*`, `stem`, `head_mix`, `head_gather` and `argmax`
+sum below `1.1`. The `20 ms` target is not met. The remaining gap is outside the router/HC/routed
+scope: `gdn_proj`, `head_linear`, `mixer`, `moe_reduce` and the QSA pair together contribute
+about `25 ms` of the two-rank span, and routed is now limited by the selected local-expert count
+rather than by decode instruction count.
+
+**59K comparison (same prompt, cache and warmup).** Prompt 59392 text tokens, `expert_cache_mib=14000`,
+24 warm decode tokens, greedy, eager. Prefill is unchanged: `356.78 s` before and `356.77 s` after
+(`166.5 tok/s`). The decode table reports the miss count together with the wall and the three
+changed phases so that only like-for-like rows are read as a comparison. The prior run's PLE
+prefetch I/O was cold (`ple_await` 7-13 ms); the R55 run's PLE rows were already staged
+(`ple_await` 0). The non-PLE wall column subtracts `ple_await` and is the fair wall comparison.
+
+| Token | Misses (old/new) | Wall old (ms) | Wall new (ms) | Non-PLE old | Non-PLE new | Routed old/new | HC old/new | Route old/new |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 5 / 5 | 50.31 | 34.26 | 37.53 | 34.26 | 28.60 / 16.67 | 12.49 / 6.71 | 2.43 / 2.11 |
+| 1 | 15 / 15 | 68.61 | 52.48 | 55.90 | 52.48 | 55.59 / 42.51 | 12.20 / 6.67 | 2.46 / 2.10 |
+| 2 | 21 / 22 | 75.89 | 58.74 | 68.89 | 58.74 | 65.61 / 53.14 | 12.20 / 6.69 | 2.44 / 2.12 |
+| 3 | 14 / 15 | 74.90 | 54.56 | 66.04 | 54.56 | 62.53 / 45.23 | 12.25 / 6.70 | 2.44 / 2.11 |
+| 4 | 20 / 20 | 85.22 | 63.68 | 77.00 | 63.68 | 77.39 / 58.22 | 12.22 / 6.67 | 2.45 / 2.14 |
+| 5 | 15 / 15 | 76.69 | 47.56 | 69.57 | 47.56 | 74.52 / 37.01 | 12.22 / 6.68 | 2.43 / 2.09 |
+
+The HC and route phases are independent of the miss set and improve by the same amounts at both
+contexts. The routed span is miss-dominated at 59K; equal miss counts do not imply equal miss bytes
+or the same expert set, so the routed column is reported, not claimed as a pure kernel comparison.
+The isolated slot-bank kernel measurement above is the kernel-level evidence.

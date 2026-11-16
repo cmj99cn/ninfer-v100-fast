@@ -554,55 +554,75 @@ int run_route_case(const Case& inputs, std::size_t token, const std::string& lab
                          static_cast<float*>(split_logits.p));
     cuda_synchronize();
 
+    GuardedDeviceBuffer fused_ids_buffer(kTopK * sizeof(std::int32_t));
+    GuardedDeviceBuffer fused_coefficients_buffer(kTopK * sizeof(float));
+    GuardedDeviceBuffer fused_shared_gate_buffer(sizeof(float));
+    DeviceBuffer fused_logits((kExperts + 1) * sizeof(float));
+    DeviceBuffer fused_counter(sizeof(std::int32_t));
+    fused_counter.fill(0);
+    Tensor fused_ids{fused_ids_buffer.data(), DType::I32, {kTopK, 1}};
+    Tensor fused_coefficients{fused_coefficients_buffer.data(), DType::FP32, {kTopK, 1}};
+    Tensor fused_shared_gate{fused_shared_gate_buffer.data(), DType::FP32, {1, 1}};
+    ops::moe_nvfp4_route(x, weights, fused_ids, fused_coefficients, fused_shared_gate, 0,
+                         static_cast<float*>(fused_logits.p),
+                         static_cast<std::int32_t*>(fused_counter.p));
+    cuda_synchronize();
+
     int failures = 0;
-    if (from_device<std::uint32_t>(ids_buffer.data(), kTopK) !=
-        from_device<std::uint32_t>(split_ids_buffer.data(), kTopK)) {
-        std::cerr << label << ": the row-split route ids are not bitwise identical\n";
+    std::vector<double> expected_coefficients(kTopK);
+    for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+        expected_coefficients[static_cast<std::size_t>(rank)] =
+            oracle.coefficients[static_cast<std::size_t>(rank)];
+    }
+    const auto check_route = [&](const char* suffix, const std::int32_t* got_ids,
+                                 const float* got_coefficients, const float* got_gate) {
+        int local = 0;
+        for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+            if (got_ids[rank] != oracle.ids[static_cast<std::size_t>(rank)]) {
+                std::cerr << label << suffix << ": top-10 selection mismatch at rank " << rank
+                          << " got " << got_ids[rank] << " expected "
+                          << oracle.ids[static_cast<std::size_t>(rank)] << "\n";
+                ++local;
+            }
+        }
+        const std::vector<double> coefficients = read_f32(got_coefficients, kTopK);
+        local += verify_pointwise(std::string(label) + suffix + " coefficients", coefficients,
+                                  expected_coefficients, kRouteCoefficientCriterion);
+        double coefficient_sum = 0.0;
+        for (const double value : coefficients) { coefficient_sum += value; }
+        if (std::abs(coefficient_sum - 1.0) > kCoefficientSumTolerance) {
+            std::cerr << label << suffix << ": normalized coefficients sum to "
+                      << coefficient_sum << "\n";
+            ++local;
+        }
+        const std::vector<double> gate = read_f32(got_gate, 1);
+        local += verify_pointwise(std::string(label) + suffix + " shared gate", gate,
+                                  std::vector<double>{oracle.shared_gate},
+                                  kRouteCoefficientCriterion);
+        return local;
+    };
+    failures += check_route("", from_device<std::int32_t>(ids_buffer.data(), kTopK).data(),
+                            static_cast<const float*>(coefficients_buffer.data()),
+                            static_cast<const float*>(shared_gate_buffer.data()));
+    failures += check_route(" split", from_device<std::int32_t>(split_ids_buffer.data(), kTopK).data(),
+                            static_cast<const float*>(split_coefficients_buffer.data()),
+                            static_cast<const float*>(split_shared_gate_buffer.data()));
+    failures += check_route(" fused", from_device<std::int32_t>(fused_ids_buffer.data(), kTopK).data(),
+                            static_cast<const float*>(fused_coefficients_buffer.data()),
+                            static_cast<const float*>(fused_shared_gate_buffer.data()));
+
+    const std::vector<std::int32_t> counter = from_device<std::int32_t>(fused_counter.p, 1);
+    if (counter[0] != 0) {
+        std::cerr << label << ": the fused route counter was not reset\n";
         ++failures;
     }
-    if (from_device<std::uint32_t>(coefficients_buffer.data(), kTopK) !=
-        from_device<std::uint32_t>(split_coefficients_buffer.data(), kTopK)) {
-        std::cerr << label << ": the row-split route coefficients are not bitwise identical\n";
-        ++failures;
-    }
-    if (from_device<std::uint32_t>(shared_gate_buffer.data(), 1) !=
-        from_device<std::uint32_t>(split_shared_gate_buffer.data(), 1)) {
-        std::cerr << label << ": the row-split shared gate is not bitwise identical\n";
-        ++failures;
-    }
+
     failures += split_ids_buffer.verify_guards(label + " split ids guard");
     failures += split_coefficients_buffer.verify_guards(label + " split coefficients guard");
     failures += split_shared_gate_buffer.verify_guards(label + " split shared gate guard");
-
-    const std::vector<std::int32_t> got_ids = from_device<std::int32_t>(ids_buffer.data(), kTopK);
-    for (std::int32_t rank = 0; rank < kTopK; ++rank) {
-        if (got_ids[static_cast<std::size_t>(rank)] != oracle.ids[static_cast<std::size_t>(rank)]) {
-            std::cerr << label << ": top-10 selection mismatch at rank " << rank << " got "
-                      << got_ids[static_cast<std::size_t>(rank)] << " expected "
-                      << oracle.ids[static_cast<std::size_t>(rank)] << "\n";
-            ++failures;
-        }
-    }
-
-    const std::vector<double> got_coefficients = read_f32(coefficients_buffer.data(), kTopK);
-    std::vector<double> expected_coefficients(kTopK);
-    for (std::int32_t rank = 0; rank < kTopK; ++rank) {
-        expected_coefficients[static_cast<std::size_t>(rank)] = oracle.coefficients[static_cast<std::size_t>(rank)];
-    }
-    failures += verify_pointwise(label + " coefficients", got_coefficients, expected_coefficients,
-                                 kRouteCoefficientCriterion);
-
-    double coefficient_sum = 0.0;
-    for (const double value : got_coefficients) coefficient_sum += value;
-    if (std::abs(coefficient_sum - 1.0) > kCoefficientSumTolerance) {
-        std::cerr << label << ": normalized coefficients sum to " << coefficient_sum << "\n";
-        ++failures;
-    }
-
-    const std::vector<double> got_gate = read_f32(shared_gate_buffer.data(), 1);
-    failures += verify_pointwise(label + " shared gate", got_gate, std::vector<double>{oracle.shared_gate},
-                                 kRouteCoefficientCriterion);
-
+    failures += fused_ids_buffer.verify_guards(label + " fused ids guard");
+    failures += fused_coefficients_buffer.verify_guards(label + " fused coefficients guard");
+    failures += fused_shared_gate_buffer.verify_guards(label + " fused shared gate guard");
     failures += ids_buffer.verify_guards(label + " ids guard");
     failures += coefficients_buffer.verify_guards(label + " coefficients guard");
     failures += shared_gate_buffer.verify_guards(label + " shared gate guard");
@@ -858,7 +878,7 @@ int run_probe_cases() {
     return failures;
 }
 
-int run_cached_bitwise_case(const BatchedFixture& gate_up, const BatchedFixture& down,
+int run_cached_oracle_case(const BatchedFixture& gate_up, const BatchedFixture& down,
                             const MoeNvfp4Weights& full_weights,
                             const std::vector<float>& activation_values, DType dtype,
                             const std::string& label) {
@@ -912,18 +932,50 @@ int run_cached_bitwise_case(const BatchedFixture& gate_up, const BatchedFixture&
     const std::vector<std::uint16_t> got_serial =
         from_device<std::uint16_t>(serial.data(), kHidden);
 
+    const std::vector<float> selected_coefficients =
+        from_device<float>(coefficients_buffer.data(), kTopK);
+    std::vector<double> expected_destination(kHidden, 0.0);
+    for (std::int32_t row = 0; row < kHidden; ++row) {
+        expected_destination[static_cast<std::size_t>(row)] =
+            dtype == DType::FP16 ? f16_to_f32(residual_words[static_cast<std::size_t>(row)])
+                                 : bf16_to_f32(residual_words[static_cast<std::size_t>(row)]);
+    }
+    for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+        const std::int32_t expert = selected[static_cast<std::size_t>(rank)];
+        const std::vector<double> contribution =
+            expert_contribution(gate_up, down, expert, activation_values,
+                                selected_coefficients[static_cast<std::size_t>(rank)]);
+        for (std::int32_t row = 0; row < kHidden; ++row) {
+            expected_destination[static_cast<std::size_t>(row)] +=
+                contribution[static_cast<std::size_t>(row)];
+        }
+    }
+
+    const ReductionCriterion criterion =
+        dtype == DType::FP16 ? kF16DestinationCriterion : kDestinationCriterion;
+    std::vector<double> parallel_values(kHidden);
+    std::vector<double> serial_values(kHidden);
+    for (std::int32_t row = 0; row < kHidden; ++row) {
+        parallel_values[static_cast<std::size_t>(row)] =
+            dtype == DType::FP16 ? f16_to_f32(got_parallel[static_cast<std::size_t>(row)])
+                                 : bf16_to_f32(got_parallel[static_cast<std::size_t>(row)]);
+        serial_values[static_cast<std::size_t>(row)] =
+            dtype == DType::FP16 ? f16_to_f32(got_serial[static_cast<std::size_t>(row)])
+                                 : bf16_to_f32(got_serial[static_cast<std::size_t>(row)]);
+    }
+
     int failures = 0;
     if (changed_rows(got_serial, residual_words) < kHidden / 2U) {
         std::cerr << label << ": the slot fixture produced almost no routed contribution\n";
         ++failures;
     }
-    if (got_parallel != got_serial) {
-        std::cerr << label << ": the multi-CTA slot path is not bitwise identical to the "
-                             "single-CTA slot path\n";
-        ++failures;
-    }
+    failures += verify_reduction(label + " parallel destination", parallel_values,
+                                 expected_destination, criterion);
+    failures += verify_reduction(label + " serial destination", serial_values,
+                                 expected_destination, criterion);
     failures += parallel.verify_guards(label + " parallel guard");
     failures += serial.verify_guards(label + " serial guard");
+
     return failures;
 }
 
@@ -978,6 +1030,7 @@ int run_shared_bitwise_case(const MoeNvfp4Weights& full_weights,
     }
     failures += parallel.verify_guards(label + " parallel guard");
     failures += serial.verify_guards(label + " serial guard");
+
     return failures;
 }
 
@@ -1375,9 +1428,9 @@ int main() {
                                  kDestinationCriterion);
     failures += local_destination_buffer.verify_guards("moe_nvfp4 local destination guard");
 
-    failures += run_cached_bitwise_case(inputs.gate_up, inputs.down, weights,
+    failures += run_cached_oracle_case(inputs.gate_up, inputs.down, weights,
                                         inputs.activation[1], DType::BF16, "moe_nvfp4 cached bf16");
-    failures += run_cached_bitwise_case(gate_up_f16, down_f16, weights_f16,
+    failures += run_cached_oracle_case(gate_up_f16, down_f16, weights_f16,
                                         inputs.activation[2], DType::FP16, "moe_nvfp4 cached f16");
     failures += run_shared_bitwise_case(weights, inputs.activation[1], DType::BF16,
                                         "moe_nvfp4 shared bf16");

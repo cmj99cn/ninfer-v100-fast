@@ -68,19 +68,23 @@ struct MoeNvfp4Weights {
  *
  * Workspace:
  *   None when `route_logits` is null. Otherwise the caller supplies the [E + 1, T] FP32 scratch
- *   described under Execution.
+ *   described under Execution, and may supply a counter for the single-launch evaluator.
  *
  * Execution:
  *   Enqueues on the given stream, allocates no device memory, keeps no persistent state, and
  *   supports CUDA Graph capture and replay at bound addresses. `route_logits` is an optional
  *   caller-owned FP32 [E + 1, T] scratch. For T == 1 a non-null scratch selects the row-split
- *   evaluator: one CTA per output-row tile writes the same serial-K logits, then one CTA performs
- *   the same top-K selection and softmax. Every output element keeps its exact accumulation order,
- *   so ids and coefficients are bitwise identical to the single-CTA evaluator.
+ *   evaluator: one CTA per output-row tile writes the row logits. A non-null `route_counter`
+ *   additionally fuses the top-K selection into that launch: the last row tile performs the
+ *   selection and softmax after a device-wide fence, and resets the counter for the next call.
+ *   The counter must be zero before the first call. Without a counter the selection runs in a
+ *   second single-warp launch over the same logits. Ranking and coefficients are evaluated from
+ *   the accumulated logits, so the split evaluator is compared against the FP64 oracle rather
+ *   than against the single-CTA accumulation order.
  */
 void moe_nvfp4_route(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& expert_ids,
                      Tensor& coefficients, Tensor& shared_gate, cudaStream_t stream,
-                     float* route_logits = nullptr);
+                     float* route_logits = nullptr, std::int32_t* route_counter = nullptr);
 
 /**
  * Op: the top-10 routed NVFP4 experts and the sigmoid-gated shared expert, accumulated into

@@ -60,6 +60,10 @@ struct Variant {
         PostMixerLeaf::routed(hidden, weights, route, destination, stream);
     }
 
+    static void post_mixer_routed_finish(const MoeWeights& weights, cudaStream_t stream) {
+        PostMixerLeaf::routed_finish(weights, stream);
+    }
+
     static void post_mixer_shared(const Tensor& hidden, const MoeWeights& weights,
                                   const ops::MoeNvfp4RouteView& route, Tensor& destination,
                                   cudaStream_t stream) {

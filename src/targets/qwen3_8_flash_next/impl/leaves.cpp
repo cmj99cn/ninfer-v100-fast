@@ -118,10 +118,14 @@ void PostMixerLeaf::routed(const Tensor& hidden, const MoeWeights& weights,
                            const ops::MoeNvfp4RouteView& route, Tensor& destination,
                            cudaStream_t stream) {
     if (weights.cache != nullptr) {
-        weights.cache->routed(weights.layer, hidden, route, destination, stream);
+        weights.cache->routed_launch(weights.layer, hidden, route, destination, stream);
         return;
     }
     ops::moe_routed_nvfp4_partial(hidden, weights, route, destination, stream);
+}
+
+void PostMixerLeaf::routed_finish(const MoeWeights& weights, cudaStream_t stream) {
+    if (weights.cache != nullptr) { weights.cache->routed_finish(stream); }
 }
 
 void PostMixerLeaf::prefetch(const MoeWeights& weights, cudaStream_t stream) {

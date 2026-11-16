@@ -126,7 +126,8 @@ inline TextState::TextState(DeviceContext& device, const ModelView& model,
       ple_history_(static_cast<std::size_t>(kChannels) * ops::kPleConvWindow * kBatch * 2),
       ple_rows_(ops::kPleHeads * forward_tokens_ * kBatch * 4),
       ple_staged_rows_(ops::kPleHeads * forward_tokens_ * kBatch * 128),
-      ple_divisors_(ops::kPleShards * 4) {
+      ple_divisors_(ops::kPleShards * 4), route_counter_(4) {
+    route_counter_.fill(0);
     ple_rows_host_ = std::make_unique<PinnedHostBuffer>(
         static_cast<std::size_t>(ops::kPleHeads) * forward_tokens_ * kBatch * 4);
     ple_staged_host_ = std::make_unique<PinnedHostBuffer>(
@@ -895,7 +896,8 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
                        : Tensor{};
             ops::moe_nvfp4_route(block_input[slot], models_[slot]->layers[layer].post_mixer,
                                  route_ids, route_coefficients, route_gate, stream_for(rank),
-                                 T == 1 ? static_cast<float*>(route_logits.data) : nullptr);
+                                 T == 1 ? static_cast<float*>(route_logits.data) : nullptr,
+                                 T == 1 ? states_[slot]->route_counter() : nullptr);
             NINFER_QWEN4EXP_DIAG_MARK("route");
             routes[slot] = ops::MoeNvfp4RouteView{route_ids, route_coefficients, route_gate};
         });
@@ -905,6 +907,11 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
             Variant::post_mixer_routed(block_input[slot],
                                        models_[slot]->layers[layer].post_mixer, routes[slot],
                                        moe_out[slot], stream_for(rank));
+        });
+        for_each_rank([&](int rank) {
+            const auto slot = static_cast<std::size_t>(rank);
+            Variant::post_mixer_routed_finish(models_[slot]->layers[layer].post_mixer,
+                                              stream_for(rank));
             NINFER_QWEN4EXP_EXPERT_READ_END(layer);
             NINFER_QWEN4EXP_DIAG_MARK("routed");
         });

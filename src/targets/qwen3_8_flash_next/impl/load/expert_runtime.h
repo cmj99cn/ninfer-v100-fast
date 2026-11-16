@@ -33,8 +33,10 @@ public:
     ExpertRuntime& operator=(ExpertRuntime&&)      = delete;
     ~ExpertRuntime();
 
-    void routed(std::uint32_t layer, const Tensor& x, const ops::MoeNvfp4RouteView& route,
-                Tensor& destination, cudaStream_t stream);
+    void routed_launch(std::uint32_t layer, const Tensor& x,
+                       const ops::MoeNvfp4RouteView& route, Tensor& destination,
+                       cudaStream_t stream);
+    void routed_finish(cudaStream_t stream);
     void prefetch_previous_round(cudaStream_t stream);
 
     [[nodiscard]] const ExpertCache& cache() const noexcept { return cache_; }
@@ -53,6 +55,14 @@ public:
     }
 
 private:
+    struct PendingRoute {
+        bool active = false;
+        std::uint32_t layer = 0;
+        Tensor x;
+        Tensor destination;
+        ops::MoeNvfp4RouteView route;
+    };
+
     struct PrefetchJob {
         std::uint32_t layer;
         std::uint32_t expert;
@@ -120,6 +130,7 @@ private:
     std::int32_t* probe_active_count_dev_ = nullptr;
     std::int32_t* probe_miss_ids_dev_     = nullptr;
     std::int32_t* probe_active_ids_dev_   = nullptr;
+    PendingRoute pending_;
 };
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

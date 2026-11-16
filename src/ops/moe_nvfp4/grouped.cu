@@ -145,7 +145,7 @@ __global__ __launch_bounds__(256) void moe_nvfp4_cached_kernel(
 
 inline constexpr int kMoeDecodeThreads    = 128;
 inline constexpr int kMoeDecodeWarps      = kMoeDecodeThreads / 32;
-inline constexpr int kMoeDecodeGateUpTile = 2 * kMoeDecodeWarps;
+inline constexpr int kMoeDecodeGateUpTile = kMoeDecodeWarps;
 inline constexpr int kMoeDecodeDownTile   = 2 * kMoeDecodeWarps;
 static_assert(kMoeIntermediate % kMoeDecodeGateUpTile == 0);
 static_assert(kMoeHidden % kMoeDecodeDownTile == 0);
@@ -155,7 +155,8 @@ __device__ __forceinline__ void cached_gate_up_rows(
     const std::uint8_t* __restrict__ gate_codes, const std::uint8_t* __restrict__ gate_scales,
     float inverse_gate, const std::uint8_t* __restrict__ up_codes,
     const std::uint8_t* __restrict__ up_scales, float inverse_up, const int (&rows)[R],
-    const A* __restrict__ activation, float (&gate)[R], float (&up)[R]) {
+    const A* __restrict__ activation, const float2* __restrict__ decode_lut,
+    const float* __restrict__ scale_lut, float (&gate)[R], float (&up)[R]) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
     float gate_acc[R];
     float up_acc[R];
@@ -173,11 +174,10 @@ __device__ __forceinline__ void cached_gate_up_rows(
         for (int r = 0; r < R; ++r) {
             const int row = rows[r];
             const float gate_scale =
-                decode_nvfp4_e4m3(
-                    gate_scales[batched_nvfp4_scale_offset(row, group, kMoeHidden)]) *
+                scale_lut[gate_scales[batched_nvfp4_scale_offset(row, group, kMoeHidden)]] *
                 inverse_gate;
             const float up_scale =
-                decode_nvfp4_e4m3(up_scales[batched_nvfp4_scale_offset(row, group, kMoeHidden)]) *
+                scale_lut[up_scales[batched_nvfp4_scale_offset(row, group, kMoeHidden)]] *
                 inverse_up;
             const std::uint64_t gate_word = load_vec<std::uint64_t>(
                 gate_codes + static_cast<std::size_t>(row) * (kMoeHidden / 2U) +
@@ -188,9 +188,9 @@ __device__ __forceinline__ void cached_gate_up_rows(
 #pragma unroll
             for (int byte = 0; byte < 8; ++byte) {
                 const float2 gate_code =
-                    decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(gate_word >> (8 * byte)));
+                    decode_lut[static_cast<std::uint8_t>(gate_word >> (8 * byte))];
                 const float2 up_code =
-                    decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(up_word >> (8 * byte)));
+                    decode_lut[static_cast<std::uint8_t>(up_word >> (8 * byte))];
                 const float2 value = MoeAct<A>::pair_to_float2(words[byte]);
                 gate_acc[r] = fmaf(gate_code.x * gate_scale, value.x, gate_acc[r]);
                 gate_acc[r] = fmaf(gate_code.y * gate_scale, value.y, gate_acc[r]);
@@ -210,30 +210,34 @@ template <int R>
 __device__ __forceinline__ void cached_down_rows(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     float inverse, const int (&rows)[R], const float* __restrict__ activation,
+    const float2* __restrict__ decode_lut, const float* __restrict__ scale_lut,
     float (&value)[R]) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
     float accumulator[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) accumulator[r] = 0.0F;
     for (int group = lane; group < kMoeIntermediate / 16; group += 32) {
+        const auto* values = reinterpret_cast<const float4*>(activation + 16 * group);
+        const float4 a0 = load_vec<float4>(values);
+        const float4 a1 = load_vec<float4>(values + 1);
+        const float4 a2 = load_vec<float4>(values + 2);
+        const float4 a3 = load_vec<float4>(values + 3);
+        const float av[16] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w,
+                              a2.x, a2.y, a2.z, a2.w, a3.x, a3.y, a3.z, a3.w};
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const int row = rows[r];
             const float scale =
-                decode_nvfp4_e4m3(
-                    scales[batched_nvfp4_scale_offset(row, group, kMoeIntermediate)]) *
+                scale_lut[scales[batched_nvfp4_scale_offset(row, group, kMoeIntermediate)]] *
                 inverse;
             const std::uint64_t codes_word = load_vec<std::uint64_t>(
                 codes + static_cast<std::size_t>(row) * (kMoeIntermediate / 2U) +
                 static_cast<std::size_t>(group) * 8U);
 #pragma unroll
             for (int byte = 0; byte < 8; ++byte) {
-                const float2 code =
-                    decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(codes_word >> (8 * byte)));
-                accumulator[r] =
-                    fmaf(code.x * scale, activation[16 * group + 2 * byte], accumulator[r]);
-                accumulator[r] =
-                    fmaf(code.y * scale, activation[16 * group + 2 * byte + 1], accumulator[r]);
+                const float2 code = decode_lut[static_cast<std::uint8_t>(codes_word >> (8 * byte))];
+                accumulator[r] = fmaf(code.x * scale, av[2 * byte], accumulator[r]);
+                accumulator[r] = fmaf(code.y * scale, av[2 * byte + 1], accumulator[r]);
             }
         }
     }
@@ -253,6 +257,15 @@ __global__ __launch_bounds__(kMoeDecodeThreads) void moe_nvfp4_cached_gate_up_ke
     const int row_base = static_cast<int>(blockIdx.y) * kMoeDecodeGateUpTile;
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
     const int lane     = static_cast<int>(threadIdx.x) & 31;
+
+    __shared__ float2 decode_lut[256];
+    __shared__ float scale_lut[256];
+    for (int index = static_cast<int>(threadIdx.x); index < 256;
+         index += static_cast<int>(blockDim.x)) {
+        decode_lut[index] = decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(index));
+        scale_lut[index]  = decode_nvfp4_e4m3(static_cast<std::uint8_t>(index));
+    }
+    __syncthreads();
 
     if (probe.active_count != nullptr && blockIdx.x == 0 && blockIdx.y == 0 &&
         threadIdx.x == 0) {
@@ -275,7 +288,8 @@ __global__ __launch_bounds__(kMoeDecodeThreads) void moe_nvfp4_cached_gate_up_ke
     float gate[kRows];
     float up[kRows];
     cached_gate_up_rows<A, kRows>(base, base + kMoeGateScale, inverse_gate, base + kMoeUpCode,
-                                  base + kMoeUpScale, inverse_up, rows, x, gate, up);
+                                  base + kMoeUpScale, inverse_up, rows, x, decode_lut, scale_lut,
+                                  gate, up);
     if (lane == 0) {
         float* activation_column = activation + static_cast<std::size_t>(route) * kMoeIntermediate;
 #pragma unroll
@@ -296,6 +310,15 @@ __global__ __launch_bounds__(kMoeDecodeThreads) void moe_nvfp4_cached_down_kerne
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
     const int lane     = static_cast<int>(threadIdx.x) & 31;
 
+    __shared__ float2 decode_lut[256];
+    __shared__ float scale_lut[256];
+    for (int index = static_cast<int>(threadIdx.x); index < 256;
+         index += static_cast<int>(blockDim.x)) {
+        decode_lut[index] = decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(index));
+        scale_lut[index]  = decode_nvfp4_e4m3(static_cast<std::uint8_t>(index));
+    }
+    __syncthreads();
+
     int rows[kRows];
 #pragma unroll
     for (int r = 0; r < kRows; ++r) rows[r] = row_base + warp + r * kMoeDecodeWarps;
@@ -314,7 +337,7 @@ __global__ __launch_bounds__(kMoeDecodeThreads) void moe_nvfp4_cached_down_kerne
         const float* source = activation + static_cast<std::size_t>(route) * kMoeIntermediate;
         float value[kRows];
         cached_down_rows<kRows>(base + kMoeDownCode, base + kMoeDownScale, inverse_down, rows,
-                                source, value);
+                                source, decode_lut, scale_lut, value);
 #pragma unroll
         for (int r = 0; r < kRows; ++r) accumulator[r] += coefficient * value[r];
     }

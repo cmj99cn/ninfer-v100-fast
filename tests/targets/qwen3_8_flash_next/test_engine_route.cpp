@@ -28,7 +28,7 @@ constexpr std::uint32_t kKvCapacity = 262144;
 constexpr std::uint32_t kPageTokens = 64;
 
 constexpr std::array<TokenId, 8> kPrompt{1024, 7, 98140, 33, 4097, 512, 100, 2048};
-constexpr std::array<TokenId, 3> kDirectPathTokens{4818, 84666, 96991};
+constexpr std::array<TokenId, 3> kDirectPathTokens{4818, 84666, 5396};
 
 void require(bool condition, const std::string& message) {
     if (!condition) { throw std::runtime_error(message); }

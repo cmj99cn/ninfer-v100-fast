@@ -101,6 +101,9 @@ public:
     [[nodiscard]] const std::uint32_t* ple_rows() const noexcept;
     [[nodiscard]] const std::uint8_t* ple_staged_rows() const noexcept;
     [[nodiscard]] const ops::PleNf4Table& ple_table() const noexcept;
+    [[nodiscard]] std::int32_t* route_counter() const noexcept {
+        return static_cast<std::int32_t*>(route_counter_.p);
+    }
 
     [[nodiscard]] std::uint32_t next_position() const noexcept { return next_position_; }
     void advance_position(std::uint32_t tokens) noexcept { next_position_ += tokens; }
@@ -179,6 +182,7 @@ private:
     DeviceBuffer ple_rows_;
     DeviceBuffer ple_staged_rows_;
     DeviceBuffer ple_divisors_;
+    DeviceBuffer route_counter_;
 };
 
 // The text trunk: the embedding stem, the per-layer four-stream mixer and post-mixer, and the main

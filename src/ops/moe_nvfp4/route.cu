@@ -27,6 +27,8 @@ inline constexpr int kRouteGroups      = kMoeHidden / 16;
 inline constexpr int kRoutePhases      = kRouteGroups / 32;
 static_assert(kRouteGroups % 32 == 0);
 inline constexpr int kRouteWarpsPerCta = 8;
+inline constexpr int kRouteCtas        = (kRouteRows + kRouteWarpsPerCta - 1) / kRouteWarpsPerCta;
+inline constexpr int kRouteSlots       = (kMoeExperts + 31) / 32;
 
 template <class A>
 __device__ __forceinline__ float route_row_dot(const std::uint32_t* weight_words,
@@ -59,6 +61,51 @@ __device__ __forceinline__ float route_row_dot(const std::uint32_t* weight_words
 #pragma unroll
     for (int chain = 0; chain < 4; ++chain) { total += accumulator[chain]; }
     return warp_reduce_sum(total);
+}
+
+__device__ __forceinline__ void route_select(const float* __restrict__ logits,
+                                             std::int32_t* __restrict__ ids,
+                                             float* __restrict__ coefficients,
+                                             float* __restrict__ shared_gate) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    __shared__ float selected_value[kMoeTopK];
+
+    float values[kRouteSlots];
+#pragma unroll
+    for (int slot = 0; slot < kRouteSlots; ++slot) {
+        const int index = lane + 32 * slot;
+        values[slot]    = index < kMoeExperts ? logits[index] : -CUDART_INF_F;
+    }
+
+    for (int rank = 0; rank < kMoeTopK; ++rank) {
+        RankedValue candidate{values[0], lane};
+#pragma unroll
+        for (int slot = 1; slot < kRouteSlots; ++slot) {
+            const int index = lane + 32 * slot;
+            if (index < kMoeExperts && ranked_better({values[slot], index}, candidate)) {
+                candidate = RankedValue{values[slot], index};
+            }
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            RankedValue other;
+            other.value = __shfl_down_sync(kFullWarpMask, candidate.value, offset);
+            other.id    = __shfl_down_sync(kFullWarpMask, candidate.id, offset);
+            if (ranked_better(other, candidate)) { candidate = other; }
+        }
+        const int chosen = __shfl_sync(kFullWarpMask, candidate.id, 0);
+        if (lane == 0) {
+            ids[rank]            = chosen;
+            selected_value[rank] = candidate.value;
+        }
+        if (lane == (chosen & 31)) { values[chosen >> 5] = -CUDART_INF_F; }
+    }
+
+    float exponential =
+        lane < kMoeTopK ? expf(selected_value[lane] - selected_value[0]) : 0.0F;
+    const float denominator = warp_sum(exponential);
+    if (lane < kMoeTopK) { coefficients[lane] = exponential / denominator; }
+    if (lane == 0) { shared_gate[0] = sigmoid(logits[kMoeExperts]); }
 }
 
 template <class A>
@@ -132,61 +179,60 @@ __global__ __launch_bounds__(kRouteWarpsPerCta * 32) void moe_nvfp4_route_logits
         route_row_dot<A>(weight_words, x_column, lane);
 }
 
-__global__ __launch_bounds__(512) void moe_nvfp4_route_select_kernel(
-    const float* __restrict__ logits_in, std::int32_t* __restrict__ ids,
+__global__ __launch_bounds__(32) void moe_nvfp4_route_select_kernel(
+    const float* __restrict__ logits, std::int32_t* __restrict__ ids,
     float* __restrict__ coefficients, float* __restrict__ shared_gate) {
-    const int token = static_cast<int>(blockIdx.x);
-    const int row   = static_cast<int>(threadIdx.x);
-    const int lane  = row & 31;
-    const int warp  = row >> 5;
+    route_select(logits, ids, coefficients, shared_gate);
+}
 
-    __shared__ float logits[kRouteRows];
-    __shared__ RankedValue warp_best[16];
-    __shared__ float selected_value[kMoeTopK];
+template <class A>
+__global__ __launch_bounds__(kRouteWarpsPerCta * 32) void moe_nvfp4_route_fused_kernel(
+    const A* __restrict__ x, const __nv_bfloat16* __restrict__ control,
+    std::int32_t* __restrict__ ids, float* __restrict__ coefficients,
+    float* __restrict__ shared_gate, float* __restrict__ logits,
+    std::int32_t* __restrict__ counter) {
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int row  = static_cast<int>(blockIdx.x) * kRouteWarpsPerCta + warp;
+    if (row < kRouteRows) {
+        const std::uint32_t* weight_words = reinterpret_cast<const std::uint32_t*>(
+            control + static_cast<std::int64_t>(row) * kMoeHidden);
+        logits[row] = route_row_dot<A>(weight_words, x, lane);
+    }
+    __threadfence();
 
-    const float* source = logits_in + static_cast<std::int64_t>(token) * kRouteRows;
-    logits[row] = source[row];
-    if (row == 0) { logits[kMoeExperts] = source[kMoeExperts]; }
+    __shared__ int is_last;
+    if (threadIdx.x == 0) {
+        is_last = atomicAdd(counter, 1) == kRouteCtas - 1 ? 1 : 0;
+    }
     __syncthreads();
+    if (is_last == 0) { return; }
 
-    for (int rank = 0; rank < kMoeTopK; ++rank) {
-        RankedValue candidate{logits[row], row};
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            RankedValue other;
-            other.value = __shfl_down_sync(kFullWarpMask, candidate.value, offset);
-            other.id    = __shfl_down_sync(kFullWarpMask, candidate.id, offset);
-            if (ranked_better(other, candidate)) candidate = other;
-        }
-        if (lane == 0) warp_best[warp] = candidate;
-        __syncthreads();
-        if (row == 0) {
-            RankedValue overall = warp_best[0];
-            for (int w = 1; w < 16; ++w) {
-                if (ranked_better(warp_best[w], overall)) overall = warp_best[w];
-            }
-            ids[rank + kMoeTopK * token]   = overall.id;
-            selected_value[rank]           = overall.value;
-            logits[overall.id]             = -CUDART_INF_F;
-        }
-        __syncthreads();
-    }
-
-    if (warp == 0) {
-        float exponential = lane < kMoeTopK ? expf(selected_value[lane] - selected_value[0]) : 0.0F;
-        const float denominator = warp_sum(exponential);
-        if (lane < kMoeTopK) coefficients[lane + kMoeTopK * token] = exponential / denominator;
-    }
-    if (row == 0) shared_gate[token] = sigmoid(logits[kMoeExperts]);
+    if (warp == 0) { route_select(logits, ids, coefficients, shared_gate); }
+    if (threadIdx.x == 0) { *counter = 0; }
 }
 
 } // namespace
 
 void moe_nvfp4_route_launch(const Tensor& x, const void* control, MoeNvfp4RouteOutputs outputs,
-                            float* logits, cudaStream_t stream) {
+                            float* logits, std::int32_t* counter, cudaStream_t stream) {
     const bool split = x.ne[1] == 1 && logits != nullptr;
-    if (split) {
-        const dim3 logits_grid((kRouteRows + kRouteWarpsPerCta - 1) / kRouteWarpsPerCta, x.ne[1]);
+    if (split && counter != nullptr) {
+        if (x.dtype == DType::FP16) {
+            moe_nvfp4_route_fused_kernel<__half>
+                <<<kRouteCtas, kRouteWarpsPerCta * 32, 0, stream>>>(
+                    static_cast<const __half*>(x.data),
+                    static_cast<const __nv_bfloat16*>(control), outputs.ids, outputs.coefficients,
+                    outputs.shared_gate, logits, counter);
+        } else {
+            moe_nvfp4_route_fused_kernel<__nv_bfloat16>
+                <<<kRouteCtas, kRouteWarpsPerCta * 32, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const __nv_bfloat16*>(control), outputs.ids, outputs.coefficients,
+                    outputs.shared_gate, logits, counter);
+        }
+    } else if (split) {
+        const dim3 logits_grid(kRouteCtas, x.ne[1]);
         if (x.dtype == DType::FP16) {
             moe_nvfp4_route_logits_kernel<__half>
                 <<<logits_grid, kRouteWarpsPerCta * 32, 0, stream>>>(
@@ -198,7 +244,7 @@ void moe_nvfp4_route_launch(const Tensor& x, const void* control, MoeNvfp4RouteO
                     static_cast<const __nv_bfloat16*>(x.data),
                     static_cast<const __nv_bfloat16*>(control), logits);
         }
-        moe_nvfp4_route_select_kernel<<<x.ne[1], 512, 0, stream>>>(
+        moe_nvfp4_route_select_kernel<<<x.ne[1], 32, 0, stream>>>(
             logits, outputs.ids, outputs.coefficients, outputs.shared_gate);
     } else if (x.dtype == DType::FP16) {
         moe_nvfp4_route_kernel<__half><<<x.ne[1], 512, 0, stream>>>(
