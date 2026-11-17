@@ -95,4 +95,26 @@ void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tens
                                  cudaMemcpyDeviceToDevice, stream));
 }
 
+void stage_gdn_decode(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                      const Tensor& beta, std::int32_t rank, Tensor& conv_in, Tensor& g_rank,
+                      Tensor& beta_rank, cudaStream_t stream) {
+    const std::int32_t key_width = q.ne[0];
+    const std::int32_t channels  = conv_in.ne[0];
+    const std::int32_t heads     = g_rank.ne[0];
+    if (q.dtype != DType::FP16 || k.dtype != DType::FP16 || v.dtype != DType::FP16 ||
+        g.dtype != DType::FP32 || beta.dtype != DType::FP32 ||
+        conv_in.dtype != DType::FP16 || g_rank.dtype != DType::FP32 ||
+        beta_rank.dtype != DType::FP32 || rank < 0 || key_width <= 0 || heads <= 0 ||
+        channels < 3 * key_width || k.ne[0] != key_width || v.ne[0] != channels - 2 * key_width ||
+        g.ne[0] < (rank + 1) * heads || beta.ne[0] < (rank + 1) * heads ||
+        g_rank.ne[0] != heads || beta_rank.ne[0] != heads) {
+        throw std::invalid_argument("stage_gdn_decode: invalid geometry");
+    }
+    if (q.ne[1] != 1 || k.ne[1] != 1 || v.ne[1] != 1 || g.ne[1] != 1 || beta.ne[1] != 1 ||
+        conv_in.ne[1] != 1 || g_rank.ne[1] != 1 || beta_rank.ne[1] != 1) {
+        throw std::invalid_argument("stage_gdn_decode: requires T=1");
+    }
+    detail::stage_gdn_decode_launch(q, k, v, g, beta, rank, conv_in, g_rank, beta_rank, stream);
+}
+
 } // namespace ninfer::ops

@@ -3,9 +3,51 @@
 #include "ops/kernel/scatter.cuh"
 #include "core/device.h"
 
+#include <cuda_fp16.h>
+
 #include <cstdint>
 
 namespace ninfer::ops::detail {
+namespace {
+
+__global__ void stage_gdn_decode_kernel(const __half* q, const __half* k, const __half* v,
+                                        const float* g, const float* beta, __half* conv_in,
+                                        float* g_rank, float* beta_rank, int key_width,
+                                        int conv_channels, int value_heads, int base) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < key_width) {
+        conv_in[index] = q[index];
+    } else if (index < 2 * key_width) {
+        conv_in[index] = k[index - key_width];
+    } else if (index < conv_channels) {
+        conv_in[index] = v[index - 2 * key_width];
+    } else if (index < conv_channels + value_heads) {
+        g_rank[index - conv_channels] = g[base + index - conv_channels];
+    } else if (index < conv_channels + 2 * value_heads) {
+        beta_rank[index - conv_channels - value_heads] =
+            beta[base + index - conv_channels - value_heads];
+    }
+}
+
+} // namespace
+
+void stage_gdn_decode_launch(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                             const Tensor& beta, std::int32_t rank, Tensor& conv_in,
+                             Tensor& g_rank, Tensor& beta_rank, cudaStream_t stream) {
+    const int key_width    = q.ne[0];
+    const int conv_channels = conv_in.ne[0];
+    const int value_heads  = g_rank.ne[0];
+    const int total = conv_channels + 2 * value_heads;
+    constexpr int block = 256;
+    const int grid = (total + block - 1) / block;
+    stage_gdn_decode_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const __half*>(q.data), static_cast<const __half*>(k.data),
+        static_cast<const __half*>(v.data), static_cast<const float*>(g.data),
+        static_cast<const float*>(beta.data), static_cast<__half*>(conv_in.data),
+        static_cast<float*>(g_rank.data), static_cast<float*>(beta_rank.data), key_width,
+        conv_channels, value_heads, rank * value_heads);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void scatter_launch(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream) {
     constexpr int block        = 256;

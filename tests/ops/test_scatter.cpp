@@ -186,6 +186,69 @@ int batch_prefix_case() {
     return failures;
 }
 
+int stage_gdn_case() {
+    constexpr std::int32_t kKey    = 2048;
+    constexpr std::int32_t kValue  = 6144;
+    constexpr std::int32_t kChannels = 2 * kKey + kValue;
+    constexpr std::int32_t kHeads  = 24;
+    constexpr std::int32_t kRank   = 1;
+    const auto qb = bit_pattern(kKey, 0x11u);
+    const auto kb = bit_pattern(kKey, 0x22u);
+    const auto vb = bit_pattern(kValue, 0x33u);
+    auto bit_pattern32 = [](std::size_t count, std::uint32_t seed) {
+        std::vector<std::uint32_t> values(count);
+        std::uint32_t state = seed;
+        for (std::size_t i = 0; i < count; ++i) {
+            state     = state * 1664525u + 1013904223u;
+            values[i] = state ^ static_cast<std::uint32_t>(i << 11);
+        }
+        return values;
+    };
+    const auto gb = bit_pattern32(2 * kHeads, 0x44u);
+    const auto bb = bit_pattern32(2 * kHeads, 0x55u);
+
+    GuardedDeviceBuffer dq(qb.size() * 2), dk(kb.size() * 2), dv(vb.size() * 2);
+    GuardedDeviceBuffer dg(gb.size() * 4), db(bb.size() * 4);
+    GuardedDeviceBuffer dci(kChannels * 2), dgr(kHeads * 4), dbr(kHeads * 4);
+    dq.copy_from_host(qb.data(), dq.bytes());
+    dk.copy_from_host(kb.data(), dk.bytes());
+    dv.copy_from_host(vb.data(), dv.bytes());
+    dg.copy_from_host(gb.data(), dg.bytes());
+    db.copy_from_host(bb.data(), db.bytes());
+
+    Tensor qt(dq.data(), DType::FP16, {kKey, 1});
+    Tensor kt(dk.data(), DType::FP16, {kKey, 1});
+    Tensor vt(dv.data(), DType::FP16, {kValue, 1});
+    Tensor gt(dg.data(), DType::FP32, {2 * kHeads, 1});
+    Tensor bt(db.data(), DType::FP32, {2 * kHeads, 1});
+    Tensor cit(dci.data(), DType::FP16, {kChannels, 1});
+    Tensor grt(dgr.data(), DType::FP32, {kHeads, 1});
+    Tensor brt(dbr.data(), DType::FP32, {kHeads, 1});
+    ops::stage_gdn_decode(qt, kt, vt, gt, bt, kRank, cit, grt, brt, nullptr);
+    cuda_synchronize();
+
+    std::vector<std::uint16_t> expected_ci(kChannels);
+    for (std::int32_t i = 0; i < kKey; ++i) expected_ci[i] = qb[i];
+    for (std::int32_t i = 0; i < kKey; ++i) expected_ci[kKey + i] = kb[i];
+    for (std::int32_t i = 0; i < kValue; ++i) expected_ci[2 * kKey + i] = vb[i];
+    std::vector<std::uint32_t> expected_g(kHeads), expected_b(kHeads);
+    for (std::int32_t i = 0; i < kHeads; ++i) {
+        expected_g[i] = gb[kRank * kHeads + i];
+        expected_b[i] = bb[kRank * kHeads + i];
+    }
+    int failures = 0;
+    failures += verify_exact("stage_gdn_decode conv_in",
+                             from_device<std::uint16_t>(dci.data(), expected_ci.size()),
+                             expected_ci);
+    failures += verify_exact("stage_gdn_decode g_rank",
+                             from_device<std::uint32_t>(dgr.data(), expected_g.size()),
+                             expected_g);
+    failures += verify_exact("stage_gdn_decode beta_rank",
+                             from_device<std::uint32_t>(dbr.data(), expected_b.size()),
+                             expected_b);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -200,6 +263,7 @@ int main() {
     failures += extract_case(10240, 6144, 4096, 6);
     failures += extract_case(8192, 2048, 2048, 1);
     failures += batch_prefix_case();
+    failures += stage_gdn_case();
     std::cout << (failures ? "FAIL" : "OK") << " scatter and extract_bf16_columns\n";
     return failures ? 1 : 0;
 }

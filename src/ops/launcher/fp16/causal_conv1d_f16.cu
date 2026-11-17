@@ -57,7 +57,51 @@ __global__ void state_f16_kernel(const __half* x, const __half* state_in, __half
     state_out[2 * C + c] = pick(T + 2);
 }
 
+template <class W>
+__global__ void conv_state_f16_decode_kernel(const __half* x, const W* w,
+                                            const __half* state_in, __half* state_out,
+                                            __half* out, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) { return; }
+    const __half old0 = state_in[c];
+    const __half old1 = state_in[C + c];
+    const __half old2 = state_in[2 * C + c];
+    const __half x3   = x[c];
+    float acc         = 0.0f;
+    acc += load_weight(w + c) * __half2float(old0);
+    acc += load_weight(w + C + c) * __half2float(old1);
+    acc += load_weight(w + 2 * C + c) * __half2float(old2);
+    acc += load_weight(w + 3 * C + c) * __half2float(x3);
+    out[c]        = __float2half_rn(acc / (1.0f + expf(-acc)));
+    state_out[c]     = old1;
+    state_out[C + c] = old2;
+    state_out[2 * C + c] = x3;
+}
+
 } // namespace
+
+void causal_conv1d_silu_f16_split_launch(const Tensor& x, const Tensor& weight,
+                                         const Tensor& state_in, Tensor& state_out, Tensor& out,
+                                         cudaStream_t stream) {
+    const int C = x.ne[0];
+    const int T = x.ne[1];
+    const int threads  = 256;
+    const int blocks_c = (C + threads - 1) / threads;
+    const dim3 grid(T, blocks_c);
+    const auto* xp = static_cast<const __half*>(x.data);
+    const auto* sp = static_cast<const __half*>(state_in.data);
+    auto* op       = static_cast<__half*>(out.data);
+    if (weight.dtype == DType::BF16) {
+        conv_f16_kernel<__nv_bfloat16><<<grid, threads, 0, stream>>>(
+            xp, static_cast<const __nv_bfloat16*>(weight.data), sp, op, C, T);
+    } else {
+        conv_f16_kernel<half><<<grid, threads, 0, stream>>>(
+            xp, static_cast<const half*>(weight.data), sp, op, C, T);
+    }
+    state_f16_kernel<<<blocks_c, threads, 0, stream>>>(
+        xp, sp, static_cast<__half*>(state_out.data), C, T);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void causal_conv1d_silu_f16_launch(const Tensor& x, const Tensor& weight, const Tensor& state_in,
                                    Tensor& state_out, Tensor& out, cudaStream_t stream) {
@@ -82,6 +126,18 @@ void causal_conv1d_silu_f16_launch(const Tensor& x, const Tensor& weight, const 
     const auto* xp = static_cast<const __half*>(x.data);
     const auto* sp = static_cast<const __half*>(state_in.data);
     auto* op       = static_cast<__half*>(out.data);
+    if (T == 1) {
+        auto* sop = static_cast<__half*>(state_out.data);
+        if (weight.dtype == DType::BF16) {
+            conv_state_f16_decode_kernel<__nv_bfloat16><<<blocks_c, threads, 0, stream>>>(
+                xp, static_cast<const __nv_bfloat16*>(weight.data), sp, sop, op, C);
+        } else {
+            conv_state_f16_decode_kernel<half><<<blocks_c, threads, 0, stream>>>(
+                xp, static_cast<const half*>(weight.data), sp, sop, op, C);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (weight.dtype == DType::BF16) {
         conv_f16_kernel<__nv_bfloat16><<<grid, threads, 0, stream>>>(
             xp, static_cast<const __nv_bfloat16*>(weight.data), sp, op, C, T);

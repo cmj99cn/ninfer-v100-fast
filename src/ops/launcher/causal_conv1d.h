@@ -33,5 +33,8 @@ void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor
 // state_out may alias.
 void causal_conv1d_silu_f16_launch(const Tensor& x, const Tensor& weight, const Tensor& state_in,
                                    Tensor& state_out, Tensor& out, cudaStream_t stream);
+void causal_conv1d_silu_f16_split_launch(const Tensor& x, const Tensor& weight,
+                                         const Tensor& state_in, Tensor& state_out, Tensor& out,
+                                         cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

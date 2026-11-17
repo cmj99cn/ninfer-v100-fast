@@ -1,5 +1,6 @@
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/causal_conv1d_silu_f16.h"
+#include "ops/launcher/causal_conv1d.h"
 #include "ops/op_tester.h"
 
 #include <cuda_bf16.h>
@@ -125,6 +126,72 @@ int run_case(int C, int T, std::uint32_t seed, DType weight_dtype, bool separate
     return failures;
 }
 
+int run_fusion_case(int C, std::uint32_t seed, DType weight_dtype, bool separate_state) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    std::vector<float> xf(static_cast<std::size_t>(C)), wf(static_cast<std::size_t>(C) * 4),
+        sf(static_cast<std::size_t>(C) * 3);
+    for (auto& v : xf) v = d(rng);
+    for (auto& v : wf) v = d(rng);
+    for (auto& v : sf) v = d(rng);
+    round_to_f16(xf);
+    round_to_f16(sf);
+    if (weight_dtype == DType::FP16) {
+        round_to_f16(wf);
+    } else {
+        round_to_bf16(wf);
+    }
+    std::vector<__half> x(xf.size()), st(sf.size());
+    for (std::size_t i = 0; i < xf.size(); ++i) x[i] = __float2half_rn(xf[i]);
+    for (std::size_t i = 0; i < sf.size(); ++i) st[i] = __float2half_rn(sf[i]);
+    std::vector<std::uint16_t> w(wf.size());
+    for (std::size_t i = 0; i < wf.size(); ++i) {
+        w[i] = weight_dtype == DType::FP16 ? f32_to_f16(wf[i]) : f32_to_bf16(wf[i]);
+    }
+
+    GuardedDeviceBuffer ax(x.size() * 2), aw(w.size() * 2), as(st.size() * 2),
+        asep(st.size() * 2), aout(x.size() * 2);
+    GuardedDeviceBuffer bx(x.size() * 2), bw(w.size() * 2), bs(st.size() * 2),
+        bsep(st.size() * 2), bout(x.size() * 2);
+    auto seed_buffers = [&](GuardedDeviceBuffer& dx, GuardedDeviceBuffer& dw,
+                            GuardedDeviceBuffer& ds, GuardedDeviceBuffer& dsep) {
+        dx.copy_from_host(x.data(), dx.bytes());
+        dw.copy_from_host(w.data(), dw.bytes());
+        ds.copy_from_host(st.data(), ds.bytes());
+        dsep.copy_from_host(st.data(), dsep.bytes());
+    };
+    seed_buffers(ax, aw, as, asep);
+    seed_buffers(bx, bw, bs, bsep);
+    Tensor ax_t(ax.data(), DType::FP16, {C, 1}), aw_t(aw.data(), weight_dtype, {C, 4});
+    Tensor as_t(as.data(), DType::FP16, {3, C}), aout_t(aout.data(), DType::FP16, {C, 1});
+    Tensor bx_t(bx.data(), DType::FP16, {C, 1}), bw_t(bw.data(), weight_dtype, {C, 4});
+    Tensor bs_t(bs.data(), DType::FP16, {3, C}), bout_t(bout.data(), DType::FP16, {C, 1});
+    Tensor as_out = separate_state ? Tensor(asep.data(), DType::FP16, {3, C}) : as_t;
+    Tensor bs_out = separate_state ? Tensor(bsep.data(), DType::FP16, {3, C}) : bs_t;
+    ninfer::ops::detail::causal_conv1d_silu_f16_launch(ax_t, aw_t, as_t, as_out, aout_t, nullptr);
+    ninfer::ops::detail::causal_conv1d_silu_f16_split_launch(bx_t, bw_t, bs_t, bs_out, bout_t,
+                                                             nullptr);
+    cuda_synchronize();
+
+    int failures = 0;
+    const auto ao = from_device<std::uint16_t>(aout.data(), x.size());
+    const auto bo = from_device<std::uint16_t>(bout.data(), x.size());
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        if (ao[i] != bo[i]) { ++failures; }
+    }
+    const auto as_after = from_device<std::uint16_t>(separate_state ? asep.data() : as.data(),
+                                                    st.size());
+    const auto bs_after = from_device<std::uint16_t>(separate_state ? bsep.data() : bs.data(),
+                                                    st.size());
+    for (std::size_t i = 0; i < st.size(); ++i) {
+        if (as_after[i] != bs_after[i]) { ++failures; }
+    }
+    std::cout << "conv_f16_fusion C=" << C
+              << " weight=" << (weight_dtype == DType::FP16 ? "f16" : "bf16")
+              << " separate_state=" << separate_state << " failures=" << failures << '\n';
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -145,6 +212,10 @@ int main() {
         failures += run_case(32, 3, 9013U, DType::BF16, true, false);
         failures += run_case(33, 7, 9014U, DType::BF16, true, false);
         failures += run_case(64, 17, 9015U, DType::BF16, true, false);
+        failures += run_fusion_case(16, 9021U, DType::FP16, false);
+        failures += run_fusion_case(17, 9022U, DType::FP16, true);
+        failures += run_fusion_case(64, 9023U, DType::BF16, false);
+        failures += run_fusion_case(65, 9024U, DType::BF16, true);
         std::cout << (failures ? "FAIL" : "OK") << " causal_conv1d_f16\n";
         return failures ? 1 : 0;
     } catch (const std::exception& e) {

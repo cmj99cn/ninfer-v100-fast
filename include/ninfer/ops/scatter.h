@@ -71,4 +71,17 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
 void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tensor& destination,
                           cudaStream_t stream);
 
+/**
+ * Fuse the decode GDN staging copies into one launch:
+ *   conv_in[0:key_width]            = q
+ *   conv_in[key_width:2*key_width]  = k
+ *   conv_in[2*key_width:channels]   = v
+ *   g_rank                          = g[rank*value_heads:(rank+1)*value_heads]
+ *   beta_rank                       = beta[rank*value_heads:(rank+1)*value_heads]
+ * All tensors are contiguous with T=1. Copies are exact activation/FP32 word moves.
+ */
+void stage_gdn_decode(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                      const Tensor& beta, std::int32_t rank, Tensor& conv_in, Tensor& g_rank,
+                      Tensor& beta_rank, cudaStream_t stream);
+
 } // namespace ninfer::ops

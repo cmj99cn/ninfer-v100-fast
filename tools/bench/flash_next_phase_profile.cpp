@@ -259,9 +259,11 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
     for (std::uint32_t index = 0; index < kDecodeTokens; ++index) {
         const detail::CacheStats before = data.expert_cache_stats(0);
         begin_round();
+        if (index == 0) { setenv("NINFER_LAUNCH_GATE", "1", 1); }
         const std::int64_t decode_begin = now_ns();
         token = trunk.decode(token);
         const double decode_ms = static_cast<double>(now_ns() - decode_begin) / 1.0e6;
+        if (index == 0) { setenv("NINFER_LAUNCH_GATE", "0", 1); }
         for (std::uint32_t rank = 0; rank < kRanks; ++rank) {
             execution.dev[rank]->synchronize();
         }

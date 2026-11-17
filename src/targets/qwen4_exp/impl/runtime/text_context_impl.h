@@ -511,24 +511,31 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
         Tensor z    = activations_[slot]->alloc(kTextActivationDtype, {value_width, T});
         Tensor g    = activations_[slot]->alloc(DType::FP32, {TextConfig::gdn_value_heads, T});
         Tensor beta = activations_[slot]->alloc(DType::FP32, {TextConfig::gdn_value_heads, T});
+        Tensor g_rank    = activations_[slot]->alloc(DType::FP32, {state.gdn_value_heads(), T});
+        Tensor beta_rank = activations_[slot]->alloc(DType::FP32, {state.gdn_value_heads(), T});
         Variant::gdn_projection_control(block_input[slot], weights, q, k, v, z, g, beta, workspace_,
                                         stream_for(rank));
         NINFER_QWEN4EXP_DIAG_MARK("gdn_proj");
 
         Tensor conv_in  = activations_[slot]->alloc(kTextActivationDtype, {conv_channels, T});
         Tensor conv_out = activations_[slot]->alloc(kTextActivationDtype, {conv_channels, T});
-        const auto copy_segment = [&](const Tensor& source, std::int32_t column) {
-            CUDA_CHECK(cudaMemcpy2DAsync(
-                static_cast<std::byte*>(conv_in.data) +
-                    static_cast<std::size_t>(column) * sizeof(std::uint16_t),
-                static_cast<std::size_t>(conv_channels) * sizeof(std::uint16_t),
-                source.data, static_cast<std::size_t>(source.ne[0]) * sizeof(std::uint16_t),
-                static_cast<std::size_t>(source.ne[0]) * sizeof(std::uint16_t),
-                static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, stream_for(rank)));
-        };
-        copy_segment(q, 0);
-        copy_segment(k, key_width);
-        copy_segment(v, 2 * key_width);
+        if (T == 1) {
+            ops::stage_gdn_decode(q, k, v, g, beta, rank, conv_in, g_rank, beta_rank,
+                                  stream_for(rank));
+        } else {
+            const auto copy_segment = [&](const Tensor& source, std::int32_t column) {
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    static_cast<std::byte*>(conv_in.data) +
+                        static_cast<std::size_t>(column) * sizeof(std::uint16_t),
+                    static_cast<std::size_t>(conv_channels) * sizeof(std::uint16_t),
+                    source.data, static_cast<std::size_t>(source.ne[0]) * sizeof(std::uint16_t),
+                    static_cast<std::size_t>(source.ne[0]) * sizeof(std::uint16_t),
+                    static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, stream_for(rank)));
+            };
+            copy_segment(q, 0);
+            copy_segment(k, key_width);
+            copy_segment(v, 2 * key_width);
+        }
 
         const std::optional<std::size_t> state_slot = state.gdn_state_index(layer);
         if (!state_slot.has_value()) { throw std::logic_error("a QSA layer has no GDN state slot"); }
@@ -551,22 +558,22 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
         Tensor o_recurrent = o.view({128, state.gdn_value_heads(), T});
         Tensor o_normalized = on.view({128, state.gdn_value_heads(), T});
         Tensor recurrent_state = state.gdn_recurrent_state(gdn_index);
-        Tensor g_rank    = activations_[slot]->alloc(DType::FP32, {state.gdn_value_heads(), T});
-        Tensor beta_rank = activations_[slot]->alloc(DType::FP32, {state.gdn_value_heads(), T});
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            g_rank.data, static_cast<std::size_t>(state.gdn_value_heads()) * 4,
-            static_cast<const std::byte*>(g.data) +
-                static_cast<std::size_t>(rank * state.gdn_value_heads()) * 4,
-            static_cast<std::size_t>(TextConfig::gdn_value_heads) * 4,
-            static_cast<std::size_t>(state.gdn_value_heads()) * 4, static_cast<std::size_t>(T),
-            cudaMemcpyDeviceToDevice, stream_for(rank)));
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            beta_rank.data, static_cast<std::size_t>(state.gdn_value_heads()) * 4,
-            static_cast<const std::byte*>(beta.data) +
-                static_cast<std::size_t>(rank * state.gdn_value_heads()) * 4,
-            static_cast<std::size_t>(TextConfig::gdn_value_heads) * 4,
-            static_cast<std::size_t>(state.gdn_value_heads()) * 4, static_cast<std::size_t>(T),
-            cudaMemcpyDeviceToDevice, stream_for(rank)));
+        if (T != 1) {
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                g_rank.data, static_cast<std::size_t>(state.gdn_value_heads()) * 4,
+                static_cast<const std::byte*>(g.data) +
+                    static_cast<std::size_t>(rank * state.gdn_value_heads()) * 4,
+                static_cast<std::size_t>(TextConfig::gdn_value_heads) * 4,
+                static_cast<std::size_t>(state.gdn_value_heads()) * 4, static_cast<std::size_t>(T),
+                cudaMemcpyDeviceToDevice, stream_for(rank)));
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                beta_rank.data, static_cast<std::size_t>(state.gdn_value_heads()) * 4,
+                static_cast<const std::byte*>(beta.data) +
+                    static_cast<std::size_t>(rank * state.gdn_value_heads()) * 4,
+                static_cast<std::size_t>(TextConfig::gdn_value_heads) * 4,
+                static_cast<std::size_t>(state.gdn_value_heads()) * 4, static_cast<std::size_t>(T),
+                cudaMemcpyDeviceToDevice, stream_for(rank)));
+        }
         ops::gated_delta_net(q_recurrent, k_recurrent, v_recurrent, g_rank, beta_rank, kGdnScale,
                              true, workspace_, recurrent_state, o_recurrent, stream_for(rank));
         NINFER_QWEN4EXP_DIAG_MARK("gdn_recurrent");
