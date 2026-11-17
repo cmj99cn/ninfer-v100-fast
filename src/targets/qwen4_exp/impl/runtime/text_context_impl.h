@@ -25,6 +25,8 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #ifndef NINFER_QWEN4EXP_LAST_STAGE
@@ -588,13 +590,21 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
     row_parallel_linear(projected, output_weight, mixer_out, staging, arena_ptrs);
 }
 
-inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
-                               const std::array<Tensor, kMaximumDevices>& block_input,
-                               const std::array<Tensor, kMaximumDevices>& positions,
-                               const std::array<Tensor, kMaximumDevices>& valid_columns,
-                               const std::array<Tensor, kMaximumDevices>& table_rows,
-                               std::array<Tensor, kMaximumDevices>& mixer_out,
-                               const std::array<Tensor, kMaximumDevices>& staging) {
+inline void publish_text_qsa_tail(void* context) {
+    auto* pair = static_cast<std::pair<TextState*, std::int32_t>*>(context);
+    pair->first->publish_tail(pair->second);
+}
+
+template <class AttentionWeights>
+inline void TextTrunk::run_qsa_layer(
+    std::int32_t T, const std::array<const AttentionWeights*, kMaximumDevices>& weights,
+    const std::array<QsaLayerStateView, kMaximumDevices>& state,
+    const std::array<Tensor, kMaximumDevices>& block_input,
+    const std::array<Tensor, kMaximumDevices>& positions,
+    const std::array<Tensor, kMaximumDevices>& valid_columns,
+    const std::array<Tensor, kMaximumDevices>& table_rows,
+    std::array<Tensor, kMaximumDevices>& mixer_out,
+    const std::array<Tensor, kMaximumDevices>& staging) {
     const std::int32_t index_dim = TextConfig::index_head_dim;
     std::array<Tensor, kMaximumDevices> projected{};
     std::array<Weight, kMaximumDevices> output_weight{};
@@ -603,10 +613,10 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
     for_each_rank([&](int rank) {
         const auto slot = static_cast<std::size_t>(rank);
         WorkspaceArena& workspace_ = *workspaces_[slot];
-        const auto& weights = models_[slot]->layers[layer].attention_projection;
-        TextState& state    = *states_[slot];
+        const auto& layer_weights = *weights[slot];
+        const QsaLayerStateView& qsa_state = state[slot];
         const std::int32_t query_heads = TextConfig::query_heads / tp_;
-        const std::int32_t kv_heads    = state.kv_heads();
+        const std::int32_t kv_heads    = TextConfig::kv_heads / tp_;
         const std::int32_t query_width = query_heads * TextConfig::head_dim;
         const std::int32_t kv_width    = kv_heads * TextConfig::head_dim;
 
@@ -624,9 +634,9 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
         Tensor value       = value_flat.view({kHeadDim, kv_heads, T, kBatch});
         Tensor index_query = index_query_flat.view({index_dim, TextConfig::index_heads, T, kBatch});
         Tensor index_key   = index_key_flat.view({index_dim, TextConfig::index_kv_heads, T, kBatch});
-        Variant::attention_projection(block_input[slot], weights, query_flat, output_gate_flat,
-                                      key_flat, value_flat, index_query_flat, index_key_flat,
-                                      workspace_, stream_for(rank));
+        Variant::attention_projection(block_input[slot], layer_weights, query_flat, output_gate_flat,
+                                       key_flat, value_flat, index_query_flat, index_key_flat,
+                                       workspace_, stream_for(rank));
         NINFER_QWEN4EXP_DIAG_MARK("qsa_proj");
 
         Tensor rotated_query =
@@ -635,23 +645,22 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
             activations_[slot]->alloc(kTextActivationDtype, {index_dim, TextConfig::index_heads, T, kBatch});
 
         const ops::QsaPrepareParameters parameters{
-            .query_norm        = weights.query_norm,
-            .key_norm          = weights.key_norm,
-            .index_query_norm  = weights.index_query_norm,
-            .index_key_norm    = weights.index_key_norm,
+            .query_norm        = layer_weights.query_norm,
+            .key_norm          = layer_weights.key_norm,
+            .index_query_norm  = layer_weights.index_query_norm,
+            .index_key_norm    = layer_weights.index_key_norm,
             .rms_epsilon       = TextConfig::rms_epsilon,
             .rotary_dim        = TextConfig::rotary_dim,
             .theta             = static_cast<float>(TextConfig::rope_theta),
         };
         const ops::QsaBatchView batch{.positions = positions[slot],
-                                      .valid_columns = valid_columns[slot],
-                                      .table_rows = table_rows[slot]};
-        ops::QsaRawRecordWriteView records = state.records(static_cast<std::size_t>(T));
-        const std::int32_t qsa_slot = state.qsa_slot(layer);
-        const ops::QsaCacheView cache = state.cache(qsa_slot);
+                                       .valid_columns = valid_columns[slot],
+                                       .table_rows = table_rows[slot]};
+        ops::QsaRawRecordWriteView records = qsa_state.records;
+        const ops::QsaCacheView& cache = qsa_state.cache;
 
         ops::qsa_prepare(ops::QsaProjectionView{query, key, value, index_query, index_key},
-                         parameters, batch, state.before_tail(qsa_slot), cache, workspace_, records,
+                         parameters, batch, qsa_state.before, cache, workspace_, records,
                          rotated_query, rotated_index_query, stream_for(rank));
         NINFER_QWEN4EXP_DIAG_MARK("qsa_prep");
 
@@ -664,10 +673,6 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
                          ops::ConstQsaIndexCacheView{cache.index_k_pages, cache.page_table}, batch,
                          static_cast<std::uint32_t>(T), workspace_, selected, stream_for(rank));
         NINFER_QWEN4EXP_DIAG_MARK("qsa_index");
-#ifdef NINFER_QWEN4EXP_LAYER_DUMP
-        NINFER_QWEN4EXP_LAYER_DUMP("index_query", layer, rotated_index_query);
-        NINFER_QWEN4EXP_LAYER_DUMP("index_keys", layer, cache.index_k_pages);
-#endif
 
         Tensor attention =
             activations_[slot]->alloc(kTextActivationDtype, {kHeadDim, query_heads, T, kBatch});
@@ -676,17 +681,48 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
         NINFER_QWEN4EXP_DIAG_MARK("qsa_attn");
 
         const ops::QsaRawRecordReadView read_records{records.raw_keys, records.rope_positions};
-        ops::QsaTailStateView after = state.tail(qsa_slot);
-        ops::qsa_tail_extract(state.const_tail(qsa_slot), read_records, records.base_positions,
+        ops::QsaTailStateView after = qsa_state.after;
+        ops::qsa_tail_extract(qsa_state.const_tail, read_records, records.base_positions,
                               valid_columns[slot], after, stream_for(rank));
-        state.publish_tail(qsa_slot);
+        if (qsa_state.publish != nullptr) { qsa_state.publish(qsa_state.publish_context); }
         NINFER_QWEN4EXP_DIAG_MARK("qsa_tail");
 
         projected[slot] = attention.view({query_width, T});
-        output_weight[slot] = weights.output;
+        output_weight[slot] = layer_weights.output;
         arena_ptrs[slot] = workspaces_[slot];
     });
     row_parallel_linear(projected, output_weight, mixer_out, staging, arena_ptrs);
+}
+
+inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
+                               const std::array<Tensor, kMaximumDevices>& block_input,
+                               const std::array<Tensor, kMaximumDevices>& positions,
+                               const std::array<Tensor, kMaximumDevices>& valid_columns,
+                               const std::array<Tensor, kMaximumDevices>& table_rows,
+                               std::array<Tensor, kMaximumDevices>& mixer_out,
+                               const std::array<Tensor, kMaximumDevices>& staging) {
+    using Weights = std::remove_cvref_t<decltype(models_[0]->layers[layer].attention_projection)>;
+    std::array<const Weights*, kMaximumDevices> weights{};
+    std::array<QsaLayerStateView, kMaximumDevices> views{};
+    std::array<std::pair<TextState*, std::int32_t>, kMaximumDevices> contexts{};
+    for (int rank = 0; rank < tp_; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        TextState& state = *states_[slot];
+        const std::int32_t qsa_slot = state.qsa_slot(layer);
+        weights[slot] = &models_[slot]->layers[layer].attention_projection;
+        contexts[slot] = {&state, qsa_slot};
+        views[slot] = QsaLayerStateView{
+            .cache       = state.cache(qsa_slot),
+            .before      = state.before_tail(qsa_slot),
+            .const_tail  = state.const_tail(qsa_slot),
+            .after       = state.tail(qsa_slot),
+            .records     = state.records(static_cast<std::size_t>(T)),
+            .publish     = publish_text_qsa_tail,
+            .publish_context = &contexts[slot],
+        };
+    }
+    run_qsa_layer(T, weights, views, block_input, positions, valid_columns, table_rows, mixer_out,
+                  staging);
 }
 
 inline void TextTrunk::run_ple(std::int32_t T,

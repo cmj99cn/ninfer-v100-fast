@@ -23,6 +23,16 @@
 
 namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
 
+struct QsaLayerStateView {
+    ops::QsaCacheView cache{};
+    ops::QsaTailStateView before{};
+    ops::ConstQsaTailStateView const_tail{};
+    ops::QsaTailStateView after{};
+    ops::QsaRawRecordWriteView records{};
+    void (*publish)(void* context) = nullptr;
+    void* publish_context = nullptr;
+};
+
 struct LastStageCapture {
     bool enabled = false;
     std::vector<std::uint16_t> words;
@@ -201,6 +211,17 @@ public:
 
     TokenId prefill(std::span<const TokenId> tokens);
     TokenId decode(TokenId token);
+
+    template <class AttentionWeights>
+    void run_qsa_layer(std::int32_t tokens,
+                       const std::array<const AttentionWeights*, kMaximumDevices>& weights,
+                       const std::array<QsaLayerStateView, kMaximumDevices>& state,
+                       const std::array<Tensor, kMaximumDevices>& block_input,
+                       const std::array<Tensor, kMaximumDevices>& positions,
+                       const std::array<Tensor, kMaximumDevices>& valid_columns,
+                       const std::array<Tensor, kMaximumDevices>& table_rows,
+                       std::array<Tensor, kMaximumDevices>& mixer_out,
+                       const std::array<Tensor, kMaximumDevices>& staging);
 
 private:
     TokenId forward(std::span<const TokenId> tokens);

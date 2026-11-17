@@ -2,6 +2,7 @@ add_library(ninfer_flash_next_package STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/package.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/variant.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/leaves.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/mtp_draft.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/bindings.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/expert_cache.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/expert_runtime.cpp
