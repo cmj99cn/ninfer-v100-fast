@@ -6,6 +6,7 @@ from dataclasses import dataclass
 _DIAG_ROPE_THETA = os.environ.get("NINFER_DIAG_ROPE_THETA")
 _DIAG_ROTARY_DIM = os.environ.get("NINFER_DIAG_ROTARY_DIM")
 _DIAG_RMS_EPS = os.environ.get("NINFER_DIAG_RMS_EPS")
+_DIAG_GDN_SCALE = os.environ.get("NINFER_DIAG_GDN_SCALE")
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,8 @@ class FlashNextConfig:
 
     @property
     def gdn_scale(self) -> float:
+        if _DIAG_GDN_SCALE is not None:
+            return float(_DIAG_GDN_SCALE)
         return self.gdn_head_dim ** -0.5
 
     def is_qsa_layer(self, layer: int) -> bool:

@@ -362,7 +362,10 @@ def gated_rmsnorm(x, weight, z, epsilon):
     xf = np.asarray(x, dtype=np.float64)
     inv = 1.0 / np.sqrt(np.mean(xf * xf, axis=-1, keepdims=True) + epsilon)
     gate = sigmoid(z) if SEM["gdn_norm_gate"] == "sigmoid" else silu(z)
-    out = xf * inv * np.asarray(weight, dtype=np.float64) * gate
+    gain = np.asarray(weight, dtype=np.float64)
+    if SEM["gdn_norm_gain"] == "one_plus_w":
+        gain = 1.0 + gain
+    out = xf * inv * gain * gate
     return bf16(out)
 
 

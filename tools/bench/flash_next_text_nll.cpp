@@ -241,14 +241,25 @@ void run(const char* path, const std::vector<TokenId>& tokens) {
         matches += argmax == static_cast<std::int32_t>(tokens[position + 1]) ? 1 : 0;
     }
 
+    std::int32_t first_greedy = 0;
+    (void)log_softmax_nll(words, static_cast<std::size_t>(count - 1), vocab,
+                          tokens[count - 1], &first_greedy);
+
     std::cout.precision(12);
     std::cout << "tokens " << count << '\n';
+    std::cout << "greedy_first " << first_greedy << '\n';
     std::cout << "mean_nll " << (total / static_cast<double>(values.size())) << '\n';
     std::cout << "top1_matches " << matches << '\n';
     for (std::size_t index = 0; index < values.size(); ++index) {
         std::cout << "nll " << (index + 1) << ' ' << tokens[index + 1] << ' ' << values[index]
                   << '\n';
     }
+
+    reset();
+    const TokenId greedy_next =
+        trunk.prefill(std::span<const TokenId>{tokens.data(), tokens.size()});
+    for (int rank = 0; rank < 2; ++rank) { execution.dev[rank]->synchronize(); }
+    std::cout << "greedy_next " << greedy_next << '\n';
 }
 
 } // namespace

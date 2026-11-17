@@ -30,7 +30,8 @@ SEM = {
     "gdn_gate_mode": _get("NINFER_DIAG_GDN_GATE_MODE", "current"),
     "gdn_update_mode": _get("NINFER_DIAG_GDN_UPDATE_MODE", "current"),
     "gdn_conv_mode": _get("NINFER_DIAG_GDN_CONV_MODE", "current"),
-    "gdn_norm_gate": _get("NINFER_DIAG_GDN_NORM_GATE", "silu"),
+    "gdn_norm_gate": _get("NINFER_DIAG_GDN_NORM_GATE", "sigmoid"),
+    "gdn_norm_gain": _get("NINFER_DIAG_GDN_NORM_GAIN", "w"),
     "rope_full_dim": _get("NINFER_DIAG_ROPE_FULL_DIM", "0") == "1",
     "ablate": _get("NINFER_DIAG_ABLATE", ""),
 }
