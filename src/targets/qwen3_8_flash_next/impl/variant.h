@@ -12,6 +12,15 @@
 
 namespace ninfer::targets::qwen3_8_flash_next::detail {
 
+struct MtpConfig {
+    static constexpr std::uint32_t layers                 = 1;
+    static constexpr std::uint32_t draft_window           = 3;
+    static constexpr std::uint32_t maximum_draft_window   = 7;
+
+    static_assert(draft_window <= maximum_draft_window);
+    static_assert(layers == 1);
+};
+
 struct Variant {
     using WeightsProfile        = detail::WeightsProfile;
     using TextConfig            = detail::TextConfig;

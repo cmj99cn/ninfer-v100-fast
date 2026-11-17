@@ -81,6 +81,12 @@ set_tests_properties(ninfer_flash_next_roles_artifact_test PROPERTIES SKIP_RETUR
 ninfer_add_test(ninfer_flash_next_sharding_test
   SOURCES targets/qwen3_8_flash_next/test_sharding.cpp
   LIBRARIES ninfer_flash_next_package)
+ninfer_add_test(ninfer_flash_next_mtp_bindings_test
+  SOURCES targets/qwen3_8_flash_next/test_mtp_bindings.cpp
+  LIBRARIES ninfer_flash_next_package)
+add_test(NAME ninfer_flash_next_mtp_bindings_artifact_test
+  COMMAND ninfer_flash_next_mtp_bindings_test)
+set_tests_properties(ninfer_flash_next_mtp_bindings_artifact_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_flash_next_load_plan_test
   SOURCES targets/qwen3_8_flash_next/test_load_plan.cpp
   LIBRARIES ninfer_flash_next_package)
