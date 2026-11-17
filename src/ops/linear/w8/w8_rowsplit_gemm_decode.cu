@@ -16,6 +16,59 @@ namespace {
 
 constexpr int kRows          = 2048;
 constexpr int kHidden        = 16384;
+
+constexpr int kNarrowHidden        = 2560;
+constexpr int kNarrowGroups        = kNarrowHidden / 32;
+constexpr int kNarrowValuesPerLane = 8;
+constexpr int kNarrowPhaseValues   = 32 * kNarrowValuesPerLane;
+constexpr int kNarrowPhaseGroups   = kNarrowPhaseValues / 32;
+constexpr int kNarrowPhases        = kNarrowHidden / kNarrowPhaseValues;
+
+template <int RowsPerCta>
+__global__ __launch_bounds__(RowsPerCta * 32, 4) void w8_rowsplit_narrow_f16_decode_kernel(
+    const __half* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, __half* __restrict__ out, std::int32_t rows) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int row  = static_cast<int>(blockIdx.x) * RowsPerCta + warp;
+    if (row >= rows) { return; }
+    const auto* code_row  = codes + static_cast<std::int64_t>(row) * kNarrowHidden;
+    const auto* scale_row = scales + static_cast<std::int64_t>(row) * kNarrowGroups * 2;
+
+    float acc = 0.0f;
+#pragma unroll
+    for (int phase = 0; phase < kNarrowPhases; ++phase) {
+        unsigned scale_bits = 0;
+        if (lane < kNarrowPhaseGroups) {
+            scale_bits = *reinterpret_cast<const std::uint16_t*>(
+                scale_row + static_cast<std::int64_t>(phase * kNarrowPhaseGroups + lane) * 2);
+        }
+        scale_bits        = __shfl_sync(0xffffffffu, scale_bits, lane >> 2);
+        const float scale = __half2float(__ushort_as_half(scale_bits));
+
+        const int phase_k  = phase * kNarrowPhaseValues + lane * kNarrowValuesPerLane;
+        const uint2 packed = load_vec<uint2>(code_row + phase_k);
+        const uint4 values = load_vec<uint4>(x + phase_k);
+        const float2 xv[4] = {
+            __half22float2(*reinterpret_cast<const __half2*>(&values.x)),
+            __half22float2(*reinterpret_cast<const __half2*>(&values.y)),
+            __half22float2(*reinterpret_cast<const __half2*>(&values.z)),
+            __half22float2(*reinterpret_cast<const __half2*>(&values.w)),
+        };
+#pragma unroll
+        for (int byte = 0; byte < kNarrowValuesPerLane; ++byte) {
+            const std::uint32_t word = (&packed.x)[byte >> 2];
+            const float2 pair       = xv[byte >> 1];
+            const float activation  = (byte & 1) == 0 ? pair.x : pair.y;
+            const float weight = static_cast<float>(static_cast<std::int8_t>(word >> ((byte & 3) * 8))) *
+                                 scale;
+            acc = fmaf(weight, activation, acc);
+        }
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) { out[row] = __float2half_rn(acc); }
+}
 constexpr int kGroups        = kHidden / 32;
 constexpr int kValuesPerLane = 8;
 
@@ -96,6 +149,20 @@ void launch_w8_decode_r4(const Tensor& x, const Weight& w, Tensor& out, cudaStre
 void w8_rowsplit_decode_r16_launch(const Tensor& x, const Weight& w, Tensor& out,
                                    cudaStream_t stream) {
     launch_decode<16>(x, w, out, stream);
+}
+
+void launch_w8_narrow_f16_decode(const Tensor& x, const Weight& w, Tensor& out,
+                                 cudaStream_t stream) {
+    constexpr int kRowsPerCta = 4;
+    if (x.ne[0] != kNarrowHidden || x.ne[1] != 1 || w.n != out.ne[0] ||
+        w.padded_shape[1] != kNarrowHidden || x.dtype != DType::FP16 || out.dtype != DType::FP16) {
+        throw std::invalid_argument("W8 narrow f16 decode requires [n,2560] and T=1");
+    }
+    w8_rowsplit_narrow_f16_decode_kernel<kRowsPerCta>
+        <<<static_cast<unsigned>(div_up(w.n, kRowsPerCta)), kRowsPerCta * 32, 0, stream>>>(
+            static_cast<const __half*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), static_cast<__half*>(out.data), w.n);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops::detail

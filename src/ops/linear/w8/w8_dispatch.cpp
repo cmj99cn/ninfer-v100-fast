@@ -349,6 +349,10 @@ void w8_f16_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     // only one with an FP16 activation form. Validate the shape domain against that table.
     (void)select_w8_launch(w.n, w.k, x.ne[1], LinearPolicy::A16Only);
 #ifdef NINFER_VOLTA_BUILD
+    if (x.ne[1] == 1 && w.k == 2560 && w.padded_shape[1] == 2560 && (w.n % 4) == 0) {
+        launch_w8_narrow_f16_decode(x, w, out, stream);
+        return;
+    }
     // The tuned sm_120a tables mix SIMT, MMA, and fused QPN routes; the generic warp-per-row SIMT
     // kernel is the one that already exists for every shape on Volta, so the FP16 form uses it at
     // every T. It is exact for any T and both registered W8 widths.
