@@ -23,7 +23,7 @@ template <RmsEpilogue Epilogue>
 __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weight, float z) {
     if constexpr (Epilogue == RmsEpilogue::Offset) { weight += 1.0f; }
     float value = x * inv * weight;
-    if constexpr (Epilogue == RmsEpilogue::Gated) { value *= silu(z); }
+    if constexpr (Epilogue == RmsEpilogue::Gated) { value *= sigmoid(z); }
     return value;
 }
 
@@ -322,8 +322,8 @@ __global__ void rmsnorm_f16_gated_kernel(const __half* x, const W* weight, const
     const float inv = rsqrtf(warp_sums[0] / static_cast<float>(d) + eps);
     for (int i = tid; i < d; i += static_cast<int>(blockDim.x)) {
         const float g = __half2float(zr[i]);
-        const float silu = g / (1.0f + expf(-g));
-        orow[i] = __float2half_rn(__half2float(xr[i]) * inv * ActivationTraits<W>::load(weight + i) * silu);
+        const float gate = sigmoid(g);
+        orow[i] = __float2half_rn(__half2float(xr[i]) * inv * ActivationTraits<W>::load(weight + i) * gate);
     }
 }
 

@@ -1,6 +1,7 @@
 #include "ninfer/ops/ple.h"
 
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
+#include "ops/ple/nf4_codec.cuh"
 #include "ops/ple/ple.h"
 
 #include "core/device.h"
@@ -52,7 +53,7 @@ __global__ __launch_bounds__(kLookupBlock) void ple_lookup_kernel(
 
     const float divisor = divisors[global_row / shard_rows];
     const float scale = decode_nvfp4_e4m3(source[code_bytes_per_row + threadIdx.x / 8]);
-    const float2 codes = decode_nvfp4_e2m1x2(source[threadIdx.x]);
+    const float2 codes = decode_nf4x2(source[threadIdx.x]);
     out[threadIdx.x * 2] = PleAct<A>::from_float(codes.x * scale / divisor);
     out[threadIdx.x * 2 + 1] = PleAct<A>::from_float(codes.y * scale / divisor);
 }

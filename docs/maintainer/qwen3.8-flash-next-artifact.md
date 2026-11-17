@@ -1142,7 +1142,21 @@ profile and "old" is the BF16-only fused condition, which is also the switch tha
 The run-to-run spread is at most `6.4e-4` nat, so both differences sit at the measurement noise
 floor and at least 40 times below the R57 `0.01`-nat neutral bound. Ruling: the HC
 reduction-association change is neutral on real text; the new profile is accepted and
-`4818 84666 5396` remains the golden.
+`4818 84666 5396` remained the golden until the quality fixes below.
+
+**Re-baselined golden after the PLE/GDN quality fixes (R56).** The canonical three-token public-Engine
+route changed from `4818 84666 5396` to `504 359 81486` on the same eight-token prompt
+`1024 7 98140 33 4097 512 100 2048`. On that prompt the independent FP64 oracle now samples
+`504 359 128` greedily (first two tokens match the new golden, the third is a boundary event with
+oracle margin `1.5897`), with oracle mean teacher-forced NLL `15.2346267900` and oracle NLL of its
+own first greedy token `1.4432362860`. On the capital5 prompt the 48-layer TP2 engine now samples
+first token `11751` (` Paris`) with mean NLL `3.7311021849`, against the FP64 oracle's `11751` and
+`3.7321504757`. This is the R56 record: (i) the old and new three-token sequences above, (ii) the
+reference greedy and NLL on the same sample, and (iii) the arithmetic causes: the PLE nibble-to-value
+codebook is the NF4 NormalFloat table rather than the NVFP4 E2M1 table, and the GDN output norm gate
+is `sigmoid(z)` rather than `silu(z)` as required by `output_gate_type=sigmoid`; removing the latter
+also removes the layer-0 GDN mixer's `2.4-2.7x` gain (layer-0 mixer cosine against the oracle rises
+from `0.845` to `1.000`).
 
 **512-token 0-miss measurement.** Two-rank, 512-token prompt, `expert_cache_mib=14000`, 192 warm
 decode tokens, greedy, eager. The 0-miss decode token measured `24.45 ms` and `24.58 ms` in two

@@ -435,8 +435,32 @@ def ple_hash_rows(ids, tail, multipliers, vocab_sizes, offsets, eos):
     return np.asarray(rows, dtype=np.uint32)
 
 
+NF4_CODEBOOK = (
+    -1.0,
+    -0.6961928009986877,
+    -0.5250730514526367,
+    -0.39491748809814453,
+    -0.28444138169288635,
+    -0.18477343022823334,
+    -0.09105003625154495,
+    0.0,
+    0.07958029955625534,
+    0.16093020141124725,
+    0.24611230194568634,
+    0.33791524171829224,
+    0.44070982933044434,
+    0.5626170039176941,
+    0.7229568362236023,
+    1.0,
+)
+
+
 def e2m1_lut():
     return np.asarray([decode_e2m1_word(word) for word in range(16)], dtype=np.float64)
+
+
+def nf4_lut():
+    return np.asarray(NF4_CODEBOOK, dtype=np.float64)
 
 
 def e4m3_lut():
@@ -453,7 +477,7 @@ def ple_decode_row(row_bytes, divisor):
     codes[0::2] = low
     codes[1::2] = high
     group = np.arange(codes.size) // 16
-    values = e2m1_lut()[codes] * e4m3_lut()[scales[group]] / float(divisor)
+    values = nf4_lut()[codes] * e4m3_lut()[scales[group]] / float(divisor)
     return bf16(values)
 
 
@@ -697,11 +721,11 @@ def run_self_tests(verbose=False):
     for index in range(10):
         row[80 + index] = 0x38
     decoded = ple_decode_row(row, 2.0)
-    magnitudes = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    codebook = nf4_lut()[:8]
     expected = []
     for index in range(80):
-        expected.extend([magnitudes[index % 8] / 2.0, magnitudes[(index + 1) % 8] / 2.0])
-    check("ple_decode_row", decoded, np.array(expected), 1e-6)
+        expected.extend([codebook[index % 8] / 2.0, codebook[(index + 1) % 8] / 2.0])
+    check("ple_decode_row", decoded, bf16(np.array(expected)), 1e-6)
 
     ones = np.ones((1, 2, 4))
     gated, normalized_conv = ple_gate(

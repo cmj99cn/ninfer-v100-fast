@@ -34,9 +34,9 @@ std::vector<double> gated_rmsnorm_oracle(const std::vector<float>& input,
         const double inverse = 1.0 / std::sqrt(sum_squares / static_cast<double>(shape.d) + kEps);
         for (std::int32_t column = 0; column < shape.d; ++column) {
             const double gate_value = gate[base + column];
-            const double silu       = gate_value / (1.0 + std::exp(-gate_value));
+            const double activation = 1.0 / (1.0 + std::exp(-gate_value));
             output[base + column]   = static_cast<double>(input[base + column]) * inverse *
-                                    static_cast<double>(weight[column]) * silu;
+                                    static_cast<double>(weight[column]) * activation;
         }
     }
     return output;

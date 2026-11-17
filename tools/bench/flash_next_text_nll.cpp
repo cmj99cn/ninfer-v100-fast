@@ -45,6 +45,7 @@ constexpr std::uint32_t kKvCapacity = 262144;
 
 std::vector<std::vector<std::uint16_t>> g_steps;
 bool g_capture = false;
+std::string g_layer_dump_dir;
 
 void require(bool condition, const std::string& message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -79,10 +80,27 @@ void flash_next_text_nll_capture(const Tensor& logits, cudaStream_t stream, int 
     g_steps.push_back(std::move(words));
 }
 
+void flash_next_text_nll_layer_dump(const char* label, std::uint32_t layer, const Tensor& value) {
+    if (!g_capture || g_layer_dump_dir.empty()) { return; }
+    int previous = 0;
+    CUDA_CHECK(cudaGetDevice(&previous));
+    CUDA_CHECK(cudaSetDevice(0));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<std::uint16_t> words(value.bytes() / 2);
+    CUDA_CHECK(cudaMemcpy(words.data(), value.data, value.bytes(), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaSetDevice(previous));
+    const std::string path = g_layer_dump_dir + "/" + label + "_L" + std::to_string(layer) + ".bin";
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(words.data()),
+              static_cast<std::streamsize>(words.size() * sizeof(std::uint16_t)));
+}
+
 #define NINFER_QWEN4EXP_VARIANT ::ninfer::targets::qwen3_8_flash_next::detail::Variant
 #define NINFER_QWEN4EXP_RUNTIME_NS flash_next_text_nll_runtime
 #define NINFER_QWEN4EXP_LAST_STAGE(sample, logits) \
     ::flash_next_text_nll_capture((logits), stream_for(rank), rank, T)
+#define NINFER_QWEN4EXP_LAYER_DUMP(label, layer, value) \
+    ::flash_next_text_nll_layer_dump((label), (layer), (value))
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 #include "targets/qwen4_exp/impl/runtime/text_context_impl.h"
 #include "targets/qwen4_exp/impl/runtime/workspace_recipe.h"
@@ -90,6 +108,25 @@ void flash_next_text_nll_capture(const Tensor& logits, cudaStream_t stream, int 
 namespace {
 
 namespace rt = ninfer::targets::qwen4_exp::detail::flash_next_text_nll_runtime;
+
+void dump_ple_rows(const char* path, const rt::TextState& state, std::size_t entries) {
+    const std::size_t stride = 128;
+    std::vector<std::uint8_t> staged(entries * stride);
+    std::vector<std::uint32_t> rows(entries);
+    int previous = 0;
+    CUDA_CHECK(cudaGetDevice(&previous));
+    CUDA_CHECK(cudaSetDevice(state.device_id()));
+    CUDA_CHECK(cudaMemcpy(staged.data(), state.ple_staged_rows(), staged.size(),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(rows.data(), state.ple_rows(), rows.size() * sizeof(std::uint32_t),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaSetDevice(previous));
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(rows.data()),
+              static_cast<std::streamsize>(rows.size() * sizeof(std::uint32_t)));
+    out.write(reinterpret_cast<const char*>(staged.data()),
+              static_cast<std::streamsize>(staged.size()));
+}
 
 double log_softmax_nll(const std::vector<std::uint16_t>& words, std::size_t position,
                        std::int32_t vocab, TokenId token, std::int32_t* argmax) {
@@ -220,6 +257,9 @@ void run(const char* path, const std::vector<TokenId>& tokens) {
     (void)trunk.prefill(std::span<const TokenId>{tokens.data(), tokens.size()});
     g_capture = false;
     for (int rank = 0; rank < 2; ++rank) { execution.dev[rank]->synchronize(); }
+    if (const char* dump = environment("NINFER_FLASH_NEXT_PLE_DUMP")) {
+        dump_ple_rows(dump, *states[0], static_cast<std::size_t>(ninfer::ops::kPleHeads) * count);
+    }
 
     require(g_steps.size() == 1, "the prefill did not capture one logits span");
     const std::int32_t vocab = detail::TextConfig::vocab;
@@ -269,6 +309,9 @@ int main(int argc, char** argv) {
         std::string artifact;
         std::string token_path;
         if (const char* value = environment("NINFER_FLASH_NEXT_ARTIFACT")) { artifact = value; }
+        if (const char* value = environment("NINFER_FLASH_NEXT_LAYER_DUMP")) {
+            g_layer_dump_dir = value;
+        }
         for (int index = 1; index < argc; ++index) {
             const std::string argument = argv[index];
             const auto next = [&]() -> std::string {

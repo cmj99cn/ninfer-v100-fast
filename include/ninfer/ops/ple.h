@@ -156,8 +156,9 @@ struct PleRowAddress {
  *   group_scale[g] = exact E4M3FN value of the scale byte of group g = d / 16
  *   embedding[160 * head + d, t, b] = round_act(code_value[d] * group_scale[g] / divisor[shard])
  *
- * The codebook is the registered E2M1 codebook shared with the NVFP4 path, and the group scale is
- * the exact stored E4M3FN byte. `staged_rows[i]` must be the `row_bytes` bytes of `rows[i]` at
+ * The codebook is the 16-value NF4 NormalFloat codebook of the `nf4_g16_e4m3fn` table, not the E2M1
+ * codebook used for NVFP4 weights, and the group scale is the exact stored E4M3FN byte.
+ * `staged_rows[i]` must be the `row_bytes` bytes of `rows[i]` at
  * `row_paged_nf4_row_offset(geometry, row)` inside the payload of shard `shard`; that fetch
  * belongs to the caller, because the table stays on disk. A row outside the table's row space
  * contributes exact `+0` words.

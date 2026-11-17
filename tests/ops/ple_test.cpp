@@ -133,14 +133,13 @@ std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
 }
 
 
-constexpr double kE2M1Magnitude[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+constexpr double kNf4Codebook[16] = {
+    -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+    -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+    0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+    0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0};
 
-double oracle_e2m1(std::uint8_t code) {
-    const double magnitude = kE2M1Magnitude[code & 7U];
-    const bool negative = (code & 8U) != 0;
-    if (magnitude == 0.0) return negative ? -0.0 : 0.0;
-    return negative ? -magnitude : magnitude;
-}
+double oracle_nf4(std::uint8_t code) { return kNf4Codebook[code & 15U]; }
 
 double oracle_e4m3(std::uint8_t byte) {
     const bool negative = (byte & 0x80U) != 0;
@@ -160,7 +159,7 @@ std::vector<std::uint16_t> decode_row_oracle(const std::vector<std::byte>& row,
         const std::uint8_t code = (column % 2 == 0) ? (byte & 0xFU) : (byte >> 4U);
         const std::uint8_t scale_byte =
             static_cast<std::uint8_t>(row[geometry.code_bytes_per_row + column / geometry.group_size]);
-        const double product = oracle_e2m1(code) * oracle_e4m3(scale_byte);
+        const double product = oracle_nf4(code) * oracle_e4m3(scale_byte);
         out[column] = double_to_bf16(product / divisor);
     }
     return out;
@@ -174,7 +173,7 @@ std::vector<std::uint16_t> decode_row_oracle_f16(const std::vector<std::byte>& r
         const std::uint8_t code = (column % 2 == 0) ? (byte & 0xFU) : (byte >> 4U);
         const std::uint8_t scale_byte =
             static_cast<std::uint8_t>(row[geometry.code_bytes_per_row + column / geometry.group_size]);
-        const double product = oracle_e2m1(code) * oracle_e4m3(scale_byte);
+        const double product = oracle_nf4(code) * oracle_e4m3(scale_byte);
         out[column] = double_to_f16(product / divisor);
     }
     return out;
@@ -472,6 +471,63 @@ int test_hash_and_shard_mapping() {
     std::cout << "OK ple hash + shard mapping: " << covered_shards << " shards, "
               << negative_words << " negative words\n";
     return 0;
+}
+
+
+int test_nf4_codebook() {
+    const std::vector<std::uint64_t> shape = {ninfer::ops::kPleShardRows,
+                                              ninfer::ops::kPleFeatures};
+    const RowPagedNf4Geometry geometry =
+        row_paged_nf4_geometry(NumericFormat::NF4_G16_E4M3S, shape);
+    PleNf4Table table{};
+    table.geometry = geometry;
+    table.shard_count = ninfer::ops::kPleShards;
+    const std::vector<float> divisors(ninfer::ops::kPleShards, 1.0F);
+    const DeviceBuffer device_divisors = to_device_f32(divisors);
+    table.divisors = static_cast<const float*>(device_divisors.p);
+
+    std::vector<std::byte> row(geometry.row_bytes, std::byte{0});
+    for (std::size_t byte = 0; byte < geometry.code_bytes_per_row; ++byte) {
+        row[byte] = static_cast<std::byte>((byte & 15U) | (((byte + 1) & 15U) << 4));
+    }
+    for (std::size_t group = 0; group < geometry.scale_bytes_per_row; ++group) {
+        row[geometry.code_bytes_per_row + group] = std::byte{0x38};
+    }
+    std::vector<std::byte> staged;
+    for (std::size_t head = 0; head < ninfer::ops::kPleHeads; ++head) {
+        staged.insert(staged.end(), row.begin(), row.end());
+    }
+    const std::vector<std::uint32_t> rows(ninfer::ops::kPleHeads, 0);
+
+    const DeviceBuffer staged_block = to_device(staged);
+    const DeviceBuffer device_rows = to_device(rows);
+    const std::size_t words = ninfer::ops::kPleFeatures * ninfer::ops::kPleHeads;
+    DeviceBuffer embedding(words * 2);
+    Tensor embedding_view(embedding.p, DType::BF16,
+                          {static_cast<std::int32_t>(ninfer::ops::kPleFeatures *
+                                                     ninfer::ops::kPleHeads),
+                           1, 1});
+    ninfer::ops::ple_lookup_rows(table, static_cast<const std::uint32_t*>(device_rows.p),
+                                 rows.size(), static_cast<const std::uint8_t*>(staged_block.p),
+                                 embedding_view, 0);
+    cuda_synchronize();
+
+    std::vector<std::uint16_t> expected(ninfer::ops::kPleFeatures);
+    for (std::size_t column = 0; column < expected.size(); ++column) {
+        const std::uint8_t code = static_cast<std::uint8_t>((column / 2 + column % 2) & 15U);
+        expected[column] = double_to_bf16(oracle_nf4(code));
+    }
+    int failures = 0;
+    const auto written = read_bits(embedding.p, words);
+    for (std::size_t head = 0; head < ninfer::ops::kPleHeads; ++head) {
+        std::vector<std::uint16_t> slot(
+            written.begin() + static_cast<std::ptrdiff_t>(head * ninfer::ops::kPleFeatures),
+            written.begin() +
+                static_cast<std::ptrdiff_t>((head + 1) * ninfer::ops::kPleFeatures));
+        failures += verify_decode("ple_lookup_rows nf4 codebook", slot, expected, true);
+    }
+    if (failures == 0) std::cout << "OK ple nf4 codebook\n";
+    return failures;
 }
 
 
@@ -878,6 +934,7 @@ int main() {
 
     int failures = 0;
     failures += test_hash_and_shard_mapping();
+    failures += test_nf4_codebook();
     failures += test_gate();
     failures += test_conv(false);
     failures += test_conv(true);
