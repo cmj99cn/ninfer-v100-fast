@@ -28,15 +28,18 @@ from .ops import (
     silu,
     topk_route,
 )
+from .layouts import CURRENT, Layout
+from .semantic import SEM
 from .state import GdnState, ModelState, PleState
 from .weights import WeightStore
 
 
 class RefModel:
-    def __init__(self, artifact_path, config=CFG):
+    def __init__(self, artifact_path, config=CFG, layout: Layout | None = None):
         self.artifact = V3Artifact(artifact_path)
         self.store = WeightStore(self.artifact)
         self.cfg = config
+        self.layout = layout if layout is not None else CURRENT
         self._ids = {}
         self._weights = {}
 
@@ -62,10 +65,13 @@ class RefModel:
     def _hc(self, layer, kind):
         key = (layer, kind)
         if key not in self._weights:
-            down = self.store.contiguous_rows(self._object(f"text/layers/{layer}/{kind}/down"), 0, self.cfg.hc_lowrank + self.cfg.hc_streams)
+            parent = self.store.contiguous(self._object(f"text/layers/{layer}/{kind}/down"))
+            rows = self.layout.hc_rows(self.cfg)
+            down = parent[rows["down"]]
+            inject = parent[rows["inject"]]
             norm = self._contiguous(f"text/layers/{layer}/{kind}/norm").reshape(self.cfg.hc_streams, self.cfg.hidden)
             up = self._contiguous(f"text/layers/{layer}/{kind}/up")
-            self._weights[key] = {"down": down, "norm": norm, "up": up}
+            self._weights[key] = {"down": np.concatenate([down, inject]), "norm": norm, "up": up}
         return self._weights[key]
 
     def _final_hc(self):
@@ -90,16 +96,18 @@ class RefModel:
         if key not in self._weights:
             qkvz = self.store.w8(self._object(f"text/layers/{layer}/gdn/query"))
             control = self._contiguous(f"text/layers/{layer}/gdn/a_projection")
+            rows = self.layout.gdn_rows(self.cfg)
+            control_rows = self.layout.gdn_control_rows(self.cfg)
             self._weights[key] = {
-                "q": qkvz[0 : self.cfg.gdn_key_width],
-                "k": qkvz[self.cfg.gdn_key_width : 2 * self.cfg.gdn_key_width],
-                "v": qkvz[2 * self.cfg.gdn_key_width : 2 * self.cfg.gdn_key_width + self.cfg.gdn_value_width],
-                "z": qkvz[self.cfg.gdn_conv_channels : self.cfg.gdn_conv_channels + self.cfg.gdn_value_width],
-                "a": control[0 : self.cfg.gdn_v_heads],
-                "b": control[self.cfg.gdn_v_heads : 2 * self.cfg.gdn_v_heads],
+                "q": qkvz[rows["query"]],
+                "k": qkvz[rows["key"]],
+                "v": qkvz[rows["value"]],
+                "z": qkvz[rows["z"]],
+                "a": control[control_rows["a"]],
+                "b": control[control_rows["b"]],
                 "a_log": self._contiguous(f"text/layers/{layer}/gdn/a_log"),
                 "dt_bias": self._contiguous(f"text/layers/{layer}/gdn/dt_bias"),
-                "conv": self._contiguous(f"text/layers/{layer}/gdn/convolution"),
+                "conv": self.layout.conv_kernel(self._contiguous(f"text/layers/{layer}/gdn/convolution")),
                 "norm": self._contiguous(f"text/layers/{layer}/gdn/norm"),
                 "out": self.store.w8(self._object(f"text/layers/{layer}/gdn/output")),
             }
@@ -110,10 +118,16 @@ class RefModel:
         if key not in self._weights:
             query_gate = self.store.w8(self._object(f"text/layers/{layer}/attention/query"))
             key_value = self._contiguous(f"text/layers/{layer}/attention/key")
+            query_rows, gate_rows = self.layout.qsa_query_gate_rows(self.cfg)
+            kv_rows = self.layout.qsa_kv_rows(self.cfg)
             self._weights[key] = {
-                "query": query_gate[0 : self.cfg.query_width],
-                "gate": query_gate[self.cfg.query_width : 2 * self.cfg.query_width],
-                "kv": key_value[0 : 2 * self.cfg.kv_width + self.cfg.index_query_width + self.cfg.index_key_width],
+                "query": query_gate[query_rows],
+                "gate": query_gate[gate_rows],
+                "kv": key_value[
+                    np.concatenate(
+                        [kv_rows["key"], kv_rows["value"], kv_rows["index_query"], kv_rows["index_key"]]
+                    )
+                ],
                 "query_norm": self._contiguous(f"text/layers/{layer}/attention/query_norm"),
                 "key_norm": self._contiguous(f"text/layers/{layer}/attention/key_norm"),
                 "index_query_norm": self._contiguous(f"text/layers/{layer}/attention/index_query_norm"),
@@ -126,11 +140,12 @@ class RefModel:
         key = ("moe", layer)
         if key not in self._weights:
             parent = self._contiguous(f"text/layers/{layer}/moe/router")
+            rows = self.layout.moe_rows(self.cfg)
             gate_object = self.artifact.parts(f"text/layers/{layer}/moe/experts/gate")[0].object
             down_object = self.artifact.parts(f"text/layers/{layer}/moe/experts/down")[0].object
             self._weights[key] = {
-                "control": parent[0 : self.cfg.experts + 1],
-                "shared_up": parent[self.cfg.experts + 1 : self.cfg.experts + 1 + 2 * self.cfg.shared_intermediate],
+                "control": parent[np.concatenate([rows["router"], rows["score"]])],
+                "shared_up": parent[np.concatenate([rows["gate"], rows["up"]])],
                 "shared_down": self._contiguous(f"text/layers/{layer}/moe/shared/down"),
                 "gate_object": gate_object,
                 "down_object": down_object,
@@ -160,19 +175,76 @@ class RefModel:
             rows[index] = bf16_from_u16(np.frombuffer(raw, dtype="<u2"))
         return rows
 
+    def _read_rows(self, object_id, source_rows, row_bytes):
+        hidden = self.cfg.hidden
+        out = np.empty((source_rows.size, hidden), dtype=np.float32)
+        index = 0
+        total = int(source_rows.size)
+        while index < total:
+            stop = index + 1
+            while stop < total and int(source_rows[stop]) == int(source_rows[stop - 1]) + 1:
+                stop += 1
+            begin = int(source_rows[index])
+            count = stop - index
+            raw = self.artifact.read_object(object_id, begin * row_bytes, count * row_bytes)
+            out[index:stop] = bf16_from_u16(np.frombuffer(raw, dtype="<u2")).reshape(count, hidden)
+            index = stop
+        return out
+
     def _logits(self, sample):
         object_id = self._object("text/output_head")
         vocab = int(self.artifact.object(object_id).shape[0])
         row_bytes = self.cfg.hidden * 2
         vector = np.asarray(sample, dtype=np.float64)
+        permutation = self.layout.output_head_rows(self.cfg)
         logits = np.empty(vocab, dtype=np.float64)
         chunk = 8192
         for start in range(0, vocab, chunk):
             count = min(chunk, vocab - start)
-            raw = self.artifact.read_object(object_id, start * row_bytes, count * row_bytes)
-            weights = bf16_from_u16(np.frombuffer(raw, dtype="<u2")).reshape(count, self.cfg.hidden)
+            if permutation is None:
+                raw = self.artifact.read_object(object_id, start * row_bytes, count * row_bytes)
+                weights = bf16_from_u16(np.frombuffer(raw, dtype="<u2")).reshape(count, self.cfg.hidden)
+            else:
+                weights = self._read_rows(object_id, permutation[start : start + count], row_bytes)
             logits[start : start + count] = weights.astype(np.float64) @ vector
         return logits
+
+    def position_logits(self, samples):
+        """Logits for every position of ``samples`` (diagnostic helper)."""
+        object_id = self._object("text/output_head")
+        vocab = int(self.artifact.object(object_id).shape[0])
+        row_bytes = self.cfg.hidden * 2
+        values = np.asarray(samples, dtype=np.float64)
+        tokens = values.shape[0]
+        logits = np.empty((tokens, vocab), dtype=np.float64)
+        permutation = self.layout.output_head_rows(self.cfg)
+        chunk = 8192
+        for start in range(0, vocab, chunk):
+            count = min(chunk, vocab - start)
+            if permutation is None:
+                raw = self.artifact.read_object(object_id, start * row_bytes, count * row_bytes)
+                weights = bf16_from_u16(np.frombuffer(raw, dtype="<u2")).reshape(count, self.cfg.hidden)
+            else:
+                weights = self._read_rows(object_id, permutation[start : start + count], row_bytes)
+            logits[:, start : start + count] = values @ weights.astype(np.float64).T
+        return logits
+
+    def _stream_perm(self, value):
+        perm = SEM["hc_stream_perm"]
+        if perm == "identity" or value is None:
+            return value
+        array = np.asarray(value)
+        if array.ndim < 3 or array.shape[-2] != self.cfg.hc_streams:
+            return value
+        if perm == "rot1":
+            order = np.roll(np.arange(self.cfg.hc_streams), 1)
+        elif perm == "pair_swap":
+            order = np.array([1, 0, 3, 2])
+        elif perm == "reverse":
+            order = np.array([3, 2, 1, 0])
+        else:
+            return value
+        return np.asarray(array)[..., order, :]
 
     def ple_rows(self, ids):
         multipliers, vocab_sizes, offsets = self.artifact.ple_hash_controls()
@@ -215,9 +287,16 @@ class RefModel:
             tokens, self.cfg.index_kv_heads, self.cfg.index_head_dim
         )
         positions = np.arange(tokens, dtype=np.int64)
-        query = qsa_norm_rope(query, weights["query_norm"], positions, self.cfg.rms_epsilon, self.cfg.rope_theta, self.cfg.rotary_dim)
-        index_query = qsa_norm_rope(index_query, weights["index_query_norm"], positions, self.cfg.rms_epsilon, self.cfg.rope_theta, self.cfg.rotary_dim)
-        key = qsa_norm_rope(key, weights["key_norm"], positions, self.cfg.rms_epsilon, self.cfg.rope_theta, self.cfg.rotary_dim)
+        rope_positions = positions + SEM["rope_pos_offset"]
+        if SEM["rope_head_pos"] == "index_axis":
+            index_positions = np.stack(
+                [rope_positions // (2 ** head) for head in range(self.cfg.index_heads)], axis=1
+            )
+        else:
+            index_positions = rope_positions
+        query = qsa_norm_rope(query, weights["query_norm"], rope_positions, self.cfg.rms_epsilon, self.cfg.rope_theta, self.cfg.rotary_dim)
+        index_query = qsa_norm_rope(index_query, weights["index_query_norm"], index_positions, self.cfg.rms_epsilon, self.cfg.rope_theta, self.cfg.rotary_dim)
+        key = qsa_norm_rope(key, weights["key_norm"], rope_positions, self.cfg.rms_epsilon, self.cfg.rope_theta, self.cfg.rotary_dim)
         value_cache = f16(value)
         blocks = tokens // self.cfg.index_compress
         index_blocks = np.zeros((blocks, self.cfg.index_head_dim), dtype=np.float32)
@@ -312,6 +391,8 @@ class RefModel:
         residual, normalized = hc_expand_norm(
             embedding, self._hc(0, "attention_hc")["norm"], self.cfg.rms_epsilon
         )
+        residual = self._stream_perm(residual)
+        normalized = self._stream_perm(normalized)
         captured = {"ple_rows": self.ple_rows(tokens), "qsa": {}}
         tensors = {} if capture_tensors else None
         for layer in range(self.cfg.layers):
@@ -341,6 +422,7 @@ class RefModel:
             stage, normalized = hc_combine_norm(
                 residual, mixer, injection, moe_hc["norm"], self.cfg.rms_epsilon
             )
+            normalized = self._stream_perm(normalized)
             if tensors is not None:
                 tensors[(layer, "stage")] = stage
                 tensors[(layer, "normalized_moe")] = normalized
@@ -349,11 +431,15 @@ class RefModel:
                 tensors[(layer, "moe_block")] = block_input
                 tensors[(layer, "moe_injection")] = injection
             moe_out = self._moe(layer, block_input, self._moe_weights(layer))
+            if SEM["ablate"] == "moe":
+                moe_out = np.zeros_like(np.asarray(moe_out, dtype=np.float64))
             if tensors is not None:
                 tensors[(layer, "moe")] = moe_out
             if layer + 1 == self.cfg.ple_layer:
                 residual = hc_combine(stage, moe_out, injection)
                 residual, normalized = self._ple(residual, self._ple_weights(), captured["ple_rows"], state.ple)
+                residual = self._stream_perm(residual)
+                normalized = self._stream_perm(normalized)
             else:
                 next_norm = (
                     self._hc(layer + 1, "attention_hc")["norm"]
@@ -363,6 +449,8 @@ class RefModel:
                 residual, normalized = hc_combine_norm(
                     stage, moe_out, injection, next_norm, self.cfg.rms_epsilon
                 )
+                residual = self._stream_perm(residual)
+                normalized = self._stream_perm(normalized)
             if tensors is not None:
                 tensors[(layer, "residual_out")] = residual
                 tensors[(layer, "normalized_out")] = normalized

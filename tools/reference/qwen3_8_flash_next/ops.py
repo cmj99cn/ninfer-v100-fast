@@ -7,6 +7,7 @@ import numpy as np
 from tools.artifact.numeric import decode_e2m1_word, decode_e4m3fn_word
 
 from .config import CFG
+from .semantic import SEM
 
 
 def bf16(x):
@@ -59,23 +60,86 @@ def hc_expand_norm(embedding, norm_weight, epsilon):
     return bf16(residual), bf16(normalized)
 
 
-def hc_grouped_rmsnorm(residual, norm_weight, epsilon):
+def _hc_gain(weight):
+    w = np.asarray(weight, dtype=np.float64)
+    if SEM["hc_norm_gain"] == "w_only":
+        return w
+    return 1.0 + w
+
+
+def hc_grouped_rmsnorm(residual, norm_weight, epsilon, round_input=True):
     x = np.asarray(residual, dtype=np.float64)
+    if SEM["hc_norm_mode"] == "flatten":
+        tokens = x.shape[0]
+        flat = x.reshape(tokens, -1)
+        inv = 1.0 / np.sqrt(np.mean(flat * flat, axis=-1, keepdims=True) + epsilon)
+        weight = np.asarray(norm_weight, dtype=np.float64).reshape(-1)
+        out = (flat * inv * _hc_gain(weight)).reshape(x.shape)
+        return bf16(out)
     inv = 1.0 / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + epsilon)
-    return bf16(x * inv * (1.0 + np.asarray(norm_weight, dtype=np.float64))[None, :, :])
+    out = x * inv * _hc_gain(norm_weight)[None, :, :]
+    return bf16(out)
 
 
 def hc_combine(residual, block_output, injection):
     x = np.asarray(residual, dtype=np.float64)
-    out = x + np.asarray(injection, dtype=np.float64)[:, :, None] * np.asarray(
-        block_output, dtype=np.float64
-    )[:, None, :]
+    block = np.asarray(block_output, dtype=np.float64)[:, None, :]
+    inj = np.asarray(injection, dtype=np.float64)[:, :, None]
+    if SEM["hc_block_scale"] == "div4":
+        block = block / 4.0
+    mode = SEM["hc_combine_mode"]
+    if mode == "convex":
+        weight = sigmoid(inj)
+        out = x * (1.0 - weight) + weight * block
+    elif mode == "pre_scale":
+        out = x + inj * (block - x)
+    elif mode == "no_injection":
+        out = x + block
+    elif mode == "mul":
+        out = x * block
+    else:
+        out = x + inj * block
     return bf16(out)
 
 
 def hc_combine_norm(residual, block_output, injection, next_norm_weight, epsilon):
+    order = SEM["hc_combine_order"]
+    if order == "norm_then_update":
+        normalized = hc_grouped_rmsnorm(residual, next_norm_weight, epsilon)
+        updated = hc_combine(residual, block_output, injection)
+        return updated, normalized
     updated = hc_combine(residual, block_output, injection)
+    if SEM["hc_residual_round"] == "noround":
+        x = np.asarray(residual, dtype=np.float64)
+        block = np.asarray(block_output, dtype=np.float64)[:, None, :]
+        inj = np.asarray(injection, dtype=np.float64)[:, :, None]
+        if SEM["hc_block_scale"] == "div4":
+            block = block / 4.0
+        raw = x + inj * block
+        return updated, hc_grouped_rmsnorm(raw, next_norm_weight, epsilon)
     return updated, hc_grouped_rmsnorm(updated, next_norm_weight, epsilon)
+
+
+def _hc_block(flat, norm, down, up, tokens, streams, hidden):
+    mode = SEM["hc_mix_mode"]
+    rank = up.shape[1]
+    low = flat @ np.asarray(down[:rank], dtype=np.float64).T
+    if mode == "no_low_silu":
+        activated = low
+    elif mode == "no_stream_div":
+        activated = silu(low)
+    else:
+        activated = silu(low / streams)
+    gates = np.asarray(activated, dtype=np.float64) @ np.asarray(up, dtype=np.float64).T
+    gates = gates.reshape(tokens, streams, hidden)
+    if mode == "no_gate_sigmoid":
+        gated = gates
+    else:
+        gated = sigmoid(gates)
+    block = np.sum(gated * norm, axis=1)
+    if mode != "no_stream_div":
+        block = block / streams
+    return bf16(block)
 
 
 def hc_mix(normalized, down_injection, up, epsilon=None):
@@ -85,14 +149,21 @@ def hc_mix(normalized, down_injection, up, epsilon=None):
     flat = norm.reshape(tokens, channels)
     down = np.asarray(down_injection, dtype=np.float64)
     rank = up.shape[1]
-    low = flat @ down[:rank].T
+    block = _hc_block(flat, norm, down, up, tokens, streams, hidden)
     inject_rows = flat @ down[rank : rank + streams].T
-    activated = silu(low / streams)
-    gates = activated @ np.asarray(up, dtype=np.float64).T
-    gates = gates.reshape(tokens, streams, hidden)
-    block = np.sum(sigmoid(gates) * norm, axis=1) / streams
-    injection = fp32(2.0 * sigmoid(inject_rows / streams))
-    return bf16(block), injection
+    mode = SEM["hc_mix_mode"]
+    if mode == "no_stream_div":
+        injection = fp32(2.0 * sigmoid(inject_rows))
+    elif mode == "inject_linear":
+        injection = fp32(inject_rows / streams)
+    else:
+        injection = fp32(2.0 * sigmoid(inject_rows / streams))
+    coeff_mode = SEM["hc_inject_coeff"]
+    if coeff_mode == "sigmoid_only":
+        injection = fp32(sigmoid(inject_rows / streams))
+    elif coeff_mode == "no_sigmoid":
+        injection = fp32(2.0 * (inject_rows / streams))
+    return block, injection
 
 
 def hc_final_mix(normalized, down, up):
@@ -100,16 +171,31 @@ def hc_final_mix(normalized, down, up):
     tokens, streams, hidden = norm.shape
     channels = streams * hidden
     flat = norm.reshape(tokens, channels)
-    low = flat @ np.asarray(down, dtype=np.float64).T
-    activated = silu(low / streams)
-    gates = activated @ np.asarray(up, dtype=np.float64).T
-    gates = gates.reshape(tokens, streams, hidden)
-    block = np.sum(sigmoid(gates) * norm, axis=1) / streams
-    return bf16(block)
+    return _hc_block(flat, norm, down, up, tokens, streams, hidden)
 
 
-def rope(x, positions, theta, rotary_dim):
+def rope(x, positions, theta, rotary_dim, full=None):
     xf = np.asarray(x, dtype=np.float64)
+    mode = SEM["rope_mode"]
+    if mode == "full_head":
+        rotary_dim = xf.shape[-1]
+    if full is None:
+        full = SEM["rope_full_dim"]
+    if full:
+        half = rotary_dim // 2
+        freq = np.power(float(theta), -2.0 * np.arange(half, dtype=np.float64) / rotary_dim)
+        position = np.asarray(positions, dtype=np.float64)
+        while position.ndim < xf.ndim:
+            position = position[..., None]
+        angle = position * freq
+        cosine, sine = np.cos(angle), np.sin(angle)
+        out = xf.copy()
+        for start in range(0, xf.shape[-1], rotary_dim):
+            low = xf[..., start : start + half]
+            high = xf[..., start + half : start + rotary_dim]
+            out[..., start : start + half] = low * cosine - high * sine
+            out[..., start + half : start + rotary_dim] = high * cosine + low * sine
+        return out
     half = rotary_dim // 2
     freq = np.power(float(theta), -2.0 * np.arange(half, dtype=np.float64) / rotary_dim)
     position = np.asarray(positions, dtype=np.float64)
@@ -118,21 +204,32 @@ def rope(x, positions, theta, rotary_dim):
     angle = position * freq
     cos = np.cos(angle)
     sin = np.sin(angle)
+    sign = 1.0 if SEM["rope_sign_flip"] else -1.0
     out = xf.copy()
-    lower = xf[..., :half]
-    upper = xf[..., half:rotary_dim]
-    out[..., :half] = lower * cos - upper * sin
-    out[..., half:rotary_dim] = upper * cos + lower * sin
+    if mode == "adjacent":
+        pairs = xf[..., :rotary_dim].reshape(xf.shape[:-1] + (half, 2))
+        low = pairs[..., 0]
+        high = pairs[..., 1]
+        rot = np.empty_like(pairs)
+        rot[..., 0] = low * cos + sign * high * sin
+        rot[..., 1] = high * cos - sign * low * sin
+        out[..., :rotary_dim] = rot.reshape(xf.shape[:-1] + (rotary_dim,))
+    else:
+        start = xf.shape[-1] - rotary_dim if mode == "tail" else 0
+        low = xf[..., start : start + half]
+        high = xf[..., start + half : start + rotary_dim]
+        out[..., start : start + half] = low * cos + sign * high * sin
+        out[..., start + half : start + rotary_dim] = high * cos - sign * low * sin
     return out
 
 
-def qsa_norm_rope(x, norm_weight, positions, epsilon, theta, rotary_dim):
-    return bf16(rope(rms_offset(x, norm_weight, epsilon), positions, theta, rotary_dim))
+def qsa_norm_rope(x, norm_weight, positions, epsilon, theta, rotary_dim, full=None):
+    return bf16(rope(rms_offset(x, norm_weight, epsilon), positions, theta, rotary_dim, full))
 
 
 def qsa_index_block(raw_index_key, norm_weight, position, epsilon, theta, rotary_dim):
     mean = bf16(np.mean(np.asarray(raw_index_key, dtype=np.float64), axis=0))
-    return qsa_norm_rope(mean[None, :], norm_weight, np.array([position]), epsilon, theta, rotary_dim)[0]
+    return qsa_norm_rope(mean[None, :], norm_weight, np.array([position]), epsilon, theta, rotary_dim, full=False)[0]
 
 
 def qsa_indexer(index_query, index_key, positions, budget):
@@ -190,10 +287,21 @@ def qsa_sparse_gqa(query, output_gate, k_cache, v_cache, selections, positions, 
 
 def gdn_gating(x, a_weight, b_weight, a_log, dt_bias):
     xf = np.asarray(x, dtype=np.float64)
-    a = xf @ np.asarray(a_weight, dtype=np.float64).T
-    b = xf @ np.asarray(b_weight, dtype=np.float64).T
-    softplus = np.logaddexp(0.0, a + np.asarray(dt_bias, dtype=np.float64)[None, :])
-    g = -np.exp(np.asarray(a_log, dtype=np.float64))[None, :] * softplus
+    mode = SEM["gdn_gate_mode"]
+    if mode == "swap_ab":
+        a = xf @ np.asarray(b_weight, dtype=np.float64).T
+        b = xf @ np.asarray(a_weight, dtype=np.float64).T
+    else:
+        a = xf @ np.asarray(a_weight, dtype=np.float64).T
+        b = xf @ np.asarray(b_weight, dtype=np.float64).T
+    bias = np.asarray(dt_bias, dtype=np.float64)[None, :]
+    if mode == "gate_sigmoid":
+        g = -np.exp(np.asarray(a_log, dtype=np.float64))[None, :] * sigmoid(a + bias)
+    elif mode == "decay_direct":
+        g = -(a + bias)
+    else:
+        softplus = np.logaddexp(0.0, a + bias)
+        g = -np.exp(np.asarray(a_log, dtype=np.float64))[None, :] * softplus
     beta = sigmoid(b)
     return fp32(g), fp32(beta)
 
@@ -213,23 +321,48 @@ def gated_delta_net(q, k, v, g, beta, state, scale, epsilon):
     value_heads = vf.shape[1]
     group = value_heads // qk_heads
     head_map = np.arange(value_heads, dtype=np.int64) // group
-    qn = normalize_qk(qf, epsilon)[:, head_map, :]
-    kn = normalize_qk(kf, epsilon)[:, head_map, :]
+    mode = SEM["gdn_update_mode"]
+    if mode == "no_normalize":
+        qn = qf[:, head_map, :]
+        kn = kf[:, head_map, :]
+    else:
+        qn = normalize_qk(qf, epsilon)[:, head_map, :]
+        kn = normalize_qk(kf, epsilon)[:, head_map, :]
+    if mode == "kv_swapped":
+        write_key = normalize_qk(vf, epsilon)
+        write_val = kn
+    else:
+        write_key = kn
+        write_val = vf
     matrix = np.array(state, dtype=np.float64, copy=True)
     out = np.zeros((tokens, value_heads, dim), dtype=np.float64)
     for t in range(tokens):
         alpha = np.exp(gf[t])
-        sk = np.einsum("hij,hj->hi", matrix, kn[t])
-        delta = bf[t][:, None] * (vf[t] - alpha[:, None] * sk)
-        matrix = alpha[:, None, None] * matrix + delta[:, :, None] * kn[t][:, None, :]
-        out[t] = scale * np.einsum("hij,hj->hi", matrix, qn[t])
+        if mode == "decay_sigmoid":
+            alpha = sigmoid(gf[t])
+        elif mode == "decay_none":
+            alpha = 1.0
+        sk = np.einsum("hij,hj->hi", matrix, write_key[t])
+        if mode == "no_alpha_sk":
+            delta = bf[t][:, None] * (write_val[t] - sk)
+        else:
+            delta = bf[t][:, None] * (write_val[t] - alpha[:, None] * sk)
+        if mode == "alpha_outer":
+            matrix = alpha[:, None, None] * (
+                matrix + delta[:, :, None] * write_key[t][:, None, :]
+            )
+        else:
+            matrix = alpha[:, None, None] * matrix + delta[:, :, None] * write_key[t][:, None, :]
+        read = write_key[t] if mode == "out_uses_k" else qn[t]
+        out[t] = scale * np.einsum("hij,hj->hi", matrix, read)
     return out
 
 
 def gated_rmsnorm(x, weight, z, epsilon):
     xf = np.asarray(x, dtype=np.float64)
     inv = 1.0 / np.sqrt(np.mean(xf * xf, axis=-1, keepdims=True) + epsilon)
-    out = xf * inv * np.asarray(weight, dtype=np.float64) * silu(z)
+    gate = sigmoid(z) if SEM["gdn_norm_gate"] == "sigmoid" else silu(z)
+    out = xf * inv * np.asarray(weight, dtype=np.float64) * gate
     return bf16(out)
 
 
@@ -239,10 +372,11 @@ def causal_conv_silu(x, kernel, history):
     hist = np.asarray(history, dtype=np.float64)
     window = hist.shape[1]
     out = np.zeros((tokens, channels), dtype=np.float64)
+    reverse = SEM["gdn_conv_mode"] == "reverse_taps"
     for tap in range(kernel.shape[0]):
         weight = np.asarray(kernel[tap], dtype=np.float64)
         for t in range(tokens):
-            source = t - window + tap
+            source = t - tap if reverse else t - window + tap
             if source >= 0:
                 out[t] += weight * xf[source]
             else:

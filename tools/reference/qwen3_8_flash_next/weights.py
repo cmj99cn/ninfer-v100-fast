@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import os
 import struct
 
 import numpy as np
@@ -8,6 +9,10 @@ import numpy as np
 from tools.artifact.layouts import align_up
 
 from .ops import bf16_from_u16, e2m1_lut, e4m3_lut, ple_decode_row
+
+_NVFP4_SCALE_INVERSE = os.environ.get("NINFER_DIAG_NVFP4_SCALE_INVERSE") == "1"
+_NVFP4_DIVISOR_INVERSE = os.environ.get("NINFER_DIAG_NVFP4_DIVISOR_INVERSE") == "1"
+_W8_SCALE_INVERSE = os.environ.get("NINFER_DIAG_W8_SCALE_INVERSE") == "1"
 
 
 def decode_contiguous(raw, fmt, shape):
@@ -36,6 +41,8 @@ def decode_w8(raw, shape):
         raw[scale_offset : scale_offset + rows * groups * 2], dtype="<f2"
     ).reshape(rows, groups)
     scales = np.repeat(scales.astype(np.float64), 32, axis=1)[:, :columns]
+    if _W8_SCALE_INVERSE:
+        return (codes / np.where(scales == 0, 1.0, scales)).astype(np.float32)
     return (codes * scales).astype(np.float32)
 
 
@@ -75,7 +82,16 @@ def decode_batched_nvfp4(artifact, object_id, shape, matrix):
         "<f",
         artifact.read_object(object_id, divisor_offset + matrix * 4, 4),
     )[0]
-    return (codes_f * np.repeat(scales_f, 16, axis=1) / float(divisor)).astype(np.float32)
+    scale_rep = np.repeat(scales_f, 16, axis=1)
+    if _NVFP4_SCALE_INVERSE:
+        decoded = codes_f / np.where(scale_rep == 0, 1.0, scale_rep)
+    else:
+        decoded = codes_f * scale_rep
+    if _NVFP4_DIVISOR_INVERSE:
+        decoded = decoded * float(divisor)
+    else:
+        decoded = decoded / float(divisor)
+    return decoded.astype(np.float32)
 
 
 class WeightStore:

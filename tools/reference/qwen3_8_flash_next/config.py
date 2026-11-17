@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+
+_DIAG_ROPE_THETA = os.environ.get("NINFER_DIAG_ROPE_THETA")
+_DIAG_ROTARY_DIM = os.environ.get("NINFER_DIAG_ROTARY_DIM")
+_DIAG_RMS_EPS = os.environ.get("NINFER_DIAG_RMS_EPS")
 
 
 @dataclass(frozen=True)
@@ -36,10 +41,10 @@ class FlashNextConfig:
     ple_conv_kernel: int = 4
     ple_conv_dilation: int = 3
     ple_conv_window: int = 9
-    rope_theta: float = 1.0e7
-    rotary_dim: int = 64
+    rope_theta: float = float(_DIAG_ROPE_THETA) if _DIAG_ROPE_THETA is not None else 1.0e7
+    rotary_dim: int = int(_DIAG_ROTARY_DIM) if _DIAG_ROTARY_DIM is not None else 64
     partial_rotary: float = 0.25
-    rms_epsilon: float = 1.0e-6
+    rms_epsilon: float = float(_DIAG_RMS_EPS) if _DIAG_RMS_EPS is not None else 1.0e-6
     ple_gate_floor: float = 1.0e-6
     eos_token_id: int = 248044
 
