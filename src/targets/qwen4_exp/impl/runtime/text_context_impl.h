@@ -337,8 +337,13 @@ inline void TextState::prepare_ple_rows(std::span<const TokenId> tokens) {
 inline void TextState::await_ple_rows() {
     DeviceScope scope(device_);
     if (ple_prefetch_.valid()) { ple_prefetch_.get(); }
-    CUDA_CHECK(cudaStreamWaitEvent(stream_, ple_ready_, 0));
+    enqueue_ple_wait();
     NINFER_QWEN4EXP_PLE_PREFETCH_AWAIT();
+}
+
+inline void TextState::enqueue_ple_wait() {
+    DeviceScope scope(device_);
+    CUDA_CHECK(cudaStreamWaitEvent(stream_, ple_ready_, 0));
 }
 
 inline std::int32_t TextState::base_position() const {

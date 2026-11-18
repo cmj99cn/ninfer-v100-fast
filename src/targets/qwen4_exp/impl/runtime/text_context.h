@@ -78,6 +78,7 @@ public:
     void reset();
     void prepare_ple_rows(std::span<const TokenId> tokens);
     void await_ple_rows();
+    void enqueue_ple_wait();
     [[nodiscard]] std::int32_t base_position() const;
 
     [[nodiscard]] Tensor gdn_conv_state(std::size_t gdn_index) const;

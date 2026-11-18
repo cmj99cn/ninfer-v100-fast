@@ -31,6 +31,8 @@ struct RequestPlanImpl<NINFER_QWEN4EXP_VARIANT> {
 
 namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
 
+class GraphDecodeController;
+
 using RequestBasePlanImpl = qwen4_exp::detail::RequestBasePlanImpl<Variant>;
 using RequestPlanImpl     = qwen4_exp::detail::RequestPlanImpl<Variant>;
 
@@ -48,7 +50,7 @@ public:
     ProgramImplCore(const std::array<const ModelView*, kMaximumDevices>& models,
                     WeightsProfile weights_profile, std::unique_ptr<SequencePlanImpl> plan,
                     ExecutionContext& execution, const EngineOptions& options);
-    ~ProgramImplCore() noexcept = default;
+    ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan
     plan_request_base(const PreparedPrompt& prompt,
@@ -130,11 +132,13 @@ private:
     std::array<WorkspaceArena*, kMaximumDevices> workspace_ptrs_{};
     std::unique_ptr<ops::CollectiveComms> comms_;
     std::unique_ptr<TextTrunk> trunk_;
+    std::unique_ptr<GraphDecodeController> graph_;
     LastStageCapture logits_capture_;
     std::vector<TokenId> round_tokens_;
     std::vector<std::int32_t> round_row_counts_;
     std::uint64_t last_prefill_tokens_ = 0;
     double last_prefill_seconds_       = 0.0;
+    std::uint32_t graph_warm_steps_    = 0;
 };
 
 } // namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS

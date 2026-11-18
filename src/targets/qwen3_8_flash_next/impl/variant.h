@@ -4,6 +4,7 @@
 #include "core/tensor.h"
 #include "targets/qwen3_8_flash_next/impl/config.h"
 #include "targets/qwen3_8_flash_next/impl/leaves.h"
+#include "targets/qwen3_8_flash_next/impl/load/expert_runtime.h"
 #include <ninfer/targets/qwen3_8_flash_next/package.h>
 
 #include <cuda_runtime.h>
@@ -81,6 +82,14 @@ struct Variant {
 
     static void post_mixer_prefetch(const MoeWeights& weights, cudaStream_t stream) {
         PostMixerLeaf::prefetch(weights, stream);
+    }
+
+    static void freeze_expert_residency(const MoeWeights& weights) {
+        if (weights.cache != nullptr) { weights.cache->freeze_current_residency(); }
+    }
+
+    static void set_expert_graph_mode(const MoeWeights& weights, bool enabled) {
+        if (weights.cache != nullptr) { weights.cache->set_graph_mode(enabled); }
     }
 };
 

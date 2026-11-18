@@ -20,6 +20,11 @@
 #include <vector>
 
 namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
+
+inline constexpr std::uint32_t kGraphCaptureWarmSteps = 8;
+
+ProgramImplCore::~ProgramImplCore() noexcept = default;
+
 namespace {
 
 class ScopedDevice {
@@ -75,6 +80,10 @@ ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevi
     comms_ = std::make_unique<ops::CollectiveComms>(execution_);
     trunk_ = std::make_unique<TextTrunk>(view_ptrs_, state_ptrs_, activation_ptrs_,
                                          workspace_ptrs_, execution_, *comms_);
+    if (options_.use_cuda_graph) {
+        graph_ = std::make_unique<GraphDecodeController>(
+            execution_, state_ptrs_, activation_ptrs_, workspace_ptrs_, execution_.tp);
+    }
     CUDA_CHECK(cudaSetDevice(execution_.dev[0]->device));
 }
 
@@ -206,6 +215,23 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     for (int rank = 0; rank < execution_.tp; ++rank) {
         states_[static_cast<std::size_t>(rank)]->reset();
     }
+    if (graph_ != nullptr && !graph_->ready() &&
+        graph_warm_steps_ >= kGraphCaptureWarmSteps) {
+        for (int rank = 0; rank < execution_.tp; ++rank) {
+            const auto& model = *models_[static_cast<std::size_t>(rank)];
+            for (std::size_t layer = 0; layer < model.loaded_layers; ++layer) {
+                const auto& moe = model.layers[layer].post_mixer;
+                Variant::freeze_expert_residency(moe);
+                Variant::set_expert_graph_mode(moe, true);
+            }
+        }
+        const TokenId capture_token = static_cast<TokenId>(data.token_ids.front());
+        try {
+            graph_->capture(capture_token, [&] { trunk_->decode(capture_token); });
+        } catch (const std::exception&) {
+            graph_.reset();
+        }
+    }
     std::vector<TokenId>& tokens = data.token_ids;
     const std::uint32_t chunk = std::min(plan_->prefill_chunk,
                                          static_cast<std::uint32_t>(tokens.size()));
@@ -297,8 +323,19 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
     for (const std::uint32_t lane : lanes) {
         LaneState& state         = lanes_[lane];
         const auto decode_start  = std::chrono::steady_clock::now();
-        last_stage_capture() = &logits_capture_;
-        const TokenId token      = trunk_->decode(state.context.next_input);
+        TokenId token = 0;
+        if (graph_ != nullptr && !graph_->ready()) { ++graph_warm_steps_; }
+        if (graph_ != nullptr && graph_->ready()) {
+            token = graph_->replay(state.context.next_input, states_[0]->next_position());
+            if (logits_capture_.enabled) {
+                const std::uint16_t* words = graph_->logits();
+                logits_capture_.words.assign(
+                    words, words + static_cast<std::size_t>(TextConfig::vocab));
+            }
+        } else {
+            last_stage_capture() = &logits_capture_;
+            token = trunk_->decode(state.context.next_input);
+        }
         state.timings.decode_seconds +=
             std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
         state.last_round_token     = token;

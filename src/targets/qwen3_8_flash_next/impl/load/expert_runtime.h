@@ -40,6 +40,10 @@ public:
     void prefetch_previous_round(cudaStream_t stream);
     void prime_static_residency();
     void set_graph_mode(bool enabled) noexcept { graph_mode_ = enabled; }
+    void freeze_current_residency() noexcept {
+        cache_.freeze();
+        frozen_ = true;
+    }
 
     [[nodiscard]] const ExpertCache& cache() const noexcept { return cache_; }
     [[nodiscard]] float* activation_scratch() const noexcept {

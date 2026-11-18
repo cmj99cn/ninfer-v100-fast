@@ -42,6 +42,8 @@ struct Options {
     int reps                    = 2;
     int warmup                  = 1;
     std::uint32_t prefill_chunk = kPrefillChunk;
+    std::uint32_t expert_cache_mib = 0;
+    bool graph = false;
     std::vector<TokenId> target_tokens;
 };
 
@@ -117,6 +119,10 @@ Options parse_options(int argc, char** argv) {
             options.warmup = std::stoi(next());
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(std::stoul(next()));
+        } else if (arg == "--expert-cache-mib") {
+            options.expert_cache_mib = static_cast<std::uint32_t>(std::stoul(next()));
+        } else if (arg == "--graph") {
+            options.graph = true;
         } else if (arg == "--target-tokens") {
             options.target_tokens = parse_ids(next());
         } else {
@@ -140,8 +146,8 @@ EngineOptions engine_options(const Options& options) {
     engine.kv_capacity      = ninfer::KvCapacityPolicy::explicit_capacity(kKvCapacity);
     engine.max_concurrency  = kMaxConcurrency;
     engine.prefill_chunk    = options.prefill_chunk;
-    engine.use_cuda_graph   = false;
-    engine.expert_cache_mib = 0;
+    engine.use_cuda_graph   = options.graph;
+    engine.expert_cache_mib = options.expert_cache_mib;
     return engine;
 }
 
@@ -314,6 +320,7 @@ Json run_bench(const Options& options) {
             reps.push_back(Json{
                 {"committed_tokens", result.generated_token_ids.size() - 1},
                 {"generated_tokens", result.generated_token_ids.size()},
+                {"tokens", result.generated_token_ids},
                 {"prefill_seconds", result.timings.prefill_seconds},
                 {"first_token_seconds", result.timings.first_token_seconds},
                 {"decode_seconds", result.timings.decode_seconds},
