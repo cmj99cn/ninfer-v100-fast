@@ -3,6 +3,7 @@
 #include "targets/qwen3_8_flash_next/impl/mtp_draft.h"
 #include "targets/qwen3_8_flash_next/impl/speculative.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -46,14 +47,22 @@ int main(int argc, char** argv) {
         conditioning.copy_from_host(words.data(), words.size() * 2);
         ninfer::Tensor conditioning_view(conditioning.p, ninfer::DType::FP16, {2560, 4});
         flash::MtpDraft draft(artifact, 0);
+        constexpr std::uint32_t steps = 3;
+        const auto begin = std::chrono::steady_clock::now();
         const std::vector<ninfer::TokenId> tokens =
-            flash::draft_chain(draft, conditioning_view, 504, 3);
+            flash::draft_chain(draft, conditioning_view, 504, steps);
+        const auto end = std::chrono::steady_clock::now();
+        const double milliseconds =
+            std::chrono::duration<double, std::milli>(end - begin).count();
         std::cout << "mtp chain tokens";
         for (ninfer::TokenId token : tokens) { std::cout << ' ' << token; }
         std::cout << "\n";
-        const std::vector<ninfer::TokenId> oracle{220, 18, 220};
+        std::cout << "chain_ms " << milliseconds << " moe_host_syncs_total "
+                  << draft.host_syncs() << " moe_host_syncs_per_step "
+                  << (draft.host_syncs() / steps) << "\n";
+        const std::vector<ninfer::TokenId> oracle{220, 27967, 813};
         if (tokens != oracle) {
-            std::cerr << "MTP chain tokens do not match FP64 oracle {220, 18, 220}\n";
+            std::cerr << "MTP chain tokens do not match FP64 oracle {220, 27967, 813}\n";
             return 1;
         }
         return 0;

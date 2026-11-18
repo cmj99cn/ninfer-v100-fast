@@ -448,7 +448,7 @@ struct MtpDraft::Impl {
             .const_tail = state.const_tail(0),
             .after = state.tail(0),
             .records = state.records(static_cast<std::size_t>(tokens)),
-            .publish = nullptr,
+            .publish = family::publish_text_qsa_tail,
             .publish_context = &publish_context,
         };
         std::array<Tensor, artifact::kMaximumDevices> block_inputs{};
@@ -511,6 +511,7 @@ struct MtpDraft::Impl {
         CUDA_CHECK(cudaMemcpyAsync(control_host.data(), control_out.data,
                                    control_host.size() * sizeof(__half),
                                    cudaMemcpyDeviceToHost, stream));
+        ++host_syncs;
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         std::vector<std::pair<float, std::int32_t>> scores(kExperts);
@@ -545,6 +546,7 @@ struct MtpDraft::Impl {
         CUDA_CHECK(cudaMemcpyAsync(projection_host.data(), shared_projection.data,
                                    projection_host.size() * sizeof(__half),
                                    cudaMemcpyDeviceToHost, stream));
+        ++host_syncs;
         CUDA_CHECK(cudaStreamSynchronize(stream));
         std::vector<std::uint16_t> activated(kShared);
         for (std::int32_t index = 0; index < kShared; ++index) {
@@ -563,6 +565,7 @@ struct MtpDraft::Impl {
         std::vector<__half> shared_host(kHidden);
         CUDA_CHECK(cudaMemcpyAsync(shared_host.data(), shared_output.data,
                                    shared_host.size() * sizeof(__half), cudaMemcpyDeviceToHost, stream));
+        ++host_syncs;
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         std::vector<float> total(kHidden, 0.0F);
@@ -588,6 +591,7 @@ struct MtpDraft::Impl {
             CUDA_CHECK(cudaMemcpyAsync(expert_projection.data(), gate_up.data,
                                        expert_projection.size() * sizeof(__half),
                                        cudaMemcpyDeviceToHost, stream));
+            ++host_syncs;
             CUDA_CHECK(cudaStreamSynchronize(stream));
             for (std::int32_t row = 0; row < kIntermediate; ++row) {
                 const float gate_value = __half2float(expert_projection[static_cast<std::size_t>(row)]);
@@ -605,6 +609,7 @@ struct MtpDraft::Impl {
             CUDA_CHECK(cudaMemcpyAsync(expert_result.data(), expert_output.data,
                                        expert_result.size() * sizeof(__half),
                                        cudaMemcpyDeviceToHost, stream));
+            ++host_syncs;
             CUDA_CHECK(cudaStreamSynchronize(stream));
             const float coefficient = selected_scores[static_cast<std::size_t>(index)];
             for (std::int32_t row = 0; row < kHidden; ++row) {
@@ -619,6 +624,7 @@ struct MtpDraft::Impl {
         }
         CUDA_CHECK(cudaMemcpyAsync(destination.data, rounded.data(), rounded.size() * 2,
                                    cudaMemcpyHostToDevice, stream));
+        ++host_syncs;
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
@@ -649,6 +655,7 @@ struct MtpDraft::Impl {
     DeviceBuffer gate_bank{};
     DeviceBuffer down_bank{};
     std::uint64_t expert_bytes = 0;
+    std::uint64_t host_syncs = 0;
 };
 
 MtpDraft::MtpDraft(const std::filesystem::path& artifact, int device)
@@ -664,5 +671,7 @@ TokenId MtpDraft::run(const Tensor& conditioning, TokenId next_token, std::int32
 int MtpDraft::device() const noexcept { return impl_->device_context.device; }
 
 std::uint64_t MtpDraft::expert_bytes() const noexcept { return impl_->expert_bytes; }
+
+std::uint64_t MtpDraft::host_syncs() const noexcept { return impl_->host_syncs; }
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

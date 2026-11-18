@@ -28,6 +28,7 @@ public:
 
     [[nodiscard]] int device() const noexcept;
     [[nodiscard]] std::uint64_t expert_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t host_syncs() const noexcept;
 
 private:
     struct Impl;

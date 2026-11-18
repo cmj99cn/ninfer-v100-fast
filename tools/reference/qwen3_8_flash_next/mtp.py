@@ -91,6 +91,40 @@ class MtpWeights:
     output_head: np.ndarray
 
 
+@dataclass
+class DraftCache:
+    k: np.ndarray
+    v: np.ndarray
+    index_k: np.ndarray
+    tail_raw: list
+    tail_first: int
+
+    @classmethod
+    def fresh(cls, positions: int) -> "DraftCache":
+        return cls(
+            k=np.zeros((positions, CFG.kv_heads, CFG.head_dim)),
+            v=np.zeros((positions, CFG.kv_heads, CFG.head_dim)),
+            index_k=np.zeros((positions // CFG.index_compress + 1, CFG.index_head_dim)),
+            tail_raw=[],
+            tail_first=0,
+        )
+
+    def append(self, position: int, key: np.ndarray, value: np.ndarray,
+               index_key: np.ndarray, weights: dict) -> None:
+        self.k[position] = bf16(key)
+        self.v[position] = f16(value)
+        if not self.tail_raw:
+            self.tail_first = position
+        self.tail_raw.append(np.asarray(index_key, dtype=np.float64))
+        if len(self.tail_raw) == CFG.index_compress:
+            mean = bf16(np.mean(np.stack(self.tail_raw), axis=0))
+            self.index_k[position // CFG.index_compress] = qsa_norm_rope(
+                mean[None, :], weights["index_key_norm"],
+                np.array([self.tail_first]), CFG.rms_epsilon, CFG.rope_theta, CFG.rotary_dim,
+                full=False)[0]
+            self.tail_raw = []
+
+
 class MtpRef:
     def __init__(self, artifact_path: str):
         self.artifact = V3Artifact(artifact_path)
@@ -235,6 +269,36 @@ class MtpRef:
                                    CFG.index_compress, CFG.head_dim)
         return dense(attention.reshape(1, CFG.query_width), weights["out"])
 
+    def _qsa_chained(self, hidden: np.ndarray, weights: dict, position: int,
+                     cache: DraftCache) -> np.ndarray:
+        query = dense(hidden, weights["query"]).reshape(1, CFG.q_heads, CFG.head_dim)
+        gate = dense(hidden, weights["gate"]).reshape(1, CFG.q_heads, CFG.head_dim)
+        projected = dense(hidden, np.concatenate([
+            weights["key"], weights["value"], weights["index_query"], weights["index_key"]
+        ]))
+        key = projected[:, :CFG.kv_width].reshape(1, CFG.kv_heads, CFG.head_dim)
+        value = projected[:, CFG.kv_width:2 * CFG.kv_width].reshape(1, CFG.kv_heads, CFG.head_dim)
+        index_query = projected[:, 2 * CFG.kv_width:2 * CFG.kv_width + CFG.index_query_width]
+        index_query = index_query.reshape(1, CFG.index_heads, CFG.index_head_dim)
+        index_key = projected[:, 2 * CFG.kv_width + CFG.index_query_width:]
+        index_key = index_key.reshape(1, CFG.index_kv_heads, CFG.index_head_dim)
+
+        positions = np.asarray([position], dtype=np.int64)
+        query = qsa_norm_rope(query, weights["query_norm"], positions, CFG.rms_epsilon,
+                              CFG.rope_theta, CFG.rotary_dim)
+        index_query = qsa_norm_rope(index_query, weights["index_query_norm"], positions,
+                                    CFG.rms_epsilon, CFG.rope_theta, CFG.rotary_dim)
+        key = qsa_norm_rope(key, weights["key_norm"], positions, CFG.rms_epsilon,
+                            CFG.rope_theta, CFG.rotary_dim)
+        cache.append(position, key[0], value[0], index_key[0, 0], weights)
+        count = (position + 1) // CFG.index_compress
+        selections = qsa_indexer(index_query, cache.index_k[:count], positions,
+                                 CFG.index_block_budget)
+        attention = qsa_sparse_gqa(query, gate, cache.k[:position + 1],
+                                   cache.v[:position + 1], selections, positions,
+                                   CFG.index_compress, CFG.head_dim)
+        return dense(attention.reshape(1, CFG.query_width), weights["out"])
+
     def _moe(self, hidden: np.ndarray, weights: dict) -> np.ndarray:
         ids, coefficients, shared = topk_route(hidden, weights["control"], CFG.experts_per_token)
         values = np.asarray(hidden, dtype=np.float64)
@@ -271,7 +335,8 @@ class MtpRef:
         return bf16(total)
 
     def draft(self, hidden: np.ndarray, next_token: int, position: int,
-              weights: MtpWeights | None = None) -> tuple[int, np.ndarray, np.ndarray]:
+              weights: MtpWeights | None = None, cache: DraftCache | None = None,
+              ) -> tuple[int, np.ndarray, np.ndarray]:
         if weights is None:
             weights = self.weights()
         hidden = np.asarray(hidden, dtype=np.float64).reshape(1, CFG.residual_width)
@@ -280,7 +345,8 @@ class MtpRef:
         normalized = hc_grouped_rmsnorm(residual, weights.attention_hc["norm"], CFG.rms_epsilon)
         block_input, injection = hc_mix(normalized, weights.attention_hc["down"],
                                         weights.attention_hc["up"])
-        mixer = self._qsa(block_input, weights.qsa, position)
+        mixer = (self._qsa_chained(block_input, weights.qsa, position, cache)
+                 if cache is not None else self._qsa(block_input, weights.qsa, position))
         stage, normalized = hc_combine_norm(
             residual, mixer, injection, weights.moe_hc["norm"], CFG.rms_epsilon)
         block_input, injection = hc_mix(normalized, weights.moe_hc["down"], weights.moe_hc["up"])
@@ -294,9 +360,10 @@ class MtpRef:
     def draft_chain(self, hidden: np.ndarray, next_token: int, position: int,
                     steps: int) -> list[int]:
         weights = self.weights()
+        cache = DraftCache.fresh(position + steps)
         tokens: list[int] = []
-        for _ in range(steps):
-            token, hidden, _ = self.draft(hidden, next_token, position, weights)
+        for step in range(steps):
+            token, hidden, _ = self.draft(hidden, next_token, position + step, weights, cache)
             tokens.append(token)
             next_token = token
         return tokens

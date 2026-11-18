@@ -14,7 +14,7 @@
 namespace ninfer::targets::qwen3_8_flash_next::detail {
 
 std::vector<TokenId> draft_chain(MtpDraft& draft, const Tensor& conditioning, TokenId token,
-                                 std::uint32_t steps) {
+                                 std::uint32_t steps, std::int32_t start_position) {
     std::vector<TokenId> tokens;
     tokens.reserve(steps);
     if (steps == 0) { return tokens; }
@@ -27,7 +27,8 @@ std::vector<TokenId> draft_chain(MtpDraft& draft, const Tensor& conditioning, To
     for (std::uint32_t step = 0; step < steps; ++step) {
         const Tensor current_view(current.p, DType::FP16, {2560, 4});
         Tensor next_view(next.p, DType::FP16, {2560, 4});
-        token = draft.run(current_view, token, 0, &next_view);
+        token = draft.run(current_view, token, start_position + static_cast<std::int32_t>(step),
+                          &next_view);
         tokens.push_back(token);
         std::swap(current, next);
     }

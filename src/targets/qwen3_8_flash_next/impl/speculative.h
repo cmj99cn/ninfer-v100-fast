@@ -12,6 +12,6 @@ namespace ninfer::targets::qwen3_8_flash_next::detail {
 class MtpDraft;
 
 std::vector<TokenId> draft_chain(MtpDraft& draft, const Tensor& conditioning, TokenId first_token,
-                                 std::uint32_t steps);
+                                 std::uint32_t steps, std::int32_t start_position = 0);
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail
