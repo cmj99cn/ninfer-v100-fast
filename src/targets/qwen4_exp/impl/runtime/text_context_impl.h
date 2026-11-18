@@ -62,6 +62,40 @@
 #define NINFER_QWEN4EXP_DIAG_MARK(label)
 #endif
 
+#ifndef NINFER_QWEN4EXP_GRAPH_IDS_SRC
+#define NINFER_QWEN4EXP_GRAPH_IDS_SRC(rank, tokens) (tokens.data())
+#endif
+
+#ifndef NINFER_QWEN4EXP_GRAPH_POSITIONS_SRC
+#define NINFER_QWEN4EXP_GRAPH_POSITIONS_SRC(rank, host_positions) (host_positions.data())
+#endif
+
+#ifndef NINFER_QWEN4EXP_GRAPH_SCALARS_SRC
+#define NINFER_QWEN4EXP_GRAPH_SCALARS_SRC(rank, value, label) (&(value))
+#endif
+
+#ifndef NINFER_QWEN4EXP_GRAPH_WINNER_PTR
+#define NINFER_QWEN4EXP_GRAPH_WINNER_PTR() (&token)
+#endif
+
+#ifndef NINFER_QWEN4EXP_GRAPH_PREPARE_PLE
+#define NINFER_QWEN4EXP_GRAPH_PREPARE_PLE(rank, state, tokens) (state).prepare_ple_rows(tokens)
+#endif
+
+#ifndef NINFER_QWEN4EXP_GRAPH_PLE_AWAIT
+#define NINFER_QWEN4EXP_GRAPH_PLE_AWAIT(rank, state) (state).await_ple_rows()
+#endif
+
+#ifndef NINFER_QWEN4EXP_GRAPH_ROUTED_FINISH
+#define NINFER_QWEN4EXP_GRAPH_ROUTED_FINISH(weights, stream) \
+    Variant::post_mixer_routed_finish((weights), (stream))
+#endif
+
+#ifndef NINFER_QWEN4EXP_GRAPH_FINISH_SYNC
+#define NINFER_QWEN4EXP_GRAPH_FINISH_SYNC() \
+    CUDA_CHECK(cudaStreamSynchronize(states_[0]->stream()))
+#endif
+
 namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
 
 inline constexpr std::int32_t kHidden   = TextConfig::hidden;
@@ -757,10 +791,12 @@ inline void TextTrunk::run_ple(std::int32_t T,
         Tensor counts          = activations_[slot]->alloc(DType::I32, {kBatch});
         const std::int32_t live         = T;
         const std::int32_t column_start = 0;
-        CUDA_CHECK(cudaMemcpyAsync(offsets.data, &column_start, 4, cudaMemcpyHostToDevice,
-                                   stream_for(rank)));
-        CUDA_CHECK(cudaMemcpyAsync(counts.data, &live, 4, cudaMemcpyHostToDevice,
-                                   stream_for(rank)));
+        CUDA_CHECK(cudaMemcpyAsync(offsets.data,
+                                   NINFER_QWEN4EXP_GRAPH_SCALARS_SRC(rank, column_start, "ple_offset"), 4,
+                                   cudaMemcpyHostToDevice, stream_for(rank)));
+        CUDA_CHECK(cudaMemcpyAsync(counts.data,
+                                   NINFER_QWEN4EXP_GRAPH_SCALARS_SRC(rank, live, "ple_count"), 4,
+                                   cudaMemcpyHostToDevice, stream_for(rank)));
 
         ops::ple_gate(projected_key, projected_value, residual[slot], ple.norm_key, ple.norm_query,
                       ple.norm_conv, TextConfig::rms_epsilon, gated_value, normalized_conv,
@@ -787,7 +823,9 @@ inline void TextTrunk::run_ple(std::int32_t T,
 
 inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
     const std::int32_t T = static_cast<std::int32_t>(tokens.size());
-    for_each_rank([&](int rank) { states_[static_cast<std::size_t>(rank)]->prepare_ple_rows(tokens); });
+    for_each_rank([&](int rank) {
+        NINFER_QWEN4EXP_GRAPH_PREPARE_PLE(rank, *states_[static_cast<std::size_t>(rank)], tokens);
+    });
 
     std::array<std::optional<DeviceArena::Scope>, kMaximumDevices> activation_scopes;
     std::array<std::optional<DeviceArena::Scope>, kMaximumDevices> workspace_scopes;
@@ -828,8 +866,10 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
         cudaStream_t stream = stream_for(rank);
         NINFER_QWEN4EXP_DIAG_MARK("round_begin");
         ids[slot] = activations_[slot]->alloc(DType::I32, {T});
-        CUDA_CHECK(cudaMemcpyAsync(ids[slot].data, tokens.data(), static_cast<std::size_t>(T) * 4,
-                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(ids[slot].data,
+                                    NINFER_QWEN4EXP_GRAPH_IDS_SRC(rank, tokens),
+                                    static_cast<std::size_t>(T) * 4,
+                                    cudaMemcpyHostToDevice, stream));
         embedding_out[slot] = activations_[slot]->alloc(kTextActivationDtype, {kHidden, T});
         ops::embedding(ids[slot], models_[slot]->embedding, embedding_out[slot], stream);
 
@@ -849,12 +889,16 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
         valid_columns[slot] = activations_[slot]->alloc(DType::I32, {kBatch});
         table_rows[slot]    = activations_[slot]->alloc(DType::I32, {kBatch});
         staging[slot]       = workspaces_[slot]->alloc(kTextActivationDtype, {kHidden, T});
-        CUDA_CHECK(cudaMemcpyAsync(positions[slot].data, host_positions.data(),
-                                   static_cast<std::size_t>(T) * 4, cudaMemcpyHostToDevice,
-                                   stream));
-        CUDA_CHECK(cudaMemcpyAsync(valid_columns[slot].data, &live, 4, cudaMemcpyHostToDevice,
-                                   stream));
-        CUDA_CHECK(cudaMemcpyAsync(table_rows[slot].data, &row, 4, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(positions[slot].data,
+                                    NINFER_QWEN4EXP_GRAPH_POSITIONS_SRC(rank, host_positions),
+                                    static_cast<std::size_t>(T) * 4, cudaMemcpyHostToDevice,
+                                    stream));
+        CUDA_CHECK(cudaMemcpyAsync(valid_columns[slot].data,
+                                    NINFER_QWEN4EXP_GRAPH_SCALARS_SRC(rank, live, "live"), 4,
+                                    cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(table_rows[slot].data,
+                                    NINFER_QWEN4EXP_GRAPH_SCALARS_SRC(rank, row, "row"), 4,
+                                    cudaMemcpyHostToDevice, stream));
         ops::hc_expand_norm(embedding_out[slot],
                             models_[slot]->layers[0].attention_hc.norm, TextConfig::rms_epsilon,
                             residual[slot], normalized[slot], stream);
@@ -953,8 +997,8 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
         });
         for_each_rank([&](int rank) {
             const auto slot = static_cast<std::size_t>(rank);
-            Variant::post_mixer_routed_finish(models_[slot]->layers[layer].post_mixer,
-                                              stream_for(rank));
+            NINFER_QWEN4EXP_GRAPH_ROUTED_FINISH(models_[slot]->layers[layer].post_mixer,
+                                                stream_for(rank));
             NINFER_QWEN4EXP_EXPERT_READ_END(layer);
             NINFER_QWEN4EXP_DIAG_MARK("routed");
         });
@@ -973,7 +1017,7 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
 
         if (layer + 1 == static_cast<std::size_t>(TextConfig::ple_layer)) {
             for_each_rank([&](int rank) {
-                states_[static_cast<std::size_t>(rank)]->await_ple_rows();
+                NINFER_QWEN4EXP_GRAPH_PLE_AWAIT(rank, *states_[static_cast<std::size_t>(rank)]);
                 NINFER_QWEN4EXP_DIAG_MARK("ple_await");
             });
             for_each_rank([&](int rank) {
@@ -1048,13 +1092,12 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
         NINFER_QWEN4EXP_DIAG_MARK("argmax");
     });
 
-    CUDA_CHECK(cudaSetDevice(states_[0]->device_id()));
-    CUDA_CHECK(cudaStreamSynchronize(states_[0]->stream()));
+    NINFER_QWEN4EXP_GRAPH_FINISH_SYNC();
     std::int32_t token = 0;
-    CUDA_CHECK(cudaMemcpy(&token,
-                          static_cast<const std::byte*>(winner[0].data) +
-                              static_cast<std::size_t>(T - 1) * 4,
-                          4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(NINFER_QWEN4EXP_GRAPH_WINNER_PTR(),
+                           static_cast<const std::byte*>(winner[0].data) +
+                               static_cast<std::size_t>(T - 1) * 4,
+                           4, cudaMemcpyDeviceToHost));
     for (int rank = 0; rank < tp_; ++rank) {
         states_[static_cast<std::size_t>(rank)]->advance_position(static_cast<std::uint32_t>(T));
     }

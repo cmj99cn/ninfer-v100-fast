@@ -191,6 +191,15 @@ target_include_directories(ninfer_flash_next_text_nll PRIVATE
   ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(ninfer_flash_next_text_nll PRIVATE ninfer_flash_next_package CUDA::cudart)
 
+add_executable(ninfer_flash_next_graph_profile
+  ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_graph_profile.cpp)
+target_include_directories(ninfer_flash_next_graph_profile PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party
+  ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(ninfer_flash_next_graph_profile PRIVATE ninfer_flash_next_package CUDA::cudart)
+
 add_executable(ninfer_flash_next_phase_profile
   ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_phase_profile.cpp)
 target_include_directories(ninfer_flash_next_phase_profile PRIVATE
