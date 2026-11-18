@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -32,11 +33,13 @@ namespace {
 
 namespace artifact = ninfer::artifact;
 namespace detail = ninfer::targets::qwen3_8_flash_next::detail;
+namespace ops = ninfer::ops;
 using ninfer::DecodeGraphDefinition;
 using ninfer::DecodeGraphExecutable;
 using ninfer::DeviceArena;
 using ninfer::ExecutionContext;
 using ninfer::PinnedHostBuffer;
+using ninfer::Tensor;
 using ninfer::TokenId;
 using Package = ninfer::targets::qwen3_8_flash_next::Package;
 
@@ -62,6 +65,7 @@ struct GraphInputBlock {
 
 bool g_capturing = false;
 bool g_graph_mode = false;
+bool g_skip_ple_prepare = false;
 std::array<GraphInputBlock, kRanks> g_graph_inputs;
 std::array<std::unique_ptr<PinnedHostBuffer>, kRanks> g_ids_host;
 std::array<std::unique_ptr<PinnedHostBuffer>, kRanks> g_positions_host;
@@ -136,9 +140,9 @@ void write_static_profile(const std::filesystem::path& path) {
 #define NINFER_QWEN4EXP_GRAPH_WINNER_COPY(dst, src, bytes, stream) \
     CUDA_CHECK(cudaMemcpyAsync((dst), (src), (bytes), cudaMemcpyDeviceToHost, (stream)))
 #define NINFER_QWEN4EXP_GRAPH_PREPARE_PLE(rank, state, tokens) \
-    do { if (!g_capturing) { (state).prepare_ple_rows(tokens); } } while (0)
+    do { if (!g_capturing && !g_skip_ple_prepare) { (state).prepare_ple_rows(tokens); } } while (0)
 #define NINFER_QWEN4EXP_GRAPH_PLE_AWAIT(rank, state) \
-    do { if (!g_capturing) { (state).await_ple_rows(); } } while (0)
+    do { if (!g_capturing && !g_skip_ple_prepare) { (state).await_ple_rows(); } } while (0)
 #define NINFER_QWEN4EXP_GRAPH_ROUTED_FINISH(weights, stream) \
     do { if (!g_capturing && !g_graph_mode) { Variant::post_mixer_routed_finish((weights), (stream)); } } while (0)
 #define NINFER_QWEN4EXP_GRAPH_PREFETCH(weights, stream) \
@@ -164,6 +168,129 @@ void write_static_profile(const std::filesystem::path& path) {
 namespace {
 
 namespace rt = ninfer::targets::qwen4_exp::detail::flash_next_graph_capture_runtime;
+
+struct BufferSnapshot {
+    void* device = nullptr;
+    std::size_t bytes = 0;
+    std::vector<std::byte> host;
+};
+
+struct RankSnapshot {
+    int device = 0;
+    std::vector<BufferSnapshot> buffers;
+    std::uint32_t next_position = 0;
+    std::uint64_t ple_tail[2]{0, 0};
+};
+
+struct StateSnapshot {
+    std::vector<RankSnapshot> ranks;
+
+    void capture_from(const std::vector<rt::TextState*>& states) {
+        ranks.clear();
+        for (rt::TextState* state : states) {
+            RankSnapshot rank;
+            rank.device = state->device_id();
+            int previous = 0;
+            CUDA_CHECK(cudaGetDevice(&previous));
+            CUDA_CHECK(cudaSetDevice(rank.device));
+            const auto add = [&](const void* device, std::size_t bytes) {
+                if (device == nullptr || bytes == 0) { return; }
+                BufferSnapshot buffer;
+                buffer.device = const_cast<void*>(device);
+                buffer.bytes = bytes;
+                buffer.host.resize(bytes);
+                CUDA_CHECK(cudaMemcpy(buffer.host.data(), device, bytes, cudaMemcpyDeviceToHost));
+                rank.buffers.push_back(std::move(buffer));
+            };
+            for (std::size_t index = 0; index < state->gdn_state_entries(); ++index) {
+                const Tensor conv = state->gdn_conv_state(index);
+                const Tensor recurrent = state->gdn_recurrent_state(index);
+                add(conv.data, conv.bytes());
+                add(recurrent.data, recurrent.bytes());
+            }
+            std::vector<std::int32_t> slots;
+            for (std::size_t layer = 0; layer < static_cast<std::size_t>(detail::kTextLayers); ++layer) {
+                if (detail::TextConfig::is_qsa_layer(static_cast<int>(layer))) {
+                    slots.push_back(state->qsa_slot(layer));
+                }
+            }
+            std::sort(slots.begin(), slots.end());
+            slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+            bool page_table_added = false;
+            bool after_added = false;
+            for (std::int32_t slot : slots) {
+                const auto cache = state->cache(slot);
+                add(cache.k_pages.data, cache.k_pages.bytes());
+                add(cache.v_pages.data, cache.v_pages.bytes());
+                add(cache.index_k_pages.data, cache.index_k_pages.bytes());
+                if (!page_table_added) {
+                    add(cache.page_table.data, cache.page_table.bytes());
+                    page_table_added = true;
+                }
+                const auto before = state->before_tail(slot);
+                add(before.raw_keys.data, before.raw_keys.bytes());
+                add(before.first_rope.data, before.first_rope.bytes());
+                if (!after_added) {
+                    const auto after = state->tail(slot);
+                    add(after.raw_keys.data, after.raw_keys.bytes());
+                    add(after.first_rope.data, after.first_rope.bytes());
+                    after_added = true;
+                }
+            }
+            const auto records = state->records(kForwardTokens);
+            add(records.raw_keys.data, records.raw_keys.bytes());
+            add(records.rope_positions.data, records.rope_positions.bytes());
+            add(records.base_positions.data, records.base_positions.bytes());
+            const Tensor history = state->ple_history();
+            add(history.data, history.bytes());
+            add(state->ple_rows(),
+                static_cast<std::size_t>(ops::kPleHeads) * kForwardTokens * 4);
+            add(state->ple_staged_rows(),
+                static_cast<std::size_t>(ops::kPleHeads) * kForwardTokens * 128);
+            add(state->route_counter(), 4);
+            rank.next_position = state->next_position();
+            for (int i = 0; i < 2; ++i) { rank.ple_tail[i] = state->ple_tail(i); }
+            ranks.push_back(std::move(rank));
+            CUDA_CHECK(cudaSetDevice(previous));
+        }
+    }
+
+    void restore_to(const std::vector<rt::TextState*>& states) const {
+        require(ranks.size() == states.size(), "snapshot rank count mismatch");
+        for (std::size_t index = 0; index < states.size(); ++index) {
+            const RankSnapshot& rank = ranks[index];
+            rt::TextState* state = states[index];
+            int previous = 0;
+            CUDA_CHECK(cudaGetDevice(&previous));
+            CUDA_CHECK(cudaSetDevice(rank.device));
+            for (const BufferSnapshot& buffer : rank.buffers) {
+                CUDA_CHECK(cudaMemcpy(buffer.device, buffer.host.data(), buffer.bytes,
+                                      cudaMemcpyHostToDevice));
+            }
+            state->advance_position(rank.next_position - state->next_position());
+            state->advance_ple_tail(rank.ple_tail[0]);
+            state->advance_ple_tail(rank.ple_tail[1]);
+            CUDA_CHECK(cudaSetDevice(previous));
+        }
+    }
+
+    std::uint64_t hash() const {
+        std::uint64_t value = 1469598103934665603ULL;
+        const auto fold = [&](const void* data, std::size_t bytes) {
+            const auto* bytes_ptr = static_cast<const std::uint8_t*>(data);
+            for (std::size_t i = 0; i < bytes; ++i) {
+                value ^= static_cast<std::uint64_t>(bytes_ptr[i]);
+                value *= 1099511628211ULL;
+            }
+        };
+        for (const RankSnapshot& rank : ranks) {
+            for (const BufferSnapshot& buffer : rank.buffers) { fold(buffer.host.data(), buffer.bytes); }
+            fold(&rank.next_position, sizeof(rank.next_position));
+            fold(rank.ple_tail, sizeof(rank.ple_tail));
+        }
+        return value;
+    }
+};
 
 struct Trunks {
     std::array<std::unique_ptr<rt::TextState>, ninfer::kMaximumDevices> states;
@@ -274,18 +401,32 @@ void run(const char* path) {
         if (layer_view.cache != nullptr) { layer_view.cache->set_graph_mode(true); }
     }
 
-    const auto rebuild_state = [&]() {
-        for (std::uint32_t rank = 0; rank < g_rank_count; ++rank) { trunks.states[rank]->reset(); }
-        return prefill_and_warm();
+    std::vector<rt::TextState*> rank_states;
+    for (std::uint32_t rank = 0; rank < g_rank_count; ++rank) {
+        rank_states.push_back(trunks.states[rank].get());
+    }
+    StateSnapshot snapshot;
+    snapshot.capture_from(rank_states);
+    const std::uint64_t snapshot_hash = snapshot.hash();
+    StateSnapshot observed_state;
+    const auto restore_state = [&]() {
+        snapshot.restore_to(rank_states);
+        for (std::uint32_t rank = 0; rank < g_rank_count; ++rank) {
+            trunks.activations[rank]->reset();
+            trunks.workspaces[rank]->reset();
+        }
+        for (std::uint32_t rank = 0; rank < g_rank_count; ++rank) { execution.dev[rank]->synchronize(); }
+        observed_state.capture_from(rank_states);
+        return observed_state.hash();
     };
 
     DecodeGraphDefinition definition;
     std::size_t node_count = 0;
+    std::uint64_t capture_state_hash = 0;
     try {
+        capture_state_hash = restore_state();
         for (std::uint32_t rank = 0; rank < g_rank_count; ++rank) {
             fill_graph_inputs(rank, capture_token, position);
-            trunks.activations[rank]->reset();
-            trunks.workspaces[rank]->reset();
         }
         g_capturing = true;
         definition.capture(
@@ -302,8 +443,10 @@ void run(const char* path) {
         return;
     }
 
-    rebuild_state();
+    const std::uint64_t eager_state_hash = restore_state();
+    g_skip_ple_prepare = true;
     const TokenId eager_token = trunks.trunk->decode(capture_token);
+    g_skip_ple_prepare = false;
     for (std::uint32_t rank = 0; rank < g_rank_count; ++rank) { execution.dev[rank]->synchronize(); }
     std::vector<std::uint16_t> reference(logits_bytes / 2);
     std::memcpy(reference.data(), g_logits_host->data(), logits_bytes);
@@ -328,15 +471,14 @@ void run(const char* path) {
     std::vector<double> walls;
     std::vector<TokenId> replay_tokens;
     std::vector<std::vector<std::uint16_t>> observed_all;
-    const std::array<TokenId, 1> replay_input{capture_token};
+    std::uint64_t replay_state_hash = 0;
+    bool replay_states_match = true;
     for (std::uint32_t index = 0; index < kReplayTokens; ++index) {
-        rebuild_state();
+        const std::uint64_t state_hash = restore_state();
+        if (index == 0) { replay_state_hash = state_hash; }
+        replay_states_match &= (state_hash == snapshot_hash);
         for (std::uint32_t rank = 0; rank < g_rank_count; ++rank) {
             fill_graph_inputs(rank, capture_token, position);
-            trunks.states[rank]->prepare_ple_rows(replay_input);
-        }
-        for (std::uint32_t rank = 0; rank < g_rank_count; ++rank) {
-            trunks.states[rank]->await_ple_rows();
         }
         const std::int64_t begin = now_ns();
         executable.launch();
@@ -354,19 +496,29 @@ void run(const char* path) {
     const auto replay_rr = diff_stats(observed_all[0], observed_all[1]);
     bool token_match = true;
     for (TokenId result : replay_tokens) { token_match &= (result == eager_token); }
+    const bool state_hashes_match =
+        capture_state_hash == snapshot_hash && eager_state_hash == snapshot_hash &&
+        replay_states_match && replay_state_hash == snapshot_hash;
+    const double wall_ms_avg = sum / walls.size();
 
     std::cout << "{\"capture_ok\":true,\"tp\":" << g_rank_count
               << ",\"node_count\":" << node_count
               << ",\"capture_position\":" << position
               << ",\"capture_token\":" << capture_token
               << ",\"warm_hits\":" << warm.hits << ",\"warm_misses\":" << warm.miss_count
+              << ",\"snapshot_hash\":\"" << std::hex << snapshot_hash << std::dec << "\""
+              << ",\"state_hash_capture\":\"" << std::hex << capture_state_hash << std::dec << "\""
+              << ",\"state_hash_eager\":\"" << std::hex << eager_state_hash << std::dec << "\""
+              << ",\"state_hash_replay\":\"" << std::hex << replay_state_hash << std::dec << "\""
+              << ",\"state_hashes_match\":" << (state_hashes_match ? "true" : "false")
               << ",\"eager_token\":" << eager_token
               << ",\"token_match\":" << (token_match ? "true" : "false")
               << ",\"replay_tokens\":[";
     for (std::size_t i = 0; i < replay_tokens.size(); ++i) {
         std::cout << (i ? "," : "") << replay_tokens[i];
     }
-    std::cout << "],\"replay_wall_ms_avg\":" << (sum / walls.size())
+    std::cout << "],\"replay_wall_ms_avg\":" << wall_ms_avg
+              << ",\"replay_tok_per_s\":" << (1000.0 / wall_ms_avg)
               << ",\"eager_vs_graph_logit_diff\":" << eager_vs_graph.first
               << ",\"eager_vs_graph_logit_maxdiff\":" << eager_vs_graph.second
               << ",\"replay_replay_logit_diff\":" << replay_rr.first
