@@ -95,6 +95,43 @@ inline std::uint64_t hash_tensor(std::uint64_t hash, const Tensor& tensor) {
     return fnv(hash, words.data(), words.size() * 2);
 }
 
+inline std::uint64_t hash_region(std::uint64_t hash, const Tensor& tensor, std::size_t offset,
+                                 std::size_t bytes) {
+    std::vector<std::uint16_t> words(bytes / 2);
+    CUDA_CHECK(cudaMemcpy(words.data(), static_cast<const std::byte*>(tensor.data) + offset, bytes,
+                          cudaMemcpyDeviceToHost));
+    return fnv(hash, words.data(), words.size() * 2);
+}
+
+inline std::uint64_t kv_region_digest(rt::TextState& state, std::uint32_t position,
+                                      std::uint32_t tokens) {
+    CUDA_CHECK(cudaSetDevice(state.device_id()));
+    CUDA_CHECK(cudaStreamSynchronize(state.stream()));
+    std::uint64_t hash = 1469598103934665603ULL;
+    if (tokens == 0) { return hash; }
+    const std::uint32_t last = position + tokens - 1;
+    const int first_page = static_cast<int>(position / 64);
+    const int last_page  = static_cast<int>(last / 64);
+    for (int slot = 0; slot < detail::TextConfig::qsa_layers(); ++slot) {
+        const ninfer::ops::QsaCacheView cache = state.cache(slot);
+        const std::size_t token_bytes = static_cast<std::size_t>(cache.k_pages.ne[0]) *
+                                        static_cast<std::size_t>(cache.k_pages.ne[1]) *
+                                        static_cast<std::size_t>(cache.k_pages.ne[2]) * 2;
+        const std::size_t index_bytes = static_cast<std::size_t>(cache.index_k_pages.ne[0]) *
+                                        static_cast<std::size_t>(cache.index_k_pages.ne[1]) *
+                                        static_cast<std::size_t>(cache.index_k_pages.ne[2]) * 2;
+        for (int page = first_page; page <= last_page; ++page) {
+            hash = hash_region(hash, cache.k_pages, static_cast<std::size_t>(page) * token_bytes,
+                               token_bytes);
+            hash = hash_region(hash, cache.v_pages, static_cast<std::size_t>(page) * token_bytes,
+                               token_bytes);
+            hash = hash_region(hash, cache.index_k_pages,
+                               static_cast<std::size_t>(page) * index_bytes, index_bytes);
+        }
+    }
+    return hash;
+}
+
 inline std::uint64_t state_digest(rt::TextState& state) {
     CUDA_CHECK(cudaSetDevice(state.device_id()));
     CUDA_CHECK(cudaStreamSynchronize(state.stream()));
@@ -184,6 +221,17 @@ public:
         for (int rank = 0; rank < 2; ++rank) {
             hash = fnv(hash, &rank, sizeof(rank));
             const std::uint64_t rank_digest = state_digest(*states[static_cast<std::size_t>(rank)]);
+            hash = fnv(hash, &rank_digest, sizeof(rank_digest));
+        }
+        return hash;
+    }
+
+    std::uint64_t kv_digest(std::uint32_t position, std::uint32_t tokens) {
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (int rank = 0; rank < 2; ++rank) {
+            hash = fnv(hash, &rank, sizeof(rank));
+            const std::uint64_t rank_digest =
+                kv_region_digest(*states[static_cast<std::size_t>(rank)], position, tokens);
             hash = fnv(hash, &rank_digest, sizeof(rank_digest));
         }
         return hash;

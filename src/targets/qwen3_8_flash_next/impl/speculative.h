@@ -6,6 +6,7 @@
 #include <ninfer/types.h>
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -21,6 +22,10 @@ std::uint32_t accepted_prefix(std::span<const TokenId> drafts,
 
 std::vector<TokenId> commit_tokens(std::span<const TokenId> drafts,
                                    std::span<const TokenId> target_predictions);
+
+std::vector<TokenId> verify_sequential(
+    std::span<const TokenId> verify_tokens,
+    const std::function<TokenId(TokenId)>& forward_step);
 
 std::uint32_t verify_extent(std::uint32_t draft_count, std::uint32_t draft_window,
                             const ninfer::runtime::RoundBudget& budget, std::uint32_t frontier,

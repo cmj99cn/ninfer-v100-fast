@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace {
@@ -16,8 +17,15 @@ using flash_harness::require;
 namespace flash = ninfer::targets::qwen3_8_flash_next::detail;
 using ninfer::TokenId;
 
-constexpr std::array<TokenId, 8> kPrompt{1024, 7, 98140, 33, 4097, 512, 100, 2048};
 constexpr std::size_t kVerify = 4;
+
+const std::vector<std::vector<TokenId>> kPrompts{
+    {1024, 7, 98140, 33, 4097, 512, 100, 2048},
+    {1024, 7, 98140, 33, 4097, 512, 100, 2049},
+    {1024, 7, 98140, 33, 4097, 512, 100, 2050},
+    {100, 200, 300, 400, 500, 600, 700, 800},
+    {1, 2, 3, 4, 5, 6, 7, 8},
+};
 
 void check_greedy_prefix(std::span<const TokenId> drafts, std::span<const TokenId> predictions) {
     const std::uint32_t accepted = flash::accepted_prefix(drafts, predictions);
@@ -54,6 +62,72 @@ void check_budget() {
     require(flash::round_finished(budget, 8), "an exactly consumed budget was not finished");
 }
 
+std::vector<std::vector<std::uint16_t>> capture_steps(FlashHarness& harness,
+                                                       std::span<const TokenId> tokens) {
+    flash_harness::capture_buffer().clear();
+    flash_harness::g_logits_sink = &flash_harness::capture_buffer();
+    (void)flash::verify_sequential(tokens,
+                                   [&](TokenId token) { return harness.decode(token); });
+    flash_harness::g_logits_sink = nullptr;
+    return flash_harness::capture_buffer();
+}
+
+void check_prompt(const char* artifact, const std::vector<TokenId>& prompt, std::size_t case_index) {
+    FlashHarness harness(artifact);
+
+    harness.reset();
+    const TokenId anchor = harness.prefill(std::span<const TokenId>{prompt.data(), prompt.size()});
+    std::vector<TokenId> verify_tokens{anchor};
+    TokenId cursor = anchor;
+    for (std::size_t step = 1; step < kVerify; ++step) {
+        cursor = harness.decode(cursor);
+        verify_tokens.push_back(cursor);
+    }
+
+    harness.reset();
+    (void)harness.prefill(std::span<const TokenId>{prompt.data(), prompt.size()});
+    const auto reference_logits = capture_steps(harness, verify_tokens);
+    const std::uint64_t reference_digest = harness.digest();
+    const std::uint64_t reference_kv = harness.kv_digest(
+        static_cast<std::uint32_t>(prompt.size()), static_cast<std::uint32_t>(kVerify));
+
+    harness.reset();
+    (void)harness.prefill(std::span<const TokenId>{prompt.data(), prompt.size()});
+    const auto verify_logits = capture_steps(harness, verify_tokens);
+    const std::uint64_t verify_digest = harness.digest();
+    const std::uint64_t verify_kv = harness.kv_digest(
+        static_cast<std::uint32_t>(prompt.size()), static_cast<std::uint32_t>(kVerify));
+
+    require(verify_logits.size() == kVerify, "the sequential verify did not capture one step per token");
+    require(reference_logits.size() == kVerify, "the reference did not capture one step per token");
+    require(verify_digest == reference_digest,
+            "the sequential verify changed persistent state on prompt " + std::to_string(case_index));
+    require(verify_kv == reference_kv,
+            "the sequential verify changed KV pages on prompt " + std::to_string(case_index));
+
+    const int vocab = flash::TextConfig::vocab;
+    for (std::size_t step = 0; step < kVerify; ++step) {
+        const auto& a = verify_logits[step];
+        const auto& b = reference_logits[step];
+        require(a.size() == static_cast<std::size_t>(vocab) && b.size() == a.size(),
+                "a verify logits step has the wrong extent");
+        for (std::size_t word = 0; word < a.size(); ++word) {
+            require(a[word] == b[word],
+                    "the sequential verify changed logits at step " + std::to_string(step) +
+                        " word " + std::to_string(word) + " on prompt " +
+                        std::to_string(case_index));
+        }
+    }
+
+    harness.reset();
+    (void)harness.prefill(std::span<const TokenId>{prompt.data(), prompt.size()});
+    const auto predictions = flash::verify_sequential(verify_tokens, [&](TokenId token) {
+        return harness.decode(token);
+    });
+    require(predictions.size() == verify_tokens.size(), "verify predictions have the wrong extent");
+    check_greedy_prefix(std::span<const TokenId>{verify_tokens}.subspan(1), predictions);
+}
+
 } // namespace
 
 int main() {
@@ -77,77 +151,15 @@ int main() {
         check_greedy_prefix(std::vector<TokenId>{5, 99, 7}, std::vector<TokenId>{5, 6, 7, 9});
         check_greedy_prefix(std::vector<TokenId>{99, 6, 7}, std::vector<TokenId>{5, 6, 7, 9});
         check_budget();
-
-        FlashHarness harness(artifact);
-        harness.reset();
-        const TokenId anchor =
-            harness.prefill(std::span<const TokenId>{kPrompt.data(), kPrompt.size()});
-        const std::array<TokenId, kVerify> greedy{anchor, 359, 81486, 837};
-        flash_harness::capture_buffer().clear();
-        flash_harness::g_logits_sink = &flash_harness::capture_buffer();
-        harness.prefill(std::span<const TokenId>{greedy.data(), greedy.size()});
-        flash_harness::g_logits_sink = nullptr;
-        const std::vector<std::vector<std::uint16_t>> batched_steps =
-            flash_harness::capture_buffer();
-        require(batched_steps.size() == 1, "the batched verify did not capture one logits step");
-
-        harness.reset();
-        const TokenId sequential_anchor =
-            harness.prefill(std::span<const TokenId>{kPrompt.data(), kPrompt.size()});
-        require(sequential_anchor == anchor, "the two paths disagree on the first token");
-        flash_harness::capture_buffer().clear();
-        flash_harness::g_logits_sink = &flash_harness::capture_buffer();
-        TokenId cursor = sequential_anchor;
-        for (std::size_t step = 1; step < kVerify; ++step) {
-            cursor = harness.decode(greedy[step - 1]);
+        for (std::size_t index = 0; index < kPrompts.size(); ++index) {
+            check_prompt(artifact, kPrompts[index], index);
         }
-        flash_harness::g_logits_sink = nullptr;
-        const std::vector<std::vector<std::uint16_t>> sequential_steps =
-            flash_harness::capture_buffer();
-        require(sequential_steps.size() == kVerify - 1,
-                "the sequential path did not capture one logits step per token");
-
-        const int vocab = flash::TextConfig::vocab;
-        for (std::size_t position = 0; position < kVerify - 1; ++position) {
-            const auto& a = batched_steps[0];
-            const auto& b = sequential_steps[position];
-            require(a.size() >= (position + 1) * static_cast<std::size_t>(vocab),
-                    "the batched verify logits are short");
-            require(b.size() == static_cast<std::size_t>(vocab),
-                    "the sequential logits are short");
-            const int batched_argmax =
-                flash_harness::argmax_at(a, vocab, static_cast<int>(position));
-            const int sequential_argmax = flash_harness::argmax_at(b, vocab, 0);
-            std::size_t mismatches = 0;
-            float max_abs = 0.0F;
-            for (int index = 0; index < vocab; ++index) {
-                const std::size_t base = position * static_cast<std::size_t>(vocab) +
-                                         static_cast<std::size_t>(index);
-                __half ah;
-                __half bh;
-                std::memcpy(&ah, &a[base], sizeof(ah));
-                std::memcpy(&bh, &b[static_cast<std::size_t>(index)], sizeof(bh));
-                if (a[base] != b[static_cast<std::size_t>(index)]) { ++mismatches; }
-                max_abs = std::max(max_abs, std::abs(__half2float(ah) - __half2float(bh)));
-            }
-            std::cout << "DIAG token " << position << " logit_mismatches " << mismatches
-                      << " of " << vocab << " max_abs " << max_abs << " argmax_batched "
-                      << batched_argmax << " argmax_sequential " << sequential_argmax << '\n';
-            require(batched_argmax == sequential_argmax,
-                    "the batched verify changed the greedy decision at token " +
-                        std::to_string(position));
-        }
-
-        std::vector<TokenId> predictions;
-        for (std::size_t position = 0; position < kVerify; ++position) {
-            predictions.push_back(static_cast<TokenId>(
-                flash_harness::argmax_at(batched_steps[0], vocab, static_cast<int>(position))));
-        }
-        check_greedy_prefix(std::vector<TokenId>{greedy[1], greedy[2], greedy[3]}, predictions);
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;
     }
-    std::cout << "OK flash-next MTP verify: greedy LCP, commit, and batched logit parity\n";
+    std::cout << "OK flash-next MTP verify: sequential T=1 parity (bit-exact logits, state and KV), "
+                 "greedy LCP, commit, and budget across "
+              << kPrompts.size() << " prompts\n";
     return 0;
 }

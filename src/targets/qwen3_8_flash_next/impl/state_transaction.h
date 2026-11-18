@@ -1,41 +1,28 @@
 #pragma once
 
-#include "core/device.h"
+#ifndef NINFER_QWEN4EXP_VARIANT
+#define NINFER_QWEN4EXP_VARIANT ::ninfer::targets::qwen3_8_flash_next::detail::Variant
+#define NINFER_FLASH_NEXT_TXN_VARIANT
+#endif
+#ifndef NINFER_QWEN4EXP_RUNTIME_NS
+#define NINFER_QWEN4EXP_RUNTIME_NS flash_next_runtime
+#define NINFER_FLASH_NEXT_TXN_NS
+#endif
 
-#include <ninfer/types.h>
+#include "targets/qwen4_exp/impl/runtime/state_transaction.h"
 
-#include <array>
-#include <cstdint>
-#include <functional>
-#include <memory>
-#include <span>
-#include <vector>
-
-namespace ninfer::targets::qwen4_exp::detail::flash_next_runtime {
-class TextState;
-}
+#ifdef NINFER_FLASH_NEXT_TXN_NS
+#undef NINFER_QWEN4EXP_RUNTIME_NS
+#undef NINFER_FLASH_NEXT_TXN_NS
+#endif
+#ifdef NINFER_FLASH_NEXT_TXN_VARIANT
+#undef NINFER_QWEN4EXP_VARIANT
+#undef NINFER_FLASH_NEXT_TXN_VARIANT
+#endif
 
 namespace ninfer::targets::qwen3_8_flash_next::detail {
 
-class StateTransaction {
-public:
-    using State = ninfer::targets::qwen4_exp::detail::flash_next_runtime::TextState;
-    using Replay = std::function<void(TokenId)>;
-
-    explicit StateTransaction(std::array<State*, kMaximumDevices> states, int tp);
-    ~StateTransaction();
-
-    StateTransaction(const StateTransaction&)            = delete;
-    StateTransaction& operator=(const StateTransaction&) = delete;
-    StateTransaction(StateTransaction&&)                 = delete;
-    StateTransaction& operator=(StateTransaction&&)      = delete;
-
-    void begin();
-    void commit(std::span<const TokenId> committed, const Replay& replay);
-
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-};
+using StateTransaction =
+    ninfer::targets::qwen4_exp::detail::flash_next_runtime::StateTransaction;
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail
