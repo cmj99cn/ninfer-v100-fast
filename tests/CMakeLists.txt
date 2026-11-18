@@ -97,6 +97,16 @@ add_test(NAME ninfer_flash_next_mtp_draft_artifact_test
 set_tests_properties(ninfer_flash_next_mtp_draft_artifact_test PROPERTIES
   SKIP_RETURN_CODE 77
   ENVIRONMENT "NINFER_FLASH_NEXT_ARTIFACT=/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer;NINFER_MTP_HIDDEN=${CMAKE_SOURCE_DIR}/.superpowers/sdd/2026-11-16-flash-next-m3-mtp/assets/mtp_hidden_8tok.f16")
+ninfer_add_test(ninfer_flash_next_mtp_chain_test
+  SOURCES targets/qwen3_8_flash_next/test_mtp_chain.cpp
+  LIBRARIES ninfer_flash_next_package)
+set_tests_properties(ninfer_flash_next_mtp_chain_test PROPERTIES SKIP_RETURN_CODE 77)
+target_link_libraries(ninfer_flash_next_mtp_chain_test PRIVATE CUDA::cudart)
+add_test(NAME ninfer_flash_next_mtp_chain_artifact_test
+  COMMAND ninfer_flash_next_mtp_chain_test)
+set_tests_properties(ninfer_flash_next_mtp_chain_artifact_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  ENVIRONMENT "NINFER_FLASH_NEXT_ARTIFACT=/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer;NINFER_MTP_HIDDEN=${CMAKE_SOURCE_DIR}/.superpowers/sdd/2026-11-16-flash-next-m3-mtp/assets/mtp_hidden_8tok.f16")
 ninfer_add_test(ninfer_flash_next_load_plan_test
   SOURCES targets/qwen3_8_flash_next/test_load_plan.cpp
   LIBRARIES ninfer_flash_next_package)

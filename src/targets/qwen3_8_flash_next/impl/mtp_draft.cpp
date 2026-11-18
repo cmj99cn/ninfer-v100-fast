@@ -384,7 +384,8 @@ struct MtpDraft::Impl {
         return fp16_weight_from_host(const_cast<std::byte*>(base), rows, columns);
     }
 
-    TokenId run(const Tensor& conditioning, TokenId next_token, std::int32_t position) {
+    TokenId run(const Tensor& conditioning, TokenId next_token, std::int32_t position,
+                Tensor* chained_hidden) {
         CUDA_CHECK(cudaSetDevice(device_context.device));
         auto activation_scope = activation.scope();
         auto workspace_scope = workspace.scope();
@@ -483,6 +484,10 @@ struct MtpDraft::Impl {
         Tensor normalized_out = activation.alloc(kTextActivationDtype, {kHidden, kStreams, tokens});
         ops::hc_combine_norm(stage, moe_out, moe_injection, final_hc_weights.norm, kEpsilon,
                              residual_out, normalized_out, stream);
+        if (chained_hidden != nullptr) {
+            CUDA_CHECK(cudaMemcpyAsync(chained_hidden->data, residual_out.data,
+                                       residual_out.bytes(), cudaMemcpyDeviceToDevice, stream));
+        }
         Tensor sample = activation.alloc(kTextActivationDtype, {kHidden, tokens});
         ops::hc_final_mix(normalized_out,
                           ops::HcFinalMixWeights{final_hc_weights.down_injection,
@@ -651,9 +656,12 @@ MtpDraft::MtpDraft(const std::filesystem::path& artifact, int device)
 
 MtpDraft::~MtpDraft() = default;
 
-TokenId MtpDraft::run(const Tensor& conditioning, TokenId next_token, std::int32_t position) {
-    return impl_->run(conditioning, next_token, position);
+TokenId MtpDraft::run(const Tensor& conditioning, TokenId next_token, std::int32_t position,
+                      Tensor* chained_hidden) {
+    return impl_->run(conditioning, next_token, position, chained_hidden);
 }
+
+int MtpDraft::device() const noexcept { return impl_->device_context.device; }
 
 std::uint64_t MtpDraft::expert_bytes() const noexcept { return impl_->expert_bytes; }
 

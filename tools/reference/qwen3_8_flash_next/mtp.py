@@ -270,8 +270,10 @@ class MtpRef:
             start = end
         return bf16(total)
 
-    def draft(self, hidden: np.ndarray, next_token: int, position: int) -> tuple[int, np.ndarray]:
-        weights = self.weights()
+    def draft(self, hidden: np.ndarray, next_token: int, position: int,
+              weights: MtpWeights | None = None) -> tuple[int, np.ndarray, np.ndarray]:
+        if weights is None:
+            weights = self.weights()
         hidden = np.asarray(hidden, dtype=np.float64).reshape(1, CFG.residual_width)
         residual = bf16(self._fuse(hidden, next_token, weights)).reshape(
             1, CFG.hc_streams, CFG.hidden)
@@ -283,11 +285,21 @@ class MtpRef:
             residual, mixer, injection, weights.moe_hc["norm"], CFG.rms_epsilon)
         block_input, injection = hc_mix(normalized, weights.moe_hc["down"], weights.moe_hc["up"])
         moe_out = self._moe(block_input, weights.moe)
-        _, normalized = hc_combine_norm(
+        conditioned, normalized = hc_combine_norm(
             stage, moe_out, injection, weights.final_hc["norm"], CFG.rms_epsilon)
         sample = hc_final_mix(normalized, weights.final_hc["down"], weights.final_hc["up"])[0]
         logits = weights.output_head.astype(np.float64) @ sample.astype(np.float64)
-        return int(np.argmax(logits)), logits
+        return int(np.argmax(logits)), conditioned, logits
+
+    def draft_chain(self, hidden: np.ndarray, next_token: int, position: int,
+                    steps: int) -> list[int]:
+        weights = self.weights()
+        tokens: list[int] = []
+        for _ in range(steps):
+            token, hidden, _ = self.draft(hidden, next_token, position, weights)
+            tokens.append(token)
+            next_token = token
+        return tokens
 
 
 def decode_contiguous(artifact: V3Artifact, object_id: str, shape) -> np.ndarray:
@@ -298,6 +310,13 @@ def decode_contiguous_bytes(raw: bytes, object_id: str, shape) -> np.ndarray:
     if object_id.startswith("resource/"):
         return bf16_from_u16(np.frombuffer(raw, dtype="<u2")).reshape(shape).astype(np.float64)
     return bf16_from_u16(np.frombuffer(raw, dtype="<u2")).reshape(shape).astype(np.float64)
+
+
+def load_hidden(path: str) -> np.ndarray:
+    try:
+        return np.load(path)
+    except (ValueError, OSError):
+        return np.fromfile(path, dtype="<f2").astype(np.float64).reshape(1, CFG.residual_width)
 
 
 def target_conditioning(artifact_path: str, ids: list[int]) -> np.ndarray:
@@ -314,22 +333,30 @@ def main() -> int:
     parser.add_argument("--position", type=int)
     parser.add_argument("--hidden", help="path to a cached conditioning vector")
     parser.add_argument("--save-hidden", help="write the conditioning vector here")
+    parser.add_argument("--steps", type=int, default=1,
+                        help="draft-chain length; each step feeds back the previous hidden")
     args = parser.parse_args()
     if not args.weights:
         parser.error("--weights or NINFER_FLASH_NEXT_ARTIFACT is required")
     ids = [int(value) for value in args.ids.replace(",", " ").split()]
     if args.hidden:
-        hidden = np.load(args.hidden)
+        hidden = load_hidden(args.hidden)
     else:
         hidden = target_conditioning(args.weights, ids)
         if args.save_hidden:
             np.save(args.save_hidden, hidden)
-    position = args.position if args.position is not None else len(ids)
+    position = args.position if args.position is not None else 0
+    if args.steps < 1:
+        parser.error("--steps must be at least 1")
     with MtpRef(args.weights) as model:
-        token, logits = model.draft(hidden, args.next_token, position)
-    order = np.argsort(-logits, kind="stable")[:3]
-    print(json.dumps({"draft_token": token,
-                      "top": [(int(value), float(logits[value])) for value in order]}))
+        if args.steps == 1:
+            token, _, logits = model.draft(hidden, args.next_token, position)
+            order = np.argsort(-logits, kind="stable")[:3]
+            print(json.dumps({"draft_token": token,
+                              "top": [(int(value), float(logits[value])) for value in order]}))
+        else:
+            tokens = model.draft_chain(hidden, args.next_token, position, args.steps)
+            print(json.dumps({"draft_tokens": tokens}))
     return 0
 
 

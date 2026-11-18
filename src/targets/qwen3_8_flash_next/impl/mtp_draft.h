@@ -23,8 +23,10 @@ public:
     MtpDraft(MtpDraft&&)                 = delete;
     MtpDraft& operator=(MtpDraft&&)      = delete;
 
-    TokenId run(const Tensor& conditioning, TokenId next_token, std::int32_t position);
+    TokenId run(const Tensor& conditioning, TokenId next_token, std::int32_t position,
+                Tensor* chained_hidden = nullptr);
 
+    [[nodiscard]] int device() const noexcept;
     [[nodiscard]] std::uint64_t expert_bytes() const noexcept;
 
 private:
