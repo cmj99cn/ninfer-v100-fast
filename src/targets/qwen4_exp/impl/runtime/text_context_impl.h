@@ -10,7 +10,7 @@
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gated_residual.h"
-#include "ninfer/ops/gated_rmsnorm.h"
+#include "ninfer/ops/sigmoid_gated_rmsnorm.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/moe_nvfp4.h"
 #include "ninfer/ops/ple.h"
@@ -623,9 +623,9 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
         ops::gated_delta_net(q_recurrent, k_recurrent, v_recurrent, g_rank, beta_rank, kGdnScale,
                              true, workspace_, recurrent_state, o_recurrent, stream_for(rank));
         NINFER_QWEN4EXP_DIAG_MARK("gdn_recurrent");
-        ops::gated_rmsnorm(o_recurrent, weights.norm,
-                           z.view({128, state.gdn_value_heads(), T}), TextConfig::rms_epsilon,
-                           o_normalized, stream_for(rank));
+        ops::sigmoid_gated_rmsnorm(o_recurrent, weights.norm,
+                                   z.view({128, state.gdn_value_heads(), T}),
+                                   TextConfig::rms_epsilon, o_normalized, stream_for(rank));
         NINFER_QWEN4EXP_DIAG_MARK("gdn_norm");
         projected[slot] = on.view({value_width, T});
         output_weight[slot] = weights.output;

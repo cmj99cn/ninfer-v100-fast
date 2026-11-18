@@ -7,10 +7,10 @@
 namespace ninfer::ops {
 
 /**
- * Applies RMS normalization over ne[0] and an elementwise sigmoid gate. For each logical row r:
+ * Applies RMS normalization over ne[0] and an elementwise SiLU gate. For each logical row r:
  *
  *   inv_r    = 1 / sqrt((1/D) * sum_d x[d,r]^2 + eps)
- *   ideal[d,r] = x[d,r] * inv_r * weight[d] * sigmoid(z[d,r]).
+ *   ideal[d,r] = x[d,r] * inv_r * weight[d] * SiLU(z[d,r]).
  *
  * `x`, `z`, and `out` are same-shaped contiguous BF16 tensors, `weight` is contiguous BF16 [D],
  * and eps is positive and finite. This form does not apply a unit offset to weight. Inputs and

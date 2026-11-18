@@ -68,10 +68,54 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
     }
 }
 
+template <RmsEpilogue Epilogue>
+void gated_launch(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
+                  cudaStream_t stream) {
+    const std::int32_t d = x.ne[0];
+    if (d <= 0) { throw std::invalid_argument("rmsnorm: ne[0] must be positive"); }
+    const std::int64_t rows = out.numel() / d;
+    if (rows > std::numeric_limits<int>::max()) {
+        throw std::overflow_error("rmsnorm: row count exceeds CUDA grid limit");
+    }
+    const auto x_addr = reinterpret_cast<std::uintptr_t>(x.data);
+    const auto w_addr = reinterpret_cast<std::uintptr_t>(weight.data);
+    const auto z_addr = reinterpret_cast<std::uintptr_t>(z.data);
+    const auto o_addr = reinterpret_cast<std::uintptr_t>(out.data);
+    const bool aligned2 =
+        ((x_addr | w_addr | z_addr | o_addr) & (alignof(__nv_bfloat162) - 1)) == 0;
+    launch_rmsnorm<Epilogue>(x, weight, &z, out, d, rows, eps, aligned2, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <RmsEpilogue Epilogue>
+void f16_gated_launch(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                      Tensor& out, cudaStream_t stream) {
+    const std::int32_t d    = x.ne[0];
+    const std::int64_t rows = out.numel() / d;
+    constexpr int kBlock    = 256;
+    if (weight.dtype == DType::BF16) {
+        rmsnorm_f16_gated_kernel<Epilogue, __nv_bfloat16>
+            <<<static_cast<unsigned int>(rows), kBlock, 0, stream>>>(
+                static_cast<const __half*>(x.data),
+                static_cast<const __nv_bfloat16*>(weight.data), static_cast<const __half*>(z.data),
+                static_cast<__half*>(out.data), d, eps);
+    } else {
+        rmsnorm_f16_gated_kernel<Epilogue, __half>
+            <<<static_cast<unsigned int>(rows), kBlock, 0, stream>>>(
+                static_cast<const __half*>(x.data), static_cast<const __half*>(weight.data),
+                static_cast<const __half*>(z.data), static_cast<__half*>(out.data), d, eps);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                     const Tensor* z, Tensor& out, cudaStream_t stream) {
+    if (z != nullptr) {
+        gated_launch<RmsEpilogue::Gated>(x, weight, *z, eps, out, stream);
+        return;
+    }
     const std::int32_t d = x.ne[0];
     if (d <= 0) { throw std::invalid_argument("rmsnorm: ne[0] must be positive"); }
     const std::int64_t rows = out.numel() / d;
@@ -81,20 +125,20 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
 
     const auto x_addr = reinterpret_cast<std::uintptr_t>(x.data);
     const auto w_addr = reinterpret_cast<std::uintptr_t>(weight.data);
-    const auto z_addr = z != nullptr ? reinterpret_cast<std::uintptr_t>(z->data) : 0;
     const auto o_addr = reinterpret_cast<std::uintptr_t>(out.data);
-    const bool aligned2 =
-        ((x_addr | w_addr | z_addr | o_addr) & (alignof(__nv_bfloat162) - 1)) == 0;
+    const bool aligned2 = ((x_addr | w_addr | o_addr) & (alignof(__nv_bfloat162) - 1)) == 0;
 
-    if (z != nullptr) {
-        launch_rmsnorm<RmsEpilogue::Gated>(x, weight, z, out, d, rows, eps, aligned2, stream);
-    } else if (unit_offset) {
-        launch_rmsnorm<RmsEpilogue::Offset>(x, weight, nullptr, out, d, rows, eps, aligned2,
-                                            stream);
+    if (unit_offset) {
+        launch_rmsnorm<RmsEpilogue::Offset>(x, weight, nullptr, out, d, rows, eps, aligned2, stream);
     } else {
         launch_rmsnorm<RmsEpilogue::Plain>(x, weight, nullptr, out, d, rows, eps, aligned2, stream);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+void rmsnorm_sigmoid_gated_launch(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                                  Tensor& out, cudaStream_t stream) {
+    gated_launch<RmsEpilogue::SigmoidGated>(x, weight, z, eps, out, stream);
 }
 
 void rmsnorm_f16_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
@@ -121,21 +165,12 @@ void rmsnorm_f16_launch(const Tensor& x, const Tensor& weight, float eps, bool u
 
 void rmsnorm_f16_gated_launch(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
                               Tensor& out, cudaStream_t stream) {
-    const std::int32_t d = x.ne[0];
-    const std::int64_t rows = out.numel() / d;
-    constexpr int kBlock = 256;
-    if (weight.dtype == DType::BF16) {
-        rmsnorm_f16_gated_kernel<__nv_bfloat16>
-            <<<static_cast<unsigned int>(rows), kBlock, 0, stream>>>(
-                static_cast<const __half*>(x.data),
-                static_cast<const __nv_bfloat16*>(weight.data), static_cast<const __half*>(z.data),
-                static_cast<__half*>(out.data), d, eps);
-    } else {
-        rmsnorm_f16_gated_kernel<__half><<<static_cast<unsigned int>(rows), kBlock, 0, stream>>>(
-            static_cast<const __half*>(x.data), static_cast<const __half*>(weight.data),
-            static_cast<const __half*>(z.data), static_cast<__half*>(out.data), d, eps);
-    }
-    CUDA_CHECK(cudaGetLastError());
+    f16_gated_launch<RmsEpilogue::Gated>(x, weight, z, eps, out, stream);
+}
+
+void rmsnorm_f16_sigmoid_gated_launch(const Tensor& x, const Tensor& weight, const Tensor& z,
+                                      float eps, Tensor& out, cudaStream_t stream) {
+    f16_gated_launch<RmsEpilogue::SigmoidGated>(x, weight, z, eps, out, stream);
 }
 
 } // namespace ninfer::ops::detail

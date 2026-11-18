@@ -14,5 +14,9 @@ void rmsnorm_f16_launch(const Tensor& x, const Tensor& weight, float eps, bool u
                         Tensor& out, cudaStream_t stream);
 void rmsnorm_f16_gated_launch(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
                               Tensor& out, cudaStream_t stream);
+void rmsnorm_sigmoid_gated_launch(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                                  Tensor& out, cudaStream_t stream);
+void rmsnorm_f16_sigmoid_gated_launch(const Tensor& x, const Tensor& weight, const Tensor& z,
+                                      float eps, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

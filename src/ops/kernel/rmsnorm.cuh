@@ -17,13 +17,15 @@ enum class RmsEpilogue {
     Offset,
     Plain,
     Gated,
+    SigmoidGated,
 };
 
 template <RmsEpilogue Epilogue>
 __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weight, float z) {
     if constexpr (Epilogue == RmsEpilogue::Offset) { weight += 1.0f; }
     float value = x * inv * weight;
-    if constexpr (Epilogue == RmsEpilogue::Gated) { value *= sigmoid(z); }
+    if constexpr (Epilogue == RmsEpilogue::Gated) { value *= silu(z); }
+    if constexpr (Epilogue == RmsEpilogue::SigmoidGated) { value *= sigmoid(z); }
     return value;
 }
 
@@ -69,7 +71,7 @@ __launch_bounds__(Block) __global__
             const float2 xf = __bfloat1622float2(values[k]);
             const float2 wf = __bfloat1622float2(weight[pair]);
             float2 zf{0.0f, 0.0f};
-            if constexpr (Epilogue == RmsEpilogue::Gated) {
+            if constexpr (Epilogue == RmsEpilogue::Gated || Epilogue == RmsEpilogue::SigmoidGated) {
                 zf = __bfloat1622float2(z[row_base + pair]);
             }
             out[row_base + pair] =
@@ -111,7 +113,7 @@ __launch_bounds__(Block) __global__
     const float2 w1 = __bfloat1622float2(weight[pair1]);
     float2 z0{0.0f, 0.0f};
     float2 z1{0.0f, 0.0f};
-    if constexpr (Epilogue == RmsEpilogue::Gated) {
+    if constexpr (Epilogue == RmsEpilogue::Gated || Epilogue == RmsEpilogue::SigmoidGated) {
         z0 = __bfloat1622float2(z[row_base + pair0]);
         z1 = __bfloat1622float2(z[row_base + pair1]);
     }
@@ -164,7 +166,7 @@ __launch_bounds__(Block) __global__
             const float2 xf = __bfloat1622float2(values[k]);
             const float2 wf = __bfloat1622float2(weight[pair]);
             float2 zf{0.0f, 0.0f};
-            if constexpr (Epilogue == RmsEpilogue::Gated) {
+            if constexpr (Epilogue == RmsEpilogue::Gated || Epilogue == RmsEpilogue::SigmoidGated) {
                 zf = __bfloat1622float2(z[row_base + pair]);
             }
             out[row_base + pair] =
@@ -207,7 +209,7 @@ __launch_bounds__(512) __global__
     const float2 w1 = __bfloat1622float2(weight[pair1]);
     float2 z0{0.0f, 0.0f};
     float2 z1{0.0f, 0.0f};
-    if constexpr (Epilogue == RmsEpilogue::Gated) {
+    if constexpr (Epilogue == RmsEpilogue::Gated || Epilogue == RmsEpilogue::SigmoidGated) {
         z0 = __bfloat1622float2(z[row_base + pair0]);
         z1 = __bfloat1622float2(z[row_base + pair1]);
     }
@@ -250,7 +252,9 @@ __launch_bounds__(256) __global__
         const float xv           = __bfloat162float(x[index]);
         const float wv           = __bfloat162float(weight[i]);
         float zv                 = 0.0f;
-        if constexpr (Epilogue == RmsEpilogue::Gated) { zv = __bfloat162float(z[index]); }
+        if constexpr (Epilogue == RmsEpilogue::Gated || Epilogue == RmsEpilogue::SigmoidGated) {
+            zv = __bfloat162float(z[index]);
+        }
         out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
     }
 }
@@ -293,9 +297,9 @@ __global__ void rmsnorm_f16_generic_kernel(const __half* x, const W* weight, __h
     }
 }
 
-template <class W>
+template <RmsEpilogue Epilogue, class W>
 __global__ void rmsnorm_f16_gated_kernel(const __half* x, const W* weight, const __half* z,
-                                         __half* out, int d, float eps) {
+                                          __half* out, int d, float eps) {
     const int row = static_cast<int>(blockIdx.x);
     const int tid = static_cast<int>(threadIdx.x);
     const __half* xr = x + static_cast<std::int64_t>(row) * d;
@@ -322,8 +326,8 @@ __global__ void rmsnorm_f16_gated_kernel(const __half* x, const W* weight, const
     const float inv = rsqrtf(warp_sums[0] / static_cast<float>(d) + eps);
     for (int i = tid; i < d; i += static_cast<int>(blockDim.x)) {
         const float g = __half2float(zr[i]);
-        const float gate = sigmoid(g);
-        orow[i] = __float2half_rn(__half2float(xr[i]) * inv * ActivationTraits<W>::load(weight + i) * gate);
+        orow[i] = __float2half_rn(rmsnorm_epilogue<Epilogue>(
+            __half2float(xr[i]), inv, ActivationTraits<W>::load(weight + i), g));
     }
 }
 
