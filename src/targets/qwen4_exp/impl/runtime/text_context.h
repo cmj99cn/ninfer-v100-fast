@@ -219,6 +219,8 @@ public:
     TokenId prefill(std::span<const TokenId> tokens);
     TokenId decode(TokenId token);
 
+    void set_residual_sink(int rank, void* data, std::size_t bytes) noexcept;
+
     template <class AttentionWeights>
     void run_qsa_layer(std::int32_t tokens,
                        const std::array<const AttentionWeights*, kMaximumDevices>& weights,
@@ -279,6 +281,8 @@ private:
     const ops::CollectiveComms* comms_ = nullptr;
     int tp_                            = 1;
     cudaStream_t stream_               = nullptr;
+    std::array<void*, kMaximumDevices> residual_sinks_{};
+    std::array<std::size_t, kMaximumDevices> residual_sink_bytes_{};
 };
 
 } // namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS

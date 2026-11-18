@@ -534,6 +534,12 @@ inline void TextTrunk::reduce_rows(const std::array<Tensor, kMaximumDevices>& bu
     ops::allreduce_sum(buffer, staging, *execution_, *comms_);
 }
 
+inline void TextTrunk::set_residual_sink(int rank, void* data, std::size_t bytes) noexcept {
+    if (rank < 0 || rank >= static_cast<int>(kMaximumDevices)) { return; }
+    residual_sinks_[static_cast<std::size_t>(rank)]       = data;
+    residual_sink_bytes_[static_cast<std::size_t>(rank)] = bytes;
+}
+
 inline TokenId TextTrunk::prefill(std::span<const TokenId> tokens) { return forward(tokens); }
 
 inline TokenId TextTrunk::decode(TokenId token) {
@@ -1064,6 +1070,15 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
         NINFER_QWEN4EXP_LAYER_DUMP("normalized_out", layer, normalized[0]);
 #endif
     }
+
+    for_each_rank([&](int rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        if (residual_sinks_[slot] != nullptr) {
+            const std::size_t bytes = std::min(residual[slot].bytes(), residual_sink_bytes_[slot]);
+            CUDA_CHECK(cudaMemcpyAsync(residual_sinks_[slot], residual[slot].data, bytes,
+                                       cudaMemcpyDeviceToDevice, stream_for(rank)));
+        }
+    });
 
     std::array<Weight, kMaximumDevices> head{};
     std::array<Tensor, kMaximumDevices> winner{};

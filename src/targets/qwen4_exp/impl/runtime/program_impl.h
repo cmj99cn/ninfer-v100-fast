@@ -7,7 +7,10 @@
 #include "core/arena.h"
 #include "targets/qwen4_exp/impl/runtime/program.h"
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
+#include "targets/qwen3_8_flash_next/impl/mtp_draft.h"
+#include "targets/qwen3_8_flash_next/impl/speculative.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -80,7 +83,27 @@ ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevi
     comms_ = std::make_unique<ops::CollectiveComms>(execution_);
     trunk_ = std::make_unique<TextTrunk>(view_ptrs_, state_ptrs_, activation_ptrs_,
                                          workspace_ptrs_, execution_, *comms_);
-    if (options_.use_cuda_graph) {
+    const bool mtp_enabled = options_.speculative.backend == SpeculativeBackend::Mtp &&
+                             options_.speculative.draft_tokens > 0;
+    if (mtp_enabled) {
+        mtp_draft_window_ = std::min<std::uint32_t>(
+            options_.speculative.draft_tokens,
+            ninfer::targets::qwen3_8_flash_next::detail::MtpConfig::maximum_draft_window);
+        const std::size_t sink_bytes = static_cast<std::size_t>(plan_->prefill_chunk) *
+                                       static_cast<std::size_t>(TextConfig::residual_width) * 2;
+        for (int rank = 0; rank < execution_.tp; ++rank) {
+            residual_sinks_[static_cast<std::size_t>(rank)] = std::make_unique<DeviceBuffer>(sink_bytes);
+            trunk_->set_residual_sink(rank, residual_sinks_[static_cast<std::size_t>(rank)]->p,
+                                      sink_bytes);
+        }
+        mtp_draft_ = std::make_unique<ninfer::targets::qwen3_8_flash_next::detail::MtpDraft>(
+            options_.artifact_path, execution_.dev[0]->device);
+        mtp_transaction_ =
+            std::make_unique<StateTransaction>(state_ptrs_, execution_.tp, mtp_draft_window_ + 1);
+        mtp_stats_.backend      = SpeculativeBackend::Mtp;
+        mtp_stats_.enabled      = true;
+        mtp_stats_.draft_window = mtp_draft_window_;
+    } else if (options_.use_cuda_graph) {
         graph_ = std::make_unique<GraphDecodeController>(
             execution_, state_ptrs_, activation_ptrs_, workspace_ptrs_, execution_.tp);
     }
@@ -320,34 +343,103 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
 
     round_tokens_.clear();
     round_row_counts_.clear();
-    for (const std::uint32_t lane : lanes) {
+    for (std::size_t index = 0; index < lanes.size(); ++index) {
+        const std::uint32_t lane = lanes[index];
         LaneState& state         = lanes_[lane];
+        const runtime::RoundBudget& budget = budgets[index];
         const auto decode_start  = std::chrono::steady_clock::now();
+        const std::size_t tokens_before = round_tokens_.size();
         TokenId token = 0;
-        if (graph_ != nullptr && !graph_->ready()) { ++graph_warm_steps_; }
-        if (graph_ != nullptr && graph_->ready()) {
+        if (mtp_draft_ != nullptr) {
+            namespace flash = ninfer::targets::qwen3_8_flash_next::detail;
+            const std::uint32_t frontier = states_[0]->next_position();
+            const std::uint32_t drafts =
+                flash::verify_extent(mtp_draft_window_, mtp_draft_window_, budget, frontier,
+                                     plan_->kv_capacity);
+            const int32_t position = static_cast<std::int32_t>(frontier);
+            const Tensor conditioning(residual_sinks_[0]->p, kTextActivationDtype,
+                                      {TextConfig::residual_width, 1});
+            const std::vector<TokenId> proposals =
+                flash::draft_chain(*mtp_draft_, conditioning, state.context.next_input, drafts,
+                                   position);
+            last_stage_capture() = &logits_capture_;
+            mtp_transaction_->begin();
+            std::vector<TokenId> verify_tokens;
+            verify_tokens.reserve(proposals.size() + 1);
+            verify_tokens.push_back(state.context.next_input);
+            verify_tokens.insert(verify_tokens.end(), proposals.begin(), proposals.end());
+            const std::vector<TokenId> predictions = flash::verify_sequential(
+                verify_tokens, [&](TokenId next) { return trunk_->decode(next); });
+            const std::uint32_t accepted = flash::accepted_prefix(proposals, predictions);
+            std::vector<TokenId> committed = flash::commit_tokens(proposals, predictions);
+            std::vector<TokenId> replay;
+            replay.reserve(accepted + 1);
+            replay.push_back(state.context.next_input);
+            replay.insert(replay.end(), proposals.begin(), proposals.begin() + accepted);
+            mtp_transaction_->commit(replay, [&](TokenId next) { (void)trunk_->decode(next); });
+            mtp_stats_.rounds += 1;
+            mtp_stats_.drafted_tokens += drafts;
+            mtp_stats_.accepted_tokens += accepted;
+            if (mtp_stats_.accepted_per_position.size() < mtp_draft_window_) {
+                mtp_stats_.accepted_per_position.resize(mtp_draft_window_, 0);
+            }
+            for (std::uint32_t at = 0; at < accepted && at < mtp_draft_window_; ++at) {
+                mtp_stats_.accepted_per_position[at] += 1;
+            }
+            if (committed.empty()) { committed.push_back(predictions.front()); }
+            for (const TokenId emitted : committed) {
+                state.last_round_token     = emitted;
+                state.has_last_round_token = true;
+                round_tokens_.push_back(emitted);
+            }
+            token = state.last_round_token;
+        } else if (graph_ != nullptr && !graph_->ready()) {
+            ++graph_warm_steps_;
+            last_stage_capture() = &logits_capture_;
+            token = trunk_->decode(state.context.next_input);
+            state.last_round_token     = token;
+            state.has_last_round_token = true;
+            round_tokens_.push_back(token);
+        } else if (graph_ != nullptr && graph_->ready()) {
             token = graph_->replay(state.context.next_input, states_[0]->next_position());
             if (logits_capture_.enabled) {
                 const std::uint16_t* words = graph_->logits();
                 logits_capture_.words.assign(
                     words, words + static_cast<std::size_t>(TextConfig::vocab));
             }
+            state.last_round_token     = token;
+            state.has_last_round_token = true;
+            round_tokens_.push_back(token);
         } else {
             last_stage_capture() = &logits_capture_;
             token = trunk_->decode(state.context.next_input);
+            state.last_round_token     = token;
+            state.has_last_round_token = true;
+            round_tokens_.push_back(token);
         }
+        round_row_counts_.push_back(static_cast<std::int32_t>(round_tokens_.size() - tokens_before));
         state.timings.decode_seconds +=
             std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
-        state.last_round_token     = token;
-        state.has_last_round_token = true;
-        round_tokens_.push_back(token);
-        round_row_counts_.push_back(1);
     }
 
+    std::uint32_t stride = 0;
+    for (const std::int32_t count : round_row_counts_) {
+        stride = std::max<std::uint32_t>(stride, static_cast<std::uint32_t>(count));
+    }
+    if (stride == 0) { stride = 1; }
+    padded_tokens_.clear();
+    padded_tokens_.reserve(static_cast<std::size_t>(stride) * lanes.size());
+    std::size_t cursor = 0;
+    for (const std::int32_t count : round_row_counts_) {
+        const std::size_t take = static_cast<std::size_t>(count);
+        for (std::size_t at = 0; at < take; ++at) { padded_tokens_.push_back(round_tokens_[cursor++]); }
+        TokenId fill = take > 0 ? round_tokens_[cursor - 1] : TokenId{0};
+        for (std::size_t at = take; at < stride; ++at) { padded_tokens_.push_back(fill); }
+    }
     runtime::BatchedGeneratedRound round;
-    round.tokens       = round_tokens_;
+    round.tokens       = padded_tokens_;
     round.row_counts   = round_row_counts_;
-    round.row_stride   = 1;
+    round.row_stride   = stride;
     return round;
 }
 
@@ -422,7 +514,7 @@ ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
 SpeculativeStats
 ProgramImplCore::speculative_stats_lane(std::uint32_t lane) const noexcept {
     (void)lane;
-    return SpeculativeStats{};
+    return mtp_stats_;
 }
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {

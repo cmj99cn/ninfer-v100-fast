@@ -241,7 +241,8 @@ struct MtpDraft::Impl {
         : reader(artifact), device_context(device),
           activation(512U * 1024U * 1024U), workspace(512U * 1024U * 1024U),
           model(initial_model()),
-          state(device_context, model, 64, 1, 1, 0),
+          state(device_context, model, static_cast<std::uint32_t>(TextConfig::max_position_embeddings),
+                1, 1, 0),
           trunk(model, state, activation, workspace, device_context.stream),
           condition_ones(4 * sizeof(float)) {
         artifact::Binder binder(reader);

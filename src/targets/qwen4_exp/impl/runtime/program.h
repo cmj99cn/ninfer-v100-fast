@@ -4,6 +4,7 @@
 #include "runtime/contract/types.h"
 #include "targets/qwen4_exp/impl/runtime/instance.h"
 #include "targets/qwen4_exp/impl/runtime/layouts.h"
+#include "targets/qwen4_exp/impl/runtime/state_transaction.h"
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 #include "targets/qwen4_exp/impl/runtime/workspace_recipe.h"
 
@@ -28,6 +29,10 @@ struct RequestPlanImpl<NINFER_QWEN4EXP_VARIANT> {
 };
 
 } // namespace ninfer::targets::qwen4_exp::detail
+
+namespace ninfer::targets::qwen3_8_flash_next::detail {
+class MtpDraft;
+}
 
 namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
 
@@ -133,8 +138,14 @@ private:
     std::unique_ptr<ops::CollectiveComms> comms_;
     std::unique_ptr<TextTrunk> trunk_;
     std::unique_ptr<GraphDecodeController> graph_;
+    std::unique_ptr<ninfer::targets::qwen3_8_flash_next::detail::MtpDraft> mtp_draft_;
+    std::unique_ptr<StateTransaction> mtp_transaction_;
+    std::array<std::unique_ptr<DeviceBuffer>, kMaximumDevices> residual_sinks_;
+    std::uint32_t mtp_draft_window_ = 0;
+    SpeculativeStats mtp_stats_{};
     LastStageCapture logits_capture_;
     std::vector<TokenId> round_tokens_;
+    std::vector<TokenId> padded_tokens_;
     std::vector<std::int32_t> round_row_counts_;
     std::uint64_t last_prefill_tokens_ = 0;
     double last_prefill_seconds_       = 0.0;

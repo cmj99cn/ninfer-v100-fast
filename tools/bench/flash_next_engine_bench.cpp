@@ -44,6 +44,8 @@ struct Options {
     std::uint32_t prefill_chunk = kPrefillChunk;
     std::uint32_t expert_cache_mib = 0;
     bool graph = false;
+    std::string spec            = "none";
+    std::uint32_t draft_tokens  = 0;
     std::vector<TokenId> target_tokens;
 };
 
@@ -123,6 +125,10 @@ Options parse_options(int argc, char** argv) {
             options.expert_cache_mib = static_cast<std::uint32_t>(std::stoul(next()));
         } else if (arg == "--graph") {
             options.graph = true;
+        } else if (arg == "--spec") {
+            options.spec = next();
+        } else if (arg == "--draft-tokens") {
+            options.draft_tokens = static_cast<std::uint32_t>(std::stoul(next()));
         } else if (arg == "--target-tokens") {
             options.target_tokens = parse_ids(next());
         } else {
@@ -130,6 +136,12 @@ Options parse_options(int argc, char** argv) {
         }
     }
     require(!options.artifact.empty(), "an artifact path is required");
+    require(options.spec == "none" || options.spec == "mtp", "--spec must be none or mtp");
+    if (options.spec == "mtp") {
+        require(options.draft_tokens > 0, "--spec mtp requires a positive --draft-tokens");
+    } else {
+        require(options.draft_tokens == 0, "--draft-tokens requires --spec mtp");
+    }
     require(options.decode_tokens > 0, "the decode token budget must be positive");
     require(options.reps > 0, "the repetition count must be positive");
     require(options.warmup >= 0, "the warmup count must be non-negative");
@@ -148,6 +160,10 @@ EngineOptions engine_options(const Options& options) {
     engine.prefill_chunk    = options.prefill_chunk;
     engine.use_cuda_graph   = options.graph;
     engine.expert_cache_mib = options.expert_cache_mib;
+    if (options.spec == "mtp") {
+        engine.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
+        engine.speculative.draft_tokens = options.draft_tokens;
+    }
     return engine;
 }
 
@@ -189,6 +205,21 @@ double log_softmax_nll(const std::vector<std::uint16_t>& words, TokenId token) {
     const double log_partition = maximum + std::log(sum);
     require(token >= 0 && token < kVocab, "the sampled token is outside the vocabulary");
     return log_partition - half_words_to_float(words[static_cast<std::size_t>(token)]);
+}
+
+Json acceptance_json(const GenerationResult& result) {
+    const auto& stats = result.speculative;
+    const double drafted = static_cast<double>(stats.drafted_tokens);
+    return Json{
+        {"backend", stats.enabled ? "mtp" : "none"},
+        {"rounds", stats.rounds},
+        {"drafted_tokens", stats.drafted_tokens},
+        {"accepted_tokens", stats.accepted_tokens},
+        {"mean_accepted_per_round",
+         stats.rounds == 0 ? 0.0 : static_cast<double>(stats.accepted_tokens) / static_cast<double>(stats.rounds)},
+        {"acceptance_rate", drafted == 0.0 ? 0.0 : static_cast<double>(stats.accepted_tokens) / drafted},
+        {"accepted_per_position", stats.accepted_per_position},
+    };
 }
 
 Json memory_json(const MemorySummary& memory) {
@@ -335,6 +366,7 @@ Json run_bench(const Options& options) {
                 {"expert_miss_bytes", missed_bytes},
                 {"expert_hit_rate",
                  hits + misses == 0 ? 1.0 : static_cast<double>(hits) / static_cast<double>(hits + misses)},
+                {"acceptance", acceptance_json(result)},
             });
             decode_seconds_sum += result.timings.decode_seconds;
             committed_sum += committed;
@@ -374,7 +406,7 @@ Json run_bench(const Options& options) {
         {"reps", options.reps},
         {"warmup", options.warmup},
         {"sampling", "greedy"},
-        {"acceptance", "N/A"},
+        {"acceptance", options.spec == "mtp" ? "measured" : "N/A"},
         {"engine",
          {{"tp", 2},
           {"devices", {0, 1}},
