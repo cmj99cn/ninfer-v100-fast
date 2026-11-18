@@ -157,6 +157,28 @@ set_tests_properties(ninfer_flash_next_plan_load_forward_test PROPERTIES
 
 
 
+ninfer_add_test(ninfer_flash_next_mtp_state_test
+  SOURCES targets/qwen3_8_flash_next/test_mtp_state.cpp
+  LIBRARIES ninfer_flash_next_package)
+target_link_libraries(ninfer_flash_next_mtp_state_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_flash_next_mtp_state_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_flash_next_mtp_state_artifact_test
+  COMMAND ninfer_flash_next_mtp_state_test)
+set_tests_properties(ninfer_flash_next_mtp_state_artifact_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  ENVIRONMENT "NINFER_FLASH_NEXT_ARTIFACT=/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer")
+
+ninfer_add_test(ninfer_flash_next_mtp_verify_test
+  SOURCES targets/qwen3_8_flash_next/test_mtp_verify.cpp
+  LIBRARIES ninfer_flash_next_package)
+target_link_libraries(ninfer_flash_next_mtp_verify_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_flash_next_mtp_verify_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_flash_next_mtp_verify_artifact_test
+  COMMAND ninfer_flash_next_mtp_verify_test)
+set_tests_properties(ninfer_flash_next_mtp_verify_artifact_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  ENVIRONMENT "NINFER_FLASH_NEXT_ARTIFACT=/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer")
+
 ninfer_add_test(ninfer_flash_next_full_model_test
   SOURCES targets/qwen3_8_flash_next/test_full_model.cpp
   LIBRARIES ninfer_flash_next_package)

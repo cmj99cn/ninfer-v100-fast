@@ -118,6 +118,12 @@ public:
 
     [[nodiscard]] std::uint32_t next_position() const noexcept { return next_position_; }
     void advance_position(std::uint32_t tokens) noexcept { next_position_ += tokens; }
+    void rewind_scalars(std::uint32_t position, std::uint64_t previous,
+                        std::uint64_t current) noexcept {
+        next_position_ = position;
+        ple_tail_[0]   = previous;
+        ple_tail_[1]   = current;
+    }
 
     [[nodiscard]] std::uint64_t kv_payload_bytes() const noexcept;
     [[nodiscard]] std::uint64_t gdn_state_bytes() const noexcept;
