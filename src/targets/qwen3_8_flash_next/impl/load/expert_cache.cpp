@@ -202,6 +202,9 @@ void ExpertCache::assign(std::uint32_t slot, std::uint32_t layer, std::uint32_t 
 }
 
 std::uint32_t ExpertCache::place(std::uint32_t layer, std::uint32_t expert) {
+    if (frozen_) {
+        throw std::logic_error("the expert cache residency is frozen; a miss cannot be admitted");
+    }
     const auto slots = static_cast<std::uint32_t>(plan_.pairs);
 
     if (!spare_.empty()) {

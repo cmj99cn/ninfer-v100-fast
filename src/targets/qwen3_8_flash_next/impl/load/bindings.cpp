@@ -1453,6 +1453,9 @@ void LoadedModelData::allocate_expert_cache(const EngineOptions& options,
             }
         }
         cache_options.vram_reserve_bytes = kVramReserveBytes;
+        if (!options.expert_cache_profile.empty()) {
+            cache_options.profile = options.expert_cache_profile;
+        }
         experts_[slot] = std::make_unique<ExpertRuntime>(
             options.artifact_path, execution.dev[slot]->device,
             static_cast<std::uint32_t>(rank) * kRankExperts, cache_options, free_bytes,

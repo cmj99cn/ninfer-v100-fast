@@ -38,6 +38,8 @@ public:
                        cudaStream_t stream);
     void routed_finish(cudaStream_t stream);
     void prefetch_previous_round(cudaStream_t stream);
+    void prime_static_residency();
+    void set_graph_mode(bool enabled) noexcept { graph_mode_ = enabled; }
 
     [[nodiscard]] const ExpertCache& cache() const noexcept { return cache_; }
     [[nodiscard]] float* activation_scratch() const noexcept {
@@ -121,6 +123,8 @@ private:
     std::condition_variable prefetch_recorded_cv_;
     bool prefetch_failed_ = false;
     std::vector<std::int32_t> host_ids_;
+    bool frozen_                       = false;
+    bool graph_mode_                   = false;
     std::int32_t* probe_host_          = nullptr;
     std::int32_t* probe_miss_count_    = nullptr;
     std::int32_t* probe_active_count_  = nullptr;

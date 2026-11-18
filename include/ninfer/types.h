@@ -152,6 +152,9 @@ struct EngineOptions {
     // that memory is rejected at construction with the available budget. Every other package
     // resolves this field to zero and is unaffected by it.
     std::uint32_t expert_cache_mib = 0;
+    // When set, the qwen3.8-flash-next package seeds its resident expert set from this static
+    // profile and freezes the device lookup table. Empty keeps demand-filled residency.
+    std::filesystem::path expert_cache_profile;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
     // Zero selects a bounded worker count from the detected host concurrency.

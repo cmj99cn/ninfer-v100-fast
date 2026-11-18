@@ -89,6 +89,7 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
     prefetch_workers_ = std::make_unique<HostWorkerPool>(1, 2);
     refresh_lookup();
     CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    if (options.profile.has_value()) { prime_static_residency(); }
     if (stats_ != nullptr) {
         stats_->expert_cache_bytes = cache_bytes();
         stats_->expert_scratch_bytes = scratch_bytes();
@@ -154,6 +155,19 @@ void ExpertRuntime::refresh_lookup() {
     CUDA_CHECK(cudaEventRecord(copy_done_, copy_stream_));
 }
 
+void ExpertRuntime::prime_static_residency() {
+    const ScopedDevice scope(device_);
+    const std::uint32_t residency = cache_.residency();
+    for (std::uint32_t slot = 0; slot < residency; ++slot) {
+        const auto [layer, expert] = cache_.resident_pair(slot);
+        launch_pull(layer, expert, slot);
+    }
+    refresh_lookup();
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    cache_.freeze();
+    frozen_ = true;
+}
+
 void ExpertRuntime::record_route(std::uint32_t layer, const ops::MoeNvfp4RouteView& route,
                                  cudaStream_t stream) {
     CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(route_history_.p) +
@@ -163,6 +177,7 @@ void ExpertRuntime::record_route(std::uint32_t layer, const ops::MoeNvfp4RouteVi
 }
 
 void ExpertRuntime::prefetch_previous_round(cudaStream_t stream) {
+    if (frozen_) { return; }
     const ScopedDevice scope(device_);
     if (prefetch_future_.valid()) { prefetch_future_.get(); }
     CUDA_CHECK(cudaMemcpyAsync(route_history_host_->data(), route_history_.p, kRouteHistoryBytes,
@@ -332,19 +347,22 @@ void ExpertRuntime::routed_launch(std::uint32_t layer, const Tensor& x,
             .expert_begin = expert_begin,
             .expert_end   = expert_end,
         };
+        const ops::detail::MoeNvfp4Probe* active_probe = graph_mode_ ? nullptr : &probe;
         ops::detail::moe_nvfp4_cached_gate_up_launch(
             x, static_cast<const std::uint8_t*>(slab_.p), kPairBytes, table_row,
-            static_cast<const float*>(divisors_.p), detail_scratch, outputs, &probe, stream);
-        CUDA_CHECK(cudaEventRecord(probe_done_, stream));
-        CUDA_CHECK(cudaMemcpyAsync(rollback_.p, destination.data,
-                                   static_cast<std::size_t>(TextConfig::hidden) *
-                                       sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToDevice, stream));
+            static_cast<const float*>(divisors_.p), detail_scratch, outputs, active_probe, stream);
+        if (!graph_mode_) {
+            CUDA_CHECK(cudaEventRecord(probe_done_, stream));
+            CUDA_CHECK(cudaMemcpyAsync(rollback_.p, destination.data,
+                                       static_cast<std::size_t>(TextConfig::hidden) *
+                                           sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
         ops::detail::moe_nvfp4_cached_down_launch(
             static_cast<const std::uint8_t*>(slab_.p), kPairBytes, table_row,
             static_cast<const float*>(divisors_.p), detail_scratch, outputs, destination, stream);
-        CUDA_CHECK(cudaEventRecord(down_done_, stream));
-        pending_.active      = true;
+        if (!graph_mode_) { CUDA_CHECK(cudaEventRecord(down_done_, stream)); }
+        pending_.active      = !graph_mode_;
         pending_.layer       = layer;
         pending_.x           = x;
         pending_.destination = destination;
@@ -372,7 +390,7 @@ void ExpertRuntime::routed_launch(std::uint32_t layer, const Tensor& x,
             if (cache_.resident_slot(layer, local) < 0) { any_missing = true; }
         }
     }
-    if (!any_missing) {
+    if (frozen_ || !any_missing) {
         cache_.record_resident_lookups(static_cast<std::uint64_t>(needed.size()));
     } else {
         if (needed.size() > cache_.slots()) {
@@ -420,6 +438,7 @@ void ExpertRuntime::routed_launch(std::uint32_t layer, const Tensor& x,
 
 void ExpertRuntime::routed_finish(cudaStream_t stream) {
     if (!pending_.active) { return; }
+    if (frozen_) { pending_.active = false; return; }
     const ScopedDevice scope(device_);
     const std::uint32_t layer = pending_.layer;
     const Tensor& x = pending_.x;

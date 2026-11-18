@@ -110,6 +110,13 @@ public:
     void release_prefetch(std::uint32_t slot) noexcept;
     void note_prefetch_result(bool used) noexcept;
 
+    void seed_profile(const std::filesystem::path& profile) { seed(profile); }
+    void freeze() noexcept { frozen_ = true; }
+    [[nodiscard]] bool frozen() const noexcept { return frozen_; }
+    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> resident_pair(std::uint32_t slot) const noexcept {
+        return resident_[slot];
+    }
+    [[nodiscard]] std::uint32_t residency() const noexcept { return stats_.residency; }
     [[nodiscard]] std::uint64_t slot_offset(std::uint32_t slot) const noexcept;
     [[nodiscard]] std::uint32_t slots() const noexcept;
     [[nodiscard]] const ExpertCachePlan& plan() const noexcept { return plan_; }
@@ -134,6 +141,7 @@ private:
     std::vector<std::uint8_t> spare_mark_;
     std::uint32_t hand_      = 0;
     std::uint32_t next_free_ = 0;
+    bool frozen_             = false;
     CacheStats stats_;
 };
 

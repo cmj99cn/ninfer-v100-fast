@@ -20,6 +20,7 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -107,6 +108,16 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
+void write_static_profile(const std::filesystem::path& path) {
+    std::ofstream output(path);
+    if (!output) { throw std::runtime_error("cannot write the static expert profile"); }
+    for (std::uint32_t layer = 0; layer < detail::kTextLayers; ++layer) {
+        for (std::uint32_t expert = 0; expert < detail::kRankExperts; ++expert) {
+            output << layer << ' ' << expert << " 1\n";
+        }
+    }
+}
+
 } // namespace
 
 #define NINFER_QWEN4EXP_VARIANT ::ninfer::targets::qwen3_8_flash_next::detail::Variant
@@ -188,6 +199,9 @@ void run(const char* path) {
     options.max_concurrency = 1;
     options.prefill_chunk = kForwardTokens;
     options.expert_cache_mib = 20000;
+    const std::filesystem::path profile_path = "/tmp/ninfer_flash_next_static.profile";
+    write_static_profile(profile_path);
+    options.expert_cache_profile = profile_path;
 
     auto load_plan = Package::plan_load(binder, options, detail::WeightsProfile::Nvfp4);
     artifact::MaterializedArtifact materialized =
@@ -255,6 +269,16 @@ void run(const char* path) {
     const TokenId capture_token = token;
     const std::size_t logits_bytes = static_cast<std::size_t>(detail::TextConfig::vocab) * 2;
 
+    for (std::uint32_t rank = 0; rank < g_rank_count; ++rank) {
+        const auto layer_view = data.view(static_cast<int>(rank)).layers[0].post_mixer;
+        if (layer_view.cache != nullptr) { layer_view.cache->set_graph_mode(true); }
+    }
+
+    const auto rebuild_state = [&]() {
+        for (std::uint32_t rank = 0; rank < g_rank_count; ++rank) { trunks.states[rank]->reset(); }
+        return prefill_and_warm();
+    };
+
     DecodeGraphDefinition definition;
     std::size_t node_count = 0;
     try {
@@ -278,10 +302,6 @@ void run(const char* path) {
         return;
     }
 
-    const auto rebuild_state = [&]() {
-        for (std::uint32_t rank = 0; rank < g_rank_count; ++rank) { trunks.states[rank]->reset(); }
-        return prefill_and_warm();
-    };
     rebuild_state();
     const TokenId eager_token = trunks.trunk->decode(capture_token);
     for (std::uint32_t rank = 0; rank < g_rank_count; ++rank) { execution.dev[rank]->synchronize(); }
