@@ -78,6 +78,11 @@
 #define NINFER_QWEN4EXP_GRAPH_WINNER_PTR() (&token)
 #endif
 
+#ifndef NINFER_QWEN4EXP_GRAPH_WINNER_COPY
+#define NINFER_QWEN4EXP_GRAPH_WINNER_COPY(dst, src, bytes, stream) \
+    CUDA_CHECK(cudaMemcpy((dst), (src), (bytes), cudaMemcpyDeviceToHost))
+#endif
+
 #ifndef NINFER_QWEN4EXP_GRAPH_PREPARE_PLE
 #define NINFER_QWEN4EXP_GRAPH_PREPARE_PLE(rank, state, tokens) (state).prepare_ple_rows(tokens)
 #endif
@@ -89,6 +94,11 @@
 #ifndef NINFER_QWEN4EXP_GRAPH_ROUTED_FINISH
 #define NINFER_QWEN4EXP_GRAPH_ROUTED_FINISH(weights, stream) \
     Variant::post_mixer_routed_finish((weights), (stream))
+#endif
+
+#ifndef NINFER_QWEN4EXP_GRAPH_PREFETCH
+#define NINFER_QWEN4EXP_GRAPH_PREFETCH(weights, stream) \
+    Variant::post_mixer_prefetch((weights), (stream))
 #endif
 
 #ifndef NINFER_QWEN4EXP_GRAPH_FINISH_SYNC
@@ -913,7 +923,7 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
     if (T == 1) {
         for_each_rank([&](int rank) {
             const auto slot = static_cast<std::size_t>(rank);
-            Variant::post_mixer_prefetch(models_[slot]->layers[0].post_mixer, stream_for(rank));
+            NINFER_QWEN4EXP_GRAPH_PREFETCH(models_[slot]->layers[0].post_mixer, stream_for(rank));
         });
     }
 
@@ -1094,10 +1104,10 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
 
     NINFER_QWEN4EXP_GRAPH_FINISH_SYNC();
     std::int32_t token = 0;
-    CUDA_CHECK(cudaMemcpy(NINFER_QWEN4EXP_GRAPH_WINNER_PTR(),
-                           static_cast<const std::byte*>(winner[0].data) +
-                               static_cast<std::size_t>(T - 1) * 4,
-                           4, cudaMemcpyDeviceToHost));
+    NINFER_QWEN4EXP_GRAPH_WINNER_COPY(NINFER_QWEN4EXP_GRAPH_WINNER_PTR(),
+                                      static_cast<const std::byte*>(winner[0].data) +
+                                          static_cast<std::size_t>(T - 1) * 4,
+                                      4, stream_for(0));
     for (int rank = 0; rank < tp_; ++rank) {
         states_[static_cast<std::size_t>(rank)]->advance_position(static_cast<std::uint32_t>(T));
     }
