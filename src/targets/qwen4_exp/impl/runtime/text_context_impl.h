@@ -62,6 +62,14 @@
 #define NINFER_QWEN4EXP_DIAG_MARK(label)
 #endif
 
+#ifndef NINFER_QWEN4EXP_MOE_ENABLED
+#define NINFER_QWEN4EXP_MOE_ENABLED() true
+#endif
+
+#ifndef NINFER_QWEN4EXP_HAS_PLE
+#define NINFER_QWEN4EXP_HAS_PLE() true
+#endif
+
 #ifndef NINFER_QWEN4EXP_GRAPH_IDS_SRC
 #define NINFER_QWEN4EXP_GRAPH_IDS_SRC(rank, tokens) (tokens.data())
 #endif
@@ -992,51 +1000,54 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
         NINFER_QWEN4EXP_LAYER_DUMP("moe_injection", layer, injection[0]);
 #endif
 
-        std::array<ops::MoeNvfp4RouteView, kMaximumDevices> routes{};
-        for_each_rank([&](int rank) {
-            const auto slot = static_cast<std::size_t>(rank);
-            const std::int32_t top_k = TextConfig::experts_per_token;
-            Tensor route_ids = activations_[slot]->alloc(DType::I32, {top_k, T});
-            Tensor route_coefficients = activations_[slot]->alloc(DType::FP32, {top_k, T});
-            Tensor route_gate = activations_[slot]->alloc(DType::FP32, {T});
-            Tensor route_logits =
-                T == 1 ? activations_[slot]->alloc(DType::FP32, {TextConfig::experts + 1, T})
-                       : Tensor{};
-            ops::moe_nvfp4_route(block_input[slot], models_[slot]->layers[layer].post_mixer,
-                                 route_ids, route_coefficients, route_gate, stream_for(rank),
-                                 T == 1 ? static_cast<float*>(route_logits.data) : nullptr,
-                                 T == 1 ? states_[slot]->route_counter() : nullptr);
-            NINFER_QWEN4EXP_DIAG_MARK("route");
-            routes[slot] = ops::MoeNvfp4RouteView{route_ids, route_coefficients, route_gate};
-        });
-        for_each_rank([&](int rank) {
-            const auto slot = static_cast<std::size_t>(rank);
-            NINFER_QWEN4EXP_EXPERT_READ_BEGIN(layer);
-            Variant::post_mixer_routed(block_input[slot],
-                                       models_[slot]->layers[layer].post_mixer, routes[slot],
-                                       moe_out[slot], stream_for(rank));
-        });
-        for_each_rank([&](int rank) {
-            const auto slot = static_cast<std::size_t>(rank);
-            NINFER_QWEN4EXP_GRAPH_ROUTED_FINISH(models_[slot]->layers[layer].post_mixer,
-                                                stream_for(rank));
-            NINFER_QWEN4EXP_EXPERT_READ_END(layer);
-            NINFER_QWEN4EXP_DIAG_MARK("routed");
-        });
-        reduce_rows(moe_out, staging);
-        for_each_rank([&](int rank) {
-            const auto slot = static_cast<std::size_t>(rank);
-            NINFER_QWEN4EXP_DIAG_MARK("moe_reduce");
-            Variant::post_mixer_shared(block_input[slot],
-                                       models_[slot]->layers[layer].post_mixer, routes[slot],
-                                       moe_out[slot], stream_for(rank));
-            NINFER_QWEN4EXP_DIAG_MARK("moe_shared");
-        });
+        if (NINFER_QWEN4EXP_MOE_ENABLED()) {
+            std::array<ops::MoeNvfp4RouteView, kMaximumDevices> routes{};
+            for_each_rank([&](int rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                const std::int32_t top_k = TextConfig::experts_per_token;
+                Tensor route_ids = activations_[slot]->alloc(DType::I32, {top_k, T});
+                Tensor route_coefficients = activations_[slot]->alloc(DType::FP32, {top_k, T});
+                Tensor route_gate = activations_[slot]->alloc(DType::FP32, {T});
+                Tensor route_logits =
+                    T == 1 ? activations_[slot]->alloc(DType::FP32, {TextConfig::experts + 1, T})
+                           : Tensor{};
+                ops::moe_nvfp4_route(block_input[slot], models_[slot]->layers[layer].post_mixer,
+                                      route_ids, route_coefficients, route_gate, stream_for(rank),
+                                      T == 1 ? static_cast<float*>(route_logits.data) : nullptr,
+                                      T == 1 ? states_[slot]->route_counter() : nullptr);
+                NINFER_QWEN4EXP_DIAG_MARK("route");
+                routes[slot] = ops::MoeNvfp4RouteView{route_ids, route_coefficients, route_gate};
+            });
+            for_each_rank([&](int rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                NINFER_QWEN4EXP_EXPERT_READ_BEGIN(layer);
+                Variant::post_mixer_routed(block_input[slot],
+                                           models_[slot]->layers[layer].post_mixer, routes[slot],
+                                           moe_out[slot], stream_for(rank));
+            });
+            for_each_rank([&](int rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                NINFER_QWEN4EXP_GRAPH_ROUTED_FINISH(models_[slot]->layers[layer].post_mixer,
+                                                    stream_for(rank));
+                NINFER_QWEN4EXP_EXPERT_READ_END(layer);
+                NINFER_QWEN4EXP_DIAG_MARK("routed");
+            });
+            reduce_rows(moe_out, staging);
+            for_each_rank([&](int rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                NINFER_QWEN4EXP_DIAG_MARK("moe_reduce");
+                Variant::post_mixer_shared(block_input[slot],
+                                           models_[slot]->layers[layer].post_mixer, routes[slot],
+                                           moe_out[slot], stream_for(rank));
+                NINFER_QWEN4EXP_DIAG_MARK("moe_shared");
+            });
+        }
 #ifdef NINFER_QWEN4EXP_LAYER_DUMP
         NINFER_QWEN4EXP_LAYER_DUMP("moe", layer, moe_out[0]);
 #endif
 
-        if (layer + 1 == static_cast<std::size_t>(TextConfig::ple_layer)) {
+        if (NINFER_QWEN4EXP_HAS_PLE() &&
+            layer + 1 == static_cast<std::size_t>(TextConfig::ple_layer)) {
             for_each_rank([&](int rank) {
                 NINFER_QWEN4EXP_GRAPH_PLE_AWAIT(rank, *states_[static_cast<std::size_t>(rank)]);
                 NINFER_QWEN4EXP_DIAG_MARK("ple_await");

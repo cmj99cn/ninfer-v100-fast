@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "targets/qwen3_8_flash_next/impl/diag_switches.h"
 
 #include <ninfer/targets/qwen3_8_flash_next/package.h>
 
@@ -76,27 +77,35 @@ inline std::int32_t* graph_decode_scalar(int rank, const char* label) {
             CUDA_CHECK(cudaMemcpy((dst), (src), (bytes), cudaMemcpyDeviceToHost));           \
         }                                                                                   \
     } while (0)
+#define NINFER_QWEN4EXP_MOE_ENABLED() \
+    (!ninfer::targets::qwen3_8_flash_next::detail::diag_no_moe())
+#define NINFER_QWEN4EXP_HAS_PLE() \
+    (!ninfer::targets::qwen3_8_flash_next::detail::diag_no_ple())
 #define NINFER_QWEN4EXP_GRAPH_PREPARE_PLE(rank, state, tokens)                             \
     do {                                                                                    \
-        if (!ninfer::targets::qwen3_8_flash_next::detail::graph_decode_inputs().active) {    \
+        if (NINFER_QWEN4EXP_HAS_PLE() &&                                                    \
+            !ninfer::targets::qwen3_8_flash_next::detail::graph_decode_inputs().active) {    \
             (state).prepare_ple_rows(tokens);                                               \
         }                                                                                   \
     } while (0)
 #define NINFER_QWEN4EXP_GRAPH_PLE_AWAIT(rank, state)                                       \
     do {                                                                                    \
-        if (!ninfer::targets::qwen3_8_flash_next::detail::graph_decode_inputs().active) {    \
+        if (NINFER_QWEN4EXP_HAS_PLE() &&                                                    \
+            !ninfer::targets::qwen3_8_flash_next::detail::graph_decode_inputs().active) {    \
             (state).await_ple_rows();                                                       \
         }                                                                                   \
     } while (0)
 #define NINFER_QWEN4EXP_GRAPH_ROUTED_FINISH(weights, stream)                               \
     do {                                                                                    \
-        if (!ninfer::targets::qwen3_8_flash_next::detail::graph_decode_inputs().active) {    \
+        if (NINFER_QWEN4EXP_MOE_ENABLED() &&                                                \
+            !ninfer::targets::qwen3_8_flash_next::detail::graph_decode_inputs().active) {    \
             Variant::post_mixer_routed_finish((weights), (stream));                         \
         }                                                                                   \
     } while (0)
 #define NINFER_QWEN4EXP_GRAPH_PREFETCH(weights, stream)                                    \
     do {                                                                                    \
-        if (!ninfer::targets::qwen3_8_flash_next::detail::graph_decode_inputs().active) {    \
+        if (NINFER_QWEN4EXP_MOE_ENABLED() &&                                                \
+            !ninfer::targets::qwen3_8_flash_next::detail::graph_decode_inputs().active) {    \
             Variant::post_mixer_prefetch((weights), (stream));                              \
         }                                                                                   \
     } while (0)

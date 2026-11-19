@@ -1,6 +1,7 @@
 #pragma once
 
 #include "graph_decode_impl.h"
+#include "targets/qwen3_8_flash_next/impl/diag_switches.h"
 
 #include <ninfer/ops/ple.h>
 
@@ -69,13 +70,17 @@ inline void GraphDecodeController::capture(TokenId token, const std::function<vo
 }
 
 inline TokenId GraphDecodeController::replay(TokenId token, std::uint32_t position) {
-    for (int rank = 0; rank < ranks_; ++rank) {
-        const TokenId one[1]{token};
-        states_[static_cast<std::size_t>(rank)]->prepare_ple_rows(
-            std::span<const TokenId>{one, 1});
+    const bool ple_enabled =
+        !ninfer::targets::qwen3_8_flash_next::detail::diag_no_ple();
+    if (ple_enabled) {
+        for (int rank = 0; rank < ranks_; ++rank) {
+            const TokenId one[1]{token};
+            states_[static_cast<std::size_t>(rank)]->prepare_ple_rows(
+                std::span<const TokenId>{one, 1});
+        }
     }
     for (int rank = 0; rank < ranks_; ++rank) {
-        states_[static_cast<std::size_t>(rank)]->enqueue_ple_wait();
+        if (ple_enabled) { states_[static_cast<std::size_t>(rank)]->enqueue_ple_wait(); }
         fill_inputs(token, position);
     }
     executable_.launch();
