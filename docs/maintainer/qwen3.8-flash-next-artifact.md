@@ -925,6 +925,13 @@ explicit `--expert-cache-mib` budget is checked.
 The M2 text acceptance run is a test configuration, not a product load configuration: the public
 Engine route always loads the full 48 layers.
 
+Text activation dtype: this target builds with `NINFER_TEXT_DTYPE=f16` (`build/CMakeCache.txt`),
+which is deliberate for `sm_70` — Volta has native FP16 arithmetic but no BF16 tensor cores or
+BF16 FMA; BF16 in this codebase is storage plus software conversion to FP32 (see
+`ops/common/math.cuh` and the `HcAct`/`unpack_bf16x8` paths), which costs extra instructions on
+every unpack. All Op kernels remain dtype-templated (dual BF16/FP16) as a repository convention,
+and the CMake default remains `bf16`. All measurements in §13 are the FP16 activation profile.
+
 - The test binds the reduced role set — the first four layers with all 512 experts, the full
   embedding and the full main head — and materializes only those objects on device. Objects
   outside that set are validated only, which is the binder's existing placement contract.

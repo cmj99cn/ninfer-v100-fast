@@ -250,6 +250,21 @@ target_include_directories(ninfer_flash_next_phase_profile PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party
   ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(ninfer_flash_next_phase_profile PRIVATE ninfer_flash_next_package CUDA::cudart)
+
+add_executable(ninfer_flash_next_op_profile
+  ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_op_profile.cpp)
+target_include_directories(ninfer_flash_next_op_profile PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party
+  ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(ninfer_flash_next_op_profile PRIVATE ninfer_flash_next_package CUDA::cudart)
+
+# FP64-oracle test for the fused Flash-Next GDN qkvz W8 decode launcher.
+ninfer_add_test(ninfer_flash_next_gdn_qkvz_decode_test
+  SOURCES ops/test_flash_next_gdn_qkvz_decode.cpp
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_flash_next_gdn_qkvz_decode_test PROPERTIES SKIP_RETURN_CODE 77)
 # Host-only: no artifact, no device. Byte-level TP2 shard slice geometry per storage layout.
 ninfer_add_test(ninfer_tensor_slice_test
   SOURCES test_tensor_slice.cpp
