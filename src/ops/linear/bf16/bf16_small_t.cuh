@@ -7,7 +7,7 @@
 // owns the semantic row/token mapping, allowing pure Linear and fused projection Ops to share the
 // same computation body without a packed intermediate.
 
-#include "ops/linear/bf16/bf16_gemv.cuh"
+#include "ops/linear/gemv/two_byte_gemv.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -23,7 +23,7 @@ struct Bf16SmallTFloatPack {
 
 template <int Values>
 __device__ __forceinline__ Bf16SmallTFloatPack<Values>
-bf16_small_t_decode_pack(const Bf16GemvPack<Values>& packed) {
+bf16_small_t_decode_pack(const GemvPack<Values>& packed) {
     Bf16SmallTFloatPack<Values> result;
 #pragma unroll
     for (int pair = 0; pair < Values / 2; ++pair) {
@@ -36,7 +36,7 @@ bf16_small_t_decode_pack(const Bf16GemvPack<Values>& packed) {
 
 template <int Values, int Chains>
 __device__ __forceinline__ void bf16_small_t_accumulate(const Bf16SmallTFloatPack<Values>& weight,
-                                                        const Bf16GemvPack<Values>& activation,
+                                                        const GemvPack<Values>& activation,
                                                         float (&accumulators)[Chains]) {
     constexpr int kChainMask = Chains - 1;
 #pragma unroll
@@ -59,9 +59,9 @@ struct Bf16SmallTSharedStorage {
 template <class Geometry, int ActiveTokens, class Schedule>
 __device__ __forceinline__ void bf16_small_t_accumulate_direct_phase(
     const __nv_bfloat16* __restrict__ x, int phase, int warp_in_row, int lane,
-    const Bf16GemvPack<Schedule::kValuesPerLane> (&packed_weights)[Schedule::kRowsPerWarp],
+    const GemvPack<Schedule::kValuesPerLane> (&packed_weights)[Schedule::kRowsPerWarp],
     float (&accumulators)[Schedule::kRowsPerWarp][ActiveTokens][Schedule::kAccumulatorChains]) {
-    using Pack = Bf16GemvPack<Schedule::kValuesPerLane>;
+    using Pack = GemvPack<Schedule::kValuesPerLane>;
 #pragma unroll
     for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
         const auto weight_values = bf16_small_t_decode_pack(packed_weights[local_row]);
@@ -72,7 +72,7 @@ __device__ __forceinline__ void bf16_small_t_accumulate_direct_phase(
             for (int local_token = 0; local_token < Schedule::kTokenBatch; ++local_token) {
                 const int token = token0 + local_token;
                 if (token < ActiveTokens) {
-                    activation[local_token] = load_bf16_activation_phase<Geometry, Schedule>(
+                    activation[local_token] = load_gemv_activation_phase<__nv_bfloat16, Geometry, Schedule>(
                         x + static_cast<std::int64_t>(token) * Geometry::kInputRows, phase,
                         warp_in_row, lane);
                 }
@@ -97,7 +97,7 @@ __device__ __forceinline__ void bf16_small_t_compute_rows(
     constexpr int kValuesPerPhase = Schedule::kWarpsPerRow * kWarpSize * Schedule::kValuesPerLane;
     static_assert((Geometry::kInputRows % kValuesPerPhase) == 0);
     constexpr int kPhases = Geometry::kInputRows / kValuesPerPhase;
-    using Pack            = Bf16GemvPack<Schedule::kValuesPerLane>;
+    using Pack            = GemvPack<Schedule::kValuesPerLane>;
     const int phase0      = Schedule::kPhaseOrder == Bf16PhaseOrder::Sequential
                                 ? 0
                                 : ((row0 / Schedule::kRowsPerWarp) * Schedule::kPhaseStride) % kPhases;
@@ -110,14 +110,14 @@ __device__ __forceinline__ void bf16_small_t_compute_rows(
             Pack activation[ActiveTokens];
 #pragma unroll
             for (int token = 0; token < ActiveTokens; ++token) {
-                activation[token] = load_bf16_activation_phase<Geometry, Schedule>(
+                activation[token] = load_gemv_activation_phase<__nv_bfloat16, Geometry, Schedule>(
                     x + static_cast<std::int64_t>(token) * Geometry::kInputRows, phase, warp_in_row,
                     lane);
             }
 
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-                const Pack packed_weight = load_bf16_weight_phase<Geometry, Schedule>(
+                const Pack packed_weight = load_gemv_weight_phase<__nv_bfloat16, Geometry, Schedule>(
                     weight, row0 + local_row, phase, warp_in_row, lane);
                 const auto weight_values = bf16_small_t_decode_pack(packed_weight);
 #pragma unroll
@@ -135,7 +135,7 @@ __device__ __forceinline__ void bf16_small_t_compute_rows(
             Pack packed_weights[Schedule::kRowsPerWarp];
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-                packed_weights[local_row] = load_bf16_weight_phase<Geometry, Schedule>(
+                packed_weights[local_row] = load_gemv_weight_phase<__nv_bfloat16, Geometry, Schedule>(
                     weight, row0 + local_row, phase, warp_in_row, lane);
             }
             bf16_small_t_accumulate_direct_phase<Geometry, ActiveTokens, Schedule>(
@@ -146,7 +146,7 @@ __device__ __forceinline__ void bf16_small_t_compute_rows(
         Pack current_weights[Schedule::kRowsPerWarp];
 #pragma unroll
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-            current_weights[local_row] = load_bf16_weight_phase<Geometry, Schedule>(
+            current_weights[local_row] = load_gemv_weight_phase<__nv_bfloat16, Geometry, Schedule>(
                 weight, row0 + local_row, phase, warp_in_row, lane);
         }
 
@@ -158,7 +158,7 @@ __device__ __forceinline__ void bf16_small_t_compute_rows(
             if (iteration + 1 < kPhases) {
 #pragma unroll
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-                    next_weights[local_row] = load_bf16_weight_phase<Geometry, Schedule>(
+                    next_weights[local_row] = load_gemv_weight_phase<__nv_bfloat16, Geometry, Schedule>(
                         weight, row0 + local_row, next_phase, warp_in_row, lane);
                 }
             }

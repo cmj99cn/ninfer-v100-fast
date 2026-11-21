@@ -1,7 +1,7 @@
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 
 #include "core/device.h"
-#include "ops/linear/bf16/bf16_gemv.cuh"
+#include "ops/linear/gemv/two_byte_gemv.cuh"
 
 #include <cuda_bf16.h>
 

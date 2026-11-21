@@ -1,7 +1,7 @@
 #include "ops/linear/bf16/bf16_launch.h"
 
 #include "core/device.h"
-#include "ops/linear/bf16/bf16_gemv.cuh"
+#include "ops/linear/gemv/two_byte_gemv.cuh"
 
 #include <cuda_bf16.h>
 
@@ -21,7 +21,7 @@ void launch_geometry(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
         (Geometry::kOutputRows == 1280 || Geometry::kOutputRows == 256),
         NarrowSchedule, Bf16LinearDecodeSchedule<Geometry>>;
 
-    const Bf16ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data)};
+    const GemvContiguousOutput<__nv_bfloat16> output{static_cast<__nv_bfloat16*>(out.data)};
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     bf16_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.qdata),
@@ -48,6 +48,18 @@ void launch_bf16_decode(const Tensor& x, const Weight& weight, Tensor& out, cuda
     }
     if (weight.n == 5120 && weight.k == 6144) {
         launch_geometry<Bf16GemvGeometry<5120, 6144>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 124160 && weight.k == 2560) {
+        launch_geometry<Bf16GemvGeometry<124160, 2560>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 10240 && weight.k == 2560) {
+        launch_geometry<Bf16GemvGeometry<10240, 2560>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 2560 && weight.k == 2560) {
+        launch_geometry<Bf16GemvGeometry<2560, 2560>>(x, weight, out, stream);
         return;
     }
     throw std::invalid_argument("bf16 linear decode: unsupported exact problem");

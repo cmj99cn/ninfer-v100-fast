@@ -27,6 +27,16 @@ Fp16Launch select_fp16_launch(std::int32_t n, std::int32_t k, std::int32_t t, Li
 
 void fp16_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                    cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    // Exact-geometry T==1 decode instances for the Flash-Next output head (Vocab-split) and PLE
+    // projections. FP16 activation only; BF16 activations keep the Volta MMA route unchanged.
+    if (x.ne[1] == 1 && x.dtype == DType::FP16 &&
+        ((w.n == 124160 && w.k == 2560) || (w.n == 10240 && w.k == 2560) ||
+         (w.n == 2560 && w.k == 2560))) {
+        launch_fp16_decode(x, w, out, stream);
+        return;
+    }
+#endif
     (void)select_fp16_launch(w.n, w.k, x.ne[1], policy);
 #ifdef NINFER_VOLTA_BUILD
     if (x.dtype == DType::FP16) {

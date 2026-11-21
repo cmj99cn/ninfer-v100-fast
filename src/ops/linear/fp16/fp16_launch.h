@@ -18,5 +18,8 @@ void launch_fp16_volta_mma(const Tensor& x, const Weight& w, Tensor& out, cudaSt
 void launch_fp16_volta_mma_f16(const Tensor& x, const Weight& w, Tensor& out,
                                cudaStream_t stream);
 #endif
+// Exact-geometry T==1 decode GEMV (Flash-Next output head / PLE projections). FP16 activation
+// and FP16 weights only; any other activation dtype keeps the Volta MMA route.
+void launch_fp16_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

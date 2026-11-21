@@ -211,9 +211,13 @@ int run_fp16_linear() {
     {
         DeviceWeight hc(make_patterned(324, 10240, 601U));
         DeviceWeight head(make_patterned(124160, 2560, 603U));
+        DeviceWeight ple_key(make_patterned(10240, 2560, 605U));
+        DeviceWeight ple_value(make_patterned(2560, 2560, 607U));
         for (const std::int32_t tokens : {1, 8}) {
             failures += run_fp16_activation_case(hc, tokens);
             failures += run_fp16_activation_case(head, tokens);
+            failures += run_fp16_activation_case(ple_key, tokens);
+            failures += run_fp16_activation_case(ple_value, tokens);
         }
     }
     // One tensor-parallel shard of each form: column-parallel halves N (merger/fc1 -> 2304),

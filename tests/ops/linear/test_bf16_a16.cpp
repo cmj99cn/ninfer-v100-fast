@@ -67,6 +67,9 @@ std::vector<std::int32_t> sampled_rows(std::int32_t rows) {
     if (rows == 14336) {
         result.insert(result.end(), {1023, 6143, 6144, 7167, 7168, 13311, 13312});
     }
+    if (rows == 124160) {
+        result.insert(result.end(), {10240, 61440, 112640});
+    }
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
@@ -118,7 +121,7 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens) {
 
     std::vector<double> actual;
     std::vector<double> expected;
-    if (tokens == 1) {
+    if (tokens == 1 && rows <= 16384) {
         const std::vector<double> complete =
             oracle_all_rows(weight.host, std::span<const float>(activation));
         actual.reserve(rows);
@@ -177,6 +180,16 @@ int run_bf16_linear() {
     for (const std::int32_t tokens : {1, 8, 33}) {
         failures += run_bf16_linear_case(attention_shard, tokens);
         failures += run_bf16_linear_case(output_shard, tokens);
+    }
+    DeviceWeight head_weight(make_patterned(124160, 2560, 431U));
+    for (const std::int32_t tokens : {1, 2, 8}) {
+        failures += run_bf16_linear_case(head_weight, tokens);
+    }
+    DeviceWeight ple_key(make_patterned(10240, 2560, 433U));
+    DeviceWeight ple_value(make_patterned(2560, 2560, 435U));
+    for (const std::int32_t tokens : {1, 2, 4, 8, 33}) {
+        failures += run_bf16_linear_case(ple_key, tokens);
+        failures += run_bf16_linear_case(ple_value, tokens);
     }
     return failures;
 }

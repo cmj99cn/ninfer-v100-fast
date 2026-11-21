@@ -1,35 +1,66 @@
 #pragma once
 
+// Two-byte (BF16/FP16) row-major GEMV kernels for sm_70 decode (T == 1). Element-type generic:
+// both instantiations share the pack layout, phase math, and shared-memory staging; only the
+// pairwise conversion (bits <-> float2) and the final scalar round differ. The geometry and
+// schedule types in ops/linear/bf16/bf16_config.h are dtype-agnostic despite their Bf16 names.
+
 #include "ops/linear/bf16/bf16_config.h"
+
+#include "core/device.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
 namespace ninfer::ops::detail {
 
+template <class Element>
+struct GemvTwoByteTraits;
+
+template <>
+struct GemvTwoByteTraits<__nv_bfloat16> {
+    static __device__ __forceinline__ float2 pair_to_float2(std::uint32_t bits) {
+        return bf16x2_bits_to_float2(bits);
+    }
+    static __device__ __forceinline__ __nv_bfloat16 from_float(float value) {
+        return __float2bfloat16_rn(value);
+    }
+};
+
+template <>
+struct GemvTwoByteTraits<__half> {
+    static __device__ __forceinline__ float2 pair_to_float2(std::uint32_t bits) {
+        return __half22float2(load_vec<__half2>(&bits));
+    }
+    static __device__ __forceinline__ __half from_float(float value) {
+        return __float2half_rn(value);
+    }
+};
+
 template <int Values>
-struct alignas(Values* static_cast<int>(sizeof(__nv_bfloat16))) Bf16GemvPack {
+struct alignas(Values* static_cast<int>(sizeof(std::uint16_t))) GemvPack {
     static_assert(Values == 4 || Values == 8 || Values == 16);
     std::uint32_t words[Values / 2];
 };
 
-static_assert(sizeof(Bf16GemvPack<4>) == 8);
-static_assert(sizeof(Bf16GemvPack<8>) == 16);
-static_assert(sizeof(Bf16GemvPack<16>) == 32);
+static_assert(sizeof(GemvPack<4>) == 8);
+static_assert(sizeof(GemvPack<8>) == 16);
+static_assert(sizeof(GemvPack<16>) == 32);
 
-template <int Values>
-__device__ __forceinline__ Bf16GemvPack<Values> load_bf16_pack(const __nv_bfloat16* pointer) {
+template <class Element, int Values>
+__device__ __forceinline__ GemvPack<Values> load_gemv_pack(const Element* pointer) {
     if constexpr (Values <= 8) {
-        return load_vec<Bf16GemvPack<Values>>(pointer);
+        return load_vec<GemvPack<Values>>(pointer);
     } else {
-        Bf16GemvPack<Values> result;
-        const Bf16GemvPack<8> low  = load_vec<Bf16GemvPack<8>>(pointer);
-        const Bf16GemvPack<8> high = load_vec<Bf16GemvPack<8>>(pointer + 8);
+        GemvPack<Values> result;
+        const GemvPack<8> low  = load_vec<GemvPack<8>>(pointer);
+        const GemvPack<8> high = load_vec<GemvPack<8>>(pointer + 8);
 #pragma unroll
         for (int pair = 0; pair < 4; ++pair) {
             result.words[pair]     = low.words[pair];
@@ -39,27 +70,26 @@ __device__ __forceinline__ Bf16GemvPack<Values> load_bf16_pack(const __nv_bfloat
     }
 }
 
-template <Bf16WeightCache Cache, int Values>
-__device__ __forceinline__ Bf16GemvPack<Values>
-load_bf16_weight_pack(const __nv_bfloat16* pointer) {
+template <class Element, Bf16WeightCache Cache, int Values>
+__device__ __forceinline__ GemvPack<Values> load_gemv_weight_pack(const Element* pointer) {
     if constexpr (Cache == Bf16WeightCache::Default) {
-        return load_bf16_pack<Values>(pointer);
+        return load_gemv_pack<Element, Values>(pointer);
     } else if constexpr (Values == 4) {
         uint2 bits;
         asm volatile("ld.global.cg.v2.u32 {%0, %1}, [%2];\n"
                      : "=r"(bits.x), "=r"(bits.y)
                      : "l"(pointer));
-        return load_vec<Bf16GemvPack<Values>>(&bits);
+        return load_vec<GemvPack<Values>>(&bits);
     } else if constexpr (Values == 8) {
         uint4 bits;
         asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];\n"
                      : "=r"(bits.x), "=r"(bits.y), "=r"(bits.z), "=r"(bits.w)
                      : "l"(pointer));
-        return load_vec<Bf16GemvPack<Values>>(&bits);
+        return load_vec<GemvPack<Values>>(&bits);
     } else {
-        Bf16GemvPack<Values> result;
-        const Bf16GemvPack<8> low  = load_bf16_weight_pack<Cache, 8>(pointer);
-        const Bf16GemvPack<8> high = load_bf16_weight_pack<Cache, 8>(pointer + 8);
+        GemvPack<Values> result;
+        const GemvPack<8> low  = load_gemv_weight_pack<Element, Cache, 8>(pointer);
+        const GemvPack<8> high = load_gemv_weight_pack<Element, Cache, 8>(pointer + 8);
 #pragma unroll
         for (int pair = 0; pair < 4; ++pair) {
             result.words[pair]     = low.words[pair];
@@ -69,14 +99,14 @@ load_bf16_weight_pack(const __nv_bfloat16* pointer) {
     }
 }
 
-template <int Values, int AccumulatorChains>
-__device__ __forceinline__ void accumulate_bf16_packs(const Bf16GemvPack<Values>& weight,
-                                                      const Bf16GemvPack<Values>& activation,
+template <class Element, int Values, int AccumulatorChains>
+__device__ __forceinline__ void accumulate_gemv_packs(const GemvPack<Values>& weight,
+                                                      const GemvPack<Values>& activation,
                                                       float (&accumulators)[AccumulatorChains]) {
 #pragma unroll
     for (int pair = 0; pair < Values / 2; ++pair) {
-        const float2 w           = bf16x2_bits_to_float2(weight.words[pair]);
-        const float2 x           = bf16x2_bits_to_float2(activation.words[pair]);
+        const float2 w           = GemvTwoByteTraits<Element>::pair_to_float2(weight.words[pair]);
+        const float2 x           = GemvTwoByteTraits<Element>::pair_to_float2(activation.words[pair]);
         constexpr int kChainMask = AccumulatorChains - 1;
         accumulators[(2 * pair) & kChainMask] =
             fmaf(w.x, x.x, accumulators[(2 * pair) & kChainMask]);
@@ -85,42 +115,44 @@ __device__ __forceinline__ void accumulate_bf16_packs(const Bf16GemvPack<Values>
     }
 }
 
-struct Bf16ContiguousOutput {
-    __nv_bfloat16* data;
+template <class Element>
+struct GemvContiguousOutput {
+    Element* data;
 
-    __device__ __forceinline__ void store(std::int32_t parent_row, __nv_bfloat16 value) const {
+    __device__ __forceinline__ void store(std::int32_t parent_row, Element value) const {
         data[parent_row] = value;
     }
 };
 
-struct Bf16StoreEpilogue {
+template <class Element>
+struct GemvStoreEpilogue {
     template <class Output>
     __device__ __forceinline__ void operator()(const Output& output, std::int32_t parent_row,
                                                float accumulator) const {
-        output.store(parent_row, __float2bfloat16_rn(accumulator));
+        output.store(parent_row, GemvTwoByteTraits<Element>::from_float(accumulator));
     }
 };
 
-template <class Geometry, class Schedule>
-struct Bf16GemvSharedStorage {
+template <class Geometry, class Schedule, class Element>
+struct GemvSharedStorage {
     static constexpr int kActivationElements =
         Schedule::kActivationAccess == Bf16ActivationAccess::Shared ? Geometry::kInputRows : 8;
     static constexpr int kReductionWarps = Schedule::kWarpsPerRow > 1 ? Schedule::kWarpsPerRow : 1;
 
-    alignas(16) __nv_bfloat16 activation[kActivationElements];
+    alignas(16) Element activation[kActivationElements];
     float partials[Schedule::kRowGroupsPerCta][Schedule::kRowsPerWarp][kReductionWarps];
 };
 
-template <class Geometry, class Schedule>
-__device__ __forceinline__ const __nv_bfloat16*
-prepare_bf16_activation(const __nv_bfloat16* x, Bf16GemvSharedStorage<Geometry, Schedule>& shared) {
+template <class Element, class Geometry, class Schedule>
+__device__ __forceinline__ const Element*
+prepare_gemv_activation(const Element* x, GemvSharedStorage<Geometry, Schedule, Element>& shared) {
     if constexpr (Schedule::kActivationAccess == Bf16ActivationAccess::Direct) {
         return x;
     } else {
         static_assert((Geometry::kInputRows % 8) == 0);
         constexpr int kPacks = Geometry::kInputRows / 8;
-        auto* destination    = reinterpret_cast<Bf16GemvPack<8>*>(shared.activation);
-        const auto* source   = reinterpret_cast<const Bf16GemvPack<8>*>(x);
+        auto* destination    = reinterpret_cast<GemvPack<8>*>(shared.activation);
+        const auto* source   = reinterpret_cast<const GemvPack<8>*>(x);
         for (int pack = static_cast<int>(threadIdx.x); pack < kPacks; pack += Schedule::kThreads) {
             destination[pack] = source[pack];
         }
@@ -130,29 +162,29 @@ prepare_bf16_activation(const __nv_bfloat16* x, Bf16GemvSharedStorage<Geometry, 
 }
 
 template <class Geometry, class Schedule>
-__device__ __forceinline__ std::int32_t bf16_phase_offset(int phase, int warp_in_row, int lane) {
+__device__ __forceinline__ std::int32_t gemv_phase_offset(int phase, int warp_in_row, int lane) {
     constexpr int kValuesPerWarp = kWarpSize * Schedule::kValuesPerLane;
     return phase * Schedule::kWarpsPerRow * kValuesPerWarp + warp_in_row * kValuesPerWarp +
            lane * Schedule::kValuesPerLane;
 }
 
-template <class Geometry, class Schedule>
-__device__ __forceinline__ Bf16GemvPack<Schedule::kValuesPerLane>
-load_bf16_activation_phase(const __nv_bfloat16* activation, int phase, int warp_in_row, int lane) {
-    const int offset = bf16_phase_offset<Geometry, Schedule>(phase, warp_in_row, lane);
-    return load_bf16_pack<Schedule::kValuesPerLane>(activation + offset);
+template <class Element, class Geometry, class Schedule>
+__device__ __forceinline__ GemvPack<Schedule::kValuesPerLane>
+load_gemv_activation_phase(const Element* activation, int phase, int warp_in_row, int lane) {
+    const int offset = gemv_phase_offset<Geometry, Schedule>(phase, warp_in_row, lane);
+    return load_gemv_pack<Element, Schedule::kValuesPerLane>(activation + offset);
 }
 
-template <class Geometry, class Schedule>
-__device__ __forceinline__ Bf16GemvPack<Schedule::kValuesPerLane>
-load_bf16_weight_phase(const __nv_bfloat16* weight, int row, int phase, int warp_in_row, int lane) {
-    const int offset = bf16_phase_offset<Geometry, Schedule>(phase, warp_in_row, lane);
-    return load_bf16_weight_pack<Schedule::kWeightCache, Schedule::kValuesPerLane>(
+template <class Element, class Geometry, class Schedule>
+__device__ __forceinline__ GemvPack<Schedule::kValuesPerLane>
+load_gemv_weight_phase(const Element* weight, int row, int phase, int warp_in_row, int lane) {
+    const int offset = gemv_phase_offset<Geometry, Schedule>(phase, warp_in_row, lane);
+    return load_gemv_weight_pack<Element, Schedule::kWeightCache, Schedule::kValuesPerLane>(
         weight + static_cast<std::int64_t>(row) * Geometry::kInputRows + offset);
 }
 
 template <class Schedule, int Phases>
-__device__ __forceinline__ int bf16_phase_index(int iteration, int row0) {
+__device__ __forceinline__ int gemv_phase_index(int iteration, int row0) {
     if constexpr (Schedule::kPhaseOrder == Bf16PhaseOrder::Sequential) {
         return iteration;
     } else {
@@ -163,36 +195,36 @@ __device__ __forceinline__ int bf16_phase_index(int iteration, int row0) {
     }
 }
 
-template <class Geometry, class Schedule>
-__device__ __forceinline__ void compute_bf16_gemv_rows(
-    const __nv_bfloat16* activation, const __nv_bfloat16* weight, int row0, int warp_in_row,
+template <class Element, class Geometry, class Schedule>
+__device__ __forceinline__ void compute_gemv_rows(
+    const Element* activation, const Element* weight, int row0, int warp_in_row,
     int lane, float (&accumulators)[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains]) {
     constexpr int kValuesPerPhase = Schedule::kWarpsPerRow * kWarpSize * Schedule::kValuesPerLane;
     static_assert((Geometry::kInputRows % kValuesPerPhase) == 0);
     constexpr int kPhases = Geometry::kInputRows / kValuesPerPhase;
-    using Pack            = Bf16GemvPack<Schedule::kValuesPerLane>;
+    using Pack            = GemvPack<Schedule::kValuesPerLane>;
 
     if constexpr (Schedule::kPrefetchDepth == 1) {
 #pragma unroll Schedule::kPhaseUnroll
         for (int iteration = 0; iteration < kPhases; ++iteration) {
-            const int phase     = bf16_phase_index<Schedule, kPhases>(iteration, row0);
-            const Pack x_values = load_bf16_activation_phase<Geometry, Schedule>(activation, phase,
-                                                                                 warp_in_row, lane);
+            const int phase     = gemv_phase_index<Schedule, kPhases>(iteration, row0);
+            const Pack x_values = load_gemv_activation_phase<Element, Geometry, Schedule>(activation, phase,
+                                                                                         warp_in_row, lane);
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-                const Pack w_values = load_bf16_weight_phase<Geometry, Schedule>(
+                const Pack w_values = load_gemv_weight_phase<Element, Geometry, Schedule>(
                     weight, row0 + local_row, phase, warp_in_row, lane);
-                accumulate_bf16_packs(w_values, x_values, accumulators[local_row]);
+                accumulate_gemv_packs<Element>(w_values, x_values, accumulators[local_row]);
             }
         }
     } else {
-        const int first_phase = bf16_phase_index<Schedule, kPhases>(0, row0);
-        Pack current_x = load_bf16_activation_phase<Geometry, Schedule>(activation, first_phase,
-                                                                        warp_in_row, lane);
+        const int first_phase = gemv_phase_index<Schedule, kPhases>(0, row0);
+        Pack current_x = load_gemv_activation_phase<Element, Geometry, Schedule>(activation, first_phase,
+                                                                                 warp_in_row, lane);
         Pack current_w[Schedule::kRowsPerWarp];
 #pragma unroll
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-            current_w[local_row] = load_bf16_weight_phase<Geometry, Schedule>(
+            current_w[local_row] = load_gemv_weight_phase<Element, Geometry, Schedule>(
                 weight, row0 + local_row, first_phase, warp_in_row, lane);
         }
 
@@ -201,18 +233,18 @@ __device__ __forceinline__ void compute_bf16_gemv_rows(
             Pack next_x;
             Pack next_w[Schedule::kRowsPerWarp];
             if (iteration + 1 < kPhases) {
-                const int next_phase = bf16_phase_index<Schedule, kPhases>(iteration + 1, row0);
-                next_x = load_bf16_activation_phase<Geometry, Schedule>(activation, next_phase,
-                                                                        warp_in_row, lane);
+                const int next_phase = gemv_phase_index<Schedule, kPhases>(iteration + 1, row0);
+                next_x = load_gemv_activation_phase<Element, Geometry, Schedule>(activation, next_phase,
+                                                                                 warp_in_row, lane);
 #pragma unroll
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-                    next_w[local_row] = load_bf16_weight_phase<Geometry, Schedule>(
+                    next_w[local_row] = load_gemv_weight_phase<Element, Geometry, Schedule>(
                         weight, row0 + local_row, next_phase, warp_in_row, lane);
                 }
             }
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-                accumulate_bf16_packs(current_w[local_row], current_x, accumulators[local_row]);
+                accumulate_gemv_packs<Element>(current_w[local_row], current_x, accumulators[local_row]);
             }
             if (iteration + 1 < kPhases) {
                 current_x = next_x;
@@ -225,14 +257,13 @@ __device__ __forceinline__ void compute_bf16_gemv_rows(
     }
 }
 
-template <class Geometry, class Schedule, class Output, class Epilogue = Bf16StoreEpilogue>
-__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_gemv_kernel(
-    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
-    Epilogue epilogue = {}) {
+template <class Element, class Geometry, class Schedule, class Output, class Epilogue>
+__device__ __forceinline__ void gemv_body(const Element* __restrict__ x, const Element* __restrict__ weight,
+                                          Output output, Epilogue epilogue) {
     static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
 
-    __shared__ Bf16GemvSharedStorage<Geometry, Schedule> shared;
-    const __nv_bfloat16* activation = prepare_bf16_activation<Geometry, Schedule>(x, shared);
+    __shared__ GemvSharedStorage<Geometry, Schedule, Element> shared;
+    const Element* activation = prepare_gemv_activation<Element, Geometry, Schedule>(x, shared);
 
     const int lane        = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
     const int warp        = static_cast<int>(threadIdx.x) / kWarpSize;
@@ -242,8 +273,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int row0        = cta_row0 + row_group * Schedule::kRowsPerWarp;
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
 
-    compute_bf16_gemv_rows<Geometry, Schedule>(activation, weight, row0, warp_in_row, lane,
-                                               accumulators);
+    compute_gemv_rows<Element, Geometry, Schedule>(activation, weight, row0, warp_in_row, lane,
+                                                   accumulators);
 
     float warp_totals[Schedule::kRowsPerWarp];
 #pragma unroll
@@ -282,6 +313,20 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             }
         }
     }
+}
+
+template <class Geometry, class Schedule, class Output, class Epilogue = GemvStoreEpilogue<__nv_bfloat16>>
+__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_gemv_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
+    Epilogue epilogue = {}) {
+    gemv_body<__nv_bfloat16, Geometry, Schedule>(x, weight, output, epilogue);
+}
+
+template <class Geometry, class Schedule, class Output, class Epilogue = GemvStoreEpilogue<__half>>
+__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp16_gemv_kernel(
+    const __half* __restrict__ x, const __half* __restrict__ weight, Output output,
+    Epilogue epilogue = {}) {
+    gemv_body<__half, Geometry, Schedule>(x, weight, output, epilogue);
 }
 
 } // namespace ninfer::ops::detail
