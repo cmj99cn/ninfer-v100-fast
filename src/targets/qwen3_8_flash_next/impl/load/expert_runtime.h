@@ -64,6 +64,7 @@ private:
     struct PendingRoute {
         bool active = false;
         std::uint32_t layer = 0;
+        std::uint32_t tokens = 1;
         Tensor x;
         Tensor destination;
         ops::MoeNvfp4RouteView route;
@@ -77,11 +78,14 @@ private:
 
     static constexpr std::uint32_t kCopyStages     = 3;
     static constexpr std::uint32_t kPrefetchStages = 3;
+    static constexpr std::int32_t kRouteHistoryTokens = 8;
     static constexpr std::size_t kProbeBytes =
         (2 + 2 * static_cast<std::size_t>(TextConfig::experts)) * sizeof(std::int32_t);
-    static constexpr std::size_t kRouteHistoryBytes =
-        static_cast<std::size_t>(kTextLayers) * TextConfig::experts_per_token *
+    static constexpr std::size_t kRouteHistoryStride =
+        static_cast<std::size_t>(TextConfig::experts_per_token) * kRouteHistoryTokens *
         sizeof(std::int32_t);
+    static constexpr std::size_t kRouteHistoryBytes =
+        static_cast<std::size_t>(kTextLayers) * kRouteHistoryStride;
 
     void launch_pull(std::uint32_t layer, std::uint32_t expert, std::uint32_t slot);
     void refresh_lookup();
