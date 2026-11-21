@@ -22,6 +22,14 @@ __device__ __forceinline__ bool ranked_better(const RankedValue& a, const Ranked
     return a.value > b.value || (a.value == b.value && a.id < b.id);
 }
 
+__device__ __forceinline__ RankedValue rank_max(const RankedValue& a, const RankedValue& b) {
+    const bool better = (b.value > a.value) | ((b.value == a.value) & (b.id < a.id));
+    RankedValue result;
+    result.value = better ? b.value : a.value;
+    result.id    = better ? b.id : a.id;
+    return result;
+}
+
 inline constexpr int kRouteRows        = kMoeExperts + 1;
 inline constexpr int kRouteGroups      = kMoeHidden / 16;
 inline constexpr int kRoutePhases      = kRouteGroups / 32;
@@ -63,10 +71,13 @@ __device__ __forceinline__ float route_row_dot(const std::uint32_t* weight_words
     return warp_reduce_sum(total);
 }
 
+// Single-warp top-k tournament over kMoeExperts logits. Selection order and tie-breaking are
+// (value desc, id asc); coefficients consume the same selected values in the same order, so the
+// outputs are bitwise identical for identical logits.
 __device__ __forceinline__ void route_select(const float* __restrict__ logits,
-                                             std::int32_t* __restrict__ ids,
-                                             float* __restrict__ coefficients,
-                                             float* __restrict__ shared_gate) {
+                                              std::int32_t* __restrict__ ids,
+                                              float* __restrict__ coefficients,
+                                              float* __restrict__ shared_gate) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
     __shared__ float selected_value[kMoeTopK];
 
@@ -82,26 +93,28 @@ __device__ __forceinline__ void route_select(const float* __restrict__ logits,
 #pragma unroll
         for (int slot = 1; slot < kRouteSlots; ++slot) {
             const int index = lane + 32 * slot;
-            if (index < kMoeExperts && ranked_better({values[slot], index}, candidate)) {
-                candidate = RankedValue{values[slot], index};
-            }
+            candidate       = rank_max(candidate, RankedValue{values[slot], index});
         }
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             RankedValue other;
             other.value = __shfl_down_sync(kFullWarpMask, candidate.value, offset);
             other.id    = __shfl_down_sync(kFullWarpMask, candidate.id, offset);
-            if (ranked_better(other, candidate)) { candidate = other; }
+            candidate   = rank_max(candidate, other);
         }
         const int chosen = __shfl_sync(kFullWarpMask, candidate.id, 0);
         if (lane == 0) {
             ids[rank]            = chosen;
             selected_value[rank] = candidate.value;
         }
-        if (lane == (chosen & 31)) { values[chosen >> 5] = -CUDART_INF_F; }
+#pragma unroll
+        for (int slot = 0; slot < kRouteSlots; ++slot) {
+            const int index = lane + 32 * slot;
+            if (index == chosen) { values[slot] = -CUDART_INF_F; }
+        }
     }
 
-    float exponential =
+    const float exponential =
         lane < kMoeTopK ? expf(selected_value[lane] - selected_value[0]) : 0.0F;
     const float denominator = warp_sum(exponential);
     if (lane < kMoeTopK) { coefficients[lane] = exponential / denominator; }
