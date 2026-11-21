@@ -51,38 +51,128 @@ __device__ __forceinline__ void unpack_act_x8(const uint4& value, float* out) {
     }
 }
 
-template <bool Vectorized, int Rows>
+// Warp-per-row GEMV for small depths (e.g. the up projection, depth <= 2048): one warp per
+// row, lane-strided uint4 loads, fully unrolled inner loop.
+template <class A>
+__global__ __launch_bounds__(kGemvWarpsPerBlock * kWarpSize) void hc_project_gemv_warp_row_kernel(
+    const A* weight, const A* activation, A* output, std::int32_t rows, std::int32_t depth) {
+    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int row  = static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + warp;
+    if (row >= rows) { return; }
+    const int vectors    = depth / 8;
+    const auto* weights  = reinterpret_cast<const uint4*>(
+        __builtin_assume_aligned(weight + static_cast<std::int64_t>(row) * depth, 16));
+    const auto* values   = reinterpret_cast<const uint4*>(
+        __builtin_assume_aligned(activation, 16));
+    float sum            = 0.0F;
+#pragma unroll 2
+    for (int idx = lane; idx < vectors; idx += kWarpSize) {
+        const uint4 wv = weights[idx];
+        const uint4 av = values[idx];
+        float w[8];
+        float a[8];
+        unpack_act_x8<A>(wv, w);
+        unpack_act_x8<A>(av, a);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { sum += w[i] * a[i]; }
+    }
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) { output[row] = HcAct<A>::from_float(sum); }
+}
+
+// Fused up GEMV + sigmoid gating for decode (columns == 1, streams == 4): one CTA covers two
+// d positions; warps 0-3 compute the four stream rows for d0 and warps 4-7 for d0+1, each with
+// the warp-per-row lane-strided association (bit-identical to hc_project_gemv_warp_row_kernel),
+// then a per-half sigmoid combine produces block_input[d]. No cross-CTA communication.
+template <class A>
+__global__ __launch_bounds__(kGemvWarpsPerBlock * kWarpSize) void hc_mix_up_gate_kernel(
+    const A* __restrict__ weight, const A* __restrict__ low, const A* __restrict__ normalized,
+    A* __restrict__ block_input, std::int32_t hidden, std::int32_t rank, std::int32_t streams,
+    std::int32_t depth) {
+    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int half = warp >> 2;
+    const int s    = warp & 3;
+    const int d    = static_cast<int>(blockIdx.x) * 2 + half;
+    __shared__ float partials[2][4];
+    __shared__ A gate[2][4];
+    const int vectors = depth / 8;
+    const A* weight_row = weight + static_cast<std::int64_t>(s) * hidden * depth +
+                          static_cast<std::int64_t>(d) * depth;
+    const auto* weights = reinterpret_cast<const uint4*>(
+        __builtin_assume_aligned(weight_row, 16));
+    const auto* values  = reinterpret_cast<const uint4*>(
+        __builtin_assume_aligned(low, 16));
+    float sum           = 0.0F;
+#pragma unroll 2
+    for (int idx = lane; idx < vectors; idx += kWarpSize) {
+        const uint4 wv = weights[idx];
+        const uint4 av = values[idx];
+        float w[8];
+        float a[8];
+        unpack_act_x8<A>(wv, w);
+        unpack_act_x8<A>(av, a);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { sum += w[i] * a[i]; }
+    }
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) { partials[half][s] = sum; }
+    __syncthreads();
+    if (s == 0 && lane == 0) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { gate[half][i] = HcAct<A>::from_float(partials[half][i]); }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 || threadIdx.x == 128) {
+        const int dd = d;
+        float total = 0.0F;
+#pragma unroll
+        for (std::int32_t stream = 0; stream < streams; ++stream) {
+            const std::int64_t index = static_cast<std::int64_t>(stream) * hidden + dd;
+            total += sigmoid(HcAct<A>::to_float(gate[half][stream])) *
+                     HcAct<A>::to_float(normalized[index]);
+        }
+        block_input[dd] = HcAct<A>::from_float(total / static_cast<float>(streams));
+    }
+}
+
+template <class A, bool Vectorized, int Rows>
 __global__ __launch_bounds__(kGemvWarpsPerBlock * kWarpSize) void hc_project_gemv_kernel(
-    const __nv_bfloat16* weight, const __nv_bfloat16* activation, __nv_bfloat16* output,
-    std::int32_t rows, std::int32_t depth) {
+    const A* weight, const A* activation, A* output, std::int32_t rows, std::int32_t depth) {
     const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
     const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
     __shared__ float partials[kGemvWarpsPerBlock];
     for (int local = 0; local < Rows; ++local) {
         const int row = static_cast<int>(blockIdx.x) * Rows + local;
         if (row >= rows) { break; }
-        const __nv_bfloat16* weight_row = weight + static_cast<std::int64_t>(row) * depth;
+        const A* weight_row = weight + static_cast<std::int64_t>(row) * depth;
         float sum                       = 0.0F;
         if constexpr (Vectorized) {
             constexpr int kVector = 8;
             const int vectors     = depth / kVector;
-            const auto* weights   = reinterpret_cast<const uint4*>(weight_row);
-            const auto* values    = reinterpret_cast<const uint4*>(activation);
+            const auto* weights   = reinterpret_cast<const uint4*>(
+                __builtin_assume_aligned(weight_row, 16));
+            const auto* values    = reinterpret_cast<const uint4*>(
+                __builtin_assume_aligned(activation, 16));
             for (int base = warp * kWarpSize; base < vectors;
                  base += kGemvWarpsPerBlock * kWarpSize) {
                 const int vector_index = base + lane;
                 if (vector_index >= vectors) { break; }
+                const uint4 wv = weights[vector_index];
+                const uint4 av = values[vector_index];
                 float w[kVector];
                 float a[kVector];
-                unpack_bf16x8(weights[vector_index], w);
-                unpack_bf16x8(values[vector_index], a);
+                unpack_act_x8<A>(wv, w);
+                unpack_act_x8<A>(av, a);
 #pragma unroll
                 for (int i = 0; i < kVector; ++i) { sum += w[i] * a[i]; }
             }
         } else {
             for (std::int32_t index = warp * kWarpSize + lane; index < depth;
                  index += kGemvWarpsPerBlock * kWarpSize) {
-                sum += __bfloat162float(weight_row[index]) * __bfloat162float(activation[index]);
+                sum += HcAct<A>::to_float(weight_row[index]) *
+                       HcAct<A>::to_float(activation[index]);
             }
         }
         sum = warp_reduce_sum(sum);
@@ -92,7 +182,7 @@ __global__ __launch_bounds__(kGemvWarpsPerBlock * kWarpSize) void hc_project_gem
             float total = 0.0F;
 #pragma unroll
             for (int i = 0; i < kGemvWarpsPerBlock; ++i) { total += partials[i]; }
-            if (lane == 0) { output[row] = __float2bfloat16_rn(total); }
+            if (lane == 0) { output[row] = HcAct<A>::from_float(total); }
         }
         __syncthreads();
     }
@@ -113,16 +203,20 @@ __global__ __launch_bounds__(kGemvWarpsPerBlock * kWarpSize) void hc_mix_down_ke
         if constexpr (Vectorized) {
             constexpr int kVector = 8;
             const int vectors     = depth / kVector;
-            const auto* weights   = reinterpret_cast<const uint4*>(weight_row);
-            const auto* values    = reinterpret_cast<const uint4*>(activation);
+            const auto* weights   = reinterpret_cast<const uint4*>(
+                __builtin_assume_aligned(weight_row, 16));
+            const auto* values    = reinterpret_cast<const uint4*>(
+                __builtin_assume_aligned(activation, 16));
             for (int base = warp * kWarpSize; base < vectors;
                  base += kGemvWarpsPerBlock * kWarpSize) {
                 const int vector_index = base + lane;
                 if (vector_index >= vectors) { break; }
+                const uint4 wv = weights[vector_index];
+                const uint4 av = values[vector_index];
                 float w[kVector];
                 float a[kVector];
-                unpack_act_x8<A>(weights[vector_index], w);
-                unpack_act_x8<A>(values[vector_index], a);
+                unpack_act_x8<A>(wv, w);
+                unpack_act_x8<A>(av, a);
 #pragma unroll
                 for (int i = 0; i < kVector; ++i) { sum += w[i] * a[i]; }
             }
@@ -162,61 +256,6 @@ __global__ __launch_bounds__(kGemvWarpsPerBlock * kWarpSize) void hc_mix_down_ke
     const float total = block_reduce_sum<kBlock>(sum, scratch);
     if (threadIdx.x == 0) {
         injection[stream_index] = 2.0F * sigmoid(total / static_cast<float>(streams));
-    }
-}
-
-template <class A>
-__global__ __launch_bounds__(kBlock) void hc_mix_up_gate_kernel(
-    const A* __restrict__ weight, const A* __restrict__ activation,
-    const A* __restrict__ normalized, A* __restrict__ block_input, std::int32_t hidden,
-    std::int32_t streams, std::int32_t depth) {
-    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
-    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
-    const int d    = static_cast<int>(blockIdx.x);
-    const int s    = warp >> 1;
-    const int chunk = warp & 1;
-    __shared__ float partials[4][kGemvWarpsPerBlock];
-    __shared__ A gate[4];
-    if (threadIdx.x < 4 * kGemvWarpsPerBlock) {
-        reinterpret_cast<float*>(partials)[threadIdx.x] = 0.0F;
-    }
-    __syncthreads();
-
-    const int row = s * hidden + d;
-    const A* weight_row = weight + static_cast<std::int64_t>(row) * depth;
-    const int vectors = depth / 8;
-    const auto* weights = reinterpret_cast<const uint4*>(weight_row);
-    const auto* values  = reinterpret_cast<const uint4*>(activation);
-    float sum           = 0.0F;
-    for (int base = chunk * kWarpSize; base < vectors;
-         base += kGemvWarpsPerBlock * kWarpSize) {
-        const int vector_index = base + lane;
-        if (vector_index >= vectors) { break; }
-        float w[8];
-        float a[8];
-        unpack_act_x8<A>(weights[vector_index], w);
-        unpack_act_x8<A>(values[vector_index], a);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) { sum += w[i] * a[i]; }
-    }
-    sum = warp_reduce_sum(sum);
-    if (lane == 0) { partials[s][chunk] = sum; }
-    __syncthreads();
-    if (lane == 0 && chunk == 0) {
-        float total = 0.0F;
-#pragma unroll
-        for (int i = 0; i < kGemvWarpsPerBlock; ++i) { total += partials[s][i]; }
-        gate[s] = HcAct<A>::from_float(total);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float total = 0.0F;
-        for (std::int32_t stream = 0; stream < streams; ++stream) {
-            const std::int64_t index = static_cast<std::int64_t>(stream) * hidden + d;
-            total += sigmoid(HcAct<A>::to_float(gate[stream])) *
-                     HcAct<A>::to_float(normalized[index]);
-        }
-        block_input[d] = HcAct<A>::from_float(total / static_cast<float>(streams));
     }
 }
 
@@ -265,24 +304,82 @@ __global__ __launch_bounds__(kBlock) void hc_mix_injection_kernel(
 void hc_project_gemv_launch(const void* weight, std::int32_t rows, std::int32_t depth,
                             const void* activation, Tensor& output, cudaStream_t stream) {
     const bool vectorizable = (depth % 8) == 0;
-    const bool tiled        = rows >= 1024;
-    const auto blocks = static_cast<unsigned int>((rows + (tiled ? 3 : 0)) / (tiled ? 4 : 1));
-    if (vectorizable) {
-        if (tiled) {
-            hc_project_gemv_kernel<true, 4><<<blocks, kGemvWarpsPerBlock * kWarpSize, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(weight),
-                static_cast<const __nv_bfloat16*>(activation),
-                static_cast<__nv_bfloat16*>(output.data), rows, depth);
+    const bool fp16        = output.dtype == DType::FP16;
+    const auto blocks =
+        static_cast<unsigned int>((rows + ((rows >= 1024 ? 3 : 0))) / (rows >= 1024 ? 4 : 1));
+    if (vectorizable && depth <= 2048) {
+        const auto warp_blocks =
+            static_cast<unsigned int>((rows + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock);
+        if (fp16) {
+            hc_project_gemv_warp_row_kernel<__half><<<warp_blocks, kGemvWarpsPerBlock * kWarpSize, 0, stream>>>(
+                static_cast<const __half*>(weight), static_cast<const __half*>(activation),
+                static_cast<__half*>(output.data), rows, depth);
         } else {
-            hc_project_gemv_kernel<true, 1><<<blocks, kGemvWarpsPerBlock * kWarpSize, 0, stream>>>(
+            hc_project_gemv_warp_row_kernel<__nv_bfloat16><<<warp_blocks, kGemvWarpsPerBlock * kWarpSize, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(weight),
                 static_cast<const __nv_bfloat16*>(activation),
                 static_cast<__nv_bfloat16*>(output.data), rows, depth);
         }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    const bool tiled = rows >= 1024;
+    if (fp16) {
+        if (vectorizable) {
+            if (tiled) {
+                hc_project_gemv_kernel<__half, true, 4><<<blocks, kGemvWarpsPerBlock * kWarpSize, 0, stream>>>(
+                    static_cast<const __half*>(weight), static_cast<const __half*>(activation),
+                    static_cast<__half*>(output.data), rows, depth);
+            } else {
+                hc_project_gemv_kernel<__half, true, 1><<<blocks, kGemvWarpsPerBlock * kWarpSize, 0, stream>>>(
+                    static_cast<const __half*>(weight), static_cast<const __half*>(activation),
+                    static_cast<__half*>(output.data), rows, depth);
+            }
+        } else {
+            hc_project_gemv_kernel<__half, false, 1><<<blocks, kGemvWarpsPerBlock * kWarpSize, 0, stream>>>(
+                static_cast<const __half*>(weight), static_cast<const __half*>(activation),
+                static_cast<__half*>(output.data), rows, depth);
+        }
     } else {
-        hc_project_gemv_kernel<false, 1><<<blocks, kGemvWarpsPerBlock * kWarpSize, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(weight), static_cast<const __nv_bfloat16*>(activation),
-            static_cast<__nv_bfloat16*>(output.data), rows, depth);
+        if (vectorizable) {
+            if (tiled) {
+                hc_project_gemv_kernel<__nv_bfloat16, true, 4><<<blocks, kGemvWarpsPerBlock * kWarpSize, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(weight),
+                    static_cast<const __nv_bfloat16*>(activation),
+                    static_cast<__nv_bfloat16*>(output.data), rows, depth);
+            } else {
+                hc_project_gemv_kernel<__nv_bfloat16, true, 1><<<blocks, kGemvWarpsPerBlock * kWarpSize, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(weight),
+                    static_cast<const __nv_bfloat16*>(activation),
+                    static_cast<__nv_bfloat16*>(output.data), rows, depth);
+            }
+        } else {
+            hc_project_gemv_kernel<__nv_bfloat16, false, 1><<<blocks, kGemvWarpsPerBlock * kWarpSize, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(weight),
+                static_cast<const __nv_bfloat16*>(activation),
+                static_cast<__nv_bfloat16*>(output.data), rows, depth);
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void hc_mix_up_gate_launch(const void* weight, std::int32_t hidden, std::int32_t rank,
+                           std::int32_t streams, const void* low, const Tensor& normalized,
+                           Tensor& block_input, DType dtype, cudaStream_t stream) {
+    const unsigned grid = static_cast<unsigned>(hidden / 2);
+    const auto* low_p   = static_cast<const uint8_t*>(low);
+    if (dtype == DType::FP16) {
+        hc_mix_up_gate_kernel<__half><<<grid, kGemvWarpsPerBlock * kWarpSize, 0, stream>>>(
+            static_cast<const __half*>(weight),
+            reinterpret_cast<const __half*>(low_p),
+            static_cast<const __half*>(normalized.data),
+            static_cast<__half*>(block_input.data), hidden, rank, streams, rank);
+    } else {
+        hc_mix_up_gate_kernel<__nv_bfloat16><<<grid, kGemvWarpsPerBlock * kWarpSize, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(weight),
+            reinterpret_cast<const __nv_bfloat16*>(low_p),
+            static_cast<const __nv_bfloat16*>(normalized.data),
+            static_cast<__nv_bfloat16*>(block_input.data), hidden, rank, streams, rank);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -314,24 +411,6 @@ void hc_mix_gate_launch(const Tensor& gates, const Tensor& normalized, Tensor& b
             static_cast<const __nv_bfloat16*>(gates.data),
             static_cast<const __nv_bfloat16*>(normalized.data),
             static_cast<__nv_bfloat16*>(block_input.data), hidden, streams);
-    }
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void hc_mix_up_gate_launch(const void* weight, std::int32_t rank, const void* activation,
-                            const Tensor& normalized, Tensor& block_input, std::int32_t hidden,
-                            std::int32_t streams, cudaStream_t stream) {
-    if (normalized.dtype == DType::FP16) {
-        hc_mix_up_gate_kernel<__half><<<static_cast<unsigned>(hidden), kBlock, 0, stream>>>(
-            static_cast<const __half*>(weight), static_cast<const __half*>(activation),
-            static_cast<const __half*>(normalized.data), static_cast<__half*>(block_input.data),
-            hidden, streams, rank);
-    } else {
-        hc_mix_up_gate_kernel<__nv_bfloat16><<<static_cast<unsigned>(hidden), kBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(weight),
-            static_cast<const __nv_bfloat16*>(activation),
-            static_cast<const __nv_bfloat16*>(normalized.data),
-            static_cast<__nv_bfloat16*>(block_input.data), hidden, streams, rank);
     }
     CUDA_CHECK(cudaGetLastError());
 }
