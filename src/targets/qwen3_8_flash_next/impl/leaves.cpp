@@ -4,6 +4,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_split.h"
 #include "ninfer/ops/moe_nvfp4.h"
+#include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
 #include "targets/qwen3_8_flash_next/impl/load/expert_runtime.h"
 
 #include <array>
@@ -59,12 +60,12 @@ void AttentionProjectionLeaf::project(const Tensor& hidden, const AttentionProje
     const auto query_gate = query_gate_segments(query, output_gate);
     std::array<Tensor, 2> query_gate_outputs{query, output_gate};
     ops::linear_split(hidden, weights.query_gate, query_gate, query_gate_outputs,
-                      ops::LinearPolicy::A16Only, workspace, stream);
+                       ops::LinearPolicy::A16Only, workspace, stream);
 
     const auto key_value = key_value_segments(key, value, index_query, index_key);
     std::array<Tensor, 4> key_value_outputs{key, value, index_query, index_key};
     ops::linear_split(hidden, weights.key_value, key_value, key_value_outputs,
-                      ops::LinearPolicy::A16Only, workspace, stream);
+                       ops::LinearPolicy::A16Only, workspace, stream);
 }
 
 std::size_t AttentionProjectionLeaf::workspace_capacity_bytes(std::int32_t tokens) {
@@ -92,12 +93,20 @@ void GdnProjectionLeaf::project(const Tensor& hidden, const GdnProjectionWeights
                                 Tensor& beta, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope = workspace.scope();
 
-    const auto gdn = gdn_segments(query, key, value, z);
-    std::array<Tensor, 4> outputs{query, key, value, z};
-    ops::linear_split(hidden, weights.qkvz, gdn, outputs, ops::LinearPolicy::A16Only, workspace,
-                      stream);
-    ops::gdn_gating_proj(hidden, weights.control, weights.a_log, weights.dt_bias, workspace, g,
-                         beta, stream);
+    if (hidden.ne[1] == 1) {
+        // Decode: one fused launch covers the whole qkvz parent and the GDN control
+        // projection/gates (zero workspace, no second gating launch).
+        ops::detail::w8_gdn_qkvz_decode_launch(hidden, weights.qkvz, query, key, value, z,
+                                                weights.control, weights.a_log, weights.dt_bias,
+                                                g, beta, stream);
+    } else {
+        const auto gdn = gdn_segments(query, key, value, z);
+        std::array<Tensor, 4> outputs{query, key, value, z};
+        ops::linear_split(hidden, weights.qkvz, gdn, outputs, ops::LinearPolicy::A16Only,
+                          workspace, stream);
+        ops::gdn_gating_proj(hidden, weights.control, weights.a_log, weights.dt_bias, workspace,
+                              g, beta, stream);
+    }
 }
 
 std::size_t GdnProjectionLeaf::workspace_capacity_bytes(std::int32_t tokens) {
