@@ -70,6 +70,13 @@ int w8_a16_conformance() {
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {34816, 5120, 233U, Comparison::Sampled, false, kN34816K5120});
 
+    // Flash-Next row-parallel output shards (gdn_out/qsa_out per-rank), T=1 decode route.
+    constexpr std::array kN2560K3072{
+        a16(1), a16(2), a16(4), a16(5), a16(16), a16(17),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {2560, 3072, 291U, Comparison::Sampled, false, kN2560K3072});
+
     constexpr std::array kN5120K6144{
         a16(1),  a16(4),  a16(5),  a16(8),  a16(9),  a16(16), a16(17), a16(24),
         a16(25), a16(32), a16(33), a16(40), a16(41), a16(48), a16(49), a16(128),

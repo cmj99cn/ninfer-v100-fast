@@ -154,6 +154,7 @@ int main() {
             {14336, 5120},  // MTP attention projection
             {34816, 5120},  // MTP MLP gate/up
             {5120, 17408},  // MTP MLP down
+            {2560, 3072},   // Flash-Next row-parallel output shard (gdn_out/qsa_out), T=1 decode
         };
         std::uint32_t seed = 950U;
         for (const auto& shape : shapes) {

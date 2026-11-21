@@ -37,6 +37,7 @@ W8Launch select_w8_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
     const bool flash_next_shard = (k == 2560 && (n == 1024 || n == 3072)) ||
                                   (n == 2560 && k == 3072);
     if (flash_next_shard) {
+        if (t == 1 && n == 2560 && k == 3072) { return launch_w8_k3072_decode; }
         if (t <= 4) { return launch_w8_simt_r8_c4; }
         if (t <= 16) { return launch_w8_simt_r8_c8; }
         return n <= 1024 ? launch_w8_mma_r32_c128 : launch_w8_mma_r64_c128;
@@ -247,7 +248,7 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
 bool w8_launch_needs_volta_fallback(W8Launch launch) noexcept {
     return launch != launch_w8_decode_r4 && launch != launch_w8_small_t &&
            launch != launch_w8_simt_r8_c4 && launch != launch_w8_simt_r8_c8 &&
-           launch != launch_w8_simt_r4_c16;
+           launch != launch_w8_simt_r4_c16 && launch != launch_w8_k3072_decode;
 }
 
 // Band for the fused tensor-core route. Whatever the table above selected, on Volta it resolves
@@ -351,6 +352,11 @@ void w8_f16_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
 #ifdef NINFER_VOLTA_BUILD
     if (x.ne[1] == 1 && w.k == 2560 && w.padded_shape[1] == 2560 && (w.n % 4) == 0) {
         launch_w8_narrow_f16_decode(x, w, out, stream);
+        return;
+    }
+    if (x.ne[1] == 1 && w.k == 3072 && w.padded_shape[1] == 3072 && w.n == 2560 &&
+        w.qtype == QType::W8G32_F16S && w.layout == QuantLayout::RowSplit) {
+        launch_w8_k3072_decode(x, w, out, stream);
         return;
     }
     // The tuned sm_120a tables mix SIMT, MMA, and fused QPN routes; the generic warp-per-row SIMT

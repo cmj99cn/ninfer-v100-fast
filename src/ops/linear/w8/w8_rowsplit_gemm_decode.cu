@@ -69,6 +69,94 @@ __global__ __launch_bounds__(RowsPerCta * 32, 4) void w8_rowsplit_narrow_f16_dec
     acc = warp_reduce_sum(acc);
     if (lane == 0) { out[row] = __float2half_rn(acc); }
 }
+constexpr int kWide3072Hidden        = 3072;
+constexpr int kWide3072Groups        = kWide3072Hidden / 32;
+constexpr int kWide3072ScaleBytesRow = kWide3072Groups * 2;
+constexpr int kWide3072ValuesPerLane = 8;
+constexpr int kWide3072PhaseValues   = 32 * kWide3072ValuesPerLane;
+constexpr int kWide3072PhaseGroups   = kWide3072PhaseValues / 32;
+constexpr int kWide3072Phases        = kWide3072Hidden / kWide3072PhaseValues;
+
+template <class Act>
+struct W8K3072Act;
+
+template <>
+struct W8K3072Act<__nv_bfloat16> {
+    static __device__ __forceinline__ float2 to_float2(std::uint32_t bits) {
+        return bf16x2_bits_to_float2(bits);
+    }
+    static __device__ __forceinline__ __nv_bfloat16 round(float value) {
+        return __float2bfloat16_rn(value);
+    }
+};
+
+template <>
+struct W8K3072Act<__half> {
+    static __device__ __forceinline__ float2 to_float2(std::uint32_t bits) {
+        return __half22float2(*reinterpret_cast<const __half2*>(&bits));
+    }
+    static __device__ __forceinline__ __half round(float value) {
+        return __float2half_rn(value);
+    }
+};
+
+template <int RowsPerCta, class Act>
+__global__ __launch_bounds__(RowsPerCta * 32, 4) void w8_rowsplit_k3072_decode_kernel(
+    const Act* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, Act* __restrict__ out, std::int32_t rows) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int row  = static_cast<int>(blockIdx.x) * RowsPerCta + warp;
+    if (row >= rows) { return; }
+    const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * kWide3072Hidden;
+    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kWide3072ScaleBytesRow;
+
+    float accumulator = 0.0f;
+#pragma unroll
+    for (int phase = 0; phase < kWide3072Phases; ++phase) {
+        unsigned scale_bits = 0;
+        if (lane < kWide3072PhaseGroups) {
+            scale_bits = *reinterpret_cast<const std::uint16_t*>(
+                scale_row + static_cast<std::int64_t>(phase * kWide3072PhaseGroups + lane) * 2);
+        }
+        scale_bits        = __shfl_sync(0xffffffffu, scale_bits, lane >> 2);
+        const float scale = __half2float(__ushort_as_half(scale_bits));
+
+        const int phase_k  = phase * kWide3072PhaseValues + lane * kWide3072ValuesPerLane;
+        const uint2 packed = load_vec<uint2>(code_row + phase_k);
+        float weights[kWide3072ValuesPerLane];
+#pragma unroll
+        for (int word_index = 0; word_index < 2; ++word_index) {
+            const std::uint32_t word = (&packed.x)[word_index];
+            weights[word_index * 4 + 0] =
+                static_cast<float>(static_cast<std::int8_t>(word & 0xffu)) * scale;
+            weights[word_index * 4 + 1] =
+                static_cast<float>(static_cast<std::int8_t>((word >> 8) & 0xffu)) * scale;
+            weights[word_index * 4 + 2] =
+                static_cast<float>(static_cast<std::int8_t>((word >> 16) & 0xffu)) * scale;
+            weights[word_index * 4 + 3] =
+                static_cast<float>(static_cast<std::int8_t>((word >> 24) & 0xffu)) * scale;
+        }
+
+        const uint4 values = load_vec<uint4>(x + phase_k);
+        const float2 x0    = W8K3072Act<Act>::to_float2(values.x);
+        const float2 x1    = W8K3072Act<Act>::to_float2(values.y);
+        const float2 x2    = W8K3072Act<Act>::to_float2(values.z);
+        const float2 x3    = W8K3072Act<Act>::to_float2(values.w);
+        accumulator        = fmaf(weights[0], x0.x, accumulator);
+        accumulator        = fmaf(weights[1], x0.y, accumulator);
+        accumulator        = fmaf(weights[2], x1.x, accumulator);
+        accumulator        = fmaf(weights[3], x1.y, accumulator);
+        accumulator        = fmaf(weights[4], x2.x, accumulator);
+        accumulator        = fmaf(weights[5], x2.y, accumulator);
+        accumulator        = fmaf(weights[6], x3.x, accumulator);
+        accumulator        = fmaf(weights[7], x3.y, accumulator);
+    }
+
+    accumulator = warp_reduce_sum(accumulator);
+    if (lane == 0) { out[row] = W8K3072Act<Act>::round(accumulator); }
+}
+
 constexpr int kGroups        = kHidden / 32;
 constexpr int kValuesPerLane = 8;
 
@@ -149,6 +237,33 @@ void launch_w8_decode_r4(const Tensor& x, const Weight& w, Tensor& out, cudaStre
 void w8_rowsplit_decode_r16_launch(const Tensor& x, const Weight& w, Tensor& out,
                                    cudaStream_t stream) {
     launch_decode<16>(x, w, out, stream);
+}
+
+void launch_w8_k3072_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    constexpr int kRowsPerCta = 4;
+    const std::int32_t group = w.group_size != 0 ? static_cast<std::int32_t>(w.group_size)
+                                                 : w.group;
+    if (x.ne[0] != kWide3072Hidden || x.ne[1] != 1 || x.ne[2] != 1 || x.ne[3] != 1 ||
+        w.n != out.ne[0] || w.k != kWide3072Hidden || w.padded_shape[1] != kWide3072Hidden ||
+        w.qtype != QType::W8G32_F16S || w.layout != QuantLayout::RowSplit || group != 32 ||
+        w.qdata == nullptr || w.scales == nullptr || out.ne[1] != 1 || out.ne[2] != 1 ||
+        out.ne[3] != 1 || !x.is_contiguous() || !out.is_contiguous() || x.dtype != out.dtype ||
+        (x.dtype != DType::BF16 && x.dtype != DType::FP16)) {
+        throw std::invalid_argument(
+            "W8 k3072 decode requires contiguous [n,3072] W8G32_F16S RowSplit and T=1");
+    }
+    const unsigned grid = static_cast<unsigned>(div_up(w.n, kRowsPerCta));
+    if (x.dtype == DType::BF16) {
+        w8_rowsplit_k3072_decode_kernel<kRowsPerCta><<<grid, kRowsPerCta * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+            w.n);
+    } else {
+        w8_rowsplit_k3072_decode_kernel<kRowsPerCta><<<grid, kRowsPerCta * 32, 0, stream>>>(
+            static_cast<const __half*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), static_cast<__half*>(out.data), w.n);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_w8_narrow_f16_decode(const Tensor& x, const Weight& w, Tensor& out,
