@@ -372,11 +372,17 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
                 verify_tokens, [&](TokenId next) { return trunk_->decode(next); });
             const std::uint32_t accepted = flash::accepted_prefix(proposals, predictions);
             std::vector<TokenId> committed = flash::commit_tokens(proposals, predictions);
-            std::vector<TokenId> replay;
-            replay.reserve(accepted + 1);
-            replay.push_back(state.context.next_input);
-            replay.insert(replay.end(), proposals.begin(), proposals.begin() + accepted);
-            mtp_transaction_->commit(replay, [&](TokenId next) { (void)trunk_->decode(next); });
+            // On full acceptance the verified sequence equals the committed sequence token for
+            // token (verify_tokens == replay, both decoded T=1 in order), so the live state is
+            // already the committed state and the rollback+replay pass is redundant. Only a
+            // partial acceptance has to rewind and re-apply the accepted prefix.
+            if (accepted != proposals.size()) {
+                std::vector<TokenId> replay;
+                replay.reserve(accepted + 1);
+                replay.push_back(state.context.next_input);
+                replay.insert(replay.end(), proposals.begin(), proposals.begin() + accepted);
+                mtp_transaction_->commit(replay, [&](TokenId next) { (void)trunk_->decode(next); });
+            }
             mtp_stats_.rounds += 1;
             mtp_stats_.drafted_tokens += drafts;
             mtp_stats_.accepted_tokens += accepted;
