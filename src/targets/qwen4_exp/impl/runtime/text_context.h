@@ -218,6 +218,7 @@ public:
 
     TokenId prefill(std::span<const TokenId> tokens);
     TokenId decode(TokenId token);
+    std::vector<TokenId> decode_span(std::span<const TokenId> tokens);
 
     void set_residual_sink(int rank, void* data, std::size_t bytes) noexcept;
 
@@ -233,7 +234,8 @@ public:
                        const std::array<Tensor, kMaximumDevices>& staging);
 
 private:
-    TokenId forward(std::span<const TokenId> tokens);
+    TokenId forward(std::span<const TokenId> tokens,
+                    std::span<std::int32_t> winner_out = {});
 
     void run_gdn(std::size_t layer, std::int32_t tokens,
                  const std::array<Tensor, kMaximumDevices>& block_input,

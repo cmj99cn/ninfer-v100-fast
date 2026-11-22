@@ -562,6 +562,16 @@ inline TokenId TextTrunk::decode(TokenId token) {
     return forward(std::span<const TokenId>{&token, 1});
 }
 
+inline std::vector<TokenId> TextTrunk::decode_span(std::span<const TokenId> tokens) {
+    std::vector<std::int32_t> winners(tokens.size());
+    forward(tokens, std::span<std::int32_t>{winners});
+    std::vector<TokenId> result(tokens.size());
+    for (std::size_t index = 0; index < winners.size(); ++index) {
+        result[index] = static_cast<TokenId>(winners[index]);
+    }
+    return result;
+}
+
 inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
                                const std::array<Tensor, kMaximumDevices>& block_input,
                                std::array<Tensor, kMaximumDevices>& mixer_out,
@@ -900,7 +910,8 @@ inline void TextTrunk::run_ple(std::int32_t T,
     });
 }
 
-inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
+inline TokenId TextTrunk::forward(std::span<const TokenId> tokens,
+                                  std::span<std::int32_t> winner_out) {
     const std::int32_t T = static_cast<std::int32_t>(tokens.size());
     for_each_rank([&](int rank) {
         NINFER_QWEN4EXP_GRAPH_PREPARE_PLE(rank, *states_[static_cast<std::size_t>(rank)], tokens);
@@ -1221,10 +1232,16 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens) {
 
     NINFER_QWEN4EXP_GRAPH_FINISH_SYNC();
     std::int32_t token = 0;
-    NINFER_QWEN4EXP_GRAPH_WINNER_COPY(NINFER_QWEN4EXP_GRAPH_WINNER_PTR(),
-                                      static_cast<const std::byte*>(winner[0].data) +
-                                          static_cast<std::size_t>(T - 1) * 4,
-                                      4, stream_for(0));
+    if (winner_out.size() >= static_cast<std::size_t>(T)) {
+        NINFER_QWEN4EXP_GRAPH_WINNER_COPY(winner_out.data(), winner[0].data,
+                                          static_cast<std::size_t>(T) * 4, stream_for(0));
+        token = winner_out[static_cast<std::size_t>(T - 1)];
+    } else {
+        NINFER_QWEN4EXP_GRAPH_WINNER_COPY(NINFER_QWEN4EXP_GRAPH_WINNER_PTR(),
+                                          static_cast<const std::byte*>(winner[0].data) +
+                                              static_cast<std::size_t>(T - 1) * 4,
+                                          4, stream_for(0));
+    }
     for (int rank = 0; rank < tp_; ++rank) {
         states_[static_cast<std::size_t>(rank)]->advance_position(static_cast<std::uint32_t>(T));
     }
