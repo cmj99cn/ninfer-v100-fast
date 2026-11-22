@@ -25,9 +25,15 @@ __global__ void conv_f16_kernel(const __half* x, const W* w, const __half* state
     const int c = blockIdx.y * blockDim.x + threadIdx.x;
     if (t >= T || c >= C) return;
     const __half x3 = x[static_cast<std::int64_t>(t) * C + c];
-    const __half x0 = t >= 3 ? x[static_cast<std::int64_t>(t - 3) * C + c] : state[c];
-    const __half x1 = t >= 2 ? x[static_cast<std::int64_t>(t - 2) * C + c] : state[C + c];
-    const __half x2 = t >= 1 ? x[static_cast<std::int64_t>(t - 1) * C + c] : state[2 * C + c];
+    // Tap j reads the concatenated (-3,-2,-1, 0..T-1) stream at position t-3+j; a negative
+    // position maps to old state entry (t+j). The offset by t matters when the incoming state is
+    // non-zero and T>1 (verification windows), where the old T=1 decode only ever used index 0..2.
+    const __half x0 = t >= 3 ? x[static_cast<std::int64_t>(t - 3) * C + c]
+                             : state[static_cast<std::int64_t>(t) * C + c];
+    const __half x1 = t >= 2 ? x[static_cast<std::int64_t>(t - 2) * C + c]
+                             : state[static_cast<std::int64_t>(t + 1) * C + c];
+    const __half x2 = t >= 1 ? x[static_cast<std::int64_t>(t - 1) * C + c]
+                             : state[static_cast<std::int64_t>(t + 2) * C + c];
     float acc = 0.0f;
     acc += load_weight(w + c) * __half2float(x0);
     acc += load_weight(w + C + c) * __half2float(x1);
