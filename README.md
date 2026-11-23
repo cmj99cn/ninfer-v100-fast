@@ -6,6 +6,21 @@
 
 ---
 
+## 分支定位（请先读）
+
+本分支是 **`feat/qwen3-8-flash-next`** Flash-Next 开发分支，基于 main 的 **v0.2.5**
+（27B NVFP4 发布版）。下文保留 main 的 v0.2.5 27B 发布内容，均标注为「main 分支发布状态」；
+**本分支主体是 Flash-Next——仍在开发中的 target，不是发布产品**。
+
+- **模型与术语**：Flash-Next 即 **Qwen3.8-Flash-Next**（Qwen4Exp 系列），亦可写作
+  `qwen3.8-flash-next`；48 层（36 GDN + 12 QSA）、512 routed experts、NVFP4 权重 +
+  FP8 draft bank、TP2、INT8 KV、262144 上下文。
+- **本轮 MTP 结论（诚实记录）**：MTP 尚未超过 base——base no-spec **70.54 tok/s**，
+  MTP draft=1 + 专家画像 **51.78 tok/s**（落后约 **27%**）。**120 tok/s 目标未达成**，
+  不得解读为接近成功。详见「当前进度 → Flash-Next 分支实测」与「速度」节。
+
+---
+
 ## 项目声明（请先读）
 
 1. **本仓库全部代码与文档由 AI 编写生成。** 仓库所有者不具备大模型技术背景，不理解模型算法与推理引擎内部实现。**请不要向所有者提问任何技术问题**——所有者没有能力回答，也没有时间回复。
@@ -16,7 +31,7 @@
 
 ## 发布版本
 
-当前版本：**v0.2.5（2026-11-13）**（首个公开版本 v0.1.0，2026-10-27）。版本说明与已知限制见 [`CHANGELOG.md`](CHANGELOG.md)。
+当前版本：**v0.2.5（2026-11-13）**（首个公开版本 v0.1.0，2026-10-27）。版本说明与已知限制见 [`CHANGELOG.md`](CHANGELOG.md)。v0.2.5 是 **main 分支的发布状态**；本分支 `feat/qwen3-8-flash-next` 在此之上新增 Flash-Next 开发 target（见顶部「分支定位」），不产生新发布版本。
 
 ---
 
@@ -55,6 +70,7 @@ decode/prefill 性能回退（详见“速度”节）。
 | **缓冲命中做到极致** | `--prefix-cache` 内容寻址前缀缓存，多轮对话复用历史 KV，不重复 prefill |
 | **预填充速度做到极致** | 长文档 splitd prefill 内核（174K 上下文实测 +7.5%） |
 | **解码速度做到极致** | MTP 投机解码（`--spec mtp`）+ SM70 INT8 key-split 注意力内核 |
+| **Flash-Next target（开发中，非发布产品）** | Qwen3.8-Flash-Next / Qwen4Exp：48 层（36 GDN + 12 QSA）、512 routed experts、NVFP4 权重 + FP8 draft bank、TP2、INT8 KV、262144 上下文；artifact `/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer`（v3 容器，108 GB，分 4 个 part） |
 
 ---
 
@@ -82,7 +98,10 @@ decode/prefill 性能回退（详见“速度”节）。
 
 ---
 
-## 当前进度（v0.2.5，截至 2026-11-13）
+## 当前进度（main 分支 v0.2.5 发布状态，截至 2026-11-13）
+
+> 本节记录的是 **main 分支的 27B v0.2.5 发布状态**，不是本分支 Flash-Next 的结论。
+> 本分支 Flash-Next 的实测见本节末尾「Flash-Next 分支实测」及「速度」节。
 
 本版本在 v0.1.0 之上完成 FP16 text runtime，修复 BFCL 多轮质量，消除 FP16 路径的
 decode/prefill 回退，修复 FP16 text runtime 下 Vision 请求的 scatter dtype 失败
@@ -95,7 +114,7 @@ host tier 容量公式与分配失败指标；v0.2.4 消除多实例接纳被解
 MTP-3 87/200 = 43.5%**。MTP-3 decode 四点
 （262144 上下文、INT8 KV、FP16-embedding 制品）：**104.7 / 98.9 / 109.6 / 98.1 tok/s**。
 
-**速度与质量优化已基本到达本硬件平台的上限。**
+**速度与质量优化已基本到达本硬件平台的上限（仅为 main 分支 27B v0.2.5 发布版的结论，不适用于本分支开发中的 Flash-Next target）。**
 
 - decode：MTP-3 在四个上下文点为 104.7/98.9/109.6/98.1 tok/s，已达到或超过参考表
   （106.8/99.2/99.7/84.4）；MTP 接受率 52–66%，继续加 draft 或改采样策略的收益已进入平台期。
@@ -106,6 +125,45 @@ MTP-3 87/200 = 43.5%**。MTP-3 decode 四点
 
 剩余项（44%→43% 的边界采样、未测的 DFlash 路径）是边际优化，不是大杠杆；进一步提升需要
 不同硬件或改变产品模型。详见“质量”节的“可优化点”。
+
+### Flash-Next 分支实测（开发中，非发布产品）
+
+本节是 `feat/qwen3-8-flash-next` 分支的新增内容，与上文 main 的 27B 发布数据分开记录。
+Flash-Next 即 **Qwen3.8-Flash-Next**（Qwen4Exp 系列，亦写作 `qwen3.8-flash-next`）：
+48 层（36 GDN + 12 QSA）、512 routed experts、NVFP4 权重 + FP8 draft bank、TP2、INT8 KV、
+262144 上下文。artifact 为
+`/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer`（v3 容器，108 GB，分 4 个 part）。
+
+**实测条件**：2×V100-SXM2-32GB、TP2、`sm_70`、128-token、2 reps、cache 15000 MiB + 专家画像
+（expert profile），0 miss。
+
+| 配置 | 吞吐（tok/s） | acceptance |
+|---|---:|---:|
+| base no-spec | **70.54** | — |
+| MTP draft=1 + expert profile（顺序 T=1 verify） | **51.78** | 0.881 |
+| MTP draft=3 + profile | 42.9 | 0.772 |
+| MTP batch verify（`decode_span` 实验，已回退） | 27.0 | 0.56 |
+
+**结论（诚实记录）**：MTP 目前落后 base 约 **27%**，**120 tok/s 目标未达成**，不得解读为接近成功。
+无 profile 时 MTP 仅 **13.6–14 tok/s**（cache hit 0.85、约 1.5 万次 miss）；专家画像（从 Strata 同模型
+`expert-profile.bin` 转换到 `tools/bench/expert-profile-flash-next.txt`）把 hit 提到 1.0，吞吐从
+14 提到 51.78 tok/s。
+
+**本轮实现（commit `91b45ae5`）**：draft bank 量化常驻（5.03→2.52 GB）、MTP 状态事务 D2D 快照、
+T≤4 cached routed/shared MoE + FP16 small-T GEMM、36 层 GDN replay fold 几何注册、专家画像链路
+（`--expert-cache-profile`）。
+
+**验证**：38/38 测试通过（`ctest -R "flash_next|mtp|moe_nvfp4"`）；NLL greedy 11751、mean_nll 3.732；
+mtp_verify parity、mtp_state bit-exact、MoE T=4 oracle 全绿。
+
+**未达成 / 负结果**：CUDA Graph 对 MTP 无效（51.85 vs 51.78）；GDN replay fold 链路实测 11.36 tok/s，
+低于 14（已回退）；层分 / 并行架构未改（主模型保持 TP2）。
+
+**下一步**：Flash-Next 的 batch verify 需要 bit-exact small-T verify kernel（Strata `verify_kernels.cu`
+方式），尚未实施；greedy 语义下概率 rejection sampling 不可替代 bit-exact（数学上退化为严格比较）。
+
+**社区对比**：1cat-vllm 用 TP2 + vLLM spec 框架，Strata 用层分 PP + 定制 verify kernel，二者 MTP
+均超过 100 tok/s；本分支 TP2 + greedy + 通用 `forward(T)` 尚做不到。
 
 ### 测试参数
 
@@ -138,7 +196,8 @@ MTP-3 87/200 = 43.5%**。MTP-3 decode 四点
 | 系统 | Linux x86_64，无 root 权限环境亦可构建（见安装） |
 | CUDA | 12.8 |
 | 编译器 | GCC 13.3，CMake ≥ 3.28，Ninja |
-| 模型 | 自转换 `qwen3_8_27b_nvfp4_f16embed.ninfer`（NVFP4 + FP16 embedding，18.0 GiB；质量/速度实测用它）与标准 `qwen3_8_27b_nvfp4.ninfer`（16.8 GiB，速度相同）；源 `unsloth/Qwen3.8-27B-NVFP4` |
+| 模型（main v0.2.5 发布） | 自转换 `qwen3_8_27b_nvfp4_f16embed.ninfer`（NVFP4 + FP16 embedding，18.0 GiB；质量/速度实测用它）与标准 `qwen3_8_27b_nvfp4.ninfer`（16.8 GiB，速度相同）；源 `unsloth/Qwen3.8-27B-NVFP4` |
+| Flash-Next 模型（本分支开发中） | `/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer`（Qwen3.8-Flash-Next / Qwen4Exp，NVFP4 + FP8 draft bank，v3 容器，108 GB / 4 part，TP2，INT8 KV，262144 上下文） |
 | 服务参数 | `--tp 2 --devices 0,1 --kv-dtype int8 --max-context 262144` |
 
 ## 测试用例与结果
@@ -146,6 +205,9 @@ MTP-3 87/200 = 43.5%**。MTP-3 decode 四点
 以下全部为**本项目自身实测数据**（2026-10），不与其他引擎或 fork 对比。
 
 ### 速度（TP2，NVFP4，2×V100）
+
+> 以下 27B 数据均为 **main 分支 v0.2.5 发布状态**；本分支 Flash-Next 的实测见本节末尾
+> 「Flash-Next 分支实测速度」，完整实现与验证记录见「当前进度 → Flash-Next 分支实测」。
 
 **Prefill**
 
@@ -172,6 +234,22 @@ MTP 为各点 **2.0–2.7×**，接受率 **52–66%**（2.5–3.0 tok/round）�
 **多轮前缀缓存（`--prefix-cache`）**
 
 15 轮长上下文压力测试（8K tokens 起步、每轮追加代码块至约 39K）：全部成功，server 日志确认持续命中 `reuse=block_snapshot`，末轮缓存命中约 36800 tokens，命中后 prefill 仍保持 1200–1600 tok/s。
+
+#### Flash-Next 分支实测速度（开发中，非发布产品）
+
+条件：2×V100-SXM2-32GB、TP2、`sm_70`、128-token、2 reps、cache 15000 MiB + 专家画像（0 miss）。
+artifact：`/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer`。
+
+| 配置 | 吞吐（tok/s） | acceptance |
+|---|---:|---:|
+| base no-spec | **70.54** | — |
+| MTP draft=1 + expert profile（顺序 T=1 verify） | **51.78** | 0.881 |
+| MTP draft=3 + profile | 42.9 | 0.772 |
+| MTP batch verify（`decode_span` 实验，已回退） | 27.0 | 0.56 |
+
+**MTP 落后 base 约 27%，120 tok/s 目标未达成**（与上表数字一致，不重复计入 main 发布口径）。
+背景与负结果（无 profile 时 13.6–14 tok/s、CUDA Graph 无效、GDN replay fold 回退、下一步与社区对比）
+见「当前进度 → Flash-Next 分支实测」。
 
 ### 质量（BFCL 多轮工具调用，已解决）
 
@@ -470,6 +548,23 @@ A Tesla V100 inference engine based on NInfer: single-process TP2 (TP4 remains a
 
 ---
 
+## Branch Status (read first)
+
+This branch is **`feat/qwen3-8-flash-next`**, a Flash-Next development branch based on main's
+**v0.2.5 (27B NVFP4 release)**. The main v0.2.5 27B release content is retained below and explicitly
+marked as "main branch release status"; **the subject of this branch is Flash-Next—an in-development
+target, not a released product**.
+
+- **Model and terminology**: Flash-Next is **Qwen3.8-Flash-Next** (Qwen4Exp series, also written
+  `qwen3.8-flash-next`): 48 layers (36 GDN + 12 QSA), 512 routed experts, NVFP4 weights + FP8 draft
+  bank, TP2, INT8 KV, 262144 context.
+- **Current MTP result (recorded honestly)**: MTP has not yet beaten base—base no-spec **70.54 tok/s**
+  vs MTP draft=1 + expert profile **51.78 tok/s** (about **27%** slower). The **120 tok/s goal is not
+  met**; this must not be read as close to success. See "Current Status → Flash-Next Branch
+  Measurements" and the "Speed" section.
+
+---
+
 ## Project Statement (read first)
 
 1. **All code and documentation in this repository are generated by AI.** The repository owner has no large-model technical background and does not understand the model algorithms or the internals of the inference engine. **Please do not ask the owner technical questions**—the owner cannot answer them and has no time to reply.
@@ -480,7 +575,7 @@ A Tesla V100 inference engine based on NInfer: single-process TP2 (TP4 remains a
 
 ## Release
 
-Current release: **v0.2.5 (2026-11-13)** (first public release v0.1.0, 2026-10-27). See [`CHANGELOG.md`](CHANGELOG.md) for release notes and known limitations.
+Current release: **v0.2.5 (2026-11-13)** (first public release v0.1.0, 2026-10-27). See [`CHANGELOG.md`](CHANGELOG.md) for release notes and known limitations. v0.2.5 is the **main branch's release status**; this branch, `feat/qwen3-8-flash-next`, adds the in-development Flash-Next target on top of it (see "Branch Status" at the top) and does not produce a new release.
 
 ---
 
@@ -521,6 +616,7 @@ On 2×Tesla V100-SXM2-32GB (NVLink), use **one engine** to satisfy all of the fo
 | **Maximum cache hits** | `--prefix-cache` content-addressed prefix cache reuses historical KV across multi-turn conversations without re-prefill |
 | **Maximum prefill speed** | Long-document splitd prefill kernels (+7.5% measured at 174K context) |
 | **Maximum decode speed** | MTP speculative decoding (`--spec mtp`) + SM70 INT8 key-split attention kernels |
+| **Flash-Next target (in development, not a released product)** | Qwen3.8-Flash-Next / Qwen4Exp: 48 layers (36 GDN + 12 QSA), 512 routed experts, NVFP4 weights + FP8 draft bank, TP2, INT8 KV, 262144 context; artifact `/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer` (v3 container, 108 GB in 4 parts) |
 
 ---
 
@@ -548,7 +644,11 @@ See [`TEMP_WORKAROUNDS.md`](TEMP_WORKAROUNDS.md) for all temporary changes and r
 
 ---
 
-## Current Status (v0.2.5, as of 2026-11-13)
+## Current Status (main branch v0.2.5 release status, as of 2026-11-13)
+
+> This section records the **main branch's 27B v0.2.5 release status**, not a conclusion about this
+> branch's Flash-Next target. Flash-Next measurements are in "Flash-Next Branch Measurements" below
+> and in the "Speed" section.
 
 This version adds the FP16 text runtime on top of v0.1.0, fixes BFCL multi-turn quality,
 removes the FP16 path's decode/prefill regression, fixes the Vision `scatter` dtype
@@ -564,7 +664,7 @@ side by side. BFCL `multi_turn_base`, full 200:
 **no-spec 86/200 = 43.0%, MTP-3 87/200 = 43.5%**. MTP-3 decode at four points (262144 context, INT8 KV, FP16-embedding artifact):
 **104.7 / 98.9 / 109.6 / 98.1 tok/s**.
 
-**Speed and quality optimization has essentially reached this hardware platform's limit.**
+**Speed and quality optimization has essentially reached this hardware platform's limit (a conclusion about the main-branch 27B v0.2.5 release only, not about this branch's in-development Flash-Next target).**
 
 - Decode: MTP-3 is 104.7/98.9/109.6/98.1 tok/s at the four context points, at or above the
   reference table (106.8/99.2/99.7/84.4); MTP acceptance is 52–66%, and further draft or
@@ -577,6 +677,50 @@ side by side. BFCL `multi_turn_base`, full 200:
 The remaining items (the 44% -> 43% borderline sampling and the untested DFlash path) are
 marginal, not large levers; further gains need different hardware or a changed product model.
 See the "optimizable point" note in the Quality section.
+
+### Flash-Next Branch Measurements (in development, not a released product)
+
+This section is new to the `feat/qwen3-8-flash-next` branch and is kept separate from the main 27B
+release data above. Flash-Next is **Qwen3.8-Flash-Next** (Qwen4Exp series, also written
+`qwen3.8-flash-next`): 48 layers (36 GDN + 12 QSA), 512 routed experts, NVFP4 weights + FP8 draft
+bank, TP2, INT8 KV, 262144 context. Artifact:
+`/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer` (v3 container, 108 GB in 4 parts).
+
+**Conditions**: 2×V100-SXM2-32GB, TP2, `sm_70`, 128-token, 2 reps, cache 15000 MiB + expert profile,
+0 miss.
+
+| Configuration | Throughput (tok/s) | acceptance |
+|---|---:|---:|
+| base no-spec | **70.54** | — |
+| MTP draft=1 + expert profile (sequential T=1 verify) | **51.78** | 0.881 |
+| MTP draft=3 + profile | 42.9 | 0.772 |
+| MTP batch verify (`decode_span` experiment, rolled back) | 27.0 | 0.56 |
+
+**Conclusion (recorded honestly)**: MTP is currently about **27%** behind base, and the **120 tok/s
+goal is not met**—this must not be read as close to success. Without a profile, MTP reaches only
+**13.6–14 tok/s** (cache hit 0.85, about 15,000 misses); the expert profile (converted from Strata's
+`expert-profile.bin` for the same model to `tools/bench/expert-profile-flash-next.txt`) raises the hit
+rate to 1.0 and throughput from 14 to 51.78 tok/s.
+
+**This round's implementation (commit `91b45ae5`)**: quantized resident draft bank (5.03→2.52 GB),
+D2D snapshot for the MTP state transaction, T≤4 cached routed/shared MoE + FP16 small-T GEMM,
+geometry registration for the 36-layer GDN replay fold, and the expert-profile path
+(`--expert-cache-profile`).
+
+**Verification**: 38/38 tests pass (`ctest -R "flash_next|mtp|moe_nvfp4"`); greedy NLL 11751, mean_nll
+3.732; mtp_verify parity, mtp_state bit-exact, and MoE T=4 oracle all green.
+
+**Unmet / negative results**: CUDA Graph gives no benefit for MTP (51.85 vs 51.78); the GDN replay
+fold path measured 11.36 tok/s < 14 (rolled back); layer-split / parallel architecture is unchanged
+(the main model stays at TP2).
+
+**Next steps**: Flash-Next batch verify needs a bit-exact small-T verify kernel (Strata
+`verify_kernels.cu` style), not yet implemented; under greedy semantics probabilistic rejection
+sampling cannot replace bit-exact comparison (it mathematically degenerates to strict comparison).
+
+**Community comparison**: 1cat-vllm uses TP2 + the vLLM spec framework, and Strata uses layer-split
+PP + a custom verify kernel; both exceed 100 tok/s with MTP. This branch's TP2 + greedy + generic
+`forward(T)` cannot do so yet.
 
 ### Test Parameters
 
@@ -609,7 +753,8 @@ See the "optimizable point" note in the Quality section.
 | OS | Linux x86_64; buildable without root (see Installation) |
 | CUDA | 12.8 |
 | Compiler | GCC 13.3, CMake ≥ 3.28, Ninja |
-| Model | Self-converted `qwen3_8_27b_nvfp4_f16embed.ninfer` (NVFP4 + FP16 embedding, 18.0 GiB; used for the quality/speed measurements) and the standard `qwen3_8_27b_nvfp4.ninfer` (16.8 GiB, same speed); source `unsloth/Qwen3.8-27B-NVFP4` |
+| Model (main v0.2.5 release) | Self-converted `qwen3_8_27b_nvfp4_f16embed.ninfer` (NVFP4 + FP16 embedding, 18.0 GiB; used for the quality/speed measurements) and the standard `qwen3_8_27b_nvfp4.ninfer` (16.8 GiB, same speed); source `unsloth/Qwen3.8-27B-NVFP4` |
+| Flash-Next model (in development on this branch) | `/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer` (Qwen3.8-Flash-Next / Qwen4Exp, NVFP4 + FP8 draft bank, v3 container, 108 GB / 4 parts, TP2, INT8 KV, 262144 context) |
 | Server flags | `--tp 2 --devices 0,1 --kv-dtype int8 --max-context 262144` |
 
 ## Test Cases and Results
@@ -617,6 +762,10 @@ See the "optimizable point" note in the Quality section.
 All data below are **measured on this project** (October 2026) and are not comparisons against other engines or forks.
 
 ### Speed (TP2, NVFP4, 2×V100)
+
+> The 27B data below are all **main branch v0.2.5 release status**; Flash-Next measurements for this
+> branch are at the end of this section ("Flash-Next Branch Measurements Speed"), with the full
+> implementation and verification record under "Current Status → Flash-Next Branch Measurements".
 
 **Prefill**
 
@@ -644,6 +793,23 @@ increases by about 0.15s (draft initialization). Measured with the f16embed arti
 **Multi-turn prefix cache (`--prefix-cache`)**
 
 15-turn long-context stress test (starting at 8K tokens, appending a code block each turn up to ~39K): all turns succeeded. Server logs confirm continuous `reuse=block_snapshot` hits; the last turn hit ~36800 cached tokens, and prefill still sustained 1200–1600 tok/s after the hit.
+
+#### Flash-Next Branch Measurements Speed (in development, not a released product)
+
+Conditions: 2×V100-SXM2-32GB, TP2, `sm_70`, 128-token, 2 reps, cache 15000 MiB + expert profile
+(0 miss). Artifact: `/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer`.
+
+| Configuration | Throughput (tok/s) | acceptance |
+|---|---:|---:|
+| base no-spec | **70.54** | — |
+| MTP draft=1 + expert profile (sequential T=1 verify) | **51.78** | 0.881 |
+| MTP draft=3 + profile | 42.9 | 0.772 |
+| MTP batch verify (`decode_span` experiment, rolled back) | 27.0 | 0.56 |
+
+**MTP is about 27% behind base; the 120 tok/s goal is not met** (same numbers as the CN table above,
+not counted in the main release figures). For background and negative results (13.6–14 tok/s without a
+profile, CUDA Graph no benefit, GDN replay fold rollback, next steps and community comparison), see
+"Current Status → Flash-Next Branch Measurements".
 
 ### Quality (BFCL multi-turn tool calling, resolved)
 

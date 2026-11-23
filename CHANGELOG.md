@@ -15,6 +15,48 @@ decoding instance. `v0.2.5` (2026-11-13) reports prefix-cache reuse in every
 serving usage payload and fixes the Vision MTP bridge under the FP16 text
 runtime.
 
+## [Unreleased] - feat/qwen3-8-flash-next（开发中）
+
+分支开发条目，基于 v0.2.5；未 bump 版本号、不是 release。Flash-Next 是开发中 target，MTP 优化
+尚未达成 120 tok/s 目标，也未超过 base。
+
+### Added
+
+- 新增 Flash-Next target（开发中）。对应提交 `91b45ae5` "perf(flash-next): optimize MTP with
+  quantized draft, D2D snapshot and expert profile"。
+- draft bank FP8 量化常驻，占用从 5.03GB 降到 2.52GB。
+- 专家画像 `--expert-cache-profile` 接入 bench（画像由 Strata 同模型 `expert-profile.bin` 转换）。
+- MoE/shared T≤4 oracle 测试。
+
+### Changed
+
+- MTP 状态事务从 pageable host 往返改为 device-to-device 异步快照。
+- cached routed/shared MoE 与 FP16 linear 扩展到 T≤4；新增 GDN qkvz T≤4 的 bit-exact
+  decode kernel；注册 36 层 GDN replay fold 几何。
+
+### Performance
+
+评测条件：2×V100 TP2，cache 15000 + expert profile，0 miss，128-token、2 reps。
+
+- base：70.54 tok/s。
+- MTP draft=1 顺序 verify：51.78 tok/s，acceptance 0.881。
+- MTP draft=3：42.9 tok/s。
+- batch verify（实验，已回退）：27.0 tok/s，acceptance 0.56。
+- 无 profile 时 MTP 13.6–14 tok/s；专家画像把 hit 0.85→1.0、吞吐 14→51.78 tok/s。
+- MTP 落后 base 27%，120 tok/s 目标未达成。
+
+### Known limitations
+
+- Flash-Next 与 MTP 优化均为开发中，未作为新版本发布；MTP 未超过 base，120 tok/s 目标未达成。
+- 并行架构未改：主模型保持 TP2。1cat-vllm（TP2）与 Strata（层分 PP）的 MTP 均 >100 tok/s，
+  本分支尚未做到。
+- 负结果与回退：CUDA Graph 对 MTP 无效；GDN replay fold 链路更慢，已回退；batch verify
+  数值不等价（PLE/GDN 状态漂移），已回退到顺序 verify。
+
+### Verification
+
+- 38/38 测试通过；NLL greedy 11751。
+
 ## [0.2.5] - 2026-11-13
 
 ### Added
