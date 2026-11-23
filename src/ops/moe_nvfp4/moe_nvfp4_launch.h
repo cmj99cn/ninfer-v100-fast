@@ -24,6 +24,8 @@ struct MoeNvfp4Scratch {
     float* activation = nullptr;
 };
 
+inline constexpr std::int32_t kMoeMaxSmallT = 4;
+
 struct MoeNvfp4Probe {
     std::int32_t* active_ids   = nullptr;
     std::int32_t* miss_ids     = nullptr;

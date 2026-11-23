@@ -65,6 +65,11 @@ int main(int argc, char** argv) {
             std::cerr << "MTP chain tokens do not match FP64 oracle {220, 27967, 813}\n";
             return 1;
         }
+        if (draft.host_syncs() / steps > 1) {
+            std::cerr << "MTP draft chain performs " << (draft.host_syncs() / steps)
+                      << " host synchronizations per step, expected at most one for the router\n";
+            return 1;
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "MTP chain failed: " << error.what() << "\n";

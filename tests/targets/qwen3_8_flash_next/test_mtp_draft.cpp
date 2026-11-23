@@ -46,9 +46,20 @@ int main(int argc, char** argv) {
                                          {2560, 4});
         flash::MtpDraft draft(artifact, 0);
         const ninfer::TokenId token = draft.run(conditioning_view, 504, 0);
-        std::cout << "mtp draft token " << token << " expert_bytes " << draft.expert_bytes() << "\n";
+        std::cout << "mtp draft token " << token << " expert_bytes " << draft.expert_bytes()
+                  << " host_syncs " << draft.host_syncs() << "\n";
         if (token != 220) {
             std::cerr << "MTP draft token " << token << " does not match oracle 220\n";
+            return 1;
+        }
+        if (draft.expert_bytes() > 2700000000ULL) {
+            std::cerr << "MTP draft expert bank is still materialized in FP16: "
+                      << draft.expert_bytes() << " bytes\n";
+            return 1;
+        }
+        if (draft.host_syncs() > 1) {
+            std::cerr << "MTP draft step performs " << draft.host_syncs()
+                      << " host synchronizations, expected at most one for the router\n";
             return 1;
         }
         return 0;

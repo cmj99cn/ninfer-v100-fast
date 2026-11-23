@@ -152,7 +152,7 @@ void HostPairSource::read_divisors(std::uint32_t layer, std::uint32_t expert,
 
 ExpertCache::ExpertCache(const ExpertCacheOptions& options, std::uint64_t pair_bytes,
                          std::uint64_t available_bytes, HostPairSource& source)
-    : pair_bytes_(pair_bytes), source_(source) {
+    : pair_bytes_(pair_bytes), expert_begin_(options.expert_begin), source_(source) {
     const std::uint64_t budget = available_bytes - options.vram_reserve_bytes;
 
     if (options.capacity_bytes.has_value()) {
@@ -181,6 +181,7 @@ ExpertCache::ExpertCache(const ExpertCacheOptions& options, std::uint64_t pair_b
             "the available device memory holds no resident expert pair");
     }
 
+    access_counts_.assign(static_cast<std::size_t>(kRankPairs), 0);
     slot_of_.assign(static_cast<std::size_t>(kRankPairs), -1);
     resident_.assign(static_cast<std::size_t>(plan_.pairs), {0, 0});
     reference_.assign(static_cast<std::size_t>(plan_.pairs), 0);
@@ -276,7 +277,37 @@ void ExpertCache::seed(const std::filesystem::path& profile) {
 
     for (const auto& entry : entries) {
         if (stats_.residency == static_cast<std::uint32_t>(plan_.pairs)) { break; }
-        place(entry.layer, entry.expert);
+        if (entry.expert < expert_begin_ || entry.expert >= expert_begin_ + kRankExperts) { continue; }
+        place(entry.layer, entry.expert - expert_begin_);
+    }
+}
+
+void ExpertCache::dump_profile(const std::filesystem::path& profile) {
+    struct Entry {
+        std::uint32_t layer;
+        std::uint32_t expert;
+        std::uint64_t count;
+    };
+
+    std::vector<Entry> entries;
+    entries.reserve(static_cast<std::size_t>(kRankPairs));
+    for (std::uint32_t layer = 0; layer < kTextLayers; ++layer) {
+        for (std::uint32_t expert = 0; expert < kRankExperts; ++expert) {
+            const std::uint64_t count = access_counts_[static_cast<std::size_t>(key(layer, expert))];
+            if (count != 0) { entries.push_back({layer, expert, count}); }
+        }
+    }
+
+    std::stable_sort(entries.begin(), entries.end(), [](const Entry& left, const Entry& right) {
+        return left.count > right.count;
+    });
+
+    std::ofstream output(profile);
+    if (!output) {
+        throw std::runtime_error("cannot write the expert cache profile " + profile.string());
+    }
+    for (const auto& entry : entries) {
+        output << entry.layer << ' ' << entry.expert << ' ' << entry.count << '\n';
     }
 }
 
@@ -359,6 +390,7 @@ void ExpertCache::record_resident_lookups(std::uint64_t count) noexcept {
 }
 
 std::optional<std::uint32_t> ExpertCache::find(std::uint32_t layer, std::uint32_t expert) noexcept {
+    ++access_counts_[static_cast<std::size_t>(key(layer, expert))];
     ++stats_.lookups;
     const auto slot = slot_of_[key(layer, expert)];
     if (slot < 0) {

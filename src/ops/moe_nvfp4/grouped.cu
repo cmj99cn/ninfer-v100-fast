@@ -253,10 +253,11 @@ __global__ __launch_bounds__(kMoeDecodeThreads) void moe_nvfp4_cached_gate_up_ke
     float* __restrict__ activation, std::int32_t expert_begin, std::int32_t expert_end,
     MoeNvfp4Probe probe) {
     constexpr int kRows = kMoeDecodeGateUpTile / kMoeDecodeWarps;
-    const int route    = static_cast<int>(blockIdx.x);
-    const int row_base = static_cast<int>(blockIdx.y) * kMoeDecodeGateUpTile;
-    const int warp     = static_cast<int>(threadIdx.x) >> 5;
-    const int lane     = static_cast<int>(threadIdx.x) & 31;
+    const int token     = static_cast<int>(blockIdx.z);
+    const int route_idx = static_cast<int>(blockIdx.x) + token * kMoeTopK;
+    const int row_base  = static_cast<int>(blockIdx.y) * kMoeDecodeGateUpTile;
+    const int warp      = static_cast<int>(threadIdx.x) >> 5;
+    const int lane      = static_cast<int>(threadIdx.x) & 31;
 
     __shared__ float2 decode_lut[256];
     __shared__ float scale_lut[256];
@@ -268,12 +269,12 @@ __global__ __launch_bounds__(kMoeDecodeThreads) void moe_nvfp4_cached_gate_up_ke
     __syncthreads();
 
     if (probe.active_count != nullptr && blockIdx.x == 0 && blockIdx.y == 0 &&
-        threadIdx.x == 0) {
+        blockIdx.z == 0 && threadIdx.x == 0) {
         moe_nvfp4_probe_routes(ids, kMoeTopK, lookup, expert_begin, expert_end, probe.active_ids,
                                probe.miss_ids, probe.active_count, probe.miss_count);
     }
 
-    const std::int32_t global = ids[route];
+    const std::int32_t global = ids[route_idx];
     const std::int32_t slot   = lookup[global];
     if (slot < 0) { return; }
 
@@ -288,10 +289,11 @@ __global__ __launch_bounds__(kMoeDecodeThreads) void moe_nvfp4_cached_gate_up_ke
     float gate[kRows];
     float up[kRows];
     cached_gate_up_rows<A, kRows>(base, base + kMoeGateScale, inverse_gate, base + kMoeUpCode,
-                                  base + kMoeUpScale, inverse_up, rows, x, decode_lut, scale_lut,
-                                  gate, up);
+                                  base + kMoeUpScale, inverse_up, rows,
+                                  x + static_cast<std::size_t>(token) * kMoeHidden, decode_lut,
+                                  scale_lut, gate, up);
     if (lane == 0) {
-        float* activation_column = activation + static_cast<std::size_t>(route) * kMoeIntermediate;
+        float* activation_column = activation + static_cast<std::size_t>(route_idx) * kMoeIntermediate;
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {
             activation_column[rows[r]] = silu(gate[r]) * up[r];
@@ -306,6 +308,7 @@ __global__ __launch_bounds__(kMoeDecodeThreads) void moe_nvfp4_cached_down_kerne
     const std::int32_t* __restrict__ ids, const float* __restrict__ coefficients,
     const float* __restrict__ activation, A* __restrict__ destination) {
     constexpr int kRows = kMoeDecodeDownTile / kMoeDecodeWarps;
+    const int token    = static_cast<int>(blockIdx.y);
     const int row_base = static_cast<int>(blockIdx.x) * kMoeDecodeDownTile;
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
     const int lane     = static_cast<int>(threadIdx.x) & 31;
@@ -326,15 +329,17 @@ __global__ __launch_bounds__(kMoeDecodeThreads) void moe_nvfp4_cached_down_kerne
 #pragma unroll
     for (int r = 0; r < kRows; ++r) accumulator[r] = 0.0F;
 
+    const std::size_t route_base = static_cast<std::size_t>(token) * kMoeTopK;
     for (int route = 0; route < kMoeTopK; ++route) {
-        const std::int32_t global = ids[route];
+        const std::int32_t global = ids[route_base + static_cast<std::size_t>(route)];
         const std::int32_t slot   = lookup[global];
         if (slot < 0) { continue; }
-        const float coefficient = coefficients[route];
+        const float coefficient = coefficients[route_base + static_cast<std::size_t>(route)];
         const std::uint8_t* base = slots + static_cast<std::size_t>(slot) * slot_bytes;
         const float* slot_divisors = divisors + static_cast<std::size_t>(slot) * 3;
         const float inverse_down   = 1.0F / slot_divisors[2];
-        const float* source = activation + static_cast<std::size_t>(route) * kMoeIntermediate;
+        const float* source = activation + (route_base + static_cast<std::size_t>(route)) *
+                                              kMoeIntermediate;
         float value[kRows];
         cached_down_rows<kRows>(base + kMoeDownCode, base + kMoeDownScale, inverse_down, rows,
                                 source, decode_lut, scale_lut, value);
@@ -342,12 +347,13 @@ __global__ __launch_bounds__(kMoeDecodeThreads) void moe_nvfp4_cached_down_kerne
         for (int r = 0; r < kRows; ++r) accumulator[r] += coefficient * value[r];
     }
 
+    A* destination_column = destination + static_cast<std::size_t>(token) * kMoeHidden;
     if (lane == 0) {
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {
             const int row = rows[r];
-            destination[row] = MoeAct<A>::from_float(
-                accumulator[r] + MoeAct<A>::to_float(destination[row]));
+            destination_column[row] = MoeAct<A>::from_float(
+                accumulator[r] + MoeAct<A>::to_float(destination_column[row]));
         }
     }
 }
@@ -378,13 +384,14 @@ void moe_nvfp4_cached_gate_up_launch(const Tensor& x, const std::uint8_t* slots,
                                      const float* divisors, MoeNvfp4Scratch scratch,
                                      const MoeNvfp4RouteOutputs& route,
                                      const MoeNvfp4Probe* probe, cudaStream_t stream) {
-    if (x.ne[1] != 1 || scratch.activation == nullptr || route.ids == nullptr) {
-        throw std::invalid_argument("moe_nvfp4: the cached gate_up path needs a single token");
+    if (x.ne[1] < 1 || x.ne[1] > kMoeMaxSmallT || scratch.activation == nullptr ||
+        route.ids == nullptr) {
+        throw std::invalid_argument("moe_nvfp4: the cached gate_up path needs one to four tokens");
     }
     const MoeNvfp4Probe probe_value = probe != nullptr ? *probe : MoeNvfp4Probe{};
     const std::int32_t expert_begin = probe_value.expert_begin;
     const std::int32_t expert_end   = probe_value.expert_end;
-    const dim3 gate_up_grid(kMoeTopK, kMoeIntermediate / kMoeDecodeGateUpTile);
+    const dim3 gate_up_grid(kMoeTopK, kMoeIntermediate / kMoeDecodeGateUpTile, x.ne[1]);
     if (x.dtype == DType::FP16) {
         moe_nvfp4_cached_gate_up_kernel<__half><<<gate_up_grid, kMoeDecodeThreads, 0, stream>>>(
             static_cast<const __half*>(x.data), slots, slot_bytes, lookup, divisors, route.ids,
@@ -402,10 +409,11 @@ void moe_nvfp4_cached_down_launch(const std::uint8_t* slots, std::uint64_t slot_
                                   const std::int32_t* lookup, const float* divisors,
                                   MoeNvfp4Scratch scratch, const MoeNvfp4RouteOutputs& route,
                                   Tensor& destination, cudaStream_t stream) {
-    if (destination.ne[1] != 1 || scratch.activation == nullptr || route.ids == nullptr) {
-        throw std::invalid_argument("moe_nvfp4: the cached down path needs a single token");
+    if (destination.ne[1] < 1 || destination.ne[1] > kMoeMaxSmallT ||
+        scratch.activation == nullptr || route.ids == nullptr) {
+        throw std::invalid_argument("moe_nvfp4: the cached down path needs one to four tokens");
     }
-    const dim3 down_grid(kMoeHidden / kMoeDecodeDownTile);
+    const dim3 down_grid(kMoeHidden / kMoeDecodeDownTile, destination.ne[1]);
     if (destination.dtype == DType::FP16) {
         moe_nvfp4_cached_down_kernel<__half><<<down_grid, kMoeDecodeThreads, 0, stream>>>(
             slots, slot_bytes, lookup, divisors, route.ids, route.coefficients, scratch.activation,
@@ -424,7 +432,7 @@ void moe_nvfp4_cached_launch(const Tensor& x, const std::uint8_t* slots,
                              MoeNvfp4Scratch scratch, const MoeNvfp4RouteOutputs& route,
                              Tensor& destination, cudaStream_t stream) {
     (void)slot_count;
-    if (x.ne[1] == 1 && scratch.activation != nullptr) {
+    if (x.ne[1] >= 1 && x.ne[1] <= kMoeMaxSmallT && scratch.activation != nullptr) {
         moe_nvfp4_cached_gate_up_launch(x, slots, slot_bytes, lookup, divisors, scratch, route,
                                         nullptr, stream);
         moe_nvfp4_cached_down_launch(slots, slot_bytes, lookup, divisors, scratch, route,

@@ -51,6 +51,7 @@ struct ExpertCacheOptions {
     std::optional<std::uint64_t> capacity_bytes;   // nullopt selects the auto plan
     std::uint64_t vram_reserve_bytes               = 0;
     std::optional<std::filesystem::path> profile;
+    std::uint32_t expert_begin = 0;   // first global expert id owned by this rank
 };
 
 struct CacheStats {
@@ -111,6 +112,7 @@ public:
     void note_prefetch_result(bool used) noexcept;
 
     void seed_profile(const std::filesystem::path& profile) { seed(profile); }
+    void dump_profile(const std::filesystem::path& profile);
     void freeze() noexcept { frozen_ = true; }
     [[nodiscard]] bool frozen() const noexcept { return frozen_; }
     [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> resident_pair(std::uint32_t slot) const noexcept {
@@ -131,8 +133,10 @@ private:
     void seed(const std::filesystem::path& profile);
 
     std::uint64_t pair_bytes_;
+    std::uint32_t expert_begin_ = 0;
     ExpertCachePlan plan_;
     HostPairSource& source_;
+    std::vector<std::uint64_t> access_counts_;
     std::vector<std::int32_t> slot_of_;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> resident_;
     std::vector<std::uint8_t> reference_;

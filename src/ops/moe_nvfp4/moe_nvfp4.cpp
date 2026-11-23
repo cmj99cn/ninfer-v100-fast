@@ -308,8 +308,9 @@ void moe_routed_nvfp4_cached(const Tensor& x, const MoeNvfp4ExpertSlots& experts
         !aligned_to(experts.divisors, 16)) {
         throw std::invalid_argument("moe_nvfp4: invalid resident expert slots");
     }
-    if (tokens == 1 && scratch.activation != nullptr && !aligned_to(scratch.activation, 16)) {
-        throw std::invalid_argument("moe_nvfp4: the single-token slot bank needs an aligned "
+    if (tokens <= detail::kMoeMaxSmallT && scratch.activation != nullptr &&
+        !aligned_to(scratch.activation, 16)) {
+        throw std::invalid_argument("moe_nvfp4: the small-token slot bank needs an aligned "
                                     "activation scratch");
     }
 
@@ -326,16 +327,17 @@ void moe_routed_nvfp4_cached(const Tensor& x, const MoeNvfp4ExpertSlots& experts
     ranges.push_back(address_range(experts.divisors,
                                    static_cast<std::size_t>(experts.slot_count) * 3 * 4,
                                    "expert divisors"));
-    if (tokens == 1 && scratch.activation != nullptr) {
+    if (tokens <= detail::kMoeMaxSmallT && scratch.activation != nullptr) {
         ranges.push_back(address_range(
             scratch.activation,
-            static_cast<std::size_t>(kTopK) * kIntermediate * sizeof(float),
+            static_cast<std::size_t>(tokens) * kTopK * kIntermediate * sizeof(float),
             "activation scratch"));
     }
     require_disjoint(ranges);
 
     const detail::MoeNvfp4RouteOutputs outputs = route_outputs(route);
-    const detail::MoeNvfp4Scratch scratch_planes{tokens == 1 ? scratch.activation : nullptr};
+    const detail::MoeNvfp4Scratch scratch_planes{
+        tokens <= detail::kMoeMaxSmallT ? scratch.activation : nullptr};
     detail::moe_nvfp4_cached_launch(x, experts.payload, experts.slot_bytes, experts.slot_count,
                                     experts.lookup, experts.divisors, scratch_planes, outputs,
                                     destination, stream);
@@ -346,9 +348,9 @@ void moe_shared_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights,
                       Tensor& destination, cudaStream_t stream) {
     const std::int32_t tokens = require_tokens(x, "x");
     require_destination(destination, x.dtype, tokens);
-    const bool parallel = tokens == 1 && scratch.activation != nullptr;
+    const bool parallel = tokens <= detail::kMoeMaxSmallT && scratch.activation != nullptr;
     if (parallel && !aligned_to(scratch.activation, 16)) {
-        throw std::invalid_argument("moe_nvfp4: the single-token shared expert needs an aligned "
+        throw std::invalid_argument("moe_nvfp4: the small-token shared expert needs an aligned "
                                     "activation scratch");
     }
 
@@ -362,7 +364,7 @@ void moe_shared_nvfp4(const Tensor& x, const MoeNvfp4Weights& weights,
     if (parallel) {
         ranges.push_back(address_range(
             scratch.activation,
-            static_cast<std::size_t>(kTopK) * kIntermediate * sizeof(float),
+            static_cast<std::size_t>(tokens) * kIntermediate * sizeof(float),
             "activation scratch"));
     }
     require_disjoint(ranges);

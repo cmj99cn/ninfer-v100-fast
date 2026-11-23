@@ -6,6 +6,8 @@
 
 namespace ninfer::ops::detail {
 
+inline constexpr std::int32_t kMaxQkvzDecodeTokens = 4;
+
 void w8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                 cudaStream_t stream);
 void w8_gdn_input_decode_conv_snapshot_launch(

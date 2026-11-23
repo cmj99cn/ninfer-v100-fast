@@ -32,6 +32,8 @@ struct Fp16VoltaMmaSchedule {
     static constexpr int kRowsPerCta = kWarps * 8;
     static constexpr int kThreads    = kWarps * 32;
     static constexpr bool kSingleRowA = false;
+    static constexpr int kMaxTokens  = kTTile;
+    static constexpr int kMinBlocksPerSm = 8;
 };
 
 struct Fp16VoltaMmaDecodeSchedule {
@@ -42,18 +44,34 @@ struct Fp16VoltaMmaDecodeSchedule {
     static constexpr int kRowsPerCta = kWarps * 8;
     static constexpr int kThreads    = kWarps * 32;
     static constexpr bool kSingleRowA = true;
+    static constexpr int kMaxTokens  = 1;
+    static constexpr int kMinBlocksPerSm = 8;
+};
+
+struct Fp16VoltaMmaSmallTSchedule {
+    static constexpr int kWarps      = 1;
+    static constexpr int kKStep      = 256;
+    static constexpr int kTTile      = 32;
+    static constexpr int kXPad       = 8;
+    static constexpr int kRowsPerCta = kWarps * 8;
+    static constexpr int kThreads    = kWarps * 32;
+    static constexpr bool kSingleRowA = false;
+    static constexpr int kMaxTokens  = 8;
+    static constexpr int kMinBlocksPerSm = 2;
 };
 
 template <class A, class S = Fp16VoltaMmaSchedule>
-__global__ __launch_bounds__(S::kThreads, 8) void fp16_volta_mma_gemm_kernel(
+__global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void fp16_volta_mma_gemm_kernel(
     const __half* __restrict__ w, const A* __restrict__ x,
     A* __restrict__ out, int out_ld, int n, int k, int t) {
-    constexpr int kVecs   = S::kKStep / 8;   // uint4 (8 half) per row per tile
-    constexpr int kChunks = S::kKStep / 32;  // 32-element weight staging groups per iteration
-    constexpr int kXRows = S::kSingleRowA ? 1 : S::kTTile;
+    constexpr int kVecs      = S::kKStep / 8;   // uint4 (8 half) per row per tile
+    constexpr int kChunks    = S::kKStep / 32;  // 32-element weight staging groups per iteration
+    constexpr int kXRows     = S::kSingleRowA ? 1 : S::kTTile;
+    constexpr int kXSlots    = (S::kSingleRowA ? 1 : S::kMaxTokens) * kVecs;
+    constexpr int kXCarriers = kXSlots / S::kThreads;
     static_assert(S::kKStep % 32 == 0);
     static_assert(S::kKStep / 8 <= S::kThreads);
-    static_assert((S::kSingleRowA ? 1 : S::kTTile) * (S::kKStep / 8) <= S::kThreads);
+    static_assert(kXSlots <= S::kThreads * kXCarriers);
     static_assert(S::kSingleRowA || S::kTTile >= 32);
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -70,8 +88,8 @@ __global__ __launch_bounds__(S::kThreads, 8) void fp16_volta_mma_gemm_kernel(
     // elements run past the end of K is loaded as zeros: that both avoids an out-of-row read and
     // zero-pads the shared tail of the final partial tile.
     struct Carry {
-        uint4 xraw;
-        bool xactive;
+        uint4 xraw[kXCarriers];
+        bool xactive[kXCarriers];
         uint4 wraw[kChunks];
         bool wactive;
     };
@@ -81,15 +99,19 @@ __global__ __launch_bounds__(S::kThreads, 8) void fp16_volta_mma_gemm_kernel(
         const int nvalid = min(S::kKStep, k - kbase);
         const int index  = static_cast<int>(threadIdx.x);
         const int xslots = S::kSingleRowA ? kVecs : tcnt * kVecs;
-        carry.xactive    = index < xslots;
-        if (carry.xactive) {
-            const int row = index / kVecs;
-            const int v   = index % kVecs;
-            if (v * 8 + 8 <= nvalid) {
-                carry.xraw = *reinterpret_cast<const uint4*>(
-                    x + static_cast<std::int64_t>(t0 + row) * k + kbase + v * 8);
-            } else {
-                carry.xraw = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+        for (int item = 0; item < kXCarriers; ++item) {
+            const int slot      = index + item * S::kThreads;
+            carry.xactive[item] = slot < xslots;
+            if (carry.xactive[item]) {
+                const int row = slot / kVecs;
+                const int v   = slot % kVecs;
+                if (v * 8 + 8 <= nvalid) {
+                    carry.xraw[item] = *reinterpret_cast<const uint4*>(
+                        x + static_cast<std::int64_t>(t0 + row) * k + kbase + v * 8);
+                } else {
+                    carry.xraw[item] = make_uint4(0u, 0u, 0u, 0u);
+                }
             }
         }
         const int row     = n0 + (lane >> 2);
@@ -109,17 +131,22 @@ __global__ __launch_bounds__(S::kThreads, 8) void fp16_volta_mma_gemm_kernel(
     };
 
     auto commit = [&](const Carry& r, int buf) {
-        if (r.xactive) {
-            const int index = static_cast<int>(threadIdx.x);
-            if constexpr (std::is_same_v<A, __nv_bfloat16>) {
-                const auto* src = reinterpret_cast<const __nv_bfloat16*>(&r.xraw);
-                __half tmp[8];
 #pragma unroll
-                for (int j = 0; j < 8; ++j) { tmp[j] = __float2half(__bfloat162float(src[j])); }
-                *reinterpret_cast<uint4*>(&x_sh[buf][index / kVecs][(index % kVecs) * 8]) =
-                    *reinterpret_cast<const uint4*>(tmp);
-            } else {
-                *reinterpret_cast<uint4*>(&x_sh[buf][index / kVecs][(index % kVecs) * 8]) = r.xraw;
+        for (int item = 0; item < kXCarriers; ++item) {
+            if (r.xactive[item]) {
+                const int slot = static_cast<int>(threadIdx.x) + item * S::kThreads;
+                const int row  = slot / kVecs;
+                const int v    = slot % kVecs;
+                if constexpr (std::is_same_v<A, __nv_bfloat16>) {
+                    const auto* src = reinterpret_cast<const __nv_bfloat16*>(&r.xraw[item]);
+                    __half tmp[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) { tmp[j] = __float2half(__bfloat162float(src[j])); }
+                    *reinterpret_cast<uint4*>(&x_sh[buf][row][v * 8]) =
+                        *reinterpret_cast<const uint4*>(tmp);
+                } else {
+                    *reinterpret_cast<uint4*>(&x_sh[buf][row][v * 8]) = r.xraw[item];
+                }
             }
         }
         if (r.wactive) {

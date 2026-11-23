@@ -47,6 +47,7 @@ struct Options {
     std::string spec            = "none";
     std::uint32_t draft_tokens  = 0;
     std::vector<TokenId> target_tokens;
+    std::string expert_cache_profile;
 };
 
 void require(bool condition, const std::string& message) {
@@ -131,6 +132,8 @@ Options parse_options(int argc, char** argv) {
             options.draft_tokens = static_cast<std::uint32_t>(std::stoul(next()));
         } else if (arg == "--target-tokens") {
             options.target_tokens = parse_ids(next());
+        } else if (arg == "--expert-cache-profile") {
+            options.expert_cache_profile = next();
         } else {
             throw std::invalid_argument("unknown argument " + arg);
         }
@@ -160,6 +163,7 @@ EngineOptions engine_options(const Options& options) {
     engine.prefill_chunk    = options.prefill_chunk;
     engine.use_cuda_graph   = options.graph;
     engine.expert_cache_mib = options.expert_cache_mib;
+    engine.expert_cache_profile = options.expert_cache_profile;
     if (options.spec == "mtp") {
         engine.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
         engine.speculative.draft_tokens = options.draft_tokens;

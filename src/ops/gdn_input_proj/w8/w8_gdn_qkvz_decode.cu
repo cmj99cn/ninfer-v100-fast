@@ -16,14 +16,15 @@ namespace ninfer::ops::detail {
 namespace {
 
 // Flash-Next GDN qkvz W8G32_F16S GEMV, one launch for the whole per-rank parent.
-//   x is [2560, 1] (decode, BF16 or FP16). The parent is [8192, 2560] RowSplit W8 with
-//   FP16 scales, stored row-major per plane: code row 2560 B, scale row 160 B.
-//   Row blocks map to the four projections by output row counts:
-//   [0, q_rows) -> query, [q_rows, q_rows+k_rows) -> key,
-//   then value, then z. Each output is an independent [rows, 1] tensor of the x dtype.
-//   K=2560, group=32. One warp owns one row; fp32 FMA into a per-lane
-//   accumulator, warp-shuffle reduction, round-to-nearest store.
-//   No workspace: the reduction lives in registers.
+//   x is [2560, T] with T in [1,4] (decode/verify, BF16 or FP16). The parent is
+//   [8192, 2560] RowSplit W8 with FP16 scales, stored row-major per plane:
+//   code row 2560 B, scale row 160 B. Row blocks map to the four projections
+//   by output row counts: [0, q_rows) -> query, [q_rows, q_rows+k_rows) -> key,
+//   then value, then z. Each output is an independent [rows, T] tensor of the x
+//   dtype. Each token is an independent slice with the same warp/row mapping
+//   and FP32 accumulation order as T=1. K=2560, group=32. One warp owns one row;
+//   fp32 FMA into a per-lane accumulator, warp-shuffle reduction,
+//   round-to-nearest store. No workspace: the reduction lives in registers.
 
 constexpr int kK              = 2560;
 constexpr int kGroup          = 32;
@@ -69,6 +70,7 @@ struct Segments {
     std::int32_t q_rows;
     std::int32_t k_rows;
     std::int32_t v_rows;
+    std::int32_t z_rows;
 };
 
 template <class Act>
@@ -89,9 +91,10 @@ struct GdnQkvzOutputs {
 template <class Act>
 __device__ __forceinline__ void gdn_gating_row(const Act* __restrict__ x,
                                                const __nv_bfloat16* __restrict__ control,
-                                               const float* __restrict__ a_log,
-                                               const float* __restrict__ dt_bias, float* __restrict__ g,
-                                               float* __restrict__ beta, int control_row, int lane) {
+                                                const float* __restrict__ a_log,
+                                                const float* __restrict__ dt_bias, float* __restrict__ g,
+                                                float* __restrict__ beta, int token, int control_row,
+                                                int lane) {
     const int head   = control_row < kGdnHeads ? control_row : control_row - kGdnHeads;
     const bool is_b  = control_row >= kGdnHeads;
     const auto* wrow = control + static_cast<std::int64_t>(control_row) * kK;
@@ -100,18 +103,19 @@ __device__ __forceinline__ void gdn_gating_row(const Act* __restrict__ x,
     // with k = lane, lane+32, ..., then the same shfl_down warp reduction. The
     // control parent is read directly instead of through shared memory; the BF16
     // operand bits and the epilogue formula are unchanged.
-    float accumulator = 0.0f;
+    const Act* token_x = x + token * kK;
+    float accumulator  = 0.0f;
     for (int k = lane; k < kK; k += 32) {
         const float weight = __bfloat162float(wrow[k]);
-        const float value  = DecodeAct<Act>::to_float(x[k]);
+        const float value  = DecodeAct<Act>::to_float(token_x[k]);
         accumulator        = fmaf(weight, value, accumulator);
     }
     accumulator = warp_reduce_sum(accumulator);
     if (lane != 0) { return; }
     if (is_b) {
-        beta[head] = sigmoid(accumulator);
+        beta[token * kGdnHeads + head] = sigmoid(accumulator);
     } else {
-        g[head] = -expf(a_log[head]) * softplus(accumulator + dt_bias[head]);
+        g[token * kGdnHeads + head] = -expf(a_log[head]) * softplus(accumulator + dt_bias[head]);
     }
 }
 
@@ -121,15 +125,17 @@ __global__ __launch_bounds__(kRowsPerCta * 32, 4) void w8_gdn_qkvz_decode_kernel
     const std::uint8_t* __restrict__ scales, GdnQkvzOutputs<Act> output) {
     const int lane     = static_cast<int>(threadIdx.x) & 31;
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
+    const int token    = static_cast<int>(blockIdx.y);
     const int cta_row0 = static_cast<int>(blockIdx.x) * kRowsPerCta;
     const int row      = cta_row0 + warp;
 
     if (row >= output.qkvz_rows) {
         gdn_gating_row(x, output.control, output.a_log, output.dt_bias, output.g, output.beta,
-                       row - output.qkvz_rows, lane);
+                       token, row - output.qkvz_rows, lane);
         return;
     }
 
+    const Act* token_x            = x + token * kK;
     const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * kK;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kScaleBytesRow;
 
@@ -160,7 +166,7 @@ __global__ __launch_bounds__(kRowsPerCta * 32, 4) void w8_gdn_qkvz_decode_kernel
                 static_cast<float>(static_cast<std::int8_t>((word >> 24) & 0xffu)) * scale;
         }
 
-        const uint4 values = load_vec<uint4>(x + phase_k);
+        const uint4 values = load_vec<uint4>(token_x + phase_k);
         const float2 x0    = DecodeAct<Act>::to_float2(values.x);
         const float2 x1    = DecodeAct<Act>::to_float2(values.y);
         const float2 x2    = DecodeAct<Act>::to_float2(values.z);
@@ -180,13 +186,13 @@ __global__ __launch_bounds__(kRowsPerCta * 32, 4) void w8_gdn_qkvz_decode_kernel
     const Act projected      = DecodeAct<Act>::round(accumulator);
     const Segments& s        = output.segments;
     if (row < s.q_rows) {
-        output.query[row] = projected;
+        output.query[token * s.q_rows + row] = projected;
     } else if (row < s.k_end) {
-        output.key[row - s.q_rows] = projected;
+        output.key[token * s.k_rows + (row - s.q_rows)] = projected;
     } else if (row < s.v_end) {
-        output.value[row - s.k_end] = projected;
+        output.value[token * s.v_rows + (row - s.k_end)] = projected;
     } else {
-        output.z[row - s.v_end] = projected;
+        output.z[token * s.z_rows + (row - s.v_end)] = projected;
     }
 }
 
@@ -199,13 +205,16 @@ void validate_launch_inputs(const Tensor& x, const Weight& weight, const Tensor&
     const std::int32_t v_rows = value.ne[0];
     const std::int32_t z_rows = z.ne[0];
     const std::int64_t total  = static_cast<std::int64_t>(q_rows) + k_rows + v_rows + z_rows;
+    const std::int32_t tokens = x.ne[1];
     const std::int32_t group = weight.group_size != 0 ? static_cast<std::int32_t>(weight.group_size)
                                                       : weight.group;
     if (x.dtype != DType::BF16 && x.dtype != DType::FP16) {
-        throw std::invalid_argument("w8_gdn_qkvz_decode: x must be BF16 or FP16 [2560, 1]");
+        throw std::invalid_argument("w8_gdn_qkvz_decode: x must be BF16 or FP16 [2560, T]");
     }
-    if (!x.is_contiguous() || x.ne[0] != kK || x.ne[1] != 1 || x.ne[2] != 1 || x.ne[3] != 1) {
-        throw std::invalid_argument("w8_gdn_qkvz_decode: x must be contiguous [2560, 1]");
+    if (!x.is_contiguous() || x.ne[0] != kK || tokens < 1 || tokens > kMaxQkvzDecodeTokens ||
+        x.ne[2] != 1 || x.ne[3] != 1) {
+        throw std::invalid_argument(
+            "w8_gdn_qkvz_decode: x must be contiguous [2560, T] with T in [1,4]");
     }
     if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         group != kGroup || weight.k != kK || weight.n != total || weight.qdata == nullptr ||
@@ -214,10 +223,10 @@ void validate_launch_inputs(const Tensor& x, const Weight& weight, const Tensor&
             "w8_gdn_qkvz_decode: parent must be RowSplit W8G32_F16S [rows, 2560] with scales");
     }
     for (const Tensor* output : {&query, &key, &value, &z}) {
-        if (output->dtype != x.dtype || !output->is_contiguous() || output->ne[1] != 1 ||
+        if (output->dtype != x.dtype || !output->is_contiguous() || output->ne[1] != tokens ||
             output->ne[2] != 1 || output->ne[3] != 1 || output->data == nullptr) {
             throw std::invalid_argument(
-                "w8_gdn_qkvz_decode: outputs must be contiguous x-dtype [rows, 1]");
+                "w8_gdn_qkvz_decode: outputs must be contiguous x-dtype [rows, T]");
         }
     }
     if (control.qtype != QType::BF16_CTRL || control.layout != QuantLayout::Contiguous ||
@@ -235,11 +244,11 @@ void validate_launch_inputs(const Tensor& x, const Weight& weight, const Tensor&
         }
     }
     for (const Tensor* output : {&g, &beta}) {
-        if (output->dtype != DType::FP32 || output->ne[0] != kGdnHeads || output->ne[1] != 1 ||
-            output->ne[2] != 1 || output->ne[3] != 1 || !output->is_contiguous() ||
-            output->data == nullptr) {
+        if (output->dtype != DType::FP32 || output->ne[0] != kGdnHeads ||
+            output->ne[1] != tokens || output->ne[2] != 1 || output->ne[3] != 1 ||
+            !output->is_contiguous() || output->data == nullptr) {
             throw std::invalid_argument(
-                "w8_gdn_qkvz_decode: g and beta must be contiguous FP32 [48, 1]");
+                "w8_gdn_qkvz_decode: g and beta must be contiguous FP32 [48, T]");
         }
     }
 }
@@ -252,6 +261,7 @@ void launch_typed(const Tensor& x, const Weight& weight, Tensor& query, Tensor& 
     segments.q_rows = query.ne[0];
     segments.k_rows = key.ne[0];
     segments.v_rows = value.ne[0];
+    segments.z_rows = z.ne[0];
     segments.k_end  = segments.q_rows + segments.k_rows;
     segments.v_end  = segments.k_end + segments.v_rows;
     const GdnQkvzOutputs<Act> output{
@@ -260,8 +270,9 @@ void launch_typed(const Tensor& x, const Weight& weight, Tensor& query, Tensor& 
         static_cast<const __nv_bfloat16*>(control.qdata), static_cast<const float*>(a_log.data),
         static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
         static_cast<float*>(beta.data), weight.n};
-    const int grid = (weight.n + kControlRows) / kRowsPerCta;
-    w8_gdn_qkvz_decode_kernel<Act><<<grid, kRowsPerCta * 32, 0, stream>>>(
+    const int grid   = (weight.n + kControlRows) / kRowsPerCta;
+    const int tokens = x.ne[1];
+    w8_gdn_qkvz_decode_kernel<Act><<<dim3(grid, tokens), kRowsPerCta * 32, 0, stream>>>(
         static_cast<const Act*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), output);
     CUDA_CHECK(cudaGetLastError());

@@ -528,6 +528,11 @@ using FoldGeometry48x24Tp2 = FoldGeometry<48, 8, 24, 5120>;
 // FoldGeometry48x24Tp2, one per tensor-parallel width that halves/quarters the geometry.
 using FoldGeometry48x12Tp4 = FoldGeometry<48, 4, 12, 2560>;
 
+// Flash-Next (qwen4_exp) has 48 layers, of which 12 are QSA (layer % 4 == 3) and 36 are GDN.
+// Its GDN state pool is indexed by those 36 layers; at tp == 2 each rank owns half the heads and
+// conv channels of the 16|48, 10240-channel geometry. Group size 48/16 == 24/8 == 3 is preserved.
+using FoldGeometry36x24Tp2 = FoldGeometry<36, 8, 24, 5120>;
+
 // Every registered fold geometry, in one place, so `launch_replay_fold`'s dispatch chain is
 // generated rather than hand-written: a newly registered geometry must not be left behind in a
 // hand-written switch.
@@ -535,7 +540,8 @@ using FoldGeometry48x12Tp4 = FoldGeometry<48, 4, 12, 2560>;
     X(FoldGeometry48x48)                                                                           \
     X(FoldGeometry30x32)                                                                           \
     X(FoldGeometry48x24Tp2)                                                                        \
-    X(FoldGeometry48x12Tp4)
+    X(FoldGeometry48x12Tp4)                                                                        \
+    X(FoldGeometry36x24Tp2)
 
 template <class Geometry, class Act>
 struct FoldAccess {

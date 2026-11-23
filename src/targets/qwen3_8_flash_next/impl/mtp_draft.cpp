@@ -13,6 +13,7 @@
 #include "targets/qwen3_8_flash_next/impl/load/bindings.h"
 #include "targets/qwen3_8_flash_next/impl/load/mtp_bindings.h"
 #include "targets/qwen3_8_flash_next/impl/leaves.h"
+#include "targets/qwen3_8_flash_next/impl/mtp_draft_kernels.h"
 #include "targets/qwen3_8_flash_next/impl/variant.h"
 
 #include <cuda_bf16.h>
@@ -27,6 +28,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -43,6 +45,9 @@ namespace family = ninfer::targets::qwen4_exp::detail::flash_next_runtime;
 using ninfer::targets::qwen4_exp::detail::kTextActivationDtype;
 using mtp::MtpPlan;
 using mtp::bind_mtp_artifact;
+
+static_assert(kTextActivationDtype == DType::FP16,
+              "MTP draft kernels assume FP16 text activations");
 
 constexpr std::int32_t kHidden = TextConfig::hidden;
 constexpr std::int32_t kStreams = TextConfig::hc_streams;
@@ -74,20 +79,25 @@ inline float bf16_to_float(std::uint16_t word) {
     return __bfloat162float(value);
 }
 
-inline float e4m3_to_float(std::uint8_t code) {
-    const float sign = (code & 0x80U) != 0 ? -1.0F : 1.0F;
-    const std::uint8_t exponent = (code >> 3) & 0x0FU;
-    const std::uint8_t fraction = code & 0x07U;
-    if (exponent == 0) {
-        if (fraction == 0) { return sign * 0.0F; }
-        return sign * static_cast<float>(fraction) * (1.0F / 512.0F);
-    }
-    if (exponent == 0x0FU && fraction == 0x07U) { return sign * std::numeric_limits<float>::quiet_NaN(); }
-    return sign * (1.0F + static_cast<float>(fraction) / 8.0F) *
-           std::ldexp(1.0F, static_cast<int>(exponent) - 7);
-}
-
 inline std::size_t align256(std::size_t value) { return (value + 255U) / 256U * 256U; }
+
+struct BankLayout {
+    std::size_t code_bytes   = 0;
+    std::size_t scale_offset = 0;
+    std::size_t scale_bytes  = 0;
+    std::size_t blocks       = 0;
+    std::size_t total_bytes  = 0;
+};
+
+inline BankLayout bank_layout(std::size_t matrices, std::size_t rows, std::size_t columns) {
+    BankLayout layout;
+    layout.code_bytes   = matrices * rows * columns;
+    layout.scale_offset = align256(layout.code_bytes);
+    layout.blocks       = (rows / 128U) * (columns / 128U);
+    layout.scale_bytes  = matrices * layout.blocks * sizeof(std::uint16_t);
+    layout.total_bytes  = layout.scale_offset + layout.scale_bytes;
+    return layout;
+}
 
 struct WeightLoader {
     artifact::Reader& reader;
@@ -187,39 +197,19 @@ Weight fp16_weight_from_host(void* data, std::int32_t rows, std::int32_t columns
     return weight;
 }
 
-void decode_bank_experts(artifact::Reader& reader, const BoundParameter& bank,
-                         DeviceBuffer& destination) {
+BankLayout store_bank(artifact::Reader& reader, const BoundParameter& bank,
+                      DeviceBuffer& destination) {
     const ExpertLibrary& library = bank.library.value();
     const auto span = reader.payload(library.object);
-    const std::size_t matrices = static_cast<std::size_t>(library.matrices);
-    const std::size_t rows = static_cast<std::size_t>(library.rows);
-    const std::size_t columns = static_cast<std::size_t>(library.columns);
-    const std::size_t code_bytes = matrices * rows * columns;
-    const std::size_t scale_offset = align256(code_bytes);
-    const std::size_t row_blocks = rows / 128;
-    const std::size_t column_blocks = columns / 128;
-    const std::size_t blocks = row_blocks * column_blocks;
-    if (span.data.size() < scale_offset + matrices * blocks * 2) {
+    const BankLayout layout = bank_layout(static_cast<std::size_t>(library.matrices),
+                                          static_cast<std::size_t>(library.rows),
+                                          static_cast<std::size_t>(library.columns));
+    if (span.data.size() < layout.total_bytes) {
         throw std::runtime_error("MTP expert bank payload is truncated");
     }
-    const auto* codes = span.data.data();
-    const auto* scales = reinterpret_cast<const std::uint16_t*>(span.data.data() + scale_offset);
-    std::vector<std::uint16_t> decoded(matrices * rows * columns);
-    for (std::size_t matrix = 0; matrix < matrices; ++matrix) {
-        for (std::size_t row = 0; row < rows; ++row) {
-            for (std::size_t column = 0; column < columns; ++column) {
-                const float code = e4m3_to_float(
-                    static_cast<std::uint8_t>(codes[matrix * rows * columns + row * columns + column]));
-                const std::uint16_t scale_word =
-                    scales[matrix * blocks + (row / 128) * column_blocks + column / 128];
-                const float value = code * bf16_to_float(scale_word);
-                __half half = __float2half_rn(value);
-                std::memcpy(&decoded[(matrix * rows + row) * columns + column], &half, sizeof(half));
-            }
-        }
-    }
-    destination = DeviceBuffer(decoded.size() * 2);
-    destination.copy_from_host(decoded.data(), decoded.size() * 2);
+    destination = DeviceBuffer(layout.total_bytes);
+    destination.copy_from_host(span.data.data(), layout.total_bytes);
+    return layout;
 }
 
 void no_op_ple_fetch(void*, const ops::PleRowAddress*, std::size_t, std::byte*) {}
@@ -301,7 +291,8 @@ struct MtpDraft::Impl {
         pre_hidden_norm = loader.vector(mtp.pre_fc_hidden_norm, {kResidual});
         fc_embedding = loader.matrix(mtp.fc_embedding, kHidden, kHidden);
         fc_hidden = loader.matrix(mtp.fc_hidden, kHidden, kHidden);
-        embedding_table = loader.matrix(mtp.token_embedding, kVocab, kHidden);
+        embedding_words = loader.words(mtp.token_embedding, static_cast<std::size_t>(kVocab),
+                                       static_cast<std::size_t>(kHidden));
         output_head = loader.matrix(mtp.output_head, kVocab, kHidden);
 
         const MoePlan& moe = mtp.layer.moe;
@@ -333,9 +324,13 @@ struct MtpDraft::Impl {
                                           2 * kShared, kHidden);
         shared_down = loader.matrix(moe.shared_down, kHidden, kShared);
 
-        decode_bank_experts(reader, moe.routed_gate, gate_bank);
-        decode_bank_experts(reader, moe.routed_down, down_bank);
+        gate_layout = store_bank(reader, moe.routed_gate, gate_bank);
+        down_layout = store_bank(reader, moe.routed_down, down_bank);
         expert_bytes = gate_bank.bytes + down_bank.bytes;
+
+        gate_fp16 = DeviceBuffer(static_cast<std::size_t>(2 * kIntermediate) * kHidden * 2);
+        down_fp16 = DeviceBuffer(static_cast<std::size_t>(kHidden) * kIntermediate * 2);
+        total = DeviceBuffer(static_cast<std::size_t>(kHidden) * sizeof(float));
 
         model.layers[0].attention_projection = attention_projection;
         model.ple.rows = qwen4_exp::PleRowSource{
@@ -377,14 +372,6 @@ struct MtpDraft::Impl {
         };
     }
 
-    Weight expert_weight(DeviceBuffer& bank, std::int32_t expert, std::int32_t row_offset,
-                         std::int32_t rows, std::int32_t columns) {
-        const std::size_t bank_rows = bank.bytes / (static_cast<std::size_t>(kExperts) * columns * 2);
-        const std::byte* base = static_cast<const std::byte*>(bank.p) +
-                                (static_cast<std::size_t>(expert) * bank_rows + row_offset) * columns * 2;
-        return fp16_weight_from_host(const_cast<std::byte*>(base), rows, columns);
-    }
-
     TokenId run(const Tensor& conditioning, TokenId next_token, std::int32_t position,
                 Tensor* chained_hidden) {
         CUDA_CHECK(cudaSetDevice(device_context.device));
@@ -393,12 +380,19 @@ struct MtpDraft::Impl {
         cudaStream_t stream = device_context.stream;
 
         const std::int32_t tokens = 1;
-        Tensor ids = activation.alloc(DType::I32, {tokens});
-        const std::int32_t token_host = next_token;
-        CUDA_CHECK(cudaMemcpyAsync(ids.data, &token_host, sizeof(token_host), cudaMemcpyHostToDevice,
-                                   stream));
+        const std::int32_t token = static_cast<std::int32_t>(next_token);
+        if (token < 0 || token >= kVocab) {
+            throw std::runtime_error("MTP draft token is outside the vocabulary");
+        }
         Tensor embedding = activation.alloc(kTextActivationDtype, {kHidden, tokens});
-        ops::embedding(ids, embedding_table, embedding, stream);
+        std::vector<std::uint16_t> embedding_row(static_cast<std::size_t>(kHidden));
+        const std::uint16_t* embedding_source =
+            embedding_words.data() + static_cast<std::size_t>(token) * kHidden;
+        for (std::int32_t index = 0; index < kHidden; ++index) {
+            embedding_row[static_cast<std::size_t>(index)] = bf16_to_fp16(embedding_source[index]);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(embedding.data, embedding_row.data(), embedding_row.size() * 2,
+                                   cudaMemcpyHostToDevice, stream));
         Tensor normalized_embedding = activation.alloc(kTextActivationDtype, {kHidden, tokens});
         ops::rmsnorm(embedding, pre_embedding_norm, kEpsilon, true, normalized_embedding, stream);
         Tensor projected_embedding = activation.alloc(kTextActivationDtype, {kHidden, tokens});
@@ -543,90 +537,58 @@ struct MtpDraft::Impl {
 
         Tensor shared_projection = activation.alloc(kTextActivationDtype, {2 * kShared, 1});
         ops::linear(x, shared_up, shared_projection, ops::LinearPolicy::A16Only, workspace, stream);
-        std::vector<__half> projection_host(2 * kShared);
-        CUDA_CHECK(cudaMemcpyAsync(projection_host.data(), shared_projection.data,
-                                   projection_host.size() * sizeof(__half),
-                                   cudaMemcpyDeviceToHost, stream));
-        ++host_syncs;
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        std::vector<std::uint16_t> activated(kShared);
-        for (std::int32_t index = 0; index < kShared; ++index) {
-            const float gate = __half2float(projection_host[static_cast<std::size_t>(index)]);
-            const float up = __half2float(projection_host[static_cast<std::size_t>(kShared + index)]);
-            const float value = (gate / (1.0F + std::exp(-gate))) * up;
-            __half rounded = __float2half_rn(value);
-            std::memcpy(&activated[static_cast<std::size_t>(index)], &rounded, sizeof(rounded));
-        }
         Tensor shared_activation = activation.alloc(kTextActivationDtype, {kShared, 1});
-        CUDA_CHECK(cudaMemcpyAsync(shared_activation.data, activated.data(),
-                                   activated.size() * 2, cudaMemcpyHostToDevice, stream));
+        mtp_silu_mul_f16(shared_projection.data, shared_activation.data, kShared, stream);
         Tensor shared_output = activation.alloc(kTextActivationDtype, {kHidden, 1});
         ops::linear(shared_activation, shared_down, shared_output, ops::LinearPolicy::A16Only,
                     workspace, stream);
-        std::vector<__half> shared_host(kHidden);
-        CUDA_CHECK(cudaMemcpyAsync(shared_host.data(), shared_output.data,
-                                   shared_host.size() * sizeof(__half), cudaMemcpyDeviceToHost, stream));
-        ++host_syncs;
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        std::vector<float> total(kHidden, 0.0F);
-        for (std::int32_t index = 0; index < kHidden; ++index) {
-            total[static_cast<std::size_t>(index)] =
-                shared * __half2float(shared_host[static_cast<std::size_t>(index)]);
-        }
+        CUDA_CHECK(cudaMemsetAsync(total.p, 0, static_cast<std::size_t>(kHidden) * sizeof(float),
+                                   stream));
+        mtp_scale_add_f16(shared_output.data, shared, static_cast<float*>(total.p), kHidden, stream);
 
         Tensor gate_up = activation.alloc(kTextActivationDtype, {2 * kIntermediate, 1});
         Tensor expert_activation = activation.alloc(kTextActivationDtype, {kIntermediate, 1});
         Tensor expert_output = activation.alloc(kTextActivationDtype, {kHidden, 1});
-        std::vector<std::uint16_t> expert_activated(kIntermediate);
-        std::vector<__half> expert_projection(2 * kIntermediate);
-        std::vector<__half> expert_result(kHidden);
         for (std::int32_t index = 0; index < kTopK; ++index) {
             const std::int32_t expert = selected[static_cast<std::size_t>(index)];
-            const Weight gate = expert_weight(gate_bank, expert, 0, kIntermediate, kHidden);
-            const Weight up = expert_weight(gate_bank, expert, kIntermediate, kIntermediate, kHidden);
+            const std::size_t gate_code_offset =
+                static_cast<std::size_t>(expert) * (2 * kIntermediate) * kHidden;
+            const std::size_t gate_scale_offset =
+                static_cast<std::size_t>(expert) * gate_layout.blocks;
+            mtp_decode_fp8_block128(
+                static_cast<const std::uint8_t*>(gate_bank.p) + gate_code_offset,
+                reinterpret_cast<const std::uint16_t*>(
+                    static_cast<const std::uint8_t*>(gate_bank.p) + gate_layout.scale_offset) +
+                    gate_scale_offset,
+                2 * kIntermediate, kHidden, gate_fp16.p, stream);
+            const Weight gate = fp16_weight_from_host(gate_fp16.p, kIntermediate, kHidden);
+            const Weight up = fp16_weight_from_host(
+                static_cast<std::byte*>(gate_fp16.p) +
+                    static_cast<std::size_t>(kIntermediate) * kHidden * 2,
+                kIntermediate, kHidden);
             Tensor gate_part = gate_up.slice(0, 0, kIntermediate);
             Tensor up_part = gate_up.slice(0, kIntermediate, kIntermediate);
             ops::linear(x, gate, gate_part, ops::LinearPolicy::A16Only, workspace, stream);
             ops::linear(x, up, up_part, ops::LinearPolicy::A16Only, workspace, stream);
-            CUDA_CHECK(cudaMemcpyAsync(expert_projection.data(), gate_up.data,
-                                       expert_projection.size() * sizeof(__half),
-                                       cudaMemcpyDeviceToHost, stream));
-            ++host_syncs;
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            for (std::int32_t row = 0; row < kIntermediate; ++row) {
-                const float gate_value = __half2float(expert_projection[static_cast<std::size_t>(row)]);
-                const float up_value =
-                    __half2float(expert_projection[static_cast<std::size_t>(kIntermediate + row)]);
-                const float value = (gate_value / (1.0F + std::exp(-gate_value))) * up_value;
-                __half rounded = __float2half_rn(value);
-                std::memcpy(&expert_activated[static_cast<std::size_t>(row)], &rounded, sizeof(rounded));
-            }
-            CUDA_CHECK(cudaMemcpyAsync(expert_activation.data, expert_activated.data(),
-                                       expert_activated.size() * 2, cudaMemcpyHostToDevice, stream));
-            const Weight down = expert_weight(down_bank, expert, 0, kHidden, kIntermediate);
+            mtp_silu_mul_f16(gate_up.data, expert_activation.data, kIntermediate, stream);
+
+            const std::size_t down_code_offset =
+                static_cast<std::size_t>(expert) * kHidden * kIntermediate;
+            const std::size_t down_scale_offset =
+                static_cast<std::size_t>(expert) * down_layout.blocks;
+            mtp_decode_fp8_block128(
+                static_cast<const std::uint8_t*>(down_bank.p) + down_code_offset,
+                reinterpret_cast<const std::uint16_t*>(
+                    static_cast<const std::uint8_t*>(down_bank.p) + down_layout.scale_offset) +
+                    down_scale_offset,
+                kHidden, kIntermediate, down_fp16.p, stream);
+            const Weight down = fp16_weight_from_host(down_fp16.p, kHidden, kIntermediate);
             ops::linear(expert_activation, down, expert_output, ops::LinearPolicy::A16Only,
                         workspace, stream);
-            CUDA_CHECK(cudaMemcpyAsync(expert_result.data(), expert_output.data,
-                                       expert_result.size() * sizeof(__half),
-                                       cudaMemcpyDeviceToHost, stream));
-            ++host_syncs;
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            const float coefficient = selected_scores[static_cast<std::size_t>(index)];
-            for (std::int32_t row = 0; row < kHidden; ++row) {
-                total[static_cast<std::size_t>(row)] +=
-                    coefficient * __half2float(expert_result[static_cast<std::size_t>(row)]);
-            }
+            mtp_scale_add_f16(expert_output.data, selected_scores[static_cast<std::size_t>(index)],
+                              static_cast<float*>(total.p), kHidden, stream);
         }
-        std::vector<std::uint16_t> rounded(kHidden);
-        for (std::int32_t row = 0; row < kHidden; ++row) {
-            __half value = __float2half_rn(total[static_cast<std::size_t>(row)]);
-            std::memcpy(&rounded[static_cast<std::size_t>(row)], &value, sizeof(value));
-        }
-        CUDA_CHECK(cudaMemcpyAsync(destination.data, rounded.data(), rounded.size() * 2,
-                                   cudaMemcpyHostToDevice, stream));
-        ++host_syncs;
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        mtp_round_f16(static_cast<const float*>(total.p), destination.data, kHidden, stream);
     }
 
     artifact::Reader reader;
@@ -648,13 +610,18 @@ struct MtpDraft::Impl {
     Tensor pre_hidden_norm{};
     Weight fc_embedding{};
     Weight fc_hidden{};
-    Weight embedding_table{};
+    std::vector<std::uint16_t> embedding_words;
     Weight output_head{};
     Weight control{};
     Weight shared_up{};
     Weight shared_down{};
     DeviceBuffer gate_bank{};
     DeviceBuffer down_bank{};
+    BankLayout gate_layout{};
+    BankLayout down_layout{};
+    DeviceBuffer gate_fp16{};
+    DeviceBuffer down_fp16{};
+    DeviceBuffer total{};
     std::uint64_t expert_bytes = 0;
     std::uint64_t host_syncs = 0;
 };

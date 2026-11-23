@@ -15,6 +15,13 @@
 namespace ninfer::targets::qwen3_8_flash_next::detail {
 namespace {
 
+ExpertCacheOptions with_expert_begin(const ExpertCacheOptions& options, std::uint32_t expert_begin) {
+    ExpertCacheOptions result = options;
+    result.expert_begin        = expert_begin;
+    return result;
+}
+
+
 class ScopedDevice {
 public:
     explicit ScopedDevice(int device) {
@@ -40,12 +47,13 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
                              std::uint64_t available_bytes, qwen4_exp::TextResidentStats* stats)
     : device_(device), expert_begin_(expert_begin), stats_(stats),
       source_(artifact_path, kPairBytes),
-      cache_(options, kPairBytes, available_bytes, source_) {
+      cache_(with_expert_begin(options, expert_begin), kPairBytes, available_bytes, source_) {
     const ScopedDevice scope(device_);
     slab_    = DeviceBuffer(static_cast<std::size_t>(cache_.plan().bytes));
     lookup_  = DeviceBuffer(kLookupEntries * 4);
     divisors_ = DeviceBuffer(static_cast<std::size_t>(cache_.slots()) * 3 * 4);
     activation_scratch_ = DeviceBuffer(
+        static_cast<std::size_t>(ops::detail::kMoeMaxSmallT) *
         static_cast<std::size_t>(kTopK) *
         static_cast<std::size_t>(TextConfig::expert_intermediate) * sizeof(float));
     rollback_ = DeviceBuffer(static_cast<std::size_t>(TextConfig::hidden) * sizeof(std::uint16_t));

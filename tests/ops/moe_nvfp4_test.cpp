@@ -1034,6 +1034,214 @@ int run_shared_bitwise_case(const MoeNvfp4Weights& full_weights,
     return failures;
 }
 
+int run_shared_small_t_case(const direct_bf16_weight::HostWeight& parent,
+                            const direct_bf16_weight::HostWeight& shared_down,
+                            const MoeNvfp4Weights& full_weights,
+                            const std::vector<std::vector<float>>& activation_values, DType dtype,
+                            const std::string& label) {
+    const bool fp16 = dtype == DType::FP16;
+    const ReductionCriterion criterion = fp16 ? kF16DestinationCriterion : kDestinationCriterion;
+    int failures = 0;
+    const auto run_tokens = [&](std::int32_t tokens) {
+        const std::string case_label = label + " T=" + std::to_string(tokens);
+        std::vector<std::uint16_t> activation_words(static_cast<std::size_t>(tokens) * kHidden);
+        std::vector<std::uint16_t> residual_words(static_cast<std::size_t>(tokens) * kHidden);
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            std::vector<std::uint16_t> token_activation;
+            std::vector<std::uint16_t> token_residual;
+            build_token_words(activation_values[static_cast<std::size_t>(token)], dtype,
+                              token_activation, token_residual);
+            std::copy(token_activation.begin(), token_activation.end(),
+                      activation_words.begin() + static_cast<std::ptrdiff_t>(token) * kHidden);
+            std::copy(token_residual.begin(), token_residual.end(),
+                      residual_words.begin() + static_cast<std::ptrdiff_t>(token) * kHidden);
+        }
+
+        DeviceBuffer device_x = to_device(activation_words);
+        GuardedDeviceBuffer ids_buffer(static_cast<std::size_t>(tokens) * kTopK * sizeof(std::int32_t));
+        GuardedDeviceBuffer coefficients_buffer(static_cast<std::size_t>(tokens) * kTopK * sizeof(float));
+        GuardedDeviceBuffer shared_gate_buffer(static_cast<std::size_t>(tokens) * sizeof(float));
+        Tensor x{device_x.p, dtype, {kHidden, tokens}};
+        Tensor ids{ids_buffer.data(), DType::I32, {kTopK, tokens}};
+        Tensor coefficients{coefficients_buffer.data(), DType::FP32, {kTopK, tokens}};
+        Tensor shared_gate{shared_gate_buffer.data(), DType::FP32, {tokens}};
+        ops::moe_nvfp4_route(x, full_weights, ids, coefficients, shared_gate, 0);
+        cuda_synchronize();
+
+        const MoeNvfp4RouteView route{ids, coefficients, shared_gate};
+        DeviceBuffer scratch(static_cast<std::size_t>(tokens) * kIntermediate * sizeof(float));
+        const MoeNvfp4ExpertScratch scratch_view{static_cast<float*>(scratch.p)};
+
+        const std::size_t destination_bytes =
+            static_cast<std::size_t>(tokens) * kHidden * sizeof(std::uint16_t);
+        GuardedDeviceBuffer parallel(destination_bytes);
+        GuardedDeviceBuffer serial(destination_bytes);
+        parallel.copy_from_host(residual_words.data(), destination_bytes);
+        serial.copy_from_host(residual_words.data(), destination_bytes);
+        Tensor parallel_destination{parallel.data(), dtype, {kHidden, tokens}};
+        Tensor serial_destination{serial.data(), dtype, {kHidden, tokens}};
+
+        ops::moe_shared_nvfp4(x, full_weights, scratch_view, route, parallel_destination, 0);
+        ops::moe_shared_nvfp4(x, full_weights, MoeNvfp4ExpertScratch{}, route, serial_destination, 0);
+        cuda_synchronize();
+
+        const std::vector<double> gates =
+            read_f32(shared_gate_buffer.data(), static_cast<std::size_t>(tokens));
+        const std::vector<std::uint16_t> got_parallel =
+            from_device<std::uint16_t>(parallel.data(), static_cast<std::size_t>(tokens) * kHidden);
+        const std::vector<std::uint16_t> got_serial =
+            from_device<std::uint16_t>(serial.data(), static_cast<std::size_t>(tokens) * kHidden);
+
+        std::vector<double> expected(static_cast<std::size_t>(tokens) * kHidden, 0.0);
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            std::vector<float> oracle_activation(kHidden);
+            for (std::int32_t row = 0; row < kHidden; ++row) {
+                const std::size_t index =
+                    static_cast<std::size_t>(token) * kHidden + static_cast<std::size_t>(row);
+                const std::uint16_t word = activation_words[index];
+                oracle_activation[static_cast<std::size_t>(row)] =
+                    fp16 ? f16_to_f32(word) : bf16_to_f32(word);
+                expected[index] =
+                    fp16 ? f16_to_f32(residual_words[index]) : bf16_to_f32(residual_words[index]);
+            }
+            const std::vector<double> shared = shared_contribution(
+                parent, shared_down, oracle_activation, gates[static_cast<std::size_t>(token)]);
+            for (std::int32_t row = 0; row < kHidden; ++row) {
+                expected[static_cast<std::size_t>(token) * kHidden + static_cast<std::size_t>(row)] +=
+                    shared[static_cast<std::size_t>(row)];
+            }
+        }
+
+        std::vector<double> parallel_values(expected.size());
+        std::vector<double> serial_values(expected.size());
+        for (std::size_t index = 0; index < expected.size(); ++index) {
+            parallel_values[index] =
+                fp16 ? f16_to_f32(got_parallel[index]) : bf16_to_f32(got_parallel[index]);
+            serial_values[index] =
+                fp16 ? f16_to_f32(got_serial[index]) : bf16_to_f32(got_serial[index]);
+        }
+
+        if (changed_rows(got_serial, residual_words) <
+            static_cast<std::size_t>(tokens) * kHidden / 2U) {
+            std::cerr << case_label << ": the shared fixture produced almost no contribution\n";
+            ++failures;
+        }
+        failures += verify_reduction(case_label + " parallel", parallel_values, expected, criterion);
+        failures += verify_reduction(case_label + " serial", serial_values, expected, criterion);
+        failures += parallel.verify_guards(case_label + " parallel guard");
+        failures += serial.verify_guards(case_label + " serial guard");
+    };
+    run_tokens(2);
+    run_tokens(4);
+    return failures;
+}
+
+int run_cached_small_t_case(const BatchedFixture& gate_up, const BatchedFixture& down,
+                            const MoeNvfp4Weights& full_weights,
+                            const std::vector<std::vector<float>>& activation_values, DType dtype,
+                            const std::string& label) {
+    const std::int32_t tokens = static_cast<std::int32_t>(activation_values.size());
+    const bool fp16 = dtype == DType::FP16;
+    std::vector<std::uint16_t> activation_words(static_cast<std::size_t>(tokens) * kHidden);
+    std::vector<std::uint16_t> residual_words(static_cast<std::size_t>(tokens) * kHidden);
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        std::vector<std::uint16_t> token_activation;
+        std::vector<std::uint16_t> token_residual;
+        build_token_words(activation_values[static_cast<std::size_t>(token)], dtype,
+                          token_activation, token_residual);
+        std::copy(token_activation.begin(), token_activation.end(),
+                  activation_words.begin() + static_cast<std::ptrdiff_t>(token) * kHidden);
+        std::copy(token_residual.begin(), token_residual.end(),
+                  residual_words.begin() + static_cast<std::ptrdiff_t>(token) * kHidden);
+    }
+
+    DeviceBuffer device_x = to_device(activation_words);
+    GuardedDeviceBuffer ids_buffer(static_cast<std::size_t>(tokens) * kTopK * sizeof(std::int32_t));
+    GuardedDeviceBuffer coefficients_buffer(static_cast<std::size_t>(tokens) * kTopK * sizeof(float));
+    GuardedDeviceBuffer shared_gate_buffer(static_cast<std::size_t>(tokens) * sizeof(float));
+    Tensor x{device_x.p, dtype, {kHidden, tokens}};
+    Tensor ids{ids_buffer.data(), DType::I32, {kTopK, tokens}};
+    Tensor coefficients{coefficients_buffer.data(), DType::FP32, {kTopK, tokens}};
+    Tensor shared_gate{shared_gate_buffer.data(), DType::FP32, {tokens}};
+    ops::moe_nvfp4_route(x, full_weights, ids, coefficients, shared_gate, 0);
+    cuda_synchronize();
+
+    const MoeNvfp4RouteView route{ids, coefficients, shared_gate};
+    const std::vector<std::int32_t> selected =
+        from_device<std::int32_t>(ids_buffer.data(), static_cast<std::size_t>(tokens) * kTopK);
+    const SlotBank slots = make_slot_bank(gate_up, down, selected);
+
+    DeviceBuffer slot_payload   = to_device(slots.payload);
+    DeviceBuffer slot_divisors  = to_device(slots.divisors);
+    DeviceBuffer slot_lookup    = to_device(slots.lookup);
+    const std::size_t slot_bytes = slots.payload.size() / static_cast<std::size_t>(slots.slots);
+    const MoeNvfp4ExpertSlots bank{
+        .payload    = static_cast<const std::uint8_t*>(slot_payload.p),
+        .slot_bytes = slot_bytes,
+        .slot_count = slots.slots,
+        .lookup     = static_cast<const std::int32_t*>(slot_lookup.p),
+        .divisors   = static_cast<const float*>(slot_divisors.p),
+    };
+    DeviceBuffer scratch(static_cast<std::size_t>(tokens) * kTopK * kIntermediate * sizeof(float));
+    const MoeNvfp4ExpertScratch scratch_view{static_cast<float*>(scratch.p)};
+
+    const std::size_t destination_bytes =
+        static_cast<std::size_t>(tokens) * kHidden * sizeof(std::uint16_t);
+    GuardedDeviceBuffer parallel(destination_bytes);
+    GuardedDeviceBuffer serial(destination_bytes);
+    parallel.copy_from_host(residual_words.data(), destination_bytes);
+    serial.copy_from_host(residual_words.data(), destination_bytes);
+    Tensor parallel_destination{parallel.data(), dtype, {kHidden, tokens}};
+    Tensor serial_destination{serial.data(), dtype, {kHidden, tokens}};
+
+    ops::moe_routed_nvfp4_cached(x, bank, scratch_view, route, parallel_destination, 0);
+    ops::moe_routed_nvfp4_cached(x, bank, MoeNvfp4ExpertScratch{}, route, serial_destination, 0);
+    cuda_synchronize();
+
+    const std::vector<std::int32_t> route_ids =
+        from_device<std::int32_t>(ids_buffer.data(), static_cast<std::size_t>(tokens) * kTopK);
+    const std::vector<double> route_coefficients =
+        read_f32(coefficients_buffer.data(), static_cast<std::size_t>(tokens) * kTopK);
+    const std::vector<std::uint16_t> got_parallel =
+        from_device<std::uint16_t>(parallel.data(), static_cast<std::size_t>(tokens) * kHidden);
+    const std::vector<std::uint16_t> got_serial =
+        from_device<std::uint16_t>(serial.data(), static_cast<std::size_t>(tokens) * kHidden);
+
+    std::vector<double> expected(static_cast<std::size_t>(tokens) * kHidden, 0.0);
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        for (std::int32_t row = 0; row < kHidden; ++row) {
+            const std::uint16_t word = residual_words[static_cast<std::size_t>(token) * kHidden + row];
+            expected[static_cast<std::size_t>(token) * kHidden + row] =
+                fp16 ? f16_to_f32(word) : bf16_to_f32(word);
+        }
+        for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+            const std::int32_t expert = route_ids[static_cast<std::size_t>(token) * kTopK + rank];
+            const std::vector<double> contribution = expert_contribution(
+                gate_up, down, expert, activation_values[static_cast<std::size_t>(token)],
+                route_coefficients[static_cast<std::size_t>(token) * kTopK + rank]);
+            for (std::int32_t row = 0; row < kHidden; ++row) {
+                expected[static_cast<std::size_t>(token) * kHidden + row] +=
+                    contribution[static_cast<std::size_t>(row)];
+            }
+        }
+    }
+
+    const ReductionCriterion criterion =
+        fp16 ? kF16DestinationCriterion : kDestinationCriterion;
+    std::vector<double> parallel_values(expected.size());
+    std::vector<double> serial_values(expected.size());
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        parallel_values[index] = fp16 ? f16_to_f32(got_parallel[index]) : bf16_to_f32(got_parallel[index]);
+        serial_values[index] = fp16 ? f16_to_f32(got_serial[index]) : bf16_to_f32(got_serial[index]);
+    }
+    int failures = 0;
+    failures += verify_reduction(label + " parallel", parallel_values, expected, criterion);
+    failures += verify_reduction(label + " serial", serial_values, expected, criterion);
+    failures += parallel.verify_guards(label + " parallel guard");
+    failures += serial.verify_guards(label + " serial guard");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1432,10 +1640,22 @@ int main() {
                                         inputs.activation[1], DType::BF16, "moe_nvfp4 cached bf16");
     failures += run_cached_oracle_case(gate_up_f16, down_f16, weights_f16,
                                         inputs.activation[2], DType::FP16, "moe_nvfp4 cached f16");
+    const std::vector<std::vector<float>> small_t_activations{
+        inputs.activation[0], inputs.activation[1], inputs.activation[2], inputs.activation[3]};
+    failures += run_cached_small_t_case(inputs.gate_up, inputs.down, weights, small_t_activations,
+                                        DType::BF16, "moe_nvfp4 cached small-t bf16");
+    failures += run_cached_small_t_case(gate_up_f16, down_f16, weights_f16, small_t_activations,
+                                        DType::FP16, "moe_nvfp4 cached small-t f16");
     failures += run_shared_bitwise_case(weights, inputs.activation[1], DType::BF16,
                                         "moe_nvfp4 shared bf16");
     failures += run_shared_bitwise_case(weights_f16, inputs.activation[2], DType::FP16,
                                         "moe_nvfp4 shared f16");
+    failures += run_shared_small_t_case(inputs.parent, inputs.shared_down, weights,
+                                        small_t_activations, DType::BF16,
+                                        "moe_nvfp4 shared small-t bf16");
+    failures += run_shared_small_t_case(inputs.parent, inputs.shared_down, weights_f16,
+                                        small_t_activations, DType::FP16,
+                                        "moe_nvfp4 shared small-t f16");
     failures += run_probe_cases();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " moe_nvfp4 correctness\n";

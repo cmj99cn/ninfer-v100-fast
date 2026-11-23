@@ -93,9 +93,10 @@ void GdnProjectionLeaf::project(const Tensor& hidden, const GdnProjectionWeights
                                 Tensor& beta, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope = workspace.scope();
 
-    if (hidden.ne[1] == 1) {
-        // Decode: one fused launch covers the whole qkvz parent and the GDN control
-        // projection/gates (zero workspace, no second gating launch).
+    if (hidden.ne[1] >= 1 && hidden.ne[1] <= ops::detail::kMaxQkvzDecodeTokens) {
+        // Decode/verify: one fused launch covers the whole qkvz parent and the GDN
+        // control projection/gates (zero workspace, no second gating launch). Every
+        // token uses the same warp/row mapping and FP32 accumulation order as T=1.
         ops::detail::w8_gdn_qkvz_decode_launch(hidden, weights.qkvz, query, key, value, z,
                                                 weights.control, weights.a_log, weights.dt_bias,
                                                 g, beta, stream);

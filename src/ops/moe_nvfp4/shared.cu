@@ -112,13 +112,15 @@ __global__ __launch_bounds__(256) void moe_nvfp4_shared_kernel(
     }
 }
 
-// Decode T == 1: one warp per gate/up dot; two dots per intermediate pair; partials through
+// Decode T <= 4: one warp per gate/up dot; two dots per intermediate pair; partials through
 // shared memory. Each CTA covers four pairs (eight warps), doubling SM occupancy vs pair-per-warp.
 template <class A>
 __global__ __launch_bounds__(256) void moe_nvfp4_shared_gate_up_kernel(
     const A* __restrict__ x, const __nv_bfloat16* __restrict__ control,
     float* __restrict__ activation) {
-    const auto* x_words = reinterpret_cast<const std::uint32_t*>(x);
+    const int token = static_cast<int>(blockIdx.y);
+    const A* x_column = x + static_cast<std::int64_t>(token) * kMoeHidden;
+    const auto* x_words = reinterpret_cast<const std::uint32_t*>(x_column);
     __shared__ float partial[4][2];
 
     const int warp = static_cast<int>(threadIdx.x) >> 5;
@@ -156,17 +158,22 @@ __global__ __launch_bounds__(256) void moe_nvfp4_shared_gate_up_kernel(
     if (lane == 0) { partial[warp >> 1][warp & 1] = total; }
     __syncthreads();
     if ((warp & 1) == 0 && lane == 0) {
-        activation[pair] = silu(partial[warp >> 1][0]) * partial[warp >> 1][1];
+        activation[static_cast<std::int64_t>(token) * kMoeIntermediate + pair] =
+            silu(partial[warp >> 1][0]) * partial[warp >> 1][1];
     }
 }
 
-// Decode T == 1: one warp per four output rows, shared-staged fp32 activation, four
+// Decode T <= 4: one warp per four output rows, shared-staged fp32 activation, four
 // accumulator sets held in registers so each lane keeps four independent weight packs in flight.
 template <class A>
 __global__ __launch_bounds__(256) void moe_nvfp4_shared_down_kernel(
     const __nv_bfloat16* __restrict__ shared_down, const float* __restrict__ shared_gate,
     const float* __restrict__ activation, A* __restrict__ destination) {
-    const float gate = shared_gate[0];
+    const int token = static_cast<int>(blockIdx.y);
+    const float gate = shared_gate[token];
+    const float* token_activation =
+        activation + static_cast<std::int64_t>(token) * kMoeIntermediate;
+    A* destination_column = destination + static_cast<std::int64_t>(token) * kMoeHidden;
 
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -178,8 +185,10 @@ __global__ __launch_bounds__(256) void moe_nvfp4_shared_down_kernel(
     float accumulator[4][4] = {};
 #pragma unroll
     for (int pack = lane; pack < kMoeIntermediate / 8; pack += 32) {
-        const float4 value_low  = __ldg(reinterpret_cast<const float4*>(activation) + 2 * pack);
-        const float4 value_high = __ldg(reinterpret_cast<const float4*>(activation) + 2 * pack + 1);
+        const float4 value_low =
+            __ldg(reinterpret_cast<const float4*>(token_activation) + 2 * pack);
+        const float4 value_high =
+            __ldg(reinterpret_cast<const float4*>(token_activation) + 2 * pack + 1);
         const float values[8] = {value_low.x, value_low.y, value_low.z, value_low.w,
                                  value_high.x, value_high.y, value_high.z, value_high.w};
 #pragma unroll
@@ -205,8 +214,8 @@ __global__ __launch_bounds__(256) void moe_nvfp4_shared_down_kernel(
         for (int chain = 0; chain < 4; ++chain) { total += accumulator[row][chain]; }
         total = warp_reduce_sum(total);
         if (lane == 0) {
-            destination[row0 + row] = MoeAct<A>::from_float(
-                MoeAct<A>::to_float(destination[row0 + row]) + gate * total);
+            destination_column[row0 + row] = MoeAct<A>::from_float(
+                MoeAct<A>::to_float(destination_column[row0 + row]) + gate * total);
         }
     }
 }
@@ -216,14 +225,15 @@ __global__ __launch_bounds__(256) void moe_nvfp4_shared_down_kernel(
 void moe_nvfp4_shared_launch(const Tensor& x, const void* control, const void* shared_down,
                              MoeNvfp4Scratch scratch, const MoeNvfp4RouteOutputs& route,
                              Tensor& destination, cudaStream_t stream) {
-    const bool parallel = x.ne[1] == 1 && scratch.activation != nullptr;
+    const bool parallel =
+        x.ne[1] >= 1 && x.ne[1] <= kMoeMaxSmallT && scratch.activation != nullptr;
     if (x.dtype == DType::FP16) {
         if (parallel) {
-            const dim3 gate_up_grid(kMoeIntermediate / 4);
+            const dim3 gate_up_grid(kMoeIntermediate / 4, x.ne[1]);
             moe_nvfp4_shared_gate_up_kernel<__half><<<gate_up_grid, 256, 0, stream>>>(
                 static_cast<const __half*>(x.data), static_cast<const __nv_bfloat16*>(control),
                 scratch.activation);
-            const dim3 down_grid(kMoeHidden / 32);
+            const dim3 down_grid(kMoeHidden / 32, x.ne[1]);
             moe_nvfp4_shared_down_kernel<__half><<<down_grid, 256, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(shared_down), route.shared_gate,
                 scratch.activation, static_cast<__half*>(destination.data));
@@ -235,11 +245,11 @@ void moe_nvfp4_shared_launch(const Tensor& x, const void* control, const void* s
         }
     } else {
         if (parallel) {
-            const dim3 gate_up_grid(kMoeIntermediate / 4);
+            const dim3 gate_up_grid(kMoeIntermediate / 4, x.ne[1]);
             moe_nvfp4_shared_gate_up_kernel<__nv_bfloat16><<<gate_up_grid, 256, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),
                 static_cast<const __nv_bfloat16*>(control), scratch.activation);
-            const dim3 down_grid(kMoeHidden / 32);
+            const dim3 down_grid(kMoeHidden / 32, x.ne[1]);
             moe_nvfp4_shared_down_kernel<__nv_bfloat16><<<down_grid, 256, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(shared_down), route.shared_gate,
                 scratch.activation, static_cast<__nv_bfloat16*>(destination.data));

@@ -193,7 +193,10 @@ bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
     // FoldGeometry48x12Tp4: device r's quarter of geometry_48 at tp == 4.
     const bool geometry_48_tp4 = spec.layers == 48 && spec.qk_heads == 4 &&
                                  spec.value_heads == 12 && spec.conv_channels == 2560;
-    return geometry_48 || geometry_30 || geometry_48_tp2 || geometry_48_tp4;
+    // Flash-Next GDN-only pool: 36 GDN layers (12 of 48 layers are QSA), TP2 shard.
+    const bool geometry_36_tp2 = spec.layers == 36 && spec.qk_heads == 8 &&
+                                 spec.value_heads == 24 && spec.conv_channels == 5120;
+    return geometry_48 || geometry_30 || geometry_48_tp2 || geometry_48_tp4 || geometry_36_tp2;
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {
