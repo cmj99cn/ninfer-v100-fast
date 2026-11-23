@@ -162,8 +162,21 @@ mtp_verify parity、mtp_state bit-exact、MoE T=4 oracle 全绿。
 **下一步**：Flash-Next 的 batch verify 需要 bit-exact small-T verify kernel（Strata `verify_kernels.cu`
 方式），尚未实施；greedy 语义下概率 rejection sampling 不可替代 bit-exact（数学上退化为严格比较）。
 
-**社区对比**：1cat-vllm 用 TP2 + vLLM spec 框架，Strata 用层分 PP + 定制 verify kernel，二者 MTP
-均超过 100 tok/s；本分支 TP2 + greedy + 通用 `forward(T)` 尚做不到。
+**三方 MTP 对比（谨慎口径）**：下表只收录有明确来源的数字。各行硬件同为 2×V100-SXM2-32GB，
+但并行方式与 verify 实现不同，跨行只能作方向性对照，不能当作严格同配置 A/B。
+
+| 引擎 / target | 并行 | no-spec（tok/s） | MTP（tok/s） | 来源 |
+|---|---|---:|---|---|
+| ninfer Flash-Next（本分支，开发中） | TP2 | 70.54 | 51.78（draft=1，acc 0.881） | 本分支实测，cache 15000 MiB + expert profile，0 miss |
+| ninfer 27B（main v0.2.5 发布） | TP2 | 51.0 | 104.7（draft=3，2.74 tok/round，58% accept） | README 速度表 / `docs/vs-1cat-2026-10-16.md:67` |
+| 1cat-vllm | TP2 | 49.6 | 无权威数据 | `docs/vs-1cat-2026-10-16.md:40,67`（仅 no-spec）。本地 `speed_1cat_nvfp4_mtp.json` 文件名带 `mtp` 但无 spec 字段，不足以作为 1cat MTP 数字 |
+| Strata（层分 PP） | 层分 PP | 未单独给出 | ~110（`--spec 4 --mtp`，层分 PP） | Strata `NEXT_SESSION_HANDOFF.md:229-236` |
+
+**关键洞察**：同一 ninfer 引擎、同一硬件（2×V100 TP2）下，27B 的 MTP 是 **2× 正收益**
+（51.0 → 104.7），Flash-Next 的 MTP 却是**负收益**（70.54 → 51.78）。差异不在引擎、硬件或并行
+方式，而在 Flash-Next 的 runtime（`qwen4_exp`）的 MTP/verify 路径尚未做对。1cat-vllm 用 TP2 +
+vLLM spec 框架，Strata 用层分 PP + 定制 verify kernel，二者 MTP 都 >100 tok/s，证明 batch verify
+在此硬件可行。本分支目标是让 Flash-Next MTP 达到同类水平（≥ base 70.54，目标 120），目前未达成。
 
 ### 测试参数
 
@@ -718,9 +731,24 @@ fold path measured 11.36 tok/s < 14 (rolled back); layer-split / parallel archit
 `verify_kernels.cu` style), not yet implemented; under greedy semantics probabilistic rejection
 sampling cannot replace bit-exact comparison (it mathematically degenerates to strict comparison).
 
-**Community comparison**: 1cat-vllm uses TP2 + the vLLM spec framework, and Strata uses layer-split
-PP + a custom verify kernel; both exceed 100 tok/s with MTP. This branch's TP2 + greedy + generic
-`forward(T)` cannot do so yet.
+**Three-way MTP comparison (strict sourcing)**: the table includes only figures with an explicit
+source. All rows use the same 2×V100-SXM2-32GB hardware, but parallelism and verify implementations
+differ, so cross-row numbers are directional rather than a strict same-configuration A/B.
+
+| Engine / target | Parallelism | no-spec (tok/s) | MTP (tok/s) | Source |
+|---|---|---:|---|---|
+| ninfer Flash-Next (this branch, in development) | TP2 | 70.54 | 51.78 (draft=1, acc 0.881) | this branch: cache 15000 MiB + expert profile, 0 miss |
+| ninfer 27B (main v0.2.5 release) | TP2 | 51.0 | 104.7 (draft=3, 2.74 tok/round, 58% accept) | README speed table / `docs/vs-1cat-2026-10-16.md:67` |
+| 1cat-vllm | TP2 | 49.6 | no authoritative data | `docs/vs-1cat-2026-10-16.md:40,67` (no-spec only). Local `speed_1cat_nvfp4_mtp.json` has `mtp` in its name but no spec field, so it cannot back a 1cat MTP figure |
+| Strata (layer-split PP) | layer-split PP | not given separately | ~110 (`--spec 4 --mtp`, layer-split PP) | Strata `NEXT_SESSION_HANDOFF.md:229-236` |
+
+**Key insight**: with the same ninfer engine and the same hardware (2×V100 TP2), 27B MTP is a **2×
+win** (51.0 -> 104.7), while Flash-Next MTP is a **net loss** (70.54 -> 51.78). The difference is not
+the engine, hardware, or parallelism — it is that Flash-Next's runtime (`qwen4_exp`) MTP/verify path
+is not yet correct. 1cat-vllm uses TP2 + the vLLM spec framework and Strata uses layer-split PP + a
+custom verify kernel; both exceed 100 tok/s with MTP, showing batch verify is feasible on this
+hardware. This branch aims to bring Flash-Next MTP to the same level (>= base 70.54, target 120),
+which is not achieved yet.
 
 ### Test Parameters
 
