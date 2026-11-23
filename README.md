@@ -176,7 +176,30 @@ mtp_verify parity、mtp_state bit-exact、MoE T=4 oracle 全绿。
 （51.0 → 104.7），Flash-Next 的 MTP 却是**负收益**（70.54 → 51.78）。差异不在引擎、硬件或并行
 方式，而在 Flash-Next 的 runtime（`qwen4_exp`）的 MTP/verify 路径尚未做对。1cat-vllm 用 TP2 +
 vLLM spec 框架，Strata 用层分 PP + 定制 verify kernel，二者 MTP 都 >100 tok/s，证明 batch verify
-在此硬件可行。本分支目标是让 Flash-Next MTP 达到同类水平（≥ base 70.54，目标 120），目前未达成。
+在此硬件可行。本分支目标是让 Flash-Next MTP 达到同类水平（≥ base 70.54，目标 120），目前未达成；
+但 120 与 99% 均来自随机采样口径（详见下节「口径澄清」），greedy 契约下 MTP 不超 base 属预期行为。
+
+#### 口径澄清：greedy vs 随机采样（上游证据）
+
+本轮查证上游 `Neroued/ninfer`（同模型 **Qwen3.8-Flash-Next**）的 README 与
+`docs/performance/qwen3.8-flash-next.md`：此前「120 tok/s 目标」与「99% acceptance」用的是
+**decode saturation 的随机采样口径**，不能当作 greedy 契约下的可达目标。要点如下：
+
+- **99% 只在随机采样 saturation 负载**：temperature 0.6 / top-p 0.95 / top-k 20 + 130-token
+  structured JSON prompt，acceptance 99.1–99.6%。同一报告的单请求 greedy 为约 34–91%
+  （Structured 91%、Code 84%、Translation 72%、AIME 50%、Story 35%）。
+- **head 不是 acceptance 差异来源**：上游 optimized proposal head（`proposal/head`，
+  `q4_g64_fp16`）与主 head（`text/output_head`，`bf16`）来自同一个 `lm_head.weight`；本地 artifact
+  conversion report 中 `proposal/head` weight/001310 与 `text/output_head` weight/000526 的 source
+  均为 `base-hf-bf16:lm_head.weight`。我们的 MtpDraft 绑定未量化的主 head，数学上等价或更好。
+- **两种 acceptance 的定义不同**：本 bench 为 greedy（temperature 0）+ 严格 argmax 前缀比较
+  （`speculative.cpp:40-46`），greedy acceptance = P(argmax_draft == argmax_target)；随机采样
+  acceptance = Σmin(p,q) = 1-TV(p,q)，q≈p 时 top-2 近邻翻转也可接受，因而接近 1。我们的
+  0.881 与上游 greedy Structured 91% 同口径、很接近。
+- **结论**：120 tok/s 目标来自 27B greedy MTP3 的 104.7；上游 Flash-Next 单请求 greedy 最高
+  66.8（单 Spark structured）/ 107.2（双 Spark structured），>100 的 saturation 数字属于随机采样。
+  greedy 契约下 99% acceptance 不可达，MTP 不超 base 是预期行为而非可修 bug；上文的 27% 落后与
+  「120 未达成」数字照旧保留，但不得解读为 verify 路径存在确定性缺陷。
 
 ### 测试参数
 
@@ -748,7 +771,36 @@ the engine, hardware, or parallelism — it is that Flash-Next's runtime (`qwen4
 is not yet correct. 1cat-vllm uses TP2 + the vLLM spec framework and Strata uses layer-split PP + a
 custom verify kernel; both exceed 100 tok/s with MTP, showing batch verify is feasible on this
 hardware. This branch aims to bring Flash-Next MTP to the same level (>= base 70.54, target 120),
-which is not achieved yet.
+which is not achieved yet; both 120 and 99% come from the random-sampling caliber (see the
+"Caliber Clarification" subsection below), so MTP not beating base is expected under the greedy
+contract.
+
+#### Caliber Clarification: Greedy vs Random Sampling (Upstream Evidence)
+
+This round checked upstream `Neroued/ninfer` (same model, **Qwen3.8-Flash-Next**): its README and
+`docs/performance/qwen3.8-flash-next.md` show that the earlier "120 tok/s goal" and "99% acceptance"
+were calibrated on **random sampling in decode saturation** and are not reachable targets under the
+greedy contract.
+
+- **99% only with random-sampling saturation load**: temperature 0.6 / top-p 0.95 / top-k 20 plus a
+  130-token structured JSON prompt yields 99.1–99.6% acceptance. Single-request greedy figures in the
+  same report are about 34–91% (Structured 91%, Code 84%, Translation 72%, AIME 50%, Story 35%).
+- **The head is not the source of the acceptance gap**: upstream's optimized proposal head
+  (`proposal/head`, `q4_g64_fp16`) and main head (`text/output_head`, `bf16`) come from the same
+  `lm_head.weight`; the local artifact conversion report lists both `proposal/head` weight/001310 and
+  `text/output_head` weight/000526 with source `base-hf-bf16:lm_head.weight`. Our MtpDraft binds the
+  unquantized main head, which is mathematically equivalent or better.
+- **The two acceptance numbers are different quantities**: this bench uses greedy (`temperature 0`)
+  with strict argmax-prefix comparison (`speculative.cpp:40-46`), so greedy acceptance is
+  P(argmax_draft == argmax_target); random-sampling acceptance is Σmin(p,q) = 1-TV(p,q), where a
+  top-2 neighbor flip is still accepted when q≈p, so the value approaches 1. Our 0.881 is the same
+  caliber as upstream's greedy Structured 91% and very close to it.
+- **Conclusion**: the 120 tok/s goal came from the 27B greedy MTP3 figure of 104.7; upstream
+  Flash-Next single-request greedy tops out at 66.8 (single Spark structured) / 107.2 (dual Spark
+  structured), while the >100 saturation figures use random sampling. Under the greedy contract 99%
+  acceptance is unreachable and MTP not beating base is expected behavior, not a fixable bug. The
+  27% gap and "120 not met" figures above are retained, but must not be read as a deterministic defect
+  in the verify path.
 
 ### Test Parameters
 

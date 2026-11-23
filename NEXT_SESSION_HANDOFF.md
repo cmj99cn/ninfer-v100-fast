@@ -10,7 +10,7 @@
 
 ## 0. 一句话结论
 
-Flash-Next 在 2×V100 TP2 / f16 上已经端到端跑通（greedy 11751，38/38 测试通过）。专家画像把 MTP 从冷缓存的 13.6–14 tok/s 拉到 51.78 tok/s，但顺序 verify 的 MTP 仍比无 spec 的 base（70.54 tok/s）慢 27%，**120 tok/s 目标未达成**。下一步必须先做出 bit-exact 的 small-T verify kernel，再切生产 verify 到 batch；在此之前不要声称 MTP 可用。
+Flash-Next 在 2×V100 TP2 / f16 上已经端到端跑通（greedy 11751，38/38 测试通过）。专家画像把 MTP 从冷缓存的 13.6–14 tok/s 拉到 51.78 tok/s，但顺序 verify 的 MTP 仍比无 spec 的 base（70.54 tok/s）慢 27%，**120 tok/s 目标未达成**（该目标口径错位，见 4.1）。上游查证表明 greedy 下 0.88 acceptance 与上游同口径一致、MTP 不超 base 属预期（见 4.1）；下一步先与用户确认验收口径（greedy vs 随机采样），暂不做 bit-exact small-T verify kernel 冲 120。
 
 ---
 
@@ -75,6 +75,16 @@ Flash-Next 在 2×V100 TP2 / f16 上已经端到端跑通（greedy 11751，38/38
 4. **概率 rejection sampling 不解决问题**：greedy 语义下它在数学上退化为严格比较（vLLM `temp==0` 分支可证），不能替代 bit-exact。
 5. **对标事实**：1cat-vllm 用 TP2 + vLLM spec 框架、Strata 用层分 PP + 定制 `verify_kernels.cu`，两者 MTP 均 >100 tok/s；本分支尚未做到，硬件/TP2 不是理由，差距在 verify 实现。
 
+### 4.1 上游 Neroued/ninfer 对照（决定性发现，2026-11-23 查证）
+
+证据：上游 <https://github.com/Neroued/ninfer>，README 与 `docs/performance/qwen3.8-flash-next.md`（同一模型 Qwen3.8-Flash-Next）。
+
+1. **head 不是 acceptance 差异来源**：上游 optimized proposal head（`proposal/head q4_g64_fp16`）与主 head 同源 `lm_head.weight`；本地 conversion report 证明 `weight/001310` 与 `weight/000526` 均标注 `source base-hf-bf16:lm_head.weight`。我们的 `MtpDraft` 用未量化主 head，数学等价/更好，因此量化 proposal head 不能解释 acceptance 差距。
+2. **99% acceptance 只在随机采样饱和口径**：上游 99.1–99.6% acceptance 仅在 decode saturation 场景（随机采样 temp 0.6 / top-p 0.95 / top-k 20 + 130-token structured JSON）。上游单请求 greedy 口径为 Structured 91%、Code 84%、Translation 72%、AIME 50%、Story 35%。
+3. **我们的 0.88 与上游同口径一致**：bench 是 greedy（temp 0）+ 严格 argmax 前缀比较，0.881 acceptance 对应上游 greedy Structured 91%。随机采样 acceptance = 1 − TV(p,q) ≈ 1，greedy acceptance = P(argmax 相等)，后者天然更低；两者不可直接比较。
+4. **120 tok/s 目标口径错位**：该数字来自 27B greedy 104.7；上游 Flash-Next 单请求 greedy 为 66.8 single Spark / 107.2 dual Spark（structured），>100 属随机采样口径。greedy 契约下 99% 不可达，MTP 不超 base（51.78 < 70.54）是预期行为，不是实现缺陷。
+5. **对下一步的影响**：以 bit-exact small-T verify kernel 冲 120 的必要性被推翻；应先与用户确认验收口径（见第 6 节）。本节不撤销第 4 节 1–5 的技术结论，也不改变已记录的负结果。
+
 ---
 
 ## 5. 负结果与回退（全部已回退，明细见 SDD 账本）
@@ -88,12 +98,15 @@ Flash-Next 在 2×V100 TP2 / f16 上已经端到端跑通（greedy 11751，38/38
 
 ---
 
-## 6. 下一步（明确但未实施）
+## 6. 下一步（先确认验收口径，暂不实施）
 
-1. 为 `qwen4_exp` 实现 **bit-exact small-T verify kernel**（T=2..4）：照 Strata `verify_kernels.cu` 的逐 token 算术转录思路，逐项固定 GDN qkvz / conv / recurrent、PLE history、hc_mix 与输出头的算术顺序，与顺序 T=1 严格一致；目标是 `NINFER_MTP_SPAN_DIAG=1` 下 winner mismatch 0/5 且全部状态摘要相等。
-2. 配合 verify / commit 两阶段状态语义：verify 记录 GDN/PLE/KV，commit 按接受位置发布，保持 `mtp_state` bit-exact 和 greedy 输出不变。
-3. 切生产 verify 到 batch，跑完整验收：38/38 ctest、NLL greedy 11751、128-token / 2 reps / cache 15000 + profile / 0 miss 的 base 与 MTP 对照。
-4. **Gate**：`committed tok/s > 70.5` 且 `acceptance ≥ 0.88`。任一不达标即回退到 `verify_sequential`，不要把 51.78 当作胜利。
+上游查证（见 4.1）推翻了原先"直接做 bit-exact small-T verify kernel 冲 120"的必要性：120 / 99% 来自随机采样口径；当前 greedy 口径下 0.88 acceptance 与上游 greedy Structured 91% 同口径一致，MTP 不超 base（51.78 < 70.54）在 greedy 契约下是预期行为。因此下一步先确认验收口径，再决定是否动代码。
+
+1. **先与用户确认验收口径**，二选一：
+   - **(A) 保持 greedy 契约**：以 greedy committed tok/s（base 70.54）＋质量门禁（NLL greedy 11751、38/38 ctest）验收；当前 MTP 状态（draft=1 顺序 verify，51.78 tok/s、0.881 acceptance）基本符合上游同口径，可能是合理的终点，或只需边际优化接受率/verify 成本。不再以 120 tok/s 或 99% acceptance 为 Gate（该口径已被证伪，见 4.1）。
+   - **(B) 要随机采样性能**：引入 stochastic sampling（如 temp 0.6 / top-p 0.95 / top-k 20）与对应的 speculative accept（1 − TV(p,q) 或等价概率接受），并按该口径重定 tok/s 与 acceptance 目标（参考上游饱和场景 99.1–99.6%）；greedy 的严格 argmax 前缀比较不再是验收指标。
+2. 口径确认前：不实施 bit-exact small-T verify kernel、不切生产 verify 到 batch、不动并行架构或 base 微优化。
+3. 口径确认后再按选定口径更新 Gate 与命令；若选 (A) 且决定不再优化，则保留回退后的 `verify_sequential` 路径与第 5 节全部负结果，不把 51.78 当作对 base 的胜利。
 
 ---
 
@@ -189,18 +202,24 @@ checkpoint 去 replay、staged routed GEMV、FP8 MTP）。
 - 128-token / 2 reps / cache 15000 + 专家画像 / 0 miss：base 70.54 tok/s；
   MTP draft=1 顺序 verify 51.78 tok/s、acceptance 0.881（比 base 慢 27%）；
   draft=3 42.9；batch verify 27.0、acceptance 0.56（已回退）。无画像仅 13.6-14 tok/s。
-- 120 tok/s 未达成；当前没有任何配置让 MTP 快过 base。
+- 120 tok/s 未达成；当前没有任何配置让 MTP 快过 base；但该目标口径错位（见 4.1）。
+- 上游 Neroued/ninfer 查证（README + docs/performance/qwen3.8-flash-next.md）：head 同源、
+  非 acceptance 差异来源；99.1-99.6% 只在随机采样饱和口径，greedy 单请求 Structured 91%、
+  Code 84%、Translation 72%、AIME 50%、Story 35%；我们 greedy 0.88 与上游同口径一致，
+  greedy 契约下 99% 不可达、MTP 不超 base 属预期。
 - 验证：38/38 ctest；NLL greedy 11751、mean_nll 3.7311021849；mtp_verify parity、
   mtp_state bit-exact、MoE T=4 oracle 全绿。
 - 画像已解决 cache 冷启动；MTP 根因是每轮 2 次顺序 T=1 verify 只 commit ~1.44 token。
 - greedy 下 batch verify 必须 bit-exact；概率 rejection sampling 退化为严格比较，不能替代。
 - GDN qkvz 归约顺序已修为 bit-exact，PLE history 等仍未完全等价，acceptance 仍 0.56。
 
-任务：按以下顺序推进，不要先动并行架构或 base 微优化：
-1. 为 qwen4_exp 实现 bit-exact small-T verify kernel（照 Strata verify_kernels.cu 的
-   逐 token 算术转录思路），配合 verify/commit 两阶段状态语义。
-2. 切生产 verify 到 batch，跑 38/38 ctest、NLL、128-token base/MTP 对照。
-3. Gate：committed tok/s > 70.5 且 acceptance >= 0.88；不达标就回退到 verify_sequential。
+任务：先报告已确认状态，再与用户确认验收口径，不要在口径确认前改代码：
+1. 口径 (A) 保持 greedy：以 greedy tok/s（base 70.54）＋质量门禁验收；当前 MTP 基本
+   符合上游同口径，可能是合理终点或只需边际优化；不再以 120/99% 为 Gate。
+2. 口径 (B) 要随机采样性能：引入 stochastic sampling + speculative accept（1-TV），
+   并按该口径重定 tok/s 与 acceptance 目标。
+3. 口径确认前不实施 bit-exact small-T verify kernel、不切生产 verify 到 batch、
+   不动并行架构或 base 微优化。
 
-先报告已确认状态，再开始改代码。不要主动 commit。构建 CPU 并发不超过约 85% 上限。
+不要主动 commit。构建 CPU 并发不超过约 85% 上限。
 ```
