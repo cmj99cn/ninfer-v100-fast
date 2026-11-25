@@ -31,7 +31,7 @@
 
 | # | 项 | ms/轮 潜力 | 状态 | 证据/原因 |
 |---|---|---:|---|---|
-| B1 | 专家 7-kernel 融合 | 0.15–0.3/step | **已排除（实测负）** | `b1-b2-draft-report.md`：decode 内联进 FP16 MMA 使专家链 0.576→2.528 ms/step（4.4× 变慢），已回退；历史 m4 负结果重现。 |
+| B1 | 专家 7-kernel 融合 | 0.15–0.3/step | **已排除（根因确证）** | `debug-b1-rootcause.md`：根因是并行度/解码串行——256 线程×4 codes 的 decode 搬进 1-warp MMA 后每线程串行解 640 codes（×160）且与每轮 K-tile 屏障耦合；ldexpf 是放大器非根因（去掉仍 4.1×），m4 的全局原子根因不适用；当前形态不可修，需改独立高并行 decode kernel 或 grouped LUT 形态。 |
 | B2 | device router top-k 去 host D2H+sync | 0.10–0.25/step | **已排除（实测前提不成立）** | `b1-b2-draft-report.md`：router sync host 阻塞实测仅 0.0050 ms/step，外推的 0.15–0.30 bubble 不存在；top-k+10 槽分发无收益且有舍入/选集风险。 |
 | B3 | 跨轮门控（上轮 step-0 置信度低则 K=0） | 条件性 | **已排除** | `verify-b1-b3-feasibility.md`：无 step-0 分布统计；Q4 0.8929/FP16 0.9380 均 > 0.8；min_p=0.8 下条件收益 = 0。 |
 | B4 | draft head 词表子集（Strata 106299） | 0.07–0.23/step | **已排除** | Q4 全词表已 0.397 ms（带宽地板），子集再省有限；且 greedy argmax 在子集上会改 token，需改 artifact 语义。 |
