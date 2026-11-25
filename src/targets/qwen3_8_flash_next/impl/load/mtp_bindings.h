@@ -12,6 +12,7 @@ struct MtpPlan {
     std::vector<BoundObject> objects;
     BoundParameter token_embedding;
     BoundParameter output_head;
+    BoundParameter proposal_head;
     BoundParameter fc_embedding;
     BoundParameter fc_hidden;
     BoundParameter pre_fc_embedding_norm;

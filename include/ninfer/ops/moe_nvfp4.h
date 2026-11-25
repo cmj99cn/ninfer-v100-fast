@@ -10,6 +10,8 @@
 
 namespace ninfer::ops {
 
+inline constexpr std::int32_t kMoeRouteFusedMaxTokens = 8;
+
 /**
  * The weights of the Qwen3.8-Flash-Next MoE.
  *
@@ -73,14 +75,15 @@ struct MoeNvfp4Weights {
  * Execution:
  *   Enqueues on the given stream, allocates no device memory, keeps no persistent state, and
  *   supports CUDA Graph capture and replay at bound addresses. `route_logits` is an optional
- *   caller-owned FP32 [E + 1, T] scratch. For T == 1 a non-null scratch selects the row-split
- *   evaluator: one CTA per output-row tile writes the row logits. A non-null `route_counter`
- *   additionally fuses the top-K selection into that launch: the last row tile performs the
- *   selection and softmax after a device-wide fence, and resets the counter for the next call.
- *   The counter must be zero before the first call. Without a counter the selection runs in a
- *   second single-warp launch over the same logits. Ranking and coefficients are evaluated from
- *   the accumulated logits, so the split evaluator is compared against the FP64 oracle rather
- *   than against the single-CTA accumulation order.
+  *   caller-owned FP32 [E + 1, T] scratch. For 1 <= T <= kMoeRouteFusedMaxTokens a non-null
+  *   scratch together with a non-null `route_counter` selects the row-split fused evaluator: one
+  *   grid launch evaluates every token column, each router weight row is loaded once and reused
+  *   across columns, and the last CTA runs the top-K selection and softmax once per column after a
+  *   device-wide fence before resetting the counter. The counter must be zero before the first
+  *   call. Without a counter the selection runs in a second single-warp launch over the same logits.
+  *   Ranking and coefficients are evaluated from the accumulated logits, so the split evaluator is
+  *   compared against the FP64 oracle rather than against the single-CTA accumulation order.
+
  */
 void moe_nvfp4_route(const Tensor& x, const MoeNvfp4Weights& weights, Tensor& expert_ids,
                      Tensor& coefficients, Tensor& shared_gate, cudaStream_t stream,

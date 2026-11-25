@@ -27,9 +27,10 @@
 // per-rank contributions in rank order. It measures faster than NCCL's small-message protocol on
 // this box, keeps the step counters in device memory so CUDA-Graph replays stay correct, and
 // produces bitwise-identical bytes on every rank. `NINFER_TP_MAILBOX=0` disables it; every
-// message over the capacity, of another dtype, or of a shape the fast path does not cover falls
-// back to NCCL. The FP16 fold uses the same rank-ordered association with an FP16 rounding at
-// each step, so the BF16 path is unchanged. See docs/maintainer/sm70-v2-mailbox-port-plan.md.
+// message over the capacity, of another dtype (including FP32), or of a shape the fast path does
+// not cover falls back to NCCL. The FP16 fold uses the same rank-ordered association with an FP16
+// rounding at each step, so the BF16 path is unchanged. See
+// docs/maintainer/sm70-v2-mailbox-port-plan.md.
 //
 // The calls are stream-ordered GPU work with no host round trip, host-memory spin flag, or
 // explicit host staging, so they are CUDA-Graph capturable. Ordering between consecutive
@@ -148,14 +149,15 @@ private:
  *
  * written back to every `buffer[r]`, which afterwards hold the bitwise-identical sum.
  *
- * `buffer[r]` is a contiguous BF16 or FP16 tensor resident on `ec.dev[r]`; every rank carries
- * the same dtype and shape. `staging[r]` is scratch of the same dtype and shape, also resident
+ * `buffer[r]` is a contiguous BF16, FP16, or FP32 tensor resident on `ec.dev[r]`; every rank
+ * carries the same dtype and shape. FP32 buffers use the NCCL fallback because the mailbox only
+ * carries 16-bit activations. `staging[r]` is scratch of the same dtype and shape, also resident
  * on `ec.dev[r]`, and must not overlap `buffer[r]`. The implementation uses only rank 0's `staging[0]` as the star
  * accumulator; every rank must still supply a valid staging slot because the caller owns the
  * per-rank allocation uniformly.
  *
  * The oracle evaluates `ideal` in FP64 from the represented activation words. The observable
- * output is stored in the buffer's activation dtype, BF16 or FP16. The mailbox route adds the
+ * output is stored in the buffer's dtype, BF16, FP16, or FP32. The mailbox route adds the
  * ranks in rank order and rounds to that dtype after each addition; NCCL's in-place
  * ncclAllReduce(ncclSum) evaluates the sum with its own internal association. Neither route is
  * required to match the oracle bit-for-bit, so the output is checked within the activation

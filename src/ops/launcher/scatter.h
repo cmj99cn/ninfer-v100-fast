@@ -13,4 +13,9 @@ void scatter_bf16_batch_launch(const Tensor& source, const Tensor& lanes,
 void stage_gdn_decode_launch(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                              const Tensor& beta, std::int32_t rank, Tensor& conv_in,
                              Tensor& g_rank, Tensor& beta_rank, cudaStream_t stream);
+void stage_gdn_span_launch(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                           const Tensor& beta, std::int32_t rank, Tensor& conv_in,
+                           Tensor& g_rank, Tensor& beta_rank, cudaStream_t stream);
+void extract_gdn_columns_launch(const Tensor& source, Tensor& q, Tensor& k, Tensor& v,
+                                cudaStream_t stream);
 } // namespace ninfer::ops::detail

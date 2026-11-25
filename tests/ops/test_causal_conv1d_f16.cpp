@@ -192,6 +192,64 @@ int run_fusion_case(int C, std::uint32_t seed, DType weight_dtype, bool separate
     return failures;
 }
 
+int run_conv_cross_profile_case(int C, int columns, std::uint32_t seed, DType weight_dtype) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    std::vector<float> xf(static_cast<std::size_t>(C) * columns);
+    std::vector<float> wf(static_cast<std::size_t>(C) * 4);
+    std::vector<float> sf(static_cast<std::size_t>(C) * 3);
+    for (auto& v : xf) v = d(rng);
+    for (auto& v : wf) v = d(rng);
+    for (auto& v : sf) v = d(rng);
+    round_to_f16(xf);
+    round_to_f16(sf);
+    if (weight_dtype == DType::FP16) {
+        round_to_f16(wf);
+    } else {
+        round_to_bf16(wf);
+    }
+
+    std::vector<std::uint16_t> x(xf.size()), w(wf.size()), st(sf.size());
+    for (std::size_t i = 0; i < xf.size(); ++i) { x[i] = f32_to_f16(xf[i]); }
+    for (std::size_t i = 0; i < sf.size(); ++i) { st[i] = f32_to_f16(sf[i]); }
+    for (std::size_t i = 0; i < wf.size(); ++i) {
+        w[i] = weight_dtype == DType::FP16 ? f32_to_f16(wf[i]) : f32_to_bf16(wf[i]);
+    }
+
+    GuardedDeviceBuffer dx(x.size() * 2), dw(w.size() * 2), db_state(st.size() * 2);
+    GuardedDeviceBuffer ds_state(st.size() * 2), db_out(x.size() * 2), ds_out(x.size() * 2);
+    dx.copy_from_host(x.data(), dx.bytes());
+    dw.copy_from_host(w.data(), dw.bytes());
+    db_state.copy_from_host(st.data(), db_state.bytes());
+    ds_state.copy_from_host(st.data(), ds_state.bytes());
+    db_out.fill(0xff);
+    ds_out.fill(0xff);
+
+    Tensor weight(dw.data(), weight_dtype, {C, 4});
+    Tensor batched_state(db_state.data(), DType::FP16, {3, C});
+    Tensor sequential_state(ds_state.data(), DType::FP16, {3, C});
+    Tensor batched_out(db_out.data(), DType::FP16, {C, columns});
+    Tensor sequential_out(ds_out.data(), DType::FP16, {C, columns});
+    const Tensor batched_x(dx.data(), DType::FP16, {C, columns});
+    ops::causal_conv1d_silu_f16(batched_x, weight, batched_state, batched_out, nullptr);
+    for (int c = 0; c < columns; ++c) {
+        Tensor column     = batched_x.slice(1, c, 1);
+        Tensor out_column = sequential_out.slice(1, c, 1);
+        ops::causal_conv1d_silu_f16(column, weight, sequential_state, out_column, nullptr);
+    }
+    cuda_synchronize();
+
+    int failures = verify_exact("conv cross-profile output raw bits",
+                                from_device<std::uint16_t>(db_out.data(), x.size()),
+                                from_device<std::uint16_t>(ds_out.data(), x.size()));
+    failures += verify_exact("conv cross-profile state raw bits",
+                             from_device<std::uint16_t>(db_state.data(), st.size()),
+                             from_device<std::uint16_t>(ds_state.data(), st.size()));
+    failures += db_out.verify_guards("conv cross-profile batched out guard");
+    failures += ds_out.verify_guards("conv cross-profile sequential out guard");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -216,6 +274,9 @@ int main() {
         failures += run_fusion_case(17, 9022U, DType::FP16, true);
         failures += run_fusion_case(64, 9023U, DType::BF16, false);
         failures += run_fusion_case(65, 9024U, DType::BF16, true);
+        failures += run_conv_cross_profile_case(10240, 2, 9031U, DType::BF16);
+        failures += run_conv_cross_profile_case(33, 4, 9032U, DType::FP16);
+        failures += run_conv_cross_profile_case(10240, 8, 9033U, DType::BF16);
         std::cout << (failures ? "FAIL" : "OK") << " causal_conv1d_f16\n";
         return failures ? 1 : 0;
     } catch (const std::exception& e) {

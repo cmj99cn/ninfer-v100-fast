@@ -2,6 +2,7 @@
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
+#include "artifact/typed_binding.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "ninfer/ops/argmax.h"
@@ -12,6 +13,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "targets/qwen3_8_flash_next/impl/load/bindings.h"
 #include "targets/qwen3_8_flash_next/impl/load/mtp_bindings.h"
+#include "targets/qwen3_8_flash_next/impl/diag_switches.h"
 #include "targets/qwen3_8_flash_next/impl/leaves.h"
 #include "targets/qwen3_8_flash_next/impl/mtp_draft_kernels.h"
 #include "targets/qwen3_8_flash_next/impl/variant.h"
@@ -26,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -63,6 +66,9 @@ constexpr std::int32_t kKeyValueRows =
 constexpr std::int32_t kQueryGateRows = 2 * kQueryWidth;
 constexpr std::int32_t kVocab = TextConfig::vocab;
 constexpr float kEpsilon = TextConfig::rms_epsilon;
+
+static_assert(DraftRouterChoice::kTopK == static_cast<std::size_t>(kTopK),
+              "draft router choice capacity must match the draft top-k");
 
 inline std::uint16_t bf16_to_fp16(std::uint16_t word) {
     __nv_bfloat16 value;
@@ -178,6 +184,24 @@ struct WeightLoader {
         return Tensor(store(source.data(), source.size() * 2), DType::BF16, shape);
     }
 
+    Weight q4_weight(const BoundParameter& parameter, std::int32_t rows, std::int32_t columns) {
+        if (parameter.parts.size() != 1) {
+            throw std::runtime_error("MTP Q4 proposal head must be one whole artifact object");
+        }
+        const BoundObject& object = plan.objects.at(parameter.parts.front().object);
+        const auto span = reader.payload(object.name);
+        const std::array<std::uint64_t, 2> shape{static_cast<std::uint64_t>(rows),
+                                                 static_cast<std::uint64_t>(columns)};
+        const auto geometry =
+            artifact::row_split_geometry(artifact::NumericFormat::Q4G64_F16S, shape);
+        if (span.data.size() < geometry.encoded_bytes) {
+            throw std::runtime_error("MTP Q4 proposal head payload is truncated");
+        }
+        void* device = store(span.data.data(), static_cast<std::size_t>(geometry.encoded_bytes));
+        return artifact::staged_weight_view(artifact::NumericFormat::Q4G64_F16S, device, rows,
+                                            columns);
+    }
+
 };
 
 Weight fp16_weight_from_host(void* data, std::int32_t rows, std::int32_t columns) {
@@ -198,17 +222,30 @@ Weight fp16_weight_from_host(void* data, std::int32_t rows, std::int32_t columns
 }
 
 BankLayout store_bank(artifact::Reader& reader, const BoundParameter& bank,
-                      DeviceBuffer& destination) {
+                      DeviceBuffer& destination, int rank, int tp, std::int32_t experts) {
     const ExpertLibrary& library = bank.library.value();
     const auto span = reader.payload(library.object);
-    const BankLayout layout = bank_layout(static_cast<std::size_t>(library.matrices),
-                                          static_cast<std::size_t>(library.rows),
+    const std::size_t ranks = static_cast<std::size_t>(tp);
+    if (tp < 1 || static_cast<std::size_t>(experts) % ranks != 0 ||
+        library.matrices != static_cast<std::uint64_t>(experts)) {
+        throw std::runtime_error("MTP expert bank cannot be split across the rank group");
+    }
+    const std::size_t local_matrices = static_cast<std::size_t>(experts) / ranks;
+    const BankLayout full = bank_layout(static_cast<std::size_t>(library.matrices),
+                                        static_cast<std::size_t>(library.rows),
+                                        static_cast<std::size_t>(library.columns));
+    const BankLayout layout = bank_layout(local_matrices, static_cast<std::size_t>(library.rows),
                                           static_cast<std::size_t>(library.columns));
-    if (span.data.size() < layout.total_bytes) {
+    if (span.data.size() < full.total_bytes) {
         throw std::runtime_error("MTP expert bank payload is truncated");
     }
     destination = DeviceBuffer(layout.total_bytes);
-    destination.copy_from_host(span.data.data(), layout.total_bytes);
+    const std::size_t rank_index = static_cast<std::size_t>(rank);
+    destination.copy_from_host(span.data.data() + rank_index * layout.code_bytes,
+                               layout.code_bytes);
+    destination.copy_from_host(span.data.data() + full.scale_offset +
+                                   rank_index * layout.scale_bytes,
+                               layout.scale_bytes, layout.scale_offset);
     return layout;
 }
 
@@ -227,117 +264,132 @@ struct MtpDraft::Impl {
         return result;
     }
 
-    explicit Impl(const std::filesystem::path& artifact, int device)
-        : reader(artifact), device_context(device),
+    explicit Impl(const std::filesystem::path& artifact, int device, int rank_index, int tp)
+        : reader(artifact), device_context(device), rank(rank_index), tp(tp),
+          router_rank(rank_index == 0),
+          expert_begin(rank_index * (kExperts / tp)), local_experts(kExperts / tp),
           activation(512U * 1024U * 1024U), workspace(512U * 1024U * 1024U),
           model(initial_model()),
-          state(device_context, model, static_cast<std::uint32_t>(TextConfig::max_position_embeddings),
-                1, 1, 0),
-          trunk(model, state, activation, workspace, device_context.stream),
-          condition_ones(4 * sizeof(float)) {
+          reduce_staging(static_cast<std::size_t>(kHidden) * sizeof(float)) {
+        if (!router_rank) {
+            routed_input = DeviceBuffer(static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t));
+        }
         artifact::Binder binder(reader);
         const BindingPlan text = bind_artifact(binder, WeightsProfile::Nvfp4, 1);
         const MtpPlan mtp = bind_mtp_artifact(binder, text);
         WeightLoader loader{reader, mtp, owned};
-
-        const QsaPlan& qsa = std::get<QsaPlan>(mtp.layer.mixer);
-        const std::size_t attention_rows =
-            static_cast<std::size_t>(kQueryGateRows + kKeyValueRows);
-        std::vector<std::uint16_t> assembled_attention(attention_rows * static_cast<std::size_t>(kHidden));
-
-        auto assemble = [&](const BoundParameter& parameter, std::size_t row_begin,
-                            std::size_t count) {
-            auto region = loader.words(parameter, count, static_cast<std::size_t>(kHidden));
-            std::copy(region.begin(), region.end(),
-                      assembled_attention.begin() + row_begin * static_cast<std::size_t>(kHidden));
-        };
-        assemble(qsa.query, 0, static_cast<std::size_t>(kQueryWidth));
-        assemble(qsa.output_gate, static_cast<std::size_t>(kQueryWidth),
-                 static_cast<std::size_t>(kQueryWidth));
-        assemble(qsa.key, static_cast<std::size_t>(kQueryGateRows), static_cast<std::size_t>(TextConfig::kv_width));
-        assemble(qsa.value, static_cast<std::size_t>(kQueryGateRows) + TextConfig::kv_width,
-                 static_cast<std::size_t>(TextConfig::kv_width));
-        assemble(qsa.index_query,
-                 static_cast<std::size_t>(kQueryGateRows) + 2U * TextConfig::kv_width,
-                 static_cast<std::size_t>(TextConfig::index_query_width));
-        assemble(qsa.index_key,
-                 static_cast<std::size_t>(kQueryGateRows) + 2U * TextConfig::kv_width +
-                     TextConfig::index_query_width,
-                 static_cast<std::size_t>(TextConfig::index_key_width));
-        std::vector<std::uint16_t> assembled_fp16(assembled_attention.size());
-        for (std::size_t index = 0; index < assembled_attention.size(); ++index) {
-            assembled_fp16[index] = bf16_to_fp16(assembled_attention[index]);
-        }
-
-        attention_projection.query_gate = fp16_weight_from_host(
-            loader.store(assembled_fp16.data(), assembled_fp16.size() * 2), kQueryGateRows, kHidden);
-        attention_projection.key_value = fp16_weight_from_host(
-            const_cast<std::byte*>(static_cast<const std::byte*>(
-                attention_projection.query_gate.payload)) +
-                static_cast<std::size_t>(kQueryGateRows) * kHidden * 2,
-            kKeyValueRows, kHidden);
-        attention_projection.query_norm = loader.vector(qsa.query_norm, {TextConfig::head_dim});
-        attention_projection.key_norm = loader.vector(qsa.key_norm, {TextConfig::head_dim});
-        attention_projection.index_query_norm =
-            loader.vector(qsa.index_query_norm, {TextConfig::index_head_dim});
-        attention_projection.index_key_norm =
-            loader.vector(qsa.index_key_norm, {TextConfig::index_head_dim});
-        attention_projection.output = loader.matrix(qsa.output, kHidden, kQueryWidth);
-
-        attention_hc = hc_weights(loader, mtp.layer.attention_hc);
-        moe_hc = hc_weights(loader, mtp.layer.moe_hc);
-        final_hc_weights = hc_final_weights(loader, mtp.final_hc);
-        pre_embedding_norm = loader.vector(mtp.pre_fc_embedding_norm, {kHidden});
-        pre_hidden_norm = loader.vector(mtp.pre_fc_hidden_norm, {kResidual});
-        fc_embedding = loader.matrix(mtp.fc_embedding, kHidden, kHidden);
-        fc_hidden = loader.matrix(mtp.fc_hidden, kHidden, kHidden);
-        embedding_words = loader.words(mtp.token_embedding, static_cast<std::size_t>(kVocab),
-                                       static_cast<std::size_t>(kHidden));
-        output_head = loader.matrix(mtp.output_head, kVocab, kHidden);
-
         const MoePlan& moe = mtp.layer.moe;
-        auto control_source = loader.words(moe.router, static_cast<std::size_t>(kExperts),
+
+        if (router_rank) {
+            const QsaPlan& qsa = std::get<QsaPlan>(mtp.layer.mixer);
+            const std::size_t attention_rows =
+                static_cast<std::size_t>(kQueryGateRows + kKeyValueRows);
+            std::vector<std::uint16_t> assembled_attention(attention_rows * static_cast<std::size_t>(kHidden));
+
+            auto assemble = [&](const BoundParameter& parameter, std::size_t row_begin,
+                                std::size_t count) {
+                auto region = loader.words(parameter, count, static_cast<std::size_t>(kHidden));
+                std::copy(region.begin(), region.end(),
+                          assembled_attention.begin() + row_begin * static_cast<std::size_t>(kHidden));
+            };
+            assemble(qsa.query, 0, static_cast<std::size_t>(kQueryWidth));
+            assemble(qsa.output_gate, static_cast<std::size_t>(kQueryWidth),
+                     static_cast<std::size_t>(kQueryWidth));
+            assemble(qsa.key, static_cast<std::size_t>(kQueryGateRows), static_cast<std::size_t>(TextConfig::kv_width));
+            assemble(qsa.value, static_cast<std::size_t>(kQueryGateRows) + TextConfig::kv_width,
+                     static_cast<std::size_t>(TextConfig::kv_width));
+            assemble(qsa.index_query,
+                     static_cast<std::size_t>(kQueryGateRows) + 2U * TextConfig::kv_width,
+                     static_cast<std::size_t>(TextConfig::index_query_width));
+            assemble(qsa.index_key,
+                     static_cast<std::size_t>(kQueryGateRows) + 2U * TextConfig::kv_width +
+                         TextConfig::index_query_width,
+                     static_cast<std::size_t>(TextConfig::index_key_width));
+            std::vector<std::uint16_t> assembled_fp16(assembled_attention.size());
+            for (std::size_t index = 0; index < assembled_attention.size(); ++index) {
+                assembled_fp16[index] = bf16_to_fp16(assembled_attention[index]);
+            }
+
+            attention_projection.query_gate = fp16_weight_from_host(
+                loader.store(assembled_fp16.data(), assembled_fp16.size() * 2), kQueryGateRows, kHidden);
+            attention_projection.key_value = fp16_weight_from_host(
+                const_cast<std::byte*>(static_cast<const std::byte*>(
+                    attention_projection.query_gate.payload)) +
+                    static_cast<std::size_t>(kQueryGateRows) * kHidden * 2,
+                kKeyValueRows, kHidden);
+            attention_projection.query_norm = loader.vector(qsa.query_norm, {TextConfig::head_dim});
+            attention_projection.key_norm = loader.vector(qsa.key_norm, {TextConfig::head_dim});
+            attention_projection.index_query_norm =
+                loader.vector(qsa.index_query_norm, {TextConfig::index_head_dim});
+            attention_projection.index_key_norm =
+                loader.vector(qsa.index_key_norm, {TextConfig::index_head_dim});
+            attention_projection.output = loader.matrix(qsa.output, kHidden, kQueryWidth);
+
+            attention_hc = hc_weights(loader, mtp.layer.attention_hc);
+            moe_hc = hc_weights(loader, mtp.layer.moe_hc);
+            final_hc_weights = hc_final_weights(loader, mtp.final_hc);
+            pre_embedding_norm = loader.vector(mtp.pre_fc_embedding_norm, {kHidden});
+            pre_hidden_norm = loader.vector(mtp.pre_fc_hidden_norm, {kResidual});
+            fc_embedding = loader.matrix(mtp.fc_embedding, kHidden, kHidden);
+            fc_hidden = loader.matrix(mtp.fc_hidden, kHidden, kHidden);
+            embedding_words = loader.words(mtp.token_embedding, static_cast<std::size_t>(kVocab),
                                            static_cast<std::size_t>(kHidden));
-        auto score_source = loader.words(moe.shared_score, 1, static_cast<std::size_t>(kHidden));
-        std::vector<std::uint16_t> control_words(control_source.size() + score_source.size());
-        std::copy(control_source.begin(), control_source.end(), control_words.begin());
-        std::copy(score_source.begin(), score_source.end(), control_words.begin() + control_source.size());
-        std::vector<std::uint16_t> control_fp16(control_words.size());
-        for (std::size_t index = 0; index < control_words.size(); ++index) {
-            control_fp16[index] = bf16_to_fp16(control_words[index]);
-        }
-        control = fp16_weight_from_host(loader.store(control_fp16.data(), control_fp16.size() * 2),
-                                        kExperts + 1, kHidden);
+            output_head = diag_fp16_draft_head()
+                              ? loader.matrix(mtp.output_head, kVocab, kHidden)
+                              : loader.q4_weight(mtp.proposal_head, kVocab, kHidden);
 
-        auto gate_source = loader.words(moe.shared_gate, static_cast<std::size_t>(kShared),
-                                        static_cast<std::size_t>(kHidden));
-        auto up_source = loader.words(moe.shared_up, static_cast<std::size_t>(kShared),
-                                      static_cast<std::size_t>(kHidden));
-        std::vector<std::uint16_t> shared_words(gate_source.size() + up_source.size());
-        std::copy(gate_source.begin(), gate_source.end(), shared_words.begin());
-        std::copy(up_source.begin(), up_source.end(), shared_words.begin() + gate_source.size());
-        std::vector<std::uint16_t> shared_fp16(shared_words.size());
-        for (std::size_t index = 0; index < shared_words.size(); ++index) {
-            shared_fp16[index] = bf16_to_fp16(shared_words[index]);
-        }
-        shared_up = fp16_weight_from_host(loader.store(shared_fp16.data(), shared_fp16.size() * 2),
-                                          2 * kShared, kHidden);
-        shared_down = loader.matrix(moe.shared_down, kHidden, kShared);
+            auto control_source = loader.words(moe.router, static_cast<std::size_t>(kExperts),
+                                               static_cast<std::size_t>(kHidden));
+            auto score_source = loader.words(moe.shared_score, 1, static_cast<std::size_t>(kHidden));
+            std::vector<std::uint16_t> control_words(control_source.size() + score_source.size());
+            std::copy(control_source.begin(), control_source.end(), control_words.begin());
+            std::copy(score_source.begin(), score_source.end(), control_words.begin() + control_source.size());
+            std::vector<std::uint16_t> control_fp16(control_words.size());
+            for (std::size_t index = 0; index < control_words.size(); ++index) {
+                control_fp16[index] = bf16_to_fp16(control_words[index]);
+            }
+            control = fp16_weight_from_host(loader.store(control_fp16.data(), control_fp16.size() * 2),
+                                            kExperts + 1, kHidden);
 
-        gate_layout = store_bank(reader, moe.routed_gate, gate_bank);
-        down_layout = store_bank(reader, moe.routed_down, down_bank);
+            auto gate_source = loader.words(moe.shared_gate, static_cast<std::size_t>(kShared),
+                                            static_cast<std::size_t>(kHidden));
+            auto up_source = loader.words(moe.shared_up, static_cast<std::size_t>(kShared),
+                                          static_cast<std::size_t>(kHidden));
+            std::vector<std::uint16_t> shared_words(gate_source.size() + up_source.size());
+            std::copy(gate_source.begin(), gate_source.end(), shared_words.begin());
+            std::copy(up_source.begin(), up_source.end(), shared_words.begin() + gate_source.size());
+            std::vector<std::uint16_t> shared_fp16(shared_words.size());
+            for (std::size_t index = 0; index < shared_words.size(); ++index) {
+                shared_fp16[index] = bf16_to_fp16(shared_words[index]);
+            }
+            shared_up = fp16_weight_from_host(loader.store(shared_fp16.data(), shared_fp16.size() * 2),
+                                              2 * kShared, kHidden);
+            shared_down = loader.matrix(moe.shared_down, kHidden, kShared);
+        } // router_rank
+
+        gate_layout = store_bank(reader, moe.routed_gate, gate_bank, rank, tp, kExperts);
+        down_layout = store_bank(reader, moe.routed_down, down_bank, rank, tp, kExperts);
         expert_bytes = gate_bank.bytes + down_bank.bytes;
 
         gate_fp16 = DeviceBuffer(static_cast<std::size_t>(2 * kIntermediate) * kHidden * 2);
         down_fp16 = DeviceBuffer(static_cast<std::size_t>(kHidden) * kIntermediate * 2);
         total = DeviceBuffer(static_cast<std::size_t>(kHidden) * sizeof(float));
 
-        model.layers[0].attention_projection = attention_projection;
-        model.ple.rows = qwen4_exp::PleRowSource{
-            .context = nullptr, .fetch = no_op_ple_fetch, .divisors = ple_divisors};
-
-        const float ones[4] = {1.0F, 1.0F, 1.0F, 1.0F};
-        condition_ones.copy_from_host(ones, sizeof(ones));
+        if (router_rank) {
+            model.layers[0].attention_projection = attention_projection;
+            model.ple.rows = qwen4_exp::PleRowSource{
+                .context = nullptr, .fetch = no_op_ple_fetch, .divisors = ple_divisors};
+            state = std::make_unique<family::TextState>(
+                device_context, model,
+                static_cast<std::uint32_t>(TextConfig::max_position_embeddings), 1, 1, 0);
+            trunk = std::make_unique<family::TextTrunk>(model, *state, activation, workspace,
+                                                        device_context.stream);
+            chain_current = DeviceBuffer(MtpDraft::hidden_elements * sizeof(std::uint16_t));
+            chain_next = DeviceBuffer(MtpDraft::hidden_elements * sizeof(std::uint16_t));
+            condition_ones = DeviceBuffer(4 * sizeof(float));
+            const float ones[4] = {1.0F, 1.0F, 1.0F, 1.0F};
+            condition_ones.copy_from_host(ones, sizeof(ones));
+        }
     }
 
     static Weight hc_down_injection(WeightLoader& loader, const HcPlan& plan) {
@@ -372,11 +424,19 @@ struct MtpDraft::Impl {
         };
     }
 
-    TokenId run(const Tensor& conditioning, TokenId next_token, std::int32_t position,
-                Tensor* chained_hidden) {
+    struct Step {
+        Tensor moe_input{};
+        Tensor stage{};
+        Tensor moe_injection{};
+        Tensor moe_out{};
+        Tensor residual_out{};
+        Tensor normalized_out{};
+        Tensor shared_output{};
+        float shared = 0.0F;
+    };
+
+    Step begin(const Tensor& conditioning, TokenId next_token, std::int32_t position) {
         CUDA_CHECK(cudaSetDevice(device_context.device));
-        auto activation_scope = activation.scope();
-        auto workspace_scope = workspace.scope();
         cudaStream_t stream = device_context.stream;
 
         const std::int32_t tokens = 1;
@@ -436,13 +496,13 @@ struct MtpDraft::Impl {
         std::array<const AttentionProjectionWeights*, artifact::kMaximumDevices> weights{};
         weights[0] = &attention_projection;
         std::array<family::QsaLayerStateView, artifact::kMaximumDevices> qsa_state{};
-        std::pair<family::TextState*, std::int32_t> publish_context{&state, 0};
+        std::pair<family::TextState*, std::int32_t> publish_context{state.get(), 0};
         qsa_state[0] = family::QsaLayerStateView{
-            .cache = state.cache(0),
-            .before = state.before_tail(0),
-            .const_tail = state.const_tail(0),
-            .after = state.tail(0),
-            .records = state.records(static_cast<std::size_t>(tokens)),
+            .cache = state->cache(0),
+            .before = state->before_tail(0),
+            .const_tail = state->const_tail(0),
+            .after = state->tail(0),
+            .records = state->records(static_cast<std::size_t>(tokens)),
             .publish = family::publish_text_qsa_tail,
             .publish_context = &publish_context,
         };
@@ -458,8 +518,8 @@ struct MtpDraft::Impl {
         table_views[0] = table_rows;
         mixer_outputs[0] = mixer_out;
         staging_views[0] = staging;
-        trunk.run_qsa_layer(tokens, weights, qsa_state, block_inputs, position_views, valid_views,
-                            table_views, mixer_outputs, staging_views);
+        trunk->run_qsa_layer(tokens, weights, qsa_state, block_inputs, position_views, valid_views,
+                             table_views, mixer_outputs, staging_views);
 
         Tensor stage = activation.alloc(kTextActivationDtype, {kHidden, kStreams, tokens});
         Tensor normalized_moe = activation.alloc(kTextActivationDtype, {kHidden, kStreams, tokens});
@@ -473,33 +533,67 @@ struct MtpDraft::Impl {
 
         Tensor moe_out = activation.alloc(kTextActivationDtype, {kHidden, tokens});
         CUDA_CHECK(cudaMemsetAsync(moe_out.data, 0, moe_out.bytes(), stream));
-        moe_forward(moe_block_input, moe_out, stream);
+        Step step{};
+        step.moe_input     = moe_block_input;
+        step.stage         = stage;
+        step.moe_injection = moe_injection;
+        step.moe_out       = moe_out;
+        step.residual_out =
+            activation.alloc(kTextActivationDtype, {kHidden, kStreams, tokens});
+        step.normalized_out =
+            activation.alloc(kTextActivationDtype, {kHidden, kStreams, tokens});
+        route_and_shared(moe_block_input, step, stream);
+        run_experts(moe_block_input, selected, selected_scores, stream);
+        return step;
+    }
 
-        Tensor residual_out = activation.alloc(kTextActivationDtype, {kHidden, kStreams, tokens});
-        Tensor normalized_out = activation.alloc(kTextActivationDtype, {kHidden, kStreams, tokens});
-        ops::hc_combine_norm(stage, moe_out, moe_injection, final_hc_weights.norm, kEpsilon,
-                             residual_out, normalized_out, stream);
+    void finish_state(Step& step, Tensor* chained_hidden) {
+        CUDA_CHECK(cudaSetDevice(device_context.device));
+        cudaStream_t stream = device_context.stream;
+        mtp_scale_add_f16(step.shared_output.data, step.shared, static_cast<float*>(total.p),
+                          kHidden, stream);
+        mtp_round_f16(static_cast<const float*>(total.p), step.moe_out.data, kHidden, stream);
+        ops::hc_combine_norm(step.stage, step.moe_out, step.moe_injection, final_hc_weights.norm,
+                             kEpsilon, step.residual_out, step.normalized_out, stream);
         if (chained_hidden != nullptr) {
-            CUDA_CHECK(cudaMemcpyAsync(chained_hidden->data, residual_out.data,
-                                       residual_out.bytes(), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(chained_hidden->data, step.residual_out.data,
+                                       step.residual_out.bytes(), cudaMemcpyDeviceToDevice, stream));
         }
-        Tensor sample = activation.alloc(kTextActivationDtype, {kHidden, tokens});
-        ops::hc_final_mix(normalized_out,
+    }
+
+    TokenId finish_logits(Step& step, float* confidence = nullptr) {
+        CUDA_CHECK(cudaSetDevice(device_context.device));
+        cudaStream_t stream = device_context.stream;
+        Tensor sample = activation.alloc(kTextActivationDtype, {kHidden, 1});
+        ops::hc_final_mix(step.normalized_out,
                           ops::HcFinalMixWeights{final_hc_weights.down_injection,
                                                  final_hc_weights.up},
                           workspace, sample, stream);
-        Tensor logits = activation.alloc(kTextActivationDtype, {kVocab, tokens});
+        Tensor logits = activation.alloc(kTextActivationDtype, {kVocab, 1});
         ops::linear(sample, output_head, logits, ops::LinearPolicy::A16Only, workspace, stream);
-        Tensor winner = activation.alloc(DType::I32, {tokens});
+        Tensor winner = activation.alloc(DType::I32, {1});
         ops::argmax(logits, winner, kVocab, stream);
+        Tensor confidence_device;
+        if (confidence != nullptr) {
+            confidence_device = activation.alloc(DType::FP32, {1});
+            mtp_top1_prob_f16(logits.data, static_cast<float*>(confidence_device.data), kVocab,
+                              stream);
+        }
 
         CUDA_CHECK(cudaStreamSynchronize(stream));
         std::int32_t result = 0;
         CUDA_CHECK(cudaMemcpy(&result, winner.data, sizeof(result), cudaMemcpyDeviceToHost));
+        if (confidence != nullptr) {
+            CUDA_CHECK(cudaMemcpy(confidence, confidence_device.data, sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+        }
         return static_cast<TokenId>(result);
     }
 
-    void moe_forward(const Tensor& x, Tensor& destination, cudaStream_t stream) {
+    // Rank 0 only: the full 512-expert router and the shared expert. Produces the global top-k and
+    // coefficients (still over all experts) in `selected`/`selected_scores`, the shared scalar in
+    // step.shared and the shared expert output in step.shared_output.
+    void route_and_shared(const Tensor& x, Step& step, cudaStream_t stream) {
         Tensor control_out = activation.alloc(DType::FP16, {kExperts + 1, 1});
         ops::linear(x, control, control_out, ops::LinearPolicy::A16Only, workspace, stream);
         std::vector<__half> control_host(kExperts + 1);
@@ -516,8 +610,6 @@ struct MtpDraft::Impl {
         }
         std::partial_sort(scores.begin(), scores.begin() + kTopK, scores.end(),
                           [](const auto& left, const auto& right) { return left.first > right.first; });
-        std::array<std::int32_t, kTopK> selected{};
-        std::array<float, kTopK> selected_scores{};
         float maximum = scores[0].first;
         for (std::int32_t index = 0; index < kTopK; ++index) {
             selected[static_cast<std::size_t>(index)] = scores[static_cast<std::size_t>(index)].second;
@@ -533,7 +625,7 @@ struct MtpDraft::Impl {
         for (std::int32_t index = 0; index < kTopK; ++index) {
             selected_scores[static_cast<std::size_t>(index)] /= denominator;
         }
-        const float shared = 1.0F / (1.0F + std::exp(-__half2float(control_host[kExperts])));
+        step.shared = 1.0F / (1.0F + std::exp(-__half2float(control_host[kExperts])));
 
         Tensor shared_projection = activation.alloc(kTextActivationDtype, {2 * kShared, 1});
         ops::linear(x, shared_up, shared_projection, ops::LinearPolicy::A16Only, workspace, stream);
@@ -542,19 +634,27 @@ struct MtpDraft::Impl {
         Tensor shared_output = activation.alloc(kTextActivationDtype, {kHidden, 1});
         ops::linear(shared_activation, shared_down, shared_output, ops::LinearPolicy::A16Only,
                     workspace, stream);
+        step.shared_output = shared_output;
+    }
+
+    // Every rank: FP32 accumulation of the routed experts that fall in this rank's contiguous
+    // range, using the global top-k ids and coefficients produced by rank 0.
+    void run_experts(const Tensor& x, const std::array<std::int32_t, kTopK>& expert_ids,
+                     const std::array<float, kTopK>& weights, cudaStream_t stream) {
         CUDA_CHECK(cudaMemsetAsync(total.p, 0, static_cast<std::size_t>(kHidden) * sizeof(float),
                                    stream));
-        mtp_scale_add_f16(shared_output.data, shared, static_cast<float*>(total.p), kHidden, stream);
 
         Tensor gate_up = activation.alloc(kTextActivationDtype, {2 * kIntermediate, 1});
         Tensor expert_activation = activation.alloc(kTextActivationDtype, {kIntermediate, 1});
         Tensor expert_output = activation.alloc(kTextActivationDtype, {kHidden, 1});
         for (std::int32_t index = 0; index < kTopK; ++index) {
-            const std::int32_t expert = selected[static_cast<std::size_t>(index)];
+            const std::int32_t expert = expert_ids[static_cast<std::size_t>(index)];
+            if (expert < expert_begin || expert >= expert_begin + local_experts) { continue; }
+            const std::int32_t local = expert - expert_begin;
             const std::size_t gate_code_offset =
-                static_cast<std::size_t>(expert) * (2 * kIntermediate) * kHidden;
+                static_cast<std::size_t>(local) * (2 * kIntermediate) * kHidden;
             const std::size_t gate_scale_offset =
-                static_cast<std::size_t>(expert) * gate_layout.blocks;
+                static_cast<std::size_t>(local) * gate_layout.blocks;
             mtp_decode_fp8_block128(
                 static_cast<const std::uint8_t*>(gate_bank.p) + gate_code_offset,
                 reinterpret_cast<const std::uint16_t*>(
@@ -573,9 +673,9 @@ struct MtpDraft::Impl {
             mtp_silu_mul_f16(gate_up.data, expert_activation.data, kIntermediate, stream);
 
             const std::size_t down_code_offset =
-                static_cast<std::size_t>(expert) * kHidden * kIntermediate;
+                static_cast<std::size_t>(local) * kHidden * kIntermediate;
             const std::size_t down_scale_offset =
-                static_cast<std::size_t>(expert) * down_layout.blocks;
+                static_cast<std::size_t>(local) * down_layout.blocks;
             mtp_decode_fp8_block128(
                 static_cast<const std::uint8_t*>(down_bank.p) + down_code_offset,
                 reinterpret_cast<const std::uint16_t*>(
@@ -585,21 +685,27 @@ struct MtpDraft::Impl {
             const Weight down = fp16_weight_from_host(down_fp16.p, kHidden, kIntermediate);
             ops::linear(expert_activation, down, expert_output, ops::LinearPolicy::A16Only,
                         workspace, stream);
-            mtp_scale_add_f16(expert_output.data, selected_scores[static_cast<std::size_t>(index)],
+            mtp_scale_add_f16(expert_output.data, weights[static_cast<std::size_t>(index)],
                               static_cast<float*>(total.p), kHidden, stream);
         }
-        mtp_round_f16(static_cast<const float*>(total.p), destination.data, kHidden, stream);
     }
 
     artifact::Reader reader;
     DeviceContext device_context;
+    int rank = 0;
+    int tp = 1;
+    bool router_rank = false;
+    std::int32_t expert_begin = 0;
+    std::int32_t local_experts = kExperts;
     std::vector<DeviceBuffer> owned;
     WorkspaceArena activation;
     WorkspaceArena workspace;
     Variant::ModelView model{};
     float ple_divisors[ops::kPleShards]{};
-    family::TextState state;
-    family::TextTrunk trunk;
+    std::unique_ptr<family::TextState> state;
+    std::unique_ptr<family::TextTrunk> trunk;
+    std::array<std::int32_t, kTopK> selected{};
+    std::array<float, kTopK> selected_scores{};
     DeviceBuffer condition_ones;
 
     AttentionProjectionWeights attention_projection{};
@@ -622,24 +728,159 @@ struct MtpDraft::Impl {
     DeviceBuffer gate_fp16{};
     DeviceBuffer down_fp16{};
     DeviceBuffer total{};
+    DeviceBuffer reduce_staging{};
+    DeviceBuffer routed_input;
+    DeviceBuffer chain_current;
+    DeviceBuffer chain_next;
     std::uint64_t expert_bytes = 0;
     std::uint64_t host_syncs = 0;
 };
 
-MtpDraft::MtpDraft(const std::filesystem::path& artifact, int device)
-    : impl_(std::make_unique<Impl>(artifact, device)) {}
-
-MtpDraft::~MtpDraft() = default;
-
-TokenId MtpDraft::run(const Tensor& conditioning, TokenId next_token, std::int32_t position,
-                      Tensor* chained_hidden) {
-    return impl_->run(conditioning, next_token, position, chained_hidden);
+MtpDraft::MtpDraft(const std::filesystem::path& artifact, const ExecutionContext& execution,
+                   const ops::CollectiveComms& comms)
+    : execution_(&execution), comms_(&comms) {
+    if (execution.tp < 1 || execution.tp > static_cast<int>(kMaximumDevices)) {
+        throw std::runtime_error("MTP draft execution width is invalid");
+    }
+    int previous = 0;
+    CUDA_CHECK(cudaGetDevice(&previous));
+    for (int rank = 0; rank < execution.tp; ++rank) {
+        if (!execution.dev[static_cast<std::size_t>(rank)].has_value()) {
+            throw std::runtime_error("MTP draft rank has no device context");
+        }
+        const auto slot = static_cast<std::size_t>(rank);
+        ranks_.push_back(std::make_unique<Impl>(artifact, execution.dev[slot]->device, rank,
+                                                execution.tp));
+        CUDA_CHECK(cudaSetDevice(execution.dev[slot]->device));
+        CUDA_CHECK(cudaEventCreateWithFlags(&x_ready_[slot], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&x_after_[slot], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&reduce_before_[slot], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&reduce_after_[slot], cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaSetDevice(previous));
 }
 
-int MtpDraft::device() const noexcept { return impl_->device_context.device; }
+MtpDraft::~MtpDraft() {
+    for (int rank = 0; rank < execution_->tp; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        if (x_ready_[slot] != nullptr) { CUDA_CHECK(cudaEventDestroy(x_ready_[slot])); }
+        if (x_after_[slot] != nullptr) { CUDA_CHECK(cudaEventDestroy(x_after_[slot])); }
+        if (reduce_before_[slot] != nullptr) { CUDA_CHECK(cudaEventDestroy(reduce_before_[slot])); }
+        if (reduce_after_[slot] != nullptr) { CUDA_CHECK(cudaEventDestroy(reduce_after_[slot])); }
+    }
+}
 
-std::uint64_t MtpDraft::expert_bytes() const noexcept { return impl_->expert_bytes; }
+TokenId MtpDraft::run(const RankTensors& conditioning, TokenId next_token, std::int32_t position,
+                      RankTensors* chained_hidden, float* confidence) {
+    const int tp = execution_->tp;
+    Impl& router = *ranks_[0];
+    std::array<std::optional<WorkspaceArena::Scope>, kMaximumDevices> activation_scopes{};
+    std::array<std::optional<WorkspaceArena::Scope>, kMaximumDevices> workspace_scopes{};
+    activation_scopes[0].emplace(router.activation.scope());
+    workspace_scopes[0].emplace(router.workspace.scope());
 
-std::uint64_t MtpDraft::host_syncs() const noexcept { return impl_->host_syncs; }
+    // Rank 0 alone runs the non-expert path, the full router, the shared expert and its own expert
+    // range. The global top-k decision and shared scalar are published through MtpDraft host
+    // members, which the expert-only ranks read directly (one process, one host address space).
+    Impl::Step step = router.begin(conditioning[0], next_token, position);
+    router_.experts = router.selected;
+    router_.scores = router.selected_scores;
+    router_.shared = step.shared;
+
+    RankTensors totals{};
+    RankTensors staging{};
+    totals[0]  = Tensor(router.total.p, DType::FP32, {kHidden, 1});
+    staging[0] = Tensor(router.reduce_staging.p, DType::FP32, {kHidden, 1});
+
+    if (tp > 1) {
+        // Publish rank 0's MoE input (2560 FP16) to every peer on the device in FP16, with no host
+        // staging. The draft stream produces x while collectives run on each engine stream, so the
+        // handoff is ordered with pre-created events only; there is no host wait here.
+        CUDA_CHECK(cudaSetDevice(execution_->dev[0]->device));
+        CUDA_CHECK(cudaEventRecord(x_ready_[0], router.device_context.stream));
+        CUDA_CHECK(cudaStreamWaitEvent(execution_->dev[0]->stream, x_ready_[0], 0));
+        std::array<Tensor, kMaximumDevices> received{};
+        for (int rank = 1; rank < tp; ++rank) {
+            const auto slot = static_cast<std::size_t>(rank);
+            received[slot] =
+                Tensor(ranks_[slot]->routed_input.p, kTextActivationDtype, {kHidden, 1});
+        }
+        ops::broadcast_rank0(step.moe_input, received, *execution_, *comms_);
+
+        for (int rank = 1; rank < tp; ++rank) {
+            const auto slot = static_cast<std::size_t>(rank);
+            Impl& expert = *ranks_[slot];
+            CUDA_CHECK(cudaSetDevice(execution_->dev[slot]->device));
+            CUDA_CHECK(cudaEventRecord(x_after_[slot], execution_->dev[slot]->stream));
+            CUDA_CHECK(cudaStreamWaitEvent(expert.device_context.stream, x_after_[slot], 0));
+            activation_scopes[slot].emplace(expert.activation.scope());
+            workspace_scopes[slot].emplace(expert.workspace.scope());
+            expert.run_experts(received[slot], router_.experts, router_.scores,
+                               expert.device_context.stream);
+            totals[slot]  = Tensor(expert.total.p, DType::FP32, {kHidden, 1});
+            staging[slot] = Tensor(expert.reduce_staging.p, DType::FP32, {kHidden, 1});
+        }
+    }
+
+    // One FP32 all-reduce over the per-rank expert accumulators; the shared term is added exactly
+    // once afterwards by rank 0, which alone rounds to FP16 and runs the output head and argmax.
+    for (int rank = 0; rank < tp; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        CUDA_CHECK(cudaSetDevice(execution_->dev[slot]->device));
+        CUDA_CHECK(cudaEventRecord(reduce_before_[slot], ranks_[slot]->device_context.stream));
+        CUDA_CHECK(cudaStreamWaitEvent(execution_->dev[slot]->stream, reduce_before_[slot], 0));
+    }
+    ops::allreduce_sum(totals, staging, *execution_, *comms_);
+    for (int rank = 0; rank < tp; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        CUDA_CHECK(cudaSetDevice(execution_->dev[slot]->device));
+        CUDA_CHECK(cudaEventRecord(reduce_after_[slot], execution_->dev[slot]->stream));
+        CUDA_CHECK(cudaStreamWaitEvent(ranks_[slot]->device_context.stream, reduce_after_[slot], 0));
+    }
+
+    Tensor* chained = chained_hidden == nullptr ? nullptr : &(*chained_hidden)[0];
+    router.finish_state(step, chained);
+    return router.finish_logits(step, confidence);
+}
+
+std::vector<TokenId> MtpDraft::run_chain(const RankTensors& conditioning, TokenId first_token,
+                                         std::uint32_t steps, std::int32_t start_position,
+                                         float min_p) {
+    std::vector<TokenId> tokens;
+    tokens.reserve(steps);
+    if (steps == 0) { return tokens; }
+
+    const std::size_t bytes = hidden_elements * sizeof(std::uint16_t);
+    Impl& router = *ranks_[0];
+    int previous = 0;
+    CUDA_CHECK(cudaGetDevice(&previous));
+    CUDA_CHECK(cudaSetDevice(execution_->dev[0]->device));
+    CUDA_CHECK(cudaMemcpy(router.chain_current.p, conditioning[0].data, bytes,
+                          cudaMemcpyDeviceToDevice));
+    void* current = router.chain_current.p;
+    void* next = router.chain_next.p;
+    const bool gated = min_p > 0.0F;
+    for (std::uint32_t step = 0; step < steps; ++step) {
+        RankTensors current_views{};
+        RankTensors next_views{};
+        current_views[0] = Tensor(current, DType::FP16, {2560, 4});
+        next_views[0]    = Tensor(next, DType::FP16, {2560, 4});
+        float confidence = 0.0F;
+        first_token = run(current_views, first_token,
+                          start_position + static_cast<std::int32_t>(step), &next_views,
+                          gated ? &confidence : nullptr);
+        tokens.push_back(first_token);
+        std::swap(current, next);
+        if (gated && confidence < min_p) { break; }
+    }
+    CUDA_CHECK(cudaSetDevice(previous));
+    return tokens;
+}
+
+int MtpDraft::device() const noexcept { return ranks_[0]->device_context.device; }
+
+std::uint64_t MtpDraft::expert_bytes() const noexcept { return ranks_[0]->expert_bytes; }
+
+std::uint64_t MtpDraft::host_syncs() const noexcept { return ranks_[0]->host_syncs; }
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

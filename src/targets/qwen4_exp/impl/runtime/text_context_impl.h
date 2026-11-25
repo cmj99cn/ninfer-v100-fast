@@ -10,6 +10,7 @@
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gated_residual.h"
+#include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sigmoid_gated_rmsnorm.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/moe_nvfp4.h"
@@ -151,9 +152,38 @@ inline std::int32_t count_qsa_layers(std::size_t layers) {
     return count;
 }
 
+// One rank's replay records: the same persistent width and row capacity on every rank, with the
+// per-rank head/channel shard supplied by TextState. The width is the speculative verify span
+// (1 + draft window), independent of the forward/prefill width. The backing is a single allocation
+// whose plane offsets come from the shared planner, so no storage is shared between ranks.
+inline TextGdnReplayPlan plan_text_gdn_replay_records(std::int32_t conv_channels,
+                                                      std::int32_t qk_heads,
+                                                      std::int32_t value_heads,
+                                                      std::uint32_t replay_width) {
+    LayoutBuilder builder;
+    const GdnReplayRecordLayout layout = plan_gdn_replay_records(
+        builder, GdnReplayRecordSpec{
+                     .activation_dtype = kTextActivationDtype,
+                     .layers           = TextConfig::gdn_layers(),
+                     .record_capacity  = 8,
+                     .width = static_cast<std::int32_t>(replay_width == 0 ? 1U : replay_width),
+                     .conv_channels    = conv_channels,
+                     .qk_heads         = qk_heads,
+                     .value_heads      = value_heads,
+                     .key_dim          = TextConfig::gdn_head_dim,
+                     .value_dim        = TextConfig::gdn_head_dim,
+                 });
+    return {layout, builder.finish(256)};
+}
+
 inline TextState::TextState(DeviceContext& device, const ModelView& model,
                             std::uint32_t kv_capacity_tokens, std::uint32_t forward_tokens,
                             int tp, int rank)
+    : TextState(device, model, kv_capacity_tokens, forward_tokens, tp, rank, forward_tokens) {}
+
+inline TextState::TextState(DeviceContext& device, const ModelView& model,
+                            std::uint32_t kv_capacity_tokens, std::uint32_t forward_tokens,
+                            int tp, int rank, std::uint32_t replay_width)
     : device_scope_(device.device), ple_source_(model.ple.rows), device_(device.device),
       rank_(rank), stream_(device.stream),
       layers_(model.loaded_layers), forward_tokens_(forward_tokens == 0 ? 1 : forward_tokens),
@@ -171,8 +201,13 @@ inline TextState::TextState(DeviceContext& device, const ModelView& model,
       qsa_tail_bytes_(static_cast<std::size_t>(TextConfig::index_head_dim) * 4 * kBatch * 2),
       qsa_tail_rope_bytes_(3 * kBatch * 4),
       conv_kernels_(layers_ * static_cast<std::size_t>(conv_channels_) * 4 * 2),
-      conv_states_(layers_ * static_cast<std::size_t>(conv_channels_) * 3 * 2),
-      recurrent_states_(layers_ * 128 * 128 * static_cast<std::size_t>(gdn_value_heads_) * 4),
+      conv_states_(static_cast<std::size_t>(TextConfig::gdn_layers()) *
+                   static_cast<std::size_t>(conv_channels_) * 3 * 2),
+      recurrent_states_(static_cast<std::size_t>(TextConfig::gdn_layers()) * 128 * 128 *
+                        static_cast<std::size_t>(gdn_value_heads_) * 4),
+      gdn_replay_plan_(plan_text_gdn_replay_records(conv_channels_, gdn_key_heads_,
+                                                   gdn_value_heads_, replay_width)),
+      gdn_replay_backing_(gdn_replay_plan_.backing_bytes),
       k_pages_(qsa_page_bytes_ * static_cast<std::size_t>(qsa_layers_)),
       v_pages_(qsa_page_bytes_ * static_cast<std::size_t>(qsa_layers_)),
       index_k_pages_(qsa_index_page_bytes_ * static_cast<std::size_t>(qsa_layers_)),
@@ -204,6 +239,31 @@ inline TextState::TextState(DeviceContext& device, const ModelView& model,
     if (kv_heads_ < 1 || gdn_key_heads_ < 1 || gdn_value_heads_ % gdn_key_heads_ != 0) {
         throw std::invalid_argument("the text state GDN head split is not a legal group");
     }
+    gdn_replay_records_ = GdnReplayRecords(
+        DeviceSpan{gdn_replay_backing_.p, gdn_replay_backing_.bytes}, gdn_replay_plan_.layout);
+    verification_.width = gdn_replay_records_.spec.width;
+    verification_.qsa_raw_keys = DeviceBuffer(
+        static_cast<std::size_t>(qsa_layers_) * TextConfig::index_head_dim *
+        static_cast<std::size_t>(verification_.width) * kBatch * sizeof(std::uint16_t));
+    verification_.qsa_rope = DeviceBuffer(static_cast<std::size_t>(qsa_layers_) * 3 *
+                                          static_cast<std::size_t>(verification_.width) * kBatch *
+                                          sizeof(std::int32_t));
+    verification_.qsa_base = DeviceBuffer(static_cast<std::size_t>(qsa_layers_) * kBatch *
+                                          sizeof(std::int32_t));
+    verification_.qsa_before_keys = DeviceBuffer(
+        static_cast<std::size_t>(qsa_layers_) * TextConfig::index_head_dim * 4 * kBatch *
+        sizeof(std::uint16_t));
+    verification_.qsa_before_rope = DeviceBuffer(static_cast<std::size_t>(qsa_layers_) * 3 *
+                                                  kBatch * sizeof(std::int32_t));
+    verification_.ple_values = DeviceBuffer(static_cast<std::size_t>(kChannels) *
+                                            static_cast<std::size_t>(verification_.width) * kBatch *
+                                            sizeof(std::uint16_t));
+    verification_.ple_before = DeviceBuffer(static_cast<std::size_t>(kChannels) *
+                                            ops::kPleConvWindow * kBatch *
+                                            sizeof(std::uint16_t));
+    verification_.residual = DeviceBuffer(static_cast<std::size_t>(verification_.width) *
+                                          TextConfig::residual_width * sizeof(std::uint16_t));
+    verification_.columns = DeviceBuffer(sizeof(std::int32_t));
     if (ple_source_.fetch == nullptr || ple_source_.divisors == nullptr) {
         throw std::runtime_error("the text state requires a PLE row source");
     }
@@ -282,6 +342,16 @@ inline void TextState::reset() {
     if (ple_ready_ != nullptr) { (void)cudaEventSynchronize(ple_ready_); }
     conv_states_.fill(0);
     recurrent_states_.fill(0);
+    gdn_replay_backing_.fill(0);
+    verification_.qsa_raw_keys.fill(0);
+    verification_.qsa_rope.fill(0);
+    verification_.qsa_base.fill(0);
+    verification_.qsa_before_keys.fill(0);
+    verification_.qsa_before_rope.fill(0);
+    verification_.ple_values.fill(0);
+    verification_.ple_before.fill(0);
+    verification_.residual.fill(0);
+    verification_.columns.fill(0);
     k_pages_.fill(0);
     v_pages_.fill(0);
     index_k_pages_.fill(0);
@@ -370,8 +440,7 @@ inline std::int32_t TextState::base_position() const {
 }
 
 inline Tensor TextState::gdn_conv_state(std::size_t gdn_index) const {
-    const std::size_t layer = gdn_layers_.at(gdn_index);
-    return Tensor(conv_states_.p + layer * static_cast<std::size_t>(conv_channels_) * 3 * 2,
+    return Tensor(conv_states_.p + gdn_index * static_cast<std::size_t>(conv_channels_) * 3 * 2,
                   kTextActivationDtype, {3, conv_channels_});
 }
 
@@ -382,10 +451,128 @@ inline Tensor TextState::gdn_conv_kernel(std::size_t layer) const {
 }
 
 inline Tensor TextState::gdn_recurrent_state(std::size_t gdn_index) const {
-    const std::size_t layer = gdn_layers_.at(gdn_index);
     return Tensor(recurrent_states_.p +
-                      layer * 128 * 128 * static_cast<std::size_t>(gdn_value_heads_) * 4,
+                      gdn_index * 128 * 128 * static_cast<std::size_t>(gdn_value_heads_) * 4,
                   DType::FP32, {128, 128, gdn_value_heads_});
+}
+
+inline const GdnReplayRecords& TextState::gdn_replay_records() const noexcept {
+    return gdn_replay_records_;
+}
+
+inline LinearAttentionStateAllLayersView TextState::gdn_all_layers_view() const {
+    constexpr std::int32_t kStateDim = 128;
+    LinearAttentionStateAllLayersView view;
+    view.conv_layer0 = Tensor(conv_states_.p, kTextActivationDtype, {3, conv_channels_, 1});
+    view.recurrent_layer0 =
+        Tensor(recurrent_states_.p, DType::FP32, {kStateDim, kStateDim, gdn_value_heads_, 1});
+    view.conv_layer_stride_bytes = static_cast<std::int64_t>(conv_channels_) * 3 *
+                                   static_cast<std::int64_t>(sizeof(std::uint16_t));
+    view.recurrent_layer_stride_bytes = static_cast<std::int64_t>(kStateDim) * kStateDim *
+                                        gdn_value_heads_ * static_cast<std::int64_t>(sizeof(float));
+    view.spec = LinearAttentionStatePoolSpec{
+        .layers         = static_cast<std::uint32_t>(TextConfig::gdn_layers()),
+        .conv_channels  = conv_channels_,
+        .conv_width     = 3,
+        .value_heads    = gdn_value_heads_,
+        .value_head_dim = kStateDim,
+        .key_head_dim   = kStateDim,
+        .slot_count     = 1,
+        .conv_dtype     = kTextActivationDtype,
+    };
+    return view;
+}
+
+inline void TextState::capture_verification_state() {
+    DeviceScope scope(device_);
+    for (int slot = 0; slot < qsa_layers_; ++slot) {
+        const ops::ConstQsaTailStateView tail = const_tail(slot);
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<std::byte*>(verification_.qsa_before_keys.p) +
+                static_cast<std::size_t>(slot) * qsa_tail_bytes_,
+            tail.raw_keys.data, tail.raw_keys.bytes(), cudaMemcpyDeviceToDevice, stream_));
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<std::byte*>(verification_.qsa_before_rope.p) +
+                static_cast<std::size_t>(slot) * qsa_tail_rope_bytes_,
+            tail.first_rope.data, tail.first_rope.bytes(), cudaMemcpyDeviceToDevice, stream_));
+    }
+    const Tensor history = ple_history();
+    CUDA_CHECK(cudaMemcpyAsync(verification_.ple_before.p, history.data, history.bytes(),
+                               cudaMemcpyDeviceToDevice, stream_));
+}
+
+inline void TextState::set_verification_columns(std::int32_t columns, cudaStream_t stream) {
+    CUDA_CHECK(cudaMemcpyAsync(verification_.columns.p, &columns, sizeof(columns),
+                               cudaMemcpyHostToDevice, stream));
+}
+
+inline ops::QsaRawRecordWriteView TextState::verification_records(std::int32_t slot,
+                                                                   std::size_t entries) const {
+    const std::size_t keys = static_cast<std::size_t>(slot) * TextConfig::index_head_dim *
+                             static_cast<std::size_t>(verification_.width) * kBatch * sizeof(std::uint16_t);
+    const std::size_t rope = static_cast<std::size_t>(slot) * 3 *
+                             static_cast<std::size_t>(verification_.width) * kBatch * sizeof(std::int32_t);
+    const std::size_t base = static_cast<std::size_t>(slot) * kBatch * sizeof(std::int32_t);
+    return ops::QsaRawRecordWriteView{
+        .raw_keys = Tensor(static_cast<std::byte*>(verification_.qsa_raw_keys.p) + keys,
+                           DType::BF16,
+                           {TextConfig::index_head_dim, static_cast<std::int32_t>(entries), kBatch}),
+        .rope_positions = Tensor(static_cast<std::byte*>(verification_.qsa_rope.p) + rope,
+                                 DType::I32,
+                                 {3, static_cast<std::int32_t>(entries), kBatch}),
+        .base_positions = Tensor(static_cast<std::byte*>(verification_.qsa_base.p) + base,
+                                 DType::I32, {kBatch}),
+    };
+}
+
+inline ops::QsaRawRecordReadView TextState::verification_read_records(std::int32_t slot,
+                                                                      std::size_t entries) const {
+    const auto write = verification_records(slot, entries);
+    return ops::QsaRawRecordReadView{write.raw_keys, write.rope_positions};
+}
+
+inline Tensor TextState::verification_base_positions(std::int32_t slot) const {
+    return Tensor(static_cast<std::byte*>(verification_.qsa_base.p) +
+                      static_cast<std::size_t>(slot) * kBatch * sizeof(std::int32_t),
+                  DType::I32, {kBatch});
+}
+
+inline ops::ConstQsaTailStateView TextState::verification_before(std::int32_t slot) const {
+    return ops::ConstQsaTailStateView{
+        .raw_keys = Tensor(static_cast<std::byte*>(verification_.qsa_before_keys.p) +
+                               static_cast<std::size_t>(slot) * qsa_tail_bytes_,
+                           DType::BF16,
+                           {TextConfig::index_head_dim, 4, kBatch}),
+        .first_rope = Tensor(static_cast<std::byte*>(verification_.qsa_before_rope.p) +
+                                 static_cast<std::size_t>(slot) * qsa_tail_rope_bytes_,
+                             DType::I32, {3, kBatch}),
+    };
+}
+
+inline Tensor TextState::verification_ple_values(std::size_t entries) const {
+    return Tensor(verification_.ple_values.p, kTextActivationDtype,
+                  {kChannels, static_cast<std::int32_t>(entries), kBatch});
+}
+
+inline Tensor TextState::verification_ple_before() const {
+    return Tensor(verification_.ple_before.p, kTextActivationDtype,
+                  {kChannels, static_cast<std::int32_t>(ops::kPleConvWindow), kBatch});
+}
+
+inline Tensor TextState::verification_residual(std::size_t token) const {
+    return Tensor(static_cast<std::byte*>(verification_.residual.p) +
+                      token * static_cast<std::size_t>(TextConfig::residual_width) *
+                          sizeof(std::uint16_t),
+                  kTextActivationDtype, {TextConfig::residual_width, 1});
+}
+
+inline Tensor TextState::verification_residual_view(int entries) const {
+    return Tensor(verification_.residual.p, kTextActivationDtype,
+                  {TextConfig::residual_width, entries, kBatch});
+}
+
+inline Tensor TextState::verification_columns() const {
+    return Tensor(verification_.columns.p, DType::I32, {kBatch});
 }
 
 inline std::optional<std::size_t> TextState::gdn_state_index(std::size_t layer) const {
@@ -407,7 +594,12 @@ inline std::uint64_t TextState::gdn_state_bytes() const noexcept {
 }
 
 inline std::uint64_t TextState::reserved_bytes() const noexcept {
-    return kv_payload_bytes() + gdn_state_bytes() + ple_history_.bytes + ple_rows_.bytes +
+    return kv_payload_bytes() + gdn_state_bytes() + gdn_replay_backing_.bytes +
+           verification_.qsa_raw_keys.bytes + verification_.qsa_rope.bytes +
+           verification_.qsa_base.bytes + verification_.qsa_before_keys.bytes +
+           verification_.qsa_before_rope.bytes + verification_.ple_values.bytes +
+           verification_.ple_before.bytes + verification_.residual.bytes +
+           verification_.columns.bytes + ple_history_.bytes + ple_rows_.bytes +
            ple_staged_rows_.bytes + ple_divisors_.bytes;
 }
 
@@ -556,6 +748,75 @@ inline void TextTrunk::set_residual_sink(int rank, void* data, std::size_t bytes
     residual_sink_bytes_[static_cast<std::size_t>(rank)] = bytes;
 }
 
+inline void TextTrunk::set_gdn_state_action(GdnStateAction action) noexcept {
+    gdn_state_action_ = action;
+}
+
+inline TextTrunk::VerificationBaseline TextTrunk::capture_verification_baseline() {
+    VerificationBaseline baseline;
+    for_each_rank([&](int rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        baseline.positions[rank] = states_[slot]->next_position();
+        baseline.ple_tails[rank] = {states_[slot]->ple_tail(0), states_[slot]->ple_tail(1)};
+        states_[slot]->capture_verification_state();
+    });
+    return baseline;
+}
+
+inline void TextTrunk::commit_verified_span(std::span<const TokenId> verify_tokens,
+                                             std::uint32_t committed_count,
+                                             const VerificationBaseline& baseline) {
+
+    for_each_rank([&](int rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        TextState& state   = *states_[slot];
+        const ops::GdnReplayFoldRow row{
+            .linear_state_slot = 0,
+            .commit_columns    = static_cast<std::int32_t>(committed_count),
+        };
+        ops::gdn_replay_fold(state.gdn_replay_records(), state.gdn_all_layers_view(),
+                             std::span<const ops::GdnReplayFoldRow>(&row, 1), state.stream());
+    });
+
+    if (committed_count < verify_tokens.size()) {
+        for_each_rank([&](int rank) {
+            const auto slot = static_cast<std::size_t>(rank);
+            TextState& state = *states_[slot];
+            state.set_verification_columns(static_cast<std::int32_t>(committed_count),
+                                           state.stream());
+            for (int qsa = 0; qsa < TextConfig::qsa_layers(); ++qsa) {
+                const ops::QsaRawRecordReadView records =
+                    state.verification_read_records(qsa, verify_tokens.size());
+                ops::QsaTailStateView after = state.tail(0);
+                ops::qsa_tail_extract(state.verification_before(qsa), records,
+                                      state.verification_base_positions(qsa),
+                                      state.verification_columns(), after, state.stream());
+                state.publish_tail(qsa);
+            }
+            Tensor after_history = state.ple_history();
+            ops::ple_state_extract(
+                state.verification_ple_before(),
+                state.verification_ple_values(verify_tokens.size()),
+                state.verification_columns(), after_history, state.stream());
+            const std::uint64_t previous =
+                committed_count == 1 ? baseline.ple_tails[rank][1]
+                                     : verify_tokens[committed_count - 2];
+            const std::uint64_t current =
+                committed_count == 1 ? verify_tokens[0] : verify_tokens[committed_count - 1];
+            state.rewind_scalars(baseline.positions[rank] + committed_count, previous, current);
+        });
+    }
+
+    for_each_rank([&](int rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        if (residual_sinks_[slot] == nullptr) { return; }
+        TextState& state = *states_[slot];
+        const Tensor record = state.verification_residual(committed_count - 1);
+        CUDA_CHECK(cudaMemcpyAsync(residual_sinks_[slot], record.data, record.bytes(),
+                                   cudaMemcpyDeviceToDevice, state.stream()));
+    });
+}
+
 inline TokenId TextTrunk::prefill(std::span<const TokenId> tokens) { return forward(tokens); }
 
 inline TokenId TextTrunk::decode(TokenId token) {
@@ -587,6 +848,20 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
         const std::int32_t key_width   = state.gdn_key_heads() * TextConfig::gdn_head_dim;
         const std::int32_t value_width = state.gdn_value_heads() * TextConfig::gdn_head_dim;
         const std::int32_t conv_channels = state.conv_channels();
+        const bool record_for_replay = gdn_state_action_ == GdnStateAction::RecordForReplay;
+        const std::optional<std::size_t> state_slot = state.gdn_state_index(layer);
+        if (!state_slot.has_value()) { throw std::logic_error("a QSA layer has no GDN state slot"); }
+        const std::int32_t gdn_index = static_cast<std::int32_t>(*state_slot);
+        // The replay Op's execution domain is T in [2,16]; a one-token forward cannot be a
+        // speculative verify span and must stay on the in-place commit path.
+        if (record_for_replay && (T < 2 || T > state.gdn_replay_records().spec.width)) {
+            throw std::logic_error("GDN replay records require a multi-token span within the record width");
+        }
+        std::optional<GdnReplayRecordLayer> record_layer;
+        if (record_for_replay) {
+            // Each rank records only its own head/channel shard into its own backing.
+            record_layer = state.gdn_replay_records().layer(gdn_index, kBatch);
+        }
 
         Tensor q    = activations_[slot]->alloc(kTextActivationDtype, {key_width, T});
         Tensor k    = activations_[slot]->alloc(kTextActivationDtype, {key_width, T});
@@ -609,36 +884,42 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
             ops::stage_gdn_decode(q, k, v, g, beta, rank, conv_in, g_rank, beta_rank,
                                   stream_for(rank));
         } else {
-            const auto copy_segment = [&](const Tensor& source, std::int32_t column) {
-                CUDA_CHECK(cudaMemcpy2DAsync(
-                    static_cast<std::byte*>(conv_in.data) +
-                        static_cast<std::size_t>(column) * sizeof(std::uint16_t),
-                    static_cast<std::size_t>(conv_channels) * sizeof(std::uint16_t),
-                    source.data, static_cast<std::size_t>(source.ne[0]) * sizeof(std::uint16_t),
-                    static_cast<std::size_t>(source.ne[0]) * sizeof(std::uint16_t),
-                    static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, stream_for(rank)));
-            };
-            copy_segment(q, 0);
-            copy_segment(k, key_width);
-            copy_segment(v, 2 * key_width);
+            ops::stage_gdn_span(q, k, v, g, beta, rank, conv_in, g_rank, beta_rank,
+                                stream_for(rank));
         }
         NINFER_QWEN4EXP_DIAG_OP_END("gdn_stage");
 
-        const std::optional<std::size_t> state_slot = state.gdn_state_index(layer);
-        if (!state_slot.has_value()) { throw std::logic_error("a QSA layer has no GDN state slot"); }
-        const std::size_t gdn_index = *state_slot;
+        if (record_layer.has_value()) {
+            // conv_in is [channels,T] and the record plane is [channels,width,rows]; copy the
+            // valid T columns bit-preserving into this rank's row-0 slice.
+            CUDA_CHECK(cudaMemcpyAsync(record_layer->conv.data, conv_in.data, conv_in.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream_for(rank)));
+        }
+
         Tensor conv_state = state.gdn_conv_state(gdn_index);
+        Tensor conv_state_update = conv_state;
+        if (record_layer.has_value()) {
+            // The convolution writes its state; stage a scratch copy of the persistent history so
+            // the verify round computes the same output without committing the update.
+            conv_state_update = activations_[slot]->alloc(kTextActivationDtype, {3, conv_channels});
+            CUDA_CHECK(cudaMemcpyAsync(conv_state_update.data, conv_state.data, conv_state.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream_for(rank)));
+        }
         const Tensor conv_kernel = state.gdn_conv_kernel(layer);
         NINFER_QWEN4EXP_DIAG_OP_BEGIN("gdn_conv");
-        ops::causal_conv1d_silu(conv_in, conv_kernel, conv_state, conv_state, conv_out,
-                                stream_for(rank));
+        ops::causal_conv1d_silu(conv_in, conv_kernel, conv_state_update, conv_state_update,
+                                conv_out, stream_for(rank));
         NINFER_QWEN4EXP_DIAG_OP_END("gdn_conv");
         NINFER_QWEN4EXP_DIAG_MARK("gdn_conv");
 
         NINFER_QWEN4EXP_DIAG_OP_BEGIN("gdn_extract");
-        ops::extract_bf16_columns(conv_out, 0, q, stream_for(rank));
-        ops::extract_bf16_columns(conv_out, key_width, k, stream_for(rank));
-        ops::extract_bf16_columns(conv_out, 2 * key_width, v, stream_for(rank));
+        if (T == 1) {
+            ops::extract_bf16_columns(conv_out, 0, q, stream_for(rank));
+            ops::extract_bf16_columns(conv_out, key_width, k, stream_for(rank));
+            ops::extract_bf16_columns(conv_out, 2 * key_width, v, stream_for(rank));
+        } else {
+            ops::extract_gdn_columns(conv_out, q, k, v, stream_for(rank));
+        }
         NINFER_QWEN4EXP_DIAG_OP_END("gdn_extract");
 
         Tensor o  = activations_[slot]->alloc(kTextActivationDtype, {value_width, T});
@@ -649,25 +930,52 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
         Tensor o_recurrent = o.view({128, state.gdn_value_heads(), T});
         Tensor o_normalized = on.view({128, state.gdn_value_heads(), T});
         Tensor recurrent_state = state.gdn_recurrent_state(gdn_index);
-        if (T != 1) {
-            CUDA_CHECK(cudaMemcpy2DAsync(
-                g_rank.data, static_cast<std::size_t>(state.gdn_value_heads()) * 4,
-                static_cast<const std::byte*>(g.data) +
-                    static_cast<std::size_t>(rank * state.gdn_value_heads()) * 4,
-                static_cast<std::size_t>(TextConfig::gdn_value_heads) * 4,
-                static_cast<std::size_t>(state.gdn_value_heads()) * 4, static_cast<std::size_t>(T),
-                cudaMemcpyDeviceToDevice, stream_for(rank)));
-            CUDA_CHECK(cudaMemcpy2DAsync(
-                beta_rank.data, static_cast<std::size_t>(state.gdn_value_heads()) * 4,
-                static_cast<const std::byte*>(beta.data) +
-                    static_cast<std::size_t>(rank * state.gdn_value_heads()) * 4,
-                static_cast<std::size_t>(TextConfig::gdn_value_heads) * 4,
-                static_cast<std::size_t>(state.gdn_value_heads()) * 4, static_cast<std::size_t>(T),
-                cudaMemcpyDeviceToDevice, stream_for(rank)));
-        }
         NINFER_QWEN4EXP_DIAG_OP_BEGIN("gdn_recurrent");
-        ops::gated_delta_net(q_recurrent, k_recurrent, v_recurrent, g_rank, beta_rank, kGdnScale,
-                             true, workspace_, recurrent_state, o_recurrent, stream_for(rank));
+        if (record_layer.has_value()) {
+            Tensor valid_columns = activations_[slot]->alloc(DType::I32, {kBatch});
+            Tensor initial_slots = activations_[slot]->alloc(DType::I32, {kBatch});
+            CUDA_CHECK(cudaMemcpyAsync(
+                valid_columns.data,
+                NINFER_QWEN4EXP_GRAPH_SCALARS_SRC(rank, T, "gdn_record_columns"), 4,
+                cudaMemcpyHostToDevice, stream_for(rank)));
+            CUDA_CHECK(cudaMemsetAsync(initial_slots.data, 0, 4, stream_for(rank)));
+            Tensor q_record = q.view({128, state.gdn_key_heads(), T, kBatch});
+            Tensor k_record = k.view({128, state.gdn_key_heads(), T, kBatch});
+            Tensor v_record = v.view({128, state.gdn_value_heads(), T, kBatch});
+            Tensor g_record = g_rank.view({state.gdn_value_heads(), T, kBatch});
+            Tensor beta_record = beta_rank.view({state.gdn_value_heads(), T, kBatch});
+            Tensor key_record   = record_layer->key.slice(2, 0, T);
+            Tensor value_record = record_layer->value.slice(2, 0, T);
+            Tensor gate_record  = record_layer->gate.slice(2, 0, T);
+            Tensor record_out   = o.view({128, state.gdn_value_heads(), T, kBatch});
+            // The replay Op reads the persistent state without writing it, records this rank's
+            // raw k/v/{g,beta} for a later fold, and still produces o_recurrent for the norm.
+            ops::gated_delta_net_replay_record(
+                q_record, k_record, v_record, g_record, beta_record, kGdnScale,
+                recurrent_state.view({128, 128, state.gdn_value_heads(), 1}), valid_columns,
+                initial_slots, key_record, value_record, gate_record, record_out, stream_for(rank));
+        } else if (T == 1) {
+            // The one-token decode must share the record/fold recurrence body so a folded
+            // continuation reproduces the sequential state bit-for-bit. The slot tensor is a
+            // transient arena allocation: its address is replay-stable under graph capture and it
+            // introduces no persistent state.
+            Tensor slots = activations_[slot]->alloc(DType::I32, {kBatch});
+            CUDA_CHECK(cudaMemsetAsync(slots.data, 0, slots.bytes(), stream_for(rank)));
+            Tensor q_batch    = q.view({128, state.gdn_key_heads(), T, kBatch});
+            Tensor k_batch    = k.view({128, state.gdn_key_heads(), T, kBatch});
+            Tensor v_batch    = v.view({128, state.gdn_value_heads(), T, kBatch});
+            Tensor g_batch    = g_rank.view({state.gdn_value_heads(), T, kBatch});
+            Tensor beta_batch = beta_rank.view({state.gdn_value_heads(), T, kBatch});
+            Tensor out_batch  = o.view({128, state.gdn_value_heads(), T, kBatch});
+            Tensor state_pool = recurrent_state.view({128, 128, state.gdn_value_heads(), 1});
+            ops::gated_delta_net_snapshot(q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
+                                          /*normalize_qk=*/true, state_pool,
+                                          /*valid_columns=*/Tensor{}, slots, slots, out_batch,
+                                          stream_for(rank));
+        } else {
+            ops::gated_delta_net(q_recurrent, k_recurrent, v_recurrent, g_rank, beta_rank, kGdnScale,
+                                 true, workspace_, recurrent_state, o_recurrent, stream_for(rank));
+        }
         NINFER_QWEN4EXP_DIAG_OP_END("gdn_recurrent");
         NINFER_QWEN4EXP_DIAG_MARK("gdn_recurrent");
         NINFER_QWEN4EXP_DIAG_OP_BEGIN("gdn_norm");
@@ -831,7 +1139,8 @@ inline void TextTrunk::run_qsa(std::size_t layer, std::int32_t T,
             .before      = state.before_tail(qsa_slot),
             .const_tail  = state.const_tail(qsa_slot),
             .after       = state.tail(qsa_slot),
-            .records     = state.records(static_cast<std::size_t>(T)),
+            .records     = verifying() ? state.verification_records(qsa_slot, static_cast<std::size_t>(T))
+                                       : state.records(static_cast<std::size_t>(T)),
             .publish     = publish_text_qsa_tail,
             .publish_context = &contexts[slot],
         };
@@ -889,6 +1198,11 @@ inline void TextTrunk::run_ple(std::int32_t T,
                       stream_for(rank));
         NINFER_QWEN4EXP_DIAG_OP_END("ple_gate");
         NINFER_QWEN4EXP_DIAG_MARK("ple_gate");
+        if (verifying()) {
+            const Tensor record = state.verification_ple_values(static_cast<std::size_t>(T));
+            CUDA_CHECK(cudaMemcpyAsync(record.data, normalized_conv.data, record.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream_for(rank)));
+        }
 
         const Tensor next_norm =
             models_[slot]->layers[TextConfig::ple_layer].attention_hc.norm.view({kChannels});
@@ -1077,14 +1391,17 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens,
                 Tensor route_ids = activations_[slot]->alloc(DType::I32, {top_k, T});
                 Tensor route_coefficients = activations_[slot]->alloc(DType::FP32, {top_k, T});
                 Tensor route_gate = activations_[slot]->alloc(DType::FP32, {T});
+                const bool fused_route =
+                    T >= 1 && T <= ops::kMoeRouteFusedMaxTokens;
                 Tensor route_logits =
-                    T == 1 ? activations_[slot]->alloc(DType::FP32, {TextConfig::experts + 1, T})
-                           : Tensor{};
+                    fused_route
+                        ? activations_[slot]->alloc(DType::FP32, {TextConfig::experts + 1, T})
+                        : Tensor{};
                 NINFER_QWEN4EXP_DIAG_OP_BEGIN("route");
                 ops::moe_nvfp4_route(block_input[slot], models_[slot]->layers[layer].post_mixer,
                                       route_ids, route_coefficients, route_gate, stream_for(rank),
-                                      T == 1 ? static_cast<float*>(route_logits.data) : nullptr,
-                                      T == 1 ? states_[slot]->route_counter() : nullptr);
+                                      fused_route ? static_cast<float*>(route_logits.data) : nullptr,
+                                      fused_route ? states_[slot]->route_counter() : nullptr);
                 NINFER_QWEN4EXP_DIAG_OP_END("route");
                 NINFER_QWEN4EXP_DIAG_MARK("route");
                 routes[slot] = ops::MoeNvfp4RouteView{route_ids, route_coefficients, route_gate};
@@ -1169,6 +1486,19 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens,
 
     for_each_rank([&](int rank) {
         const auto slot = static_cast<std::size_t>(rank);
+        if (verifying()) {
+            TextState& state = *states_[slot];
+            const std::size_t token_bytes =
+                static_cast<std::size_t>(TextConfig::residual_width) * sizeof(std::uint16_t);
+            for (std::int32_t token = 0; token < T; ++token) {
+                const Tensor record = state.verification_residual(static_cast<std::size_t>(token));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    record.data,
+                    static_cast<const std::byte*>(residual[slot].data) +
+                        static_cast<std::size_t>(token) * token_bytes,
+                    record.bytes(), cudaMemcpyDeviceToDevice, stream_for(rank)));
+            }
+        }
         if (residual_sinks_[slot] != nullptr) {
             const std::size_t bytes = std::min(residual[slot].bytes(), residual_sink_bytes_[slot]);
             CUDA_CHECK(cudaMemcpyAsync(residual_sinks_[slot], residual[slot].data, bytes,

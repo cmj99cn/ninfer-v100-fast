@@ -117,4 +117,68 @@ void stage_gdn_decode(const Tensor& q, const Tensor& k, const Tensor& v, const T
     detail::stage_gdn_decode_launch(q, k, v, g, beta, rank, conv_in, g_rank, beta_rank, stream);
 }
 
+void stage_gdn_span(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                    const Tensor& beta, std::int32_t rank, Tensor& conv_in, Tensor& g_rank,
+                    Tensor& beta_rank, cudaStream_t stream) {
+    const std::int32_t key_width   = q.ne[0];
+    const std::int32_t tokens      = q.ne[1];
+    const std::int32_t channels    = conv_in.ne[0];
+    const std::int32_t value_heads = g_rank.ne[0];
+    const std::int32_t value_width = channels - 2 * key_width;
+    if (q.dtype != DType::FP16 || k.dtype != DType::FP16 || v.dtype != DType::FP16 ||
+        g.dtype != DType::FP32 || beta.dtype != DType::FP32 ||
+        conv_in.dtype != DType::FP16 || g_rank.dtype != DType::FP32 ||
+        beta_rank.dtype != DType::FP32 || rank < 0 || key_width <= 0 || value_width <= 0 ||
+        value_heads <= 0 || tokens < 2 || k.ne[0] != key_width || v.ne[0] != value_width ||
+        g.ne[0] < (rank + 1) * value_heads || beta.ne[0] < (rank + 1) * value_heads ||
+        g_rank.ne[0] != value_heads || beta_rank.ne[0] != value_heads ||
+        k.ne[1] != tokens || v.ne[1] != tokens || conv_in.ne[1] != tokens ||
+        g.ne[1] != tokens || beta.ne[1] != tokens || g_rank.ne[1] != tokens ||
+        beta_rank.ne[1] != tokens) {
+        throw std::invalid_argument("stage_gdn_span: invalid geometry");
+    }
+    const auto rank_two = [](const Tensor& tensor) {
+        return tensor.ne[2] == 1 && tensor.ne[3] == 1;
+    };
+    if (!rank_two(q) || !rank_two(k) || !rank_two(v) || !rank_two(g) || !rank_two(beta) ||
+        !rank_two(conv_in) || !rank_two(g_rank) || !rank_two(beta_rank) ||
+        !q.is_contiguous() || !k.is_contiguous() || !v.is_contiguous() || !g.is_contiguous() ||
+        !beta.is_contiguous() || !conv_in.is_contiguous() || !g_rank.is_contiguous() ||
+        !beta_rank.is_contiguous() || q.data == nullptr || k.data == nullptr ||
+        v.data == nullptr || g.data == nullptr || beta.data == nullptr ||
+        conv_in.data == nullptr || g_rank.data == nullptr || beta_rank.data == nullptr) {
+        throw std::invalid_argument("stage_gdn_span: tensors must be contiguous rank-2 and non-null");
+    }
+    detail::stage_gdn_span_launch(q, k, v, g, beta, rank, conv_in, g_rank, beta_rank, stream);
+}
+
+void extract_gdn_columns(const Tensor& source, Tensor& q, Tensor& k, Tensor& v,
+                         cudaStream_t stream) {
+    const std::int32_t channels    = source.ne[0];
+    const std::int32_t tokens      = source.ne[1];
+    const std::int32_t key_width   = q.ne[0];
+    const std::int32_t value_width = channels - 2 * key_width;
+    if (source.dtype != DType::FP16 || q.dtype != DType::FP16 || k.dtype != DType::FP16 ||
+        v.dtype != DType::FP16 || channels <= 0 || tokens <= 0 || key_width <= 0 ||
+        value_width <= 0 || k.ne[0] != key_width || v.ne[0] != value_width ||
+        q.ne[1] != tokens || k.ne[1] != tokens || v.ne[1] != tokens) {
+        throw std::invalid_argument("extract_gdn_columns: invalid GDN [channels,T] geometry");
+    }
+    const auto rank_two = [](const Tensor& tensor) {
+        return tensor.ne[2] == 1 && tensor.ne[3] == 1;
+    };
+    if (!rank_two(source) || !rank_two(q) || !rank_two(k) || !rank_two(v) ||
+        !source.is_contiguous() || !q.is_contiguous() || !k.is_contiguous() ||
+        !v.is_contiguous() || source.data == nullptr || q.data == nullptr ||
+        k.data == nullptr || v.data == nullptr) {
+        throw std::invalid_argument(
+            "extract_gdn_columns: tensors must be contiguous rank-2 and non-null");
+    }
+    if (source.data == q.data || source.data == k.data || source.data == v.data ||
+        q.data == k.data || k.data == v.data || q.data == v.data) {
+        throw std::invalid_argument("extract_gdn_columns: source and destinations must not alias");
+    }
+    detail::extract_gdn_columns_launch(source, q, k, v, stream);
+}
+
 } // namespace ninfer::ops

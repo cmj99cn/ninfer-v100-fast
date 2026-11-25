@@ -158,7 +158,8 @@ inline std::uint64_t state_digest(rt::TextState& state) {
 
 class FlashHarness {
 public:
-    explicit FlashHarness(const char* path) : execution({0, 1}), reader(path), binder(reader, 2) {
+    explicit FlashHarness(const char* path, std::uint32_t replay_width = 0)
+        : execution({0, 1}), reader(path), binder(reader, 2) {
         ninfer::EngineOptions options;
         options.artifact_path = path;
         options.device = 0;
@@ -186,7 +187,8 @@ public:
             CUDA_CHECK(cudaGetDevice(&previous));
             CUDA_CHECK(cudaSetDevice(execution.dev[slot]->device));
             states[slot] = std::make_unique<rt::TextState>(
-                *execution.dev[slot], data->view(rank), kKvCapacity, kForwardTokens, 2, rank);
+                *execution.dev[slot], data->view(rank), kKvCapacity, kForwardTokens, 2, rank,
+                replay_width == 0 ? kForwardTokens : replay_width);
             activations[slot] = std::make_unique<DeviceArena>(
                 rt::text_activation_capacity_bytes(kForwardTokens));
             workspaces[slot] = std::make_unique<DeviceArena>(recipe.lane_capacity_bytes);
@@ -209,6 +211,13 @@ public:
             states[slot]->reset();
             activations[slot]->reset();
             workspaces[slot]->reset();
+            // Test-only determinism: `DeviceArena::reset()` only rewinds the suballocation cursor,
+            // so a later T=1 oracle pass could observe stale bytes left by an earlier T>1 batched
+            // forward through allocator reuse. Zero the whole reused arena on this device so the
+            // oracle is independent of which route ran before it. Production Engine does not zero
+            // its arenas; this strictly removes allocator noise from the numerical comparison.
+            CUDA_CHECK(cudaMemset(activations[slot]->base(), 0, activations[slot]->capacity()));
+            CUDA_CHECK(cudaMemset(workspaces[slot]->base(), 0, workspaces[slot]->capacity()));
             CUDA_CHECK(cudaSetDevice(previous));
         }
     }

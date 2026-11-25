@@ -133,6 +133,27 @@ struct GemvStoreEpilogue {
     }
 };
 
+// Column-major [rows, Columns] output for the small-T batched decode route. Column c lives at a
+// fixed stride of `rows` elements, matching out.slice(1, c, 1) of the T==1 sequential caller.
+template <class Element>
+struct GemvColumnContiguousOutput {
+    Element* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, Element value, int column) const {
+        data[static_cast<std::int64_t>(column) * rows + parent_row] = value;
+    }
+};
+
+template <class Element>
+struct GemvColumnStoreEpilogue {
+    template <class Output>
+    __device__ __forceinline__ void operator()(const Output& output, std::int32_t parent_row,
+                                               float accumulator, int column) const {
+        output.store(parent_row, GemvTwoByteTraits<Element>::from_float(accumulator), column);
+    }
+};
+
 template <class Geometry, class Schedule, class Element>
 struct GemvSharedStorage {
     static constexpr int kActivationElements =
@@ -313,6 +334,79 @@ __device__ __forceinline__ void gemv_body(const Element* __restrict__ x, const E
             }
         }
     }
+}
+
+// Multi-column counterpart of gemv_body. The weight pack of each row/phase is fetched once and
+// applied to every token column; each column keeps its own accumulator set and goes through the
+// exact same chain accumulation, phase order, warp reduction and from_float rounding as the T==1
+// path, so the result is raw-bit identical to a sequential T==1 replay.
+template <class Element, class Geometry, class Schedule, int Columns, class Output, class Epilogue>
+__device__ __forceinline__ void gemv_multi_body(const Element* __restrict__ x,
+                                                const Element* __restrict__ weight, Output output,
+                                                Epilogue epilogue) {
+    static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
+    static_assert(Schedule::kActivationAccess == Bf16ActivationAccess::Direct);
+    static_assert(Schedule::kWarpsPerRow == 1);
+    static_assert(Schedule::kPrefetchDepth == 1);
+    static_assert((Geometry::kInputRows % 8) == 0);
+
+    const int lane        = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp        = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int row_group   = warp / Schedule::kWarpsPerRow;
+    const int warp_in_row = warp % Schedule::kWarpsPerRow;
+    const int row0        = static_cast<int>(blockIdx.x) * Schedule::kRowsPerCta +
+                           row_group * Schedule::kRowsPerWarp;
+    (void)warp_in_row;
+
+    constexpr int kValuesPerPhase = Schedule::kWarpsPerRow * kWarpSize * Schedule::kValuesPerLane;
+    constexpr int kPhases         = Geometry::kInputRows / kValuesPerPhase;
+    using Pack                    = GemvPack<Schedule::kValuesPerLane>;
+
+    float accumulators[Columns][Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
+#pragma unroll
+    for (int iteration = 0; iteration < kPhases; ++iteration) {
+        const int phase = gemv_phase_index<Schedule, kPhases>(iteration, row0);
+        Pack w_values[Schedule::kRowsPerWarp];
+#pragma unroll
+        for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+            w_values[local_row] = load_gemv_weight_phase<Element, Geometry, Schedule>(
+                weight, row0 + local_row, phase, 0, lane);
+        }
+#pragma unroll
+        for (int column = 0; column < Columns; ++column) {
+            const Element* column_x =
+                x + static_cast<std::int64_t>(column) * Geometry::kInputRows;
+            const Pack x_values =
+                load_gemv_activation_phase<Element, Geometry, Schedule>(column_x, phase, 0, lane);
+#pragma unroll
+            for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+                accumulate_gemv_packs<Element>(w_values[local_row], x_values,
+                                               accumulators[column][local_row]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int column = 0; column < Columns; ++column) {
+#pragma unroll
+        for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+            float total = 0.0F;
+#pragma unroll
+            for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
+                total += accumulators[column][local_row][chain];
+            }
+            total = warp_reduce_sum(total);
+            if (lane == 0) { epilogue(output, row0 + local_row, total, column); }
+        }
+    }
+}
+
+template <class Geometry, class Schedule, int Columns>
+__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp16_gemv_multi_kernel(
+    const __half* __restrict__ x, const __half* __restrict__ weight,
+    GemvColumnContiguousOutput<__half> output) {
+    gemv_multi_body<__half, Geometry, Schedule, Columns>(
+        x, weight, output, GemvColumnStoreEpilogue<__half>{});
 }
 
 template <class Geometry, class Schedule, class Output, class Epilogue = GemvStoreEpilogue<__nv_bfloat16>>

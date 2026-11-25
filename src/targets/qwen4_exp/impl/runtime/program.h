@@ -4,7 +4,6 @@
 #include "runtime/contract/types.h"
 #include "targets/qwen4_exp/impl/runtime/instance.h"
 #include "targets/qwen4_exp/impl/runtime/layouts.h"
-#include "targets/qwen4_exp/impl/runtime/state_transaction.h"
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 #include "targets/qwen4_exp/impl/runtime/workspace_recipe.h"
 
@@ -139,7 +138,6 @@ private:
     std::unique_ptr<TextTrunk> trunk_;
     std::unique_ptr<GraphDecodeController> graph_;
     std::unique_ptr<ninfer::targets::qwen3_8_flash_next::detail::MtpDraft> mtp_draft_;
-    std::unique_ptr<StateTransaction> mtp_transaction_;
     std::array<std::unique_ptr<DeviceBuffer>, kMaximumDevices> residual_sinks_;
     std::uint32_t mtp_draft_window_ = 0;
     SpeculativeStats mtp_stats_{};

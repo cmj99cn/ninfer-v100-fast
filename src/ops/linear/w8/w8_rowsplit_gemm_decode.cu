@@ -69,6 +69,68 @@ __global__ __launch_bounds__(RowsPerCta * 32, 4) void w8_rowsplit_narrow_f16_dec
     acc = warp_reduce_sum(acc);
     if (lane == 0) { out[row] = __float2half_rn(acc); }
 }
+
+// True batched counterpart of w8_rowsplit_narrow_f16_decode_kernel. The W8 code/scale planes (the
+// weight) are fetched once per row and phase, then applied to every token column. Each column keeps
+// its own accumulator with the identical byte-to-weight decode, group scale, fmaf order, warp
+// reduction and final rounding as the T==1 kernel.
+template <int RowsPerCta, int Columns>
+__global__ __launch_bounds__(RowsPerCta * 32, 4) void w8_rowsplit_narrow_f16_decode_multi_kernel(
+    const __half* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, __half* __restrict__ out, std::int32_t rows) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int row  = static_cast<int>(blockIdx.x) * RowsPerCta + warp;
+    if (row >= rows) { return; }
+    const auto* code_row  = codes + static_cast<std::int64_t>(row) * kNarrowHidden;
+    const auto* scale_row = scales + static_cast<std::int64_t>(row) * kNarrowGroups * 2;
+
+    float acc[Columns];
+#pragma unroll
+    for (int column = 0; column < Columns; ++column) { acc[column] = 0.0f; }
+#pragma unroll
+    for (int phase = 0; phase < kNarrowPhases; ++phase) {
+        unsigned scale_bits = 0;
+        if (lane < kNarrowPhaseGroups) {
+            scale_bits = *reinterpret_cast<const std::uint16_t*>(
+                scale_row + static_cast<std::int64_t>(phase * kNarrowPhaseGroups + lane) * 2);
+        }
+        scale_bits        = __shfl_sync(0xffffffffu, scale_bits, lane >> 2);
+        const float scale = __half2float(__ushort_as_half(scale_bits));
+
+        const int phase_k  = phase * kNarrowPhaseValues + lane * kNarrowValuesPerLane;
+        const uint2 packed = load_vec<uint2>(code_row + phase_k);
+#pragma unroll
+        for (int column = 0; column < Columns; ++column) {
+            const uint4 values = load_vec<uint4>(
+                x + static_cast<std::int64_t>(column) * kNarrowHidden + phase_k);
+            const float2 xv[4] = {
+                __half22float2(*reinterpret_cast<const __half2*>(&values.x)),
+                __half22float2(*reinterpret_cast<const __half2*>(&values.y)),
+                __half22float2(*reinterpret_cast<const __half2*>(&values.z)),
+                __half22float2(*reinterpret_cast<const __half2*>(&values.w)),
+            };
+#pragma unroll
+            for (int byte = 0; byte < kNarrowValuesPerLane; ++byte) {
+                const std::uint32_t word = (&packed.x)[byte >> 2];
+                const float2 pair       = xv[byte >> 1];
+                const float activation  = (byte & 1) == 0 ? pair.x : pair.y;
+                const float weight = static_cast<float>(
+                                         static_cast<std::int8_t>(word >> ((byte & 3) * 8))) *
+                                     scale;
+                acc[column] = fmaf(weight, activation, acc[column]);
+            }
+        }
+    }
+#pragma unroll
+    for (int column = 0; column < Columns; ++column) {
+        acc[column] = warp_reduce_sum(acc[column]);
+        if (lane == 0) {
+            out[static_cast<std::int64_t>(column) * rows + row] = __float2half_rn(acc[column]);
+        }
+    }
+}
+
 constexpr int kWide3072Hidden        = 3072;
 constexpr int kWide3072Groups        = kWide3072Hidden / 32;
 constexpr int kWide3072ScaleBytesRow = kWide3072Groups * 2;
@@ -277,6 +339,63 @@ void launch_w8_narrow_f16_decode(const Tensor& x, const Weight& w, Tensor& out,
         <<<static_cast<unsigned>(div_up(w.n, kRowsPerCta)), kRowsPerCta * 32, 0, stream>>>(
             static_cast<const __half*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), static_cast<__half*>(out.data), w.n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_w8_narrow_f16_decode_multi(const Tensor& x, const Weight& w, Tensor& out,
+                                       std::int32_t columns, cudaStream_t stream) {
+    constexpr int kRowsPerCta = 4;
+    if (x.ne[0] != kNarrowHidden || w.n != out.ne[0] ||
+        w.padded_shape[1] != kNarrowHidden || x.dtype != DType::FP16 || out.dtype != DType::FP16) {
+        throw std::invalid_argument("W8 narrow f16 multi decode requires [n,2560]");
+    }
+    const unsigned grid = static_cast<unsigned>(div_up(w.n, kRowsPerCta));
+    switch (columns) {
+    case 2:
+        w8_rowsplit_narrow_f16_decode_multi_kernel<kRowsPerCta, 2>
+            <<<grid, kRowsPerCta * 32, 0, stream>>>(
+                static_cast<const __half*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), static_cast<__half*>(out.data), w.n);
+        break;
+    case 3:
+        w8_rowsplit_narrow_f16_decode_multi_kernel<kRowsPerCta, 3>
+            <<<grid, kRowsPerCta * 32, 0, stream>>>(
+                static_cast<const __half*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), static_cast<__half*>(out.data), w.n);
+        break;
+    case 4:
+        w8_rowsplit_narrow_f16_decode_multi_kernel<kRowsPerCta, 4>
+            <<<grid, kRowsPerCta * 32, 0, stream>>>(
+                static_cast<const __half*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), static_cast<__half*>(out.data), w.n);
+        break;
+    case 5:
+        w8_rowsplit_narrow_f16_decode_multi_kernel<kRowsPerCta, 5>
+            <<<grid, kRowsPerCta * 32, 0, stream>>>(
+                static_cast<const __half*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), static_cast<__half*>(out.data), w.n);
+        break;
+    case 6:
+        w8_rowsplit_narrow_f16_decode_multi_kernel<kRowsPerCta, 6>
+            <<<grid, kRowsPerCta * 32, 0, stream>>>(
+                static_cast<const __half*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), static_cast<__half*>(out.data), w.n);
+        break;
+    case 7:
+        w8_rowsplit_narrow_f16_decode_multi_kernel<kRowsPerCta, 7>
+            <<<grid, kRowsPerCta * 32, 0, stream>>>(
+                static_cast<const __half*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), static_cast<__half*>(out.data), w.n);
+        break;
+    case 8:
+        w8_rowsplit_narrow_f16_decode_multi_kernel<kRowsPerCta, 8>
+            <<<grid, kRowsPerCta * 32, 0, stream>>>(
+                static_cast<const __half*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), static_cast<__half*>(out.data), w.n);
+        break;
+    default:
+        throw std::invalid_argument("W8 narrow f16 multi decode: unsupported column count");
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

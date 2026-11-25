@@ -2,7 +2,9 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/gdn_replay_records.h"
 #include "core/host_worker_pool.h"
+#include "core/linear_attention_state.h"
 #include "core/tensor.h"
 #include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/ple.h"
@@ -57,6 +59,32 @@ inline void capture_last_stage(const Tensor& logits, cudaStream_t stream) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+enum class GdnStateAction : std::uint8_t {
+    UpdateInPlace,
+    RecordForReplay,
+};
+
+struct TextGdnReplayPlan {
+    GdnReplayRecordLayout layout;
+    std::size_t backing_bytes = 0;
+};
+
+// One rank's persistent span-verification records. The GDN records live in gdn_replay_records_;
+// these buffers hold the other state transitions of the same span so a partial accept can rebuild
+// QSA tails, PLE history and the draft conditioning without replaying the accepted prefix.
+struct TextVerificationRecords {
+    std::int32_t width        = 1;
+    DeviceBuffer qsa_raw_keys;    // [qsa_layers, index_head_dim, width, kBatch], BF16
+    DeviceBuffer qsa_rope;        // [qsa_layers, 3, width, kBatch], I32
+    DeviceBuffer qsa_base;        // [qsa_layers, kBatch], I32
+    DeviceBuffer qsa_before_keys; // [qsa_layers, index_head_dim, 4, kBatch], BF16
+    DeviceBuffer qsa_before_rope; // [qsa_layers, 3, kBatch], I32
+    DeviceBuffer ple_values;      // [kChannels, width, kBatch], activation dtype
+    DeviceBuffer ple_before;      // [kChannels, kPleConvWindow, kBatch], activation dtype
+    DeviceBuffer residual;        // [width, residual_width], activation dtype
+    DeviceBuffer columns;         // [1], I32
+};
+
 struct TextLaneContext {
     std::vector<TokenId> prompt_tokens;
     std::uint32_t processed_prompt_tokens = 0;
@@ -73,6 +101,8 @@ public:
               std::uint32_t forward_tokens);
     TextState(DeviceContext& device, const ModelView& model, std::uint32_t kv_capacity_tokens,
               std::uint32_t forward_tokens, int tp, int rank);
+    TextState(DeviceContext& device, const ModelView& model, std::uint32_t kv_capacity_tokens,
+              std::uint32_t forward_tokens, int tp, int rank, std::uint32_t replay_width);
     ~TextState();
 
     void reset();
@@ -83,7 +113,23 @@ public:
 
     [[nodiscard]] Tensor gdn_conv_state(std::size_t gdn_index) const;
     [[nodiscard]] Tensor gdn_recurrent_state(std::size_t gdn_index) const;
+    [[nodiscard]] const GdnReplayRecords& gdn_replay_records() const noexcept;
+    [[nodiscard]] LinearAttentionStateAllLayersView gdn_all_layers_view() const;
     [[nodiscard]] std::optional<std::size_t> gdn_state_index(std::size_t layer) const;
+
+    void capture_verification_state();
+    void set_verification_columns(std::int32_t columns, cudaStream_t stream);
+    [[nodiscard]] ops::QsaRawRecordWriteView verification_records(std::int32_t slot,
+                                                                   std::size_t entries) const;
+    [[nodiscard]] ops::QsaRawRecordReadView verification_read_records(std::int32_t slot,
+                                                                      std::size_t entries) const;
+    [[nodiscard]] Tensor verification_base_positions(std::int32_t slot) const;
+    [[nodiscard]] ops::ConstQsaTailStateView verification_before(std::int32_t slot) const;
+    [[nodiscard]] Tensor verification_ple_values(std::size_t entries) const;
+    [[nodiscard]] Tensor verification_ple_before() const;
+    [[nodiscard]] Tensor verification_residual(std::size_t token) const;
+    [[nodiscard]] Tensor verification_residual_view(int entries) const;
+    [[nodiscard]] Tensor verification_columns() const;
     [[nodiscard]] std::size_t gdn_state_entries() const noexcept;
 
     [[nodiscard]] int device_id() const noexcept { return device_; }
@@ -184,6 +230,10 @@ private:
     DeviceBuffer conv_kernels_;
     DeviceBuffer conv_states_;
     DeviceBuffer recurrent_states_;
+    TextGdnReplayPlan gdn_replay_plan_;
+    DeviceBuffer gdn_replay_backing_;
+    GdnReplayRecords gdn_replay_records_;
+    TextVerificationRecords verification_;
     DeviceBuffer k_pages_;
     DeviceBuffer v_pages_;
     DeviceBuffer index_k_pages_;
@@ -221,6 +271,25 @@ public:
     std::vector<TokenId> decode_span(std::span<const TokenId> tokens);
 
     void set_residual_sink(int rank, void* data, std::size_t bytes) noexcept;
+
+    // A speculative verify span records its GDN transition instead of committing it. Each rank
+    // writes its own head/channel shard into that rank's records owned by TextState. The same
+    // action switches QSA/PLE/residual recording into the matching per-rank verification buffers.
+    void set_gdn_state_action(GdnStateAction action) noexcept;
+    [[nodiscard]] bool verifying() const noexcept {
+        return gdn_state_action_ == GdnStateAction::RecordForReplay;
+    }
+
+    struct VerificationBaseline {
+        std::array<std::uint32_t, kMaximumDevices> positions{};
+        std::array<std::array<std::uint64_t, 2>, kMaximumDevices> ple_tails{};
+    };
+
+    [[nodiscard]] VerificationBaseline capture_verification_baseline();
+
+    void commit_verified_span(std::span<const TokenId> verify_tokens,
+                              std::uint32_t committed_count,
+                              const VerificationBaseline& baseline);
 
     template <class AttentionWeights>
     void run_qsa_layer(std::int32_t tokens,
@@ -283,6 +352,7 @@ private:
     const ops::CollectiveComms* comms_ = nullptr;
     int tp_                            = 1;
     cudaStream_t stream_               = nullptr;
+    GdnStateAction gdn_state_action_   = GdnStateAction::UpdateInPlace;
     std::array<void*, kMaximumDevices> residual_sinks_{};
     std::array<std::size_t, kMaximumDevices> residual_sink_bytes_{};
 };

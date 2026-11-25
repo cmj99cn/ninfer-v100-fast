@@ -26,4 +26,9 @@ void launch_fp16_volta_mma_small_t(const Tensor& x, const Weight& w, Tensor& out
 // and FP16 weights only; any other activation dtype keeps the Volta MMA route.
 void launch_fp16_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
+// True batched small-T counterpart: one weight load per row/phase reused across `columns` token
+// columns, raw-bit identical to a sequential replay of launch_fp16_decode.
+void launch_fp16_decode_multi(const Tensor& x, const Weight& w, Tensor& out, std::int32_t columns,
+                              cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

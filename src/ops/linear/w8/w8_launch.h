@@ -39,6 +39,8 @@ void launch_w8_simt_r4_c16(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_simt_r8_c4_f16(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_simt_r8_c8_f16(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_narrow_f16_decode(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_narrow_f16_decode_multi(const Tensor&, const Weight&, Tensor&, std::int32_t columns,
+                                       cudaStream_t);
 void launch_w8_k3072_decode(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 void launch_w8_mma_r32_c64(const Tensor&, const Weight&, Tensor&, cudaStream_t);

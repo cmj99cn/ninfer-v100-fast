@@ -275,6 +275,82 @@ __global__ void causal_conv1d_decode_distinct_kernel(
     }
 }
 
+// True batched counterpart of causal_conv1d_decode_kernel. The four weights are loaded once per
+// channel and reused across all T columns. The state is chained in registers: each column reads the
+// exact BF16 values the sequential T==1 launches would reload from conv_state, so the four-tap
+// accumulation order, silu and output rounding stay bit-identical.
+__global__ void causal_conv1d_decode_multi_kernel(const __nv_bfloat16* x,
+                                                  const __nv_bfloat16* weight,
+                                                  __nv_bfloat16* conv_state, __nv_bfloat16* out,
+                                                  std::int32_t C, std::int32_t T) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    const std::int64_t C64    = static_cast<std::int64_t>(C);
+
+    for (std::int64_t c64 = start; c64 < C64; c64 += stride) {
+        const std::int32_t c = static_cast<std::int32_t>(c64);
+        const float w0 = __bfloat162float(weight[c]);
+        const float w1 = __bfloat162float(weight[C64 + c]);
+        const float w2 = __bfloat162float(weight[2 * C64 + c]);
+        const float w3 = __bfloat162float(weight[3 * C64 + c]);
+        __nv_bfloat16 s0 = conv_state[c];
+        __nv_bfloat16 s1 = conv_state[C64 + c];
+        __nv_bfloat16 s2 = conv_state[2 * C64 + c];
+        for (std::int32_t t = 0; t < T; ++t) {
+            const __nv_bfloat16 x0 = x[static_cast<std::int64_t>(t) * C64 + c];
+            float acc = 0.0f;
+            acc += w0 * __bfloat162float(s0);
+            acc += w1 * __bfloat162float(s1);
+            acc += w2 * __bfloat162float(s2);
+            acc += w3 * __bfloat162float(x0);
+            out[static_cast<std::int64_t>(t) * C64 + c] = __float2bfloat16_rn(silu(acc));
+            s0 = s1;
+            s1 = s2;
+            s2 = x0;
+        }
+        conv_state[c]           = s0;
+        conv_state[C64 + c]     = s1;
+        conv_state[2 * C64 + c] = s2;
+    }
+}
+
+// Distinct-state form of causal_conv1d_decode_multi_kernel: the initial history is read from
+// conv_state_in and the trailing window is published to conv_state_out after the whole span.
+__global__ void causal_conv1d_decode_distinct_multi_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ conv_state_in, __nv_bfloat16* __restrict__ conv_state_out,
+    __nv_bfloat16* __restrict__ out, std::int32_t C, std::int32_t T) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    const std::int64_t C64    = static_cast<std::int64_t>(C);
+
+    for (std::int64_t c64 = start; c64 < C64; c64 += stride) {
+        const std::int32_t c = static_cast<std::int32_t>(c64);
+        const float w0 = __bfloat162float(weight[c]);
+        const float w1 = __bfloat162float(weight[C64 + c]);
+        const float w2 = __bfloat162float(weight[2 * C64 + c]);
+        const float w3 = __bfloat162float(weight[3 * C64 + c]);
+        __nv_bfloat16 s0 = conv_state_in[c];
+        __nv_bfloat16 s1 = conv_state_in[C64 + c];
+        __nv_bfloat16 s2 = conv_state_in[2 * C64 + c];
+        for (std::int32_t t = 0; t < T; ++t) {
+            const __nv_bfloat16 x0 = x[static_cast<std::int64_t>(t) * C64 + c];
+            float acc = 0.0f;
+            acc += w0 * __bfloat162float(s0);
+            acc += w1 * __bfloat162float(s1);
+            acc += w2 * __bfloat162float(s2);
+            acc += w3 * __bfloat162float(x0);
+            out[static_cast<std::int64_t>(t) * C64 + c] = __float2bfloat16_rn(silu(acc));
+            s0 = s1;
+            s1 = s2;
+            s2 = x0;
+        }
+        conv_state_out[c]           = s0;
+        conv_state_out[C64 + c]     = s1;
+        conv_state_out[2 * C64 + c] = s2;
+    }
+}
+
 __global__ void causal_conv1d_snapshot_decode_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,

@@ -84,6 +84,64 @@ __global__ void conv_state_f16_decode_kernel(const __half* x, const W* w,
     state_out[2 * C + c] = x3;
 }
 
+// True batched counterpart of conv_state_f16_decode_kernel. The four convolution weights are
+// fetched once per channel and reused across the whole verify span. The convolution state is a
+// mathematical chain, so it advances column by column in registers; the three carried values are
+// the exact FP16 values the sequential T==1 launches would reload from state_out. The four-tap
+// accumulation order, silu rounding and output rounding are unchanged.
+template <class W, int Columns>
+__global__ void conv_state_f16_decode_multi_kernel(const __half* x, const W* w,
+                                                   const __half* state_in, __half* state_out,
+                                                   __half* out, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) { return; }
+    const float w0 = load_weight(w + c);
+    const float w1 = load_weight(w + C + c);
+    const float w2 = load_weight(w + 2 * C + c);
+    const float w3 = load_weight(w + 3 * C + c);
+    __half s0 = state_in[c];
+    __half s1 = state_in[C + c];
+    __half s2 = state_in[2 * C + c];
+#pragma unroll
+    for (int t = 0; t < Columns; ++t) {
+        const __half x3 = x[static_cast<std::int64_t>(t) * C + c];
+        float acc       = 0.0f;
+        acc += w0 * __half2float(s0);
+        acc += w1 * __half2float(s1);
+        acc += w2 * __half2float(s2);
+        acc += w3 * __half2float(x3);
+        out[static_cast<std::int64_t>(t) * C + c] = __float2half_rn(acc / (1.0f + expf(-acc)));
+        s0 = s1;
+        s1 = s2;
+        s2 = x3;
+    }
+    state_out[c]         = s0;
+    state_out[C + c]     = s1;
+    state_out[2 * C + c] = s2;
+}
+
+template <class W, int Columns>
+void launch_conv_multi(const __half* xp, const W* wp, const __half* sp, __half* sop, __half* op,
+                       int C, int threads, int blocks_c, cudaStream_t stream) {
+    conv_state_f16_decode_multi_kernel<W, Columns><<<blocks_c, threads, 0, stream>>>(
+        xp, wp, sp, sop, op, C);
+}
+
+template <class W>
+void dispatch_conv_multi(const __half* xp, const W* wp, const __half* sp, __half* sop, __half* op,
+                         int C, int T, int threads, int blocks_c, cudaStream_t stream) {
+    switch (T) {
+    case 2: launch_conv_multi<W, 2>(xp, wp, sp, sop, op, C, threads, blocks_c, stream); break;
+    case 3: launch_conv_multi<W, 3>(xp, wp, sp, sop, op, C, threads, blocks_c, stream); break;
+    case 4: launch_conv_multi<W, 4>(xp, wp, sp, sop, op, C, threads, blocks_c, stream); break;
+    case 5: launch_conv_multi<W, 5>(xp, wp, sp, sop, op, C, threads, blocks_c, stream); break;
+    case 6: launch_conv_multi<W, 6>(xp, wp, sp, sop, op, C, threads, blocks_c, stream); break;
+    case 7: launch_conv_multi<W, 7>(xp, wp, sp, sop, op, C, threads, blocks_c, stream); break;
+    case 8: launch_conv_multi<W, 8>(xp, wp, sp, sop, op, C, threads, blocks_c, stream); break;
+    default: throw std::invalid_argument("causal_conv1d_f16 multi: unsupported column count");
+    }
+}
+
 } // namespace
 
 void causal_conv1d_silu_f16_split_launch(const Tensor& x, const Tensor& weight,
@@ -140,6 +198,18 @@ void causal_conv1d_silu_f16_launch(const Tensor& x, const Tensor& weight, const 
         } else {
             conv_state_f16_decode_kernel<half><<<blocks_c, threads, 0, stream>>>(
                 xp, static_cast<const half*>(weight.data), sp, sop, op, C);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    if (T >= 2 && T <= 8) {
+        auto* sop = static_cast<__half*>(state_out.data);
+        if (weight.dtype == DType::BF16) {
+            dispatch_conv_multi<__nv_bfloat16>(xp, static_cast<const __nv_bfloat16*>(weight.data),
+                                               sp, sop, op, C, T, threads, blocks_c, stream);
+        } else {
+            dispatch_conv_multi<half>(xp, static_cast<const half*>(weight.data), sp, sop, op, C, T,
+                                      threads, blocks_c, stream);
         }
         CUDA_CHECK(cudaGetLastError());
         return;

@@ -64,13 +64,23 @@ ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevi
         }
     }
 
+    const bool mtp_enabled = options_.speculative.backend == SpeculativeBackend::Mtp &&
+                             options_.speculative.draft_tokens > 0;
+    std::uint32_t replay_width = 1;
+    if (mtp_enabled) {
+        mtp_draft_window_ = std::min<std::uint32_t>(
+            options_.speculative.draft_tokens,
+            ninfer::targets::qwen3_8_flash_next::detail::MtpConfig::maximum_draft_window);
+        replay_width = mtp_draft_window_ + 1U;
+    }
+
     for (int rank = 0; rank < execution_.tp; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         const ScopedDevice scope(execution_.dev[slot]->device);
         states_[slot] = std::make_unique<TextState>(
             *execution_.dev[slot], *models_[slot],
             std::max<std::uint32_t>(plan_->kv_capacity, plan_->capacity),
-            std::max<std::uint32_t>(plan_->prefill_chunk, 1), execution_.tp, rank);
+            std::max<std::uint32_t>(plan_->prefill_chunk, 1), execution_.tp, rank, replay_width);
         activation_arenas_[slot] =
             std::make_unique<WorkspaceArena>(std::max<std::size_t>(plan_->activation_capacity_bytes, 1));
         work_arenas_[slot] =
@@ -83,12 +93,7 @@ ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevi
     comms_ = std::make_unique<ops::CollectiveComms>(execution_);
     trunk_ = std::make_unique<TextTrunk>(view_ptrs_, state_ptrs_, activation_ptrs_,
                                          workspace_ptrs_, execution_, *comms_);
-    const bool mtp_enabled = options_.speculative.backend == SpeculativeBackend::Mtp &&
-                             options_.speculative.draft_tokens > 0;
     if (mtp_enabled) {
-        mtp_draft_window_ = std::min<std::uint32_t>(
-            options_.speculative.draft_tokens,
-            ninfer::targets::qwen3_8_flash_next::detail::MtpConfig::maximum_draft_window);
         const std::size_t sink_bytes = static_cast<std::size_t>(plan_->prefill_chunk) *
                                        static_cast<std::size_t>(TextConfig::residual_width) * 2;
         for (int rank = 0; rank < execution_.tp; ++rank) {
@@ -97,9 +102,7 @@ ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevi
                                       sink_bytes);
         }
         mtp_draft_ = std::make_unique<ninfer::targets::qwen3_8_flash_next::detail::MtpDraft>(
-            options_.artifact_path, execution_.dev[0]->device);
-        mtp_transaction_ =
-            std::make_unique<StateTransaction>(state_ptrs_, execution_.tp, mtp_draft_window_ + 1);
+            options_.artifact_path, execution_, *comms_);
         mtp_stats_.backend      = SpeculativeBackend::Mtp;
         mtp_stats_.enabled      = true;
         mtp_stats_.draft_window = mtp_draft_window_;
@@ -357,34 +360,51 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
                 flash::verify_extent(mtp_draft_window_, mtp_draft_window_, budget, frontier,
                                      plan_->kv_capacity);
             const int32_t position = static_cast<std::int32_t>(frontier);
-            const Tensor conditioning(residual_sinks_[0]->p, kTextActivationDtype,
-                                      {TextConfig::residual_width, 1});
+            flash::MtpDraft::RankTensors conditioning{};
+            for (int rank = 0; rank < execution_.tp; ++rank) {
+                const auto slot = static_cast<std::size_t>(rank);
+                conditioning[slot] =
+                    Tensor(residual_sinks_[slot]->p, kTextActivationDtype,
+                           {TextConfig::residual_width, 1});
+            }
             const std::vector<TokenId> proposals =
                 flash::draft_chain(*mtp_draft_, conditioning, state.context.next_input, drafts,
                                    position);
             last_stage_capture() = &logits_capture_;
-            mtp_transaction_->begin();
-            std::vector<TokenId> verify_tokens;
-            verify_tokens.reserve(proposals.size() + 1);
-            verify_tokens.push_back(state.context.next_input);
-            verify_tokens.insert(verify_tokens.end(), proposals.begin(), proposals.end());
-            const std::vector<TokenId> predictions = flash::verify_sequential(
-                verify_tokens, [&](TokenId next) { return trunk_->decode(next); });
-            const std::uint32_t accepted = flash::accepted_prefix(proposals, predictions);
-            std::vector<TokenId> committed = flash::commit_tokens(proposals, predictions);
-            // On full acceptance the verified sequence equals the committed sequence token for
-            // token (verify_tokens == replay, both decoded T=1 in order), so the live state is
-            // already the committed state and the rollback+replay pass is redundant. Only a
-            // partial acceptance has to rewind and re-apply the accepted prefix.
-            if (accepted != proposals.size()) {
-                std::vector<TokenId> replay;
-                replay.reserve(accepted + 1);
-                replay.push_back(state.context.next_input);
-                replay.insert(replay.end(), proposals.begin(), proposals.begin() + accepted);
-                mtp_transaction_->commit(replay, [&](TokenId next) { (void)trunk_->decode(next); });
+            std::uint32_t accepted = 0;
+            std::vector<TokenId> committed;
+            if (drafts == 0) {
+                // A one-token verify span cannot produce replay records; commit it in place.
+                token = trunk_->decode(state.context.next_input);
+                committed.push_back(token);
+            } else {
+                std::vector<TokenId> verify_tokens;
+                verify_tokens.reserve(proposals.size() + 1);
+                verify_tokens.push_back(state.context.next_input);
+                verify_tokens.insert(verify_tokens.end(), proposals.begin(), proposals.end());
+
+                const TextTrunk::VerificationBaseline baseline =
+                    trunk_->capture_verification_baseline();
+                struct ActionGuard {
+                    TextTrunk* trunk;
+                    ~ActionGuard() { trunk->set_gdn_state_action(GdnStateAction::UpdateInPlace); }
+                } guard{trunk_.get()};
+                trunk_->set_gdn_state_action(GdnStateAction::RecordForReplay);
+                const std::vector<TokenId> predictions = trunk_->decode_span(verify_tokens);
+                accepted = flash::accepted_prefix(proposals, predictions);
+                committed = flash::commit_tokens(proposals, predictions);
+                if (committed.empty()) { committed.push_back(predictions.front()); }
+                trunk_->commit_verified_span(verify_tokens, accepted + 1, baseline);
+                // The sink copy is staged on each rank's non-blocking stream; make it visible to
+                // the next round's draft before returning.
+                {
+                    const ScopedDevice scope(states_[0]->device_id());
+                    CUDA_CHECK(cudaStreamSynchronize(states_[0]->stream()));
+                }
+                flash::observe_residual_sink(conditioning[0]);
             }
             mtp_stats_.rounds += 1;
-            mtp_stats_.drafted_tokens += drafts;
+            mtp_stats_.drafted_tokens += static_cast<std::uint64_t>(proposals.size());
             mtp_stats_.accepted_tokens += accepted;
             if (mtp_stats_.accepted_per_position.size() < mtp_draft_window_) {
                 mtp_stats_.accepted_per_position.resize(mtp_draft_window_, 0);
@@ -392,7 +412,6 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
             for (std::uint32_t at = 0; at < accepted && at < mtp_draft_window_; ++at) {
                 mtp_stats_.accepted_per_position[at] += 1;
             }
-            if (committed.empty()) { committed.push_back(predictions.front()); }
             for (const TokenId emitted : committed) {
                 state.last_round_token     = emitted;
                 state.has_last_round_token = true;

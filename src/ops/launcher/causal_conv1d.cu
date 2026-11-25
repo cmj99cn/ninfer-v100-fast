@@ -130,6 +130,31 @@ void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Te
     CUDA_CHECK(cudaGetLastError());
 }
 
+void causal_conv1d_decode_multi_launch(const Tensor& x, const Tensor& weight,
+                                       const Tensor& conv_state_in, Tensor& conv_state_out,
+                                       Tensor& out, cudaStream_t stream) {
+    constexpr int kBlock = 256;
+    const std::int32_t C = x.ne[0];
+    const std::int32_t T = x.ne[1];
+    if (conv_state_in.data == conv_state_out.data) {
+        causal_conv1d_decode_multi_kernel<<<grid_for(C, kBlock, "decode multi"), kBlock, 0,
+                                            stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.data),
+            static_cast<__nv_bfloat16*>(conv_state_out.data), static_cast<__nv_bfloat16*>(out.data),
+            C, T);
+    } else {
+        causal_conv1d_decode_distinct_multi_kernel<<<
+            grid_for(C, kBlock, "distinct decode multi"), kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.data),
+            static_cast<const __nv_bfloat16*>(conv_state_in.data),
+            static_cast<__nv_bfloat16*>(conv_state_out.data), static_cast<__nv_bfloat16*>(out.data),
+            C, T);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <bool Masked>
 void launch_batched_sequence_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
                                       const Tensor& valid_columns,

@@ -48,11 +48,17 @@ constexpr RoleGeometry vector_of(std::array<std::uint64_t, 3> shape) {
 }
 
 constexpr RoleGeometry bank(std::array<std::uint64_t, 3> shape, std::uint64_t row_begin,
-                            std::uint64_t row_count) {
+                             std::uint64_t row_count) {
     return RoleGeometry{NumericFormat::FP8_E4M3FN_BLOCK128_BF16S,
                         StorageLayout::BlockScaleM128K128V1, 3, shape, row_begin, row_count, 0,
                         shape[2], shape[0], shape[0]};
 }
+
+constexpr RoleGeometry row_split_q4(std::array<std::uint64_t, 3> shape) {
+    return RoleGeometry{NumericFormat::Q4G64_F16S, StorageLayout::RowSplitK128V1, 2, shape, 0,
+                        shape[0], 0, shape[1], 1, 1};
+}
+
 
 class PlanBuilder {
 public:
@@ -76,6 +82,10 @@ public:
 
     BoundParameter bind_global(std::string_view name, const RoleGeometry& geometry) {
         return bind_at(std::string("mtp/") + std::string(name), geometry);
+    }
+
+    BoundParameter bind_artifact_parameter(std::string_view name, const RoleGeometry& geometry) {
+        return bind_at(std::string(name), geometry);
     }
 
     BoundParameter bind_at(const std::string& parameter, const RoleGeometry& geometry) {
@@ -209,6 +219,7 @@ std::vector<const BoundParameter*> MtpPlan::parameters() const {
     std::vector<const BoundParameter*> out;
     out.push_back(&token_embedding);
     out.push_back(&output_head);
+    out.push_back(&proposal_head);
     out.push_back(&fc_embedding);
     out.push_back(&fc_hidden);
     out.push_back(&pre_fc_embedding_norm);
@@ -265,6 +276,8 @@ MtpPlan bind_mtp_artifact(artifact::Binder& binder, const BindingPlan& text) {
 
     plan.token_embedding = builder.bind_shared(text.token_embedding);
     plan.output_head = builder.bind_shared(text.output_head);
+    plan.proposal_head = builder.bind_artifact_parameter(
+        "proposal/head", row_split_q4(shape2(TextConfig::vocab, TextConfig::hidden)));
     plan.fc_embedding = builder.bind_global("fc_embedding",
                                      dense(shape2(TextConfig::hidden, TextConfig::hidden), 0,
                                            TextConfig::hidden, TextConfig::hidden));
@@ -387,9 +400,9 @@ MtpPlan bind_mtp_artifact(artifact::Binder& binder, const BindingPlan& text) {
              TextConfig::hidden));
 
     plan.binding_count = builder.binding_count();
-    if (plan.binding_count != 36) {
+    if (plan.binding_count != 37) {
         throw ArtifactError("qwen3.8-flash-next: the MTP plan parsed " +
-                            std::to_string(plan.binding_count) + " bindings; it expects 36");
+                            std::to_string(plan.binding_count) + " bindings; it expects 37");
     }
     if (layer.moe.routed_gate.library->object != kBankGate ||
         layer.moe.routed_up.library->object != kBankGate ||

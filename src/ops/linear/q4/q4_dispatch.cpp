@@ -99,6 +99,10 @@ Q4Launch select_q4_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t
             break;
         }
         break;
+    case 2560:
+        // Flash-Next Q4 proposal head; the MTP draft consumes it at T=1 with FP16 activations.
+        if (n == 248320 && t == 1) { return launch_q4_simt_r8_c4; }
+        break;
     case 2048:
         if (n == 131072) {
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }

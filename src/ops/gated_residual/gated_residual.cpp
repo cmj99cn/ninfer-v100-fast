@@ -280,15 +280,24 @@ void hc_mix(const Tensor& normalized, const HcMixWeights& weights, WorkspaceAren
                                   static_cast<std::size_t>(rank) * channels * 2;
     const DType weight_dtype = weights.down_injection.qtype == QType::FP16_CTRL ? DType::FP16
                                                                                 : DType::BF16;
-    const bool fuse_up = columns == 1 &&
-                         (normalized.dtype == DType::BF16 || normalized.dtype == DType::FP16) &&
-                         streams == 4 && (hidden % 2) == 0 && (rank % 8) == 0;
-    if (fuse_up) {
+    const bool decode_profile =
+        (normalized.dtype == DType::BF16 || normalized.dtype == DType::FP16) && streams == 4 &&
+        (hidden % 2) == 0 && (rank % 8) == 0;
+    if (columns == 1 && decode_profile) {
         detail::hc_mix_down_silu_launch(down.qdata, rank, channels, flattened.data, low,
                                         injection_rows, weight_dtype, &injection, streams,
                                         stream);
         detail::hc_mix_up_gate_launch(weights.up.qdata, hidden, rank, streams, low.data,
                                       normalized, block_input, normalized.dtype, stream);
+        return;
+    }
+    if (columns >= 2 && columns <= 8 && decode_profile) {
+        detail::hc_mix_down_silu_multi_launch(down.qdata, rank, channels, flattened.data, low,
+                                               injection_rows, weight_dtype, &injection, streams,
+                                               columns, stream);
+        detail::hc_mix_up_gate_multi_launch(weights.up.qdata, hidden, rank, streams, low.data,
+                                             normalized, block_input, normalized.dtype, columns,
+                                             stream);
         return;
     }
     if (columns == 1 &&
@@ -333,14 +342,24 @@ void hc_final_mix(const Tensor& normalized, const HcFinalMixWeights& weights,
     const Tensor flattened = normalized.view({channels, columns});
 
     const DType weight_dtype = weights.down.qtype == QType::FP16_CTRL ? DType::FP16
-                                                                      : DType::BF16;
-    if (columns == 1 &&
+                                                                       : DType::BF16;
+    const bool decode_profile =
         (normalized.dtype == DType::BF16 || normalized.dtype == DType::FP16) && streams == 4 &&
-        (hidden % 2) == 0 && (rank % 8) == 0) {
+        (hidden % 2) == 0 && (rank % 8) == 0;
+    if (columns == 1 && decode_profile) {
         detail::hc_mix_down_silu_launch(weights.down.qdata, rank, channels, flattened.data, low,
                                         nullptr, weight_dtype, nullptr, streams, stream);
         detail::hc_mix_up_gate_launch(weights.up.qdata, hidden, rank, streams, low.data,
                                       normalized, sample_hidden, normalized.dtype, stream);
+        return;
+    }
+    if (columns >= 2 && columns <= 8 && decode_profile) {
+        detail::hc_mix_down_silu_multi_launch(weights.down.qdata, rank, channels, flattened.data,
+                                               low, nullptr, weight_dtype, nullptr, streams,
+                                               columns, stream);
+        detail::hc_mix_up_gate_multi_launch(weights.up.qdata, hidden, rank, streams, low.data,
+                                             normalized, sample_hidden, normalized.dtype, columns,
+                                             stream);
         return;
     }
     if (columns == 1 &&

@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "ninfer/ops/allreduce.h"
 #include "targets/qwen3_8_flash_next/impl/mtp_draft.h"
 #include "targets/qwen3_8_flash_next/impl/speculative.h"
 
@@ -124,12 +125,25 @@ int main() {
         check_prefix(full_accept, greedy, "full acceptance");
 
         auto words = read_hidden(hidden);
-        ninfer::DeviceBuffer conditioning(words.size() * 2);
-        conditioning.copy_from_host(words.data(), words.size() * 2);
-        ninfer::Tensor view(conditioning.p, ninfer::DType::FP16, {2560, 4});
-        flash::MtpDraft draft(artifact, 0);
+        ninfer::ExecutionContext execution({0, 1});
+        ninfer::ops::CollectiveComms comms(execution);
+        std::array<ninfer::DeviceBuffer, 2> conditioning;
+        flash::MtpDraft::RankTensors views{};
+        int previous = 0;
+        CUDA_CHECK(cudaGetDevice(&previous));
+        for (int rank = 0; rank < 2; ++rank) {
+            CUDA_CHECK(cudaSetDevice(execution.dev[static_cast<std::size_t>(rank)]->device));
+            conditioning[static_cast<std::size_t>(rank)] =
+                ninfer::DeviceBuffer(words.size() * 2);
+            conditioning[static_cast<std::size_t>(rank)].copy_from_host(words.data(), words.size() * 2);
+            views[static_cast<std::size_t>(rank)] =
+                ninfer::Tensor(conditioning[static_cast<std::size_t>(rank)].p,
+                               ninfer::DType::FP16, {2560, 4});
+        }
+        CUDA_CHECK(cudaSetDevice(previous));
+        flash::MtpDraft draft(artifact, execution, comms);
         const std::vector<TokenId> drafts =
-            flash::draft_chain(draft, view, 504, kSteps);
+            flash::draft_chain(draft, views, 504, kSteps);
         const std::vector<TokenId> real_commit = commit(drafts, greedy);
         check_prefix(real_commit, greedy, "real MTP chain");
 

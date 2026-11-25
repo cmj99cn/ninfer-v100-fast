@@ -1,6 +1,10 @@
 #include "core/arena.h"
+#include "core/device.h"
+#include "ninfer/ops/allreduce.h"
 #include "targets/qwen3_8_flash_next/impl/mtp_draft.h"
 
+#include <array>
+#include <cuda_runtime.h>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -39,21 +43,40 @@ int main(int argc, char** argv) {
             std::cout << "skip: MTP draft needs an artifact and a hidden fixture\n";
             return 77;
         }
+        int devices = 0;
+        if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) {
+            std::cout << "skip: TP2 MTP draft needs two devices\n";
+            return 77;
+        }
         auto words = read_hidden(hidden);
-        ninfer::DeviceBuffer conditioning(words.size() * 2);
-        conditioning.copy_from_host(words.data(), words.size() * 2);
-        ninfer::Tensor conditioning_view(conditioning.p, ninfer::DType::FP16,
-                                         {2560, 4});
-        flash::MtpDraft draft(artifact, 0);
-        const ninfer::TokenId token = draft.run(conditioning_view, 504, 0);
+        ninfer::ExecutionContext execution({0, 1});
+        ninfer::ops::CollectiveComms comms(execution);
+        std::array<ninfer::DeviceBuffer, 2> conditioning;
+        flash::MtpDraft::RankTensors conditioning_ranks{};
+        int previous = 0;
+        CUDA_CHECK(cudaGetDevice(&previous));
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto slot = static_cast<std::size_t>(rank);
+            CUDA_CHECK(cudaSetDevice(execution.dev[slot]->device));
+            conditioning[slot] = ninfer::DeviceBuffer(words.size() * 2);
+            conditioning[slot].copy_from_host(words.data(), words.size() * 2);
+            conditioning_ranks[slot] =
+                ninfer::Tensor(conditioning[slot].p, ninfer::DType::FP16, {2560, 4});
+        }
+        CUDA_CHECK(cudaSetDevice(previous));
+        flash::MtpDraft draft(artifact, execution, comms);
+        const ninfer::TokenId token = draft.run(conditioning_ranks, 504, 0);
         std::cout << "mtp draft token " << token << " expert_bytes " << draft.expert_bytes()
                   << " host_syncs " << draft.host_syncs() << "\n";
+        // The first draft token is identical under the accepted Q4 proposal/head default and the
+        // FP16 A/B switch. Later steps legitimately differ; committed output is protected by
+        // verify and by the greedy equivalence test.
         if (token != 220) {
             std::cerr << "MTP draft token " << token << " does not match oracle 220\n";
             return 1;
         }
-        if (draft.expert_bytes() > 2700000000ULL) {
-            std::cerr << "MTP draft expert bank is still materialized in FP16: "
+        if (draft.expert_bytes() < 1200000000ULL || draft.expert_bytes() > 1300000000ULL) {
+            std::cerr << "MTP draft per-rank expert bank has an unexpected size: "
                       << draft.expert_bytes() << " bytes\n";
             return 1;
         }

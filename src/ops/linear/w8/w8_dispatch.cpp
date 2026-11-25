@@ -354,6 +354,11 @@ void w8_f16_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         launch_w8_narrow_f16_decode(x, w, out, stream);
         return;
     }
+    if (x.ne[1] >= 2 && x.ne[1] <= 8 && w.k == 2560 && w.padded_shape[1] == 2560 &&
+        (w.n % 4) == 0) {
+        launch_w8_narrow_f16_decode_multi(x, w, out, x.ne[1], stream);
+        return;
+    }
     if (x.ne[1] == 1 && w.k == 3072 && w.padded_shape[1] == 3072 && w.n == 2560 &&
         w.qtype == QType::W8G32_F16S && w.layout == QuantLayout::RowSplit) {
         launch_w8_k3072_decode(x, w, out, stream);

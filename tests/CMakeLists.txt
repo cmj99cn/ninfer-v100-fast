@@ -97,6 +97,16 @@ add_test(NAME ninfer_flash_next_mtp_draft_artifact_test
 set_tests_properties(ninfer_flash_next_mtp_draft_artifact_test PROPERTIES
   SKIP_RETURN_CODE 77
   ENVIRONMENT "NINFER_FLASH_NEXT_ARTIFACT=/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer;NINFER_MTP_HIDDEN=${CMAKE_SOURCE_DIR}/.superpowers/sdd/2026-11-16-flash-next-m3-mtp/assets/mtp_hidden_8tok.f16")
+ninfer_add_test(ninfer_flash_next_mtp_draft_confidence_test
+  SOURCES targets/qwen3_8_flash_next/test_mtp_draft_confidence.cpp
+  LIBRARIES ninfer_flash_next_package)
+target_link_libraries(ninfer_flash_next_mtp_draft_confidence_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_flash_next_mtp_draft_confidence_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_flash_next_mtp_draft_confidence_artifact_test
+  COMMAND ninfer_flash_next_mtp_draft_confidence_test)
+set_tests_properties(ninfer_flash_next_mtp_draft_confidence_artifact_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  ENVIRONMENT "NINFER_FLASH_NEXT_ARTIFACT=/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer;NINFER_MTP_HIDDEN=${CMAKE_SOURCE_DIR}/.superpowers/sdd/2026-11-16-flash-next-m3-mtp/assets/mtp_hidden_8tok.f16")
 ninfer_add_test(ninfer_flash_next_mtp_chain_test
   SOURCES targets/qwen3_8_flash_next/test_mtp_chain.cpp
   LIBRARIES ninfer_flash_next_package)
@@ -165,6 +175,39 @@ set_tests_properties(ninfer_flash_next_mtp_state_test PROPERTIES SKIP_RETURN_COD
 add_test(NAME ninfer_flash_next_mtp_state_artifact_test
   COMMAND ninfer_flash_next_mtp_state_test)
 set_tests_properties(ninfer_flash_next_mtp_state_artifact_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  ENVIRONMENT "NINFER_FLASH_NEXT_ARTIFACT=/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer")
+
+ninfer_add_test(ninfer_flash_next_gdn_replay_storage_test
+  SOURCES targets/qwen3_8_flash_next/test_gdn_replay_storage.cpp
+  LIBRARIES ninfer_flash_next_package)
+target_link_libraries(ninfer_flash_next_gdn_replay_storage_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_flash_next_gdn_replay_storage_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_flash_next_gdn_replay_storage_artifact_test
+  COMMAND ninfer_flash_next_gdn_replay_storage_test)
+set_tests_properties(ninfer_flash_next_gdn_replay_storage_artifact_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  ENVIRONMENT "NINFER_FLASH_NEXT_ARTIFACT=/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer")
+
+ninfer_add_test(ninfer_flash_next_mtp_fold_commit_test
+  SOURCES targets/qwen3_8_flash_next/test_mtp_fold_commit.cpp
+  LIBRARIES ninfer_engine ninfer_flash_next_package)
+target_link_libraries(ninfer_flash_next_mtp_fold_commit_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_flash_next_mtp_fold_commit_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_flash_next_mtp_fold_commit_artifact_test
+  COMMAND ninfer_flash_next_mtp_fold_commit_test)
+set_tests_properties(ninfer_flash_next_mtp_fold_commit_artifact_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  ENVIRONMENT "NINFER_FLASH_NEXT_ARTIFACT=/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer")
+
+ninfer_add_test(ninfer_flash_next_acceptance_sink_diag_test
+  SOURCES targets/qwen3_8_flash_next/test_mtp_acceptance_sink_diag.cpp
+  LIBRARIES ninfer_flash_next_package)
+target_link_libraries(ninfer_flash_next_acceptance_sink_diag_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_flash_next_acceptance_sink_diag_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_flash_next_acceptance_sink_diag_artifact_test
+  COMMAND ninfer_flash_next_acceptance_sink_diag_test)
+set_tests_properties(ninfer_flash_next_acceptance_sink_diag_artifact_test PROPERTIES
   SKIP_RETURN_CODE 77
   ENVIRONMENT "NINFER_FLASH_NEXT_ARTIFACT=/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer")
 
@@ -629,6 +672,10 @@ ninfer_add_op_test(ninfer_qsa_reduction_order_test
 ninfer_add_op_test(ninfer_linear_split_test
   SOURCES ops/linear_split_test.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_linear_test(ninfer_small_t_split_cross_profile_test
+  ops/linear/small_t_split_cross_profile_test.cpp)
+ninfer_add_linear_test(ninfer_small_t_decode_replay_test
+  ops/linear/small_t_decode_replay_test.cpp)
 ninfer_add_op_test(ninfer_linear_add_split_test
   SOURCES ops/test_linear_add_split.cpp
   LIBRARIES ninfer_ops)
@@ -771,6 +818,9 @@ ninfer_add_op_test(ninfer_gated_delta_net_replay_record_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_gdn_replay_fold_test
   SOURCES ops/test_gdn_replay_fold.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_decode_record_equivalence_test
+  SOURCES ops/test_gdn_decode_record_equivalence.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_fused_linear_test(
   ninfer_linear_add_q5_a16_test

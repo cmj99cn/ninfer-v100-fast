@@ -84,4 +84,42 @@ void stage_gdn_decode(const Tensor& q, const Tensor& k, const Tensor& v, const T
                       const Tensor& beta, std::int32_t rank, Tensor& conv_in, Tensor& g_rank,
                       Tensor& beta_rank, cudaStream_t stream);
 
+/**
+ * Op: stage_gdn_span
+ *
+ * Fuse the multi-token GDN staging copies into one launch. For every t in [0,T):
+ *   conv_in[0:key_width,t]            = q[:,t]
+ *   conv_in[key_width:2*key_width,t]  = k[:,t]
+ *   conv_in[2*key_width:channels,t]   = v[:,t]
+ *   g_rank[:,t]                       = g[rank*value_heads:(rank+1)*value_heads,t]
+ *   beta_rank[:,t]                    = beta[rank*value_heads:(rank+1)*value_heads,t]
+ *
+ * Logical shapes: contiguous FP16 q/k [key_width,T], v [channels-2*key_width,T],
+ * conv_in [channels,T]; contiguous FP32 g/beta [g_heads,T] and g_rank/beta_rank
+ * [value_heads,T]. T>=2; the T=1 route is stage_gdn_decode.
+ *
+ * Numeric: exact activation/FP32 word moves, bit-identical to the five replaced
+ * cudaMemcpy2DAsync calls. No persistent state; inputs are not modified.
+ */
+void stage_gdn_span(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                    const Tensor& beta, std::int32_t rank, Tensor& conv_in, Tensor& g_rank,
+                    Tensor& beta_rank, cudaStream_t stream);
+
+/**
+ * Op: extract_gdn_columns
+ *
+ * Fuse the GDN post-convolution extracts into one launch. For every t in [0,T):
+ *   q[:,t] = conv_out[0:key_width,t]
+ *   k[:,t] = conv_out[key_width:2*key_width,t]
+ *   v[:,t] = conv_out[2*key_width:channels,t]
+ *
+ * Logical shapes: contiguous FP16 conv_out [channels,T], q/k [key_width,T], and
+ * v [channels-2*key_width,T]. T>=1; layouts and strides are unchanged from three
+ * separate extract_bf16_columns calls.
+ *
+ * Numeric: exact activation word moves. The source and destinations must not alias.
+ */
+void extract_gdn_columns(const Tensor& source, Tensor& q, Tensor& k, Tensor& v,
+                         cudaStream_t stream);
+
 } // namespace ninfer::ops

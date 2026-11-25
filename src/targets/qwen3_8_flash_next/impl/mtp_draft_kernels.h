@@ -19,4 +19,8 @@ void mtp_scale_add_f16(const void* source, float scale, float* total, std::int32
 void mtp_round_f16(const float* total, void* destination, std::int32_t count,
                    cudaStream_t stream);
 
+// Top-1 softmax probability over one FP16 [valid_rows,1] logit column. Writes one FP32 value.
+void mtp_top1_prob_f16(const void* logits, float* prob_out, std::int32_t valid_rows,
+                       cudaStream_t stream);
+
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

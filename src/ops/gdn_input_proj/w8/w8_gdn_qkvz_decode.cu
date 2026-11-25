@@ -15,16 +15,17 @@
 namespace ninfer::ops::detail {
 namespace {
 
-// Flash-Next GDN qkvz W8G32_F16S GEMV, one launch for the whole per-rank parent.
+// Flash-Next GDN qkvz W8G32_F16S multi-column GEMV, one launch for the whole per-rank parent.
 //   x is [2560, T] with T in [1,4] (decode/verify, BF16 or FP16). The parent is
 //   [8192, 2560] RowSplit W8 with FP16 scales, stored row-major per plane:
 //   code row 2560 B, scale row 160 B. Row blocks map to the four projections
 //   by output row counts: [0, q_rows) -> query, [q_rows, q_rows+k_rows) -> key,
 //   then value, then z. Each output is an independent [rows, T] tensor of the x
-//   dtype. Each token is an independent slice with the same warp/row mapping
-//   and FP32 accumulation order as T=1. K=2560, group=32. One warp owns one row;
-//   fp32 FMA into a per-lane accumulator, warp-shuffle reduction,
-//   round-to-nearest store. No workspace: the reduction lives in registers.
+//   dtype. One warp owns one row and one CTA owns the T token columns: the code,
+//   scale and BF16 control rows are loaded once and reused across columns. Each
+//   column keeps the same warp/row mapping and FP32 accumulation order as T=1.
+//   K=2560, group=32. fp32 FMA into per-column per-lane accumulators, warp-shuffle
+//   reduction, round-to-nearest store. No workspace: reductions live in registers.
 
 constexpr int kK              = 2560;
 constexpr int kGroup          = 32;
@@ -88,58 +89,70 @@ struct GdnQkvzOutputs {
     std::int32_t qkvz_rows;
 };
 
-template <class Act>
-__device__ __forceinline__ void gdn_gating_row(const Act* __restrict__ x,
-                                               const __nv_bfloat16* __restrict__ control,
+template <class Act, int Columns>
+__device__ __forceinline__ void gdn_gating_rows(const Act* __restrict__ x,
+                                                const __nv_bfloat16* __restrict__ control,
                                                 const float* __restrict__ a_log,
-                                                const float* __restrict__ dt_bias, float* __restrict__ g,
-                                                float* __restrict__ beta, int token, int control_row,
-                                                int lane) {
+                                                const float* __restrict__ dt_bias,
+                                                float* __restrict__ g, float* __restrict__ beta,
+                                                int control_row, int lane) {
     const int head   = control_row < kGdnHeads ? control_row : control_row - kGdnHeads;
     const bool is_b  = control_row >= kGdnHeads;
     const auto* wrow = control + static_cast<std::int64_t>(control_row) * kK;
 
-    // Match the FP16 gdn_gating_proj route bit-for-bit: one scalar fmaf per lane
-    // with k = lane, lane+32, ..., then the same shfl_down warp reduction. The
-    // control parent is read directly instead of through shared memory; the BF16
-    // operand bits and the epilogue formula are unchanged.
-    const Act* token_x = x + token * kK;
-    float accumulator  = 0.0f;
+    // The BF16 control row is read once per CTA and reused across all token columns.
+    // Each column keeps the same lane-strided fmaf order, shfl_down reduction and
+    // epilogue as the single-token route, so every g/beta bit is unchanged.
+    float accumulator[Columns];
+#pragma unroll
+    for (int column = 0; column < Columns; ++column) { accumulator[column] = 0.0f; }
     for (int k = lane; k < kK; k += 32) {
         const float weight = __bfloat162float(wrow[k]);
-        const float value  = DecodeAct<Act>::to_float(token_x[k]);
-        accumulator        = fmaf(weight, value, accumulator);
+#pragma unroll
+        for (int column = 0; column < Columns; ++column) {
+            const float value = DecodeAct<Act>::to_float(x[static_cast<std::int64_t>(column) * kK + k]);
+            accumulator[column] = fmaf(weight, value, accumulator[column]);
+        }
     }
-    accumulator = warp_reduce_sum(accumulator);
-    if (lane != 0) { return; }
-    if (is_b) {
-        beta[token * kGdnHeads + head] = sigmoid(accumulator);
-    } else {
-        g[token * kGdnHeads + head] = -expf(a_log[head]) * softplus(accumulator + dt_bias[head]);
+#pragma unroll
+    for (int column = 0; column < Columns; ++column) {
+        const float reduced = warp_reduce_sum(accumulator[column]);
+        if (lane == 0) {
+            const int slot = column * kGdnHeads + head;
+            if (is_b) {
+                beta[slot] = sigmoid(reduced);
+            } else {
+                g[slot] = -expf(a_log[head]) * softplus(reduced + dt_bias[head]);
+            }
+        }
     }
 }
 
-template <class Act>
-__global__ __launch_bounds__(kRowsPerCta * 32, 4) void w8_gdn_qkvz_decode_kernel(
+// True batched counterpart: the W8 code/scale planes and the BF16 control row are
+// fetched once per output row, then reused for every token column. Each column has
+// its own FP32 accumulator with the identical byte decode, group scale, fmaf order,
+// warp reduction and rounding as the single-column path, so the results are bit-exact.
+template <class Act, int Columns>
+__global__ __launch_bounds__(kRowsPerCta * 32, 4) void w8_gdn_qkvz_decode_multi_kernel(
     const Act* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, GdnQkvzOutputs<Act> output) {
     const int lane     = static_cast<int>(threadIdx.x) & 31;
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
-    const int token    = static_cast<int>(blockIdx.y);
     const int cta_row0 = static_cast<int>(blockIdx.x) * kRowsPerCta;
     const int row      = cta_row0 + warp;
 
     if (row >= output.qkvz_rows) {
-        gdn_gating_row(x, output.control, output.a_log, output.dt_bias, output.g, output.beta,
-                       token, row - output.qkvz_rows, lane);
+        gdn_gating_rows<Act, Columns>(x, output.control, output.a_log, output.dt_bias, output.g,
+                                      output.beta, row - output.qkvz_rows, lane);
         return;
     }
 
-    const Act* token_x            = x + token * kK;
     const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * kK;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kScaleBytesRow;
 
-    float accumulator = 0.0f;
+    float accumulator[Columns];
+#pragma unroll
+    for (int column = 0; column < Columns; ++column) { accumulator[column] = 0.0f; }
 #pragma unroll
     for (int phase = 0; phase < kPhases; ++phase) {
         unsigned scale_bits = 0;
@@ -166,33 +179,40 @@ __global__ __launch_bounds__(kRowsPerCta * 32, 4) void w8_gdn_qkvz_decode_kernel
                 static_cast<float>(static_cast<std::int8_t>((word >> 24) & 0xffu)) * scale;
         }
 
-        const uint4 values = load_vec<uint4>(token_x + phase_k);
-        const float2 x0    = DecodeAct<Act>::to_float2(values.x);
-        const float2 x1    = DecodeAct<Act>::to_float2(values.y);
-        const float2 x2    = DecodeAct<Act>::to_float2(values.z);
-        const float2 x3    = DecodeAct<Act>::to_float2(values.w);
-        accumulator        = fmaf(weights[0], x0.x, accumulator);
-        accumulator        = fmaf(weights[1], x0.y, accumulator);
-        accumulator        = fmaf(weights[2], x1.x, accumulator);
-        accumulator        = fmaf(weights[3], x1.y, accumulator);
-        accumulator        = fmaf(weights[4], x2.x, accumulator);
-        accumulator        = fmaf(weights[5], x2.y, accumulator);
-        accumulator        = fmaf(weights[6], x3.x, accumulator);
-        accumulator        = fmaf(weights[7], x3.y, accumulator);
+#pragma unroll
+        for (int column = 0; column < Columns; ++column) {
+            const Act* token_x = x + static_cast<std::int64_t>(column) * kK;
+            const uint4 values = load_vec<uint4>(token_x + phase_k);
+            const float2 x0    = DecodeAct<Act>::to_float2(values.x);
+            const float2 x1    = DecodeAct<Act>::to_float2(values.y);
+            const float2 x2    = DecodeAct<Act>::to_float2(values.z);
+            const float2 x3    = DecodeAct<Act>::to_float2(values.w);
+            accumulator[column] = fmaf(weights[0], x0.x, accumulator[column]);
+            accumulator[column] = fmaf(weights[1], x0.y, accumulator[column]);
+            accumulator[column] = fmaf(weights[2], x1.x, accumulator[column]);
+            accumulator[column] = fmaf(weights[3], x1.y, accumulator[column]);
+            accumulator[column] = fmaf(weights[4], x2.x, accumulator[column]);
+            accumulator[column] = fmaf(weights[5], x2.y, accumulator[column]);
+            accumulator[column] = fmaf(weights[6], x3.x, accumulator[column]);
+            accumulator[column] = fmaf(weights[7], x3.y, accumulator[column]);
+        }
     }
 
-    accumulator = warp_reduce_sum(accumulator);
-    if (lane != 0) { return; }
-    const Act projected      = DecodeAct<Act>::round(accumulator);
-    const Segments& s        = output.segments;
-    if (row < s.q_rows) {
-        output.query[token * s.q_rows + row] = projected;
-    } else if (row < s.k_end) {
-        output.key[token * s.k_rows + (row - s.q_rows)] = projected;
-    } else if (row < s.v_end) {
-        output.value[token * s.v_rows + (row - s.k_end)] = projected;
-    } else {
-        output.z[token * s.z_rows + (row - s.v_end)] = projected;
+    const Segments& s = output.segments;
+#pragma unroll
+    for (int column = 0; column < Columns; ++column) {
+        const float reduced = warp_reduce_sum(accumulator[column]);
+        if (lane != 0) { continue; }
+        const Act projected = DecodeAct<Act>::round(reduced);
+        if (row < s.q_rows) {
+            output.query[static_cast<std::int64_t>(column) * s.q_rows + row] = projected;
+        } else if (row < s.k_end) {
+            output.key[static_cast<std::int64_t>(column) * s.k_rows + (row - s.q_rows)] = projected;
+        } else if (row < s.v_end) {
+            output.value[static_cast<std::int64_t>(column) * s.v_rows + (row - s.k_end)] = projected;
+        } else {
+            output.z[static_cast<std::int64_t>(column) * s.z_rows + (row - s.v_end)] = projected;
+        }
     }
 }
 
@@ -272,9 +292,28 @@ void launch_typed(const Tensor& x, const Weight& weight, Tensor& query, Tensor& 
         static_cast<float*>(beta.data), weight.n};
     const int grid   = (weight.n + kControlRows) / kRowsPerCta;
     const int tokens = x.ne[1];
-    w8_gdn_qkvz_decode_kernel<Act><<<dim3(grid, tokens), kRowsPerCta * 32, 0, stream>>>(
-        static_cast<const Act*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), output);
+    const auto* activation = static_cast<const Act*>(x.data);
+    const auto* codes      = static_cast<const std::uint8_t*>(weight.qdata);
+    const auto* scales     = static_cast<const std::uint8_t*>(weight.scales);
+    switch (tokens) {
+    case 1:
+        w8_gdn_qkvz_decode_multi_kernel<Act, 1>
+            <<<dim3(grid, 1), kRowsPerCta * 32, 0, stream>>>(activation, codes, scales, output);
+        break;
+    case 2:
+        w8_gdn_qkvz_decode_multi_kernel<Act, 2>
+            <<<dim3(grid, 1), kRowsPerCta * 32, 0, stream>>>(activation, codes, scales, output);
+        break;
+    case 3:
+        w8_gdn_qkvz_decode_multi_kernel<Act, 3>
+            <<<dim3(grid, 1), kRowsPerCta * 32, 0, stream>>>(activation, codes, scales, output);
+        break;
+    case 4:
+        w8_gdn_qkvz_decode_multi_kernel<Act, 4>
+            <<<dim3(grid, 1), kRowsPerCta * 32, 0, stream>>>(activation, codes, scales, output);
+        break;
+    default: throw std::invalid_argument("w8_gdn_qkvz_decode: unsupported token count");
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -24,13 +24,25 @@ void hc_combine_norm_launch(const Tensor& residual, const Tensor& block_output,
 void hc_mix_silu_launch(Tensor& values, std::int32_t streams, cudaStream_t stream);
 
 void hc_mix_up_gate_launch(const void* weight, std::int32_t hidden, std::int32_t rank,
-                           std::int32_t streams, const void* low, const Tensor& normalized,
-                           Tensor& block_input, DType dtype, cudaStream_t stream);
+                            std::int32_t streams, const void* low, const Tensor& normalized,
+                            Tensor& block_input, DType dtype, cudaStream_t stream);
+
+void hc_mix_up_gate_multi_launch(const void* weight, std::int32_t hidden, std::int32_t rank,
+                                  std::int32_t streams, const void* low, const Tensor& normalized,
+                                  Tensor& block_input, DType dtype, std::int32_t columns,
+                                  cudaStream_t stream);
 
 void hc_mix_down_silu_launch(const void* weight, std::int32_t rows, std::int32_t depth,
-                             const void* activation, Tensor& output, const void* injection_rows,
-                             DType weight_dtype, Tensor* injection, std::int32_t streams,
-                             cudaStream_t stream);
+                              const void* activation, Tensor& output, const void* injection_rows,
+                              DType weight_dtype, Tensor* injection, std::int32_t streams,
+                              cudaStream_t stream);
+
+void hc_mix_down_silu_multi_launch(const void* weight, std::int32_t rows, std::int32_t depth,
+                                    const void* activation, Tensor& output,
+                                    const void* injection_rows, DType weight_dtype,
+                                    Tensor* injection, std::int32_t streams, std::int32_t columns,
+                                    cudaStream_t stream);
+
 
 
 void hc_project_gemv_launch(const void* weight, std::int32_t rows, std::int32_t depth,

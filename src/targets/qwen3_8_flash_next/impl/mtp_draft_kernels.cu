@@ -4,6 +4,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <math_constants.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -90,6 +91,79 @@ __global__ void round_f16_kernel(const float* __restrict__ total,
     destination[index] = __half_as_ushort(__float2half_rn(total[index]));
 }
 
+struct OnlineSoftmax {
+    float maximum;
+    float denominator;
+};
+
+__device__ __forceinline__ OnlineSoftmax combine_softmax(OnlineSoftmax left,
+                                                         OnlineSoftmax right) {
+    if (left.maximum > right.maximum) {
+        return {left.maximum,
+                left.denominator + right.denominator * expf(right.maximum - left.maximum)};
+    }
+    if (right.maximum > left.maximum) {
+        return {right.maximum,
+                left.denominator * expf(left.maximum - right.maximum) + right.denominator};
+    }
+    return {left.maximum, left.denominator + right.denominator};
+}
+
+__device__ __forceinline__ OnlineSoftmax warp_reduce_softmax(OnlineSoftmax value) {
+    constexpr unsigned int kMask = 0xffffffffu;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        OnlineSoftmax other;
+        other.maximum        = __shfl_down_sync(kMask, value.maximum, offset);
+        other.denominator    = __shfl_down_sync(kMask, value.denominator, offset);
+        value                = combine_softmax(value, other);
+    }
+    return value;
+}
+
+__global__ void top1_prob_f16_kernel(const std::uint16_t* __restrict__ logits,
+                                     float* __restrict__ probability, int valid_rows) {
+    constexpr int kWarpSize = 32;
+    __shared__ float warp_maxima[8];
+    __shared__ float warp_denominators[8];
+
+    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+
+    OnlineSoftmax local{-CUDART_INF_F, 0.0F};
+    for (int row = static_cast<int>(threadIdx.x); row < valid_rows;
+         row += static_cast<int>(blockDim.x)) {
+        const float value = __half2float(__ushort_as_half(logits[row]));
+        if (value > local.maximum) {
+            local.denominator = local.denominator * expf(local.maximum - value) + 1.0F;
+            local.maximum     = value;
+        } else {
+            local.denominator += expf(value - local.maximum);
+        }
+    }
+
+    local = warp_reduce_softmax(local);
+    if (lane == 0) {
+        warp_maxima[warp]     = local.maximum;
+        warp_denominators[warp] = local.denominator;
+    }
+    __syncthreads();
+
+    OnlineSoftmax total{-CUDART_INF_F, 0.0F};
+    if (warp == 0) {
+        OnlineSoftmax part;
+        part.maximum     = lane < (static_cast<int>(blockDim.x) / kWarpSize)
+                               ? warp_maxima[lane]
+                               : -CUDART_INF_F;
+        part.denominator = lane < (static_cast<int>(blockDim.x) / kWarpSize)
+                               ? warp_denominators[lane]
+                               : 0.0F;
+        total = warp_reduce_softmax(part);
+    }
+    if (threadIdx.x == 0) {
+        probability[0] = total.denominator > 0.0F ? 1.0F / total.denominator : 0.0F;
+    }
+}
+
 inline int block_count(int total, int threads) { return (total + threads - 1) / threads; }
 
 } // namespace
@@ -129,6 +203,17 @@ void mtp_round_f16(const float* total, void* destination, std::int32_t count,
     constexpr int kThreads = 256;
     round_f16_kernel<<<block_count(count, kThreads), kThreads, 0, stream>>>(
         total, static_cast<std::uint16_t*>(destination), count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void mtp_top1_prob_f16(const void* logits, float* prob_out, std::int32_t valid_rows,
+                       cudaStream_t stream) {
+    if (valid_rows <= 0) {
+        throw std::invalid_argument("MTP draft: top-1 probability needs a non-empty vocabulary");
+    }
+    constexpr int kThreads = 256;
+    top1_prob_f16_kernel<<<1, kThreads, 0, stream>>>(
+        static_cast<const std::uint16_t*>(logits), prob_out, valid_rows);
     CUDA_CHECK(cudaGetLastError());
 }
 

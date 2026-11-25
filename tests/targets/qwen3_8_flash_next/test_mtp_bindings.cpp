@@ -31,7 +31,7 @@ void check_artifact(const char* path) {
     ninfer::artifact::Binder binder(reader);
     const flash::BindingPlan text = flash::bind_artifact(binder, flash::WeightsProfile::Nvfp4, 1);
     const auto mtp = flash::mtp::bind_mtp_artifact(binder, text);
-    require(mtp.binding_count == 36, "the MTP plan did not parse all 36 bindings");
+    require(mtp.binding_count == 37, "the MTP plan did not parse all 37 bindings");
 
     const auto& gate = mtp.layer.moe.routed_gate.library;
     const auto& up = mtp.layer.moe.routed_up.library;
@@ -55,6 +55,13 @@ void check_artifact(const char* path) {
             "mtp/token_embedding does not share the text embedding object");
     require(mtp.output_head.parts.front().object == text.output_head.parts.front().object,
             "mtp/output_head does not share the text output head object");
+    require(mtp.proposal_head.parameter == "proposal/head",
+            "the MTP proposal head does not bind the artifact's proposal/head parameter");
+    const auto& proposal = mtp.objects.at(mtp.proposal_head.parts.front().object);
+    require(proposal.name == "weight/001310", "the MTP proposal head is not object 001310");
+    require(binder.tensor_format(proposal.name) ==
+                ninfer::artifact::NumericFormat::Q4G64_F16S,
+            "the MTP proposal head is not the artifact's Q4 head");
 
     const std::set<std::string> roles{
         "token_embedding", "output_head", "fc_embedding", "fc_hidden",

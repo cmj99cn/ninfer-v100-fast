@@ -57,6 +57,9 @@ void AttentionProjectionLeaf::project(const Tensor& hidden, const AttentionProje
                                      WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope = workspace.scope();
 
+    // The whole [hidden, T] span goes through linear_split once. The W8 query/gate segments land in
+    // launch_w8_narrow_f16_decode_multi (one weight load reused across columns); the FP16 key/value
+    // segments use the Volta MMA route, which is already bit-exact across T. No per-column replay.
     const auto query_gate = query_gate_segments(query, output_gate);
     std::array<Tensor, 2> query_gate_outputs{query, output_gate};
     ops::linear_split(hidden, weights.query_gate, query_gate, query_gate_outputs,

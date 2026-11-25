@@ -629,6 +629,125 @@ int run_route_case(const Case& inputs, std::size_t token, const std::string& lab
     return failures;
 }
 
+int run_route_cross_profile_case(const Case& inputs, std::int32_t columns, const char* label) {
+    std::vector<float> activations(static_cast<std::size_t>(kHidden) * columns);
+    for (std::int32_t c = 0; c < columns; ++c) {
+        for (std::int32_t row = 0; row < kHidden; ++row) {
+            activations[static_cast<std::size_t>(c) * kHidden + static_cast<std::size_t>(row)] =
+                inputs.activation[static_cast<std::size_t>(c)][static_cast<std::size_t>(row)];
+        }
+    }
+
+    DeviceBuffer device_parent      = to_device(inputs.parent.bits);
+    DeviceBuffer device_shared_down = to_device(inputs.shared_down.bits);
+    DeviceBuffer device_gate_up     = to_device(inputs.gate_up.payload);
+    DeviceBuffer device_down        = to_device(inputs.down.payload);
+    DeviceBuffer device_x           = to_device_bf16(activations);
+
+    MoeNvfp4Weights weights;
+    weights.router_shared  = inputs.parent.device_weight(device_parent.p);
+    weights.shared_down    = inputs.shared_down.device_weight(device_shared_down.p);
+    weights.routed_gate_up = inputs.gate_up.view(device_gate_up.p);
+    weights.routed_down    = inputs.down.view(device_down.p);
+
+    const std::size_t ids_bytes          = static_cast<std::size_t>(kTopK) * columns * sizeof(std::int32_t);
+    const std::size_t coefficients_bytes = static_cast<std::size_t>(kTopK) * columns * sizeof(float);
+    const std::size_t gate_bytes         = static_cast<std::size_t>(columns) * sizeof(float);
+    const std::size_t logits_bytes =
+        static_cast<std::size_t>(kExperts + 1) * columns * sizeof(float);
+
+    GuardedDeviceBuffer batched_ids(ids_bytes);
+    GuardedDeviceBuffer batched_coefficients(coefficients_bytes);
+    GuardedDeviceBuffer batched_gate(gate_bytes);
+    std::vector<GuardedDeviceBuffer> sequential_ids;
+    std::vector<GuardedDeviceBuffer> sequential_coefficients;
+    std::vector<GuardedDeviceBuffer> sequential_gate;
+    for (std::int32_t c = 0; c < columns; ++c) {
+        sequential_ids.emplace_back(kTopK * sizeof(std::int32_t));
+        sequential_coefficients.emplace_back(kTopK * sizeof(float));
+        sequential_gate.emplace_back(sizeof(float));
+    }
+    DeviceBuffer batched_logits(logits_bytes);
+    DeviceBuffer sequential_logits(logits_bytes);
+    DeviceBuffer batched_counter(sizeof(std::int32_t));
+    DeviceBuffer sequential_counter(sizeof(std::int32_t));
+    batched_counter.fill(0);
+    sequential_counter.fill(0);
+
+    const Tensor x{device_x.p, DType::BF16, {kHidden, columns}};
+    Tensor batched_ids_tensor{batched_ids.data(), DType::I32, {kTopK, columns}};
+    Tensor batched_coefficients_tensor{batched_coefficients.data(), DType::FP32, {kTopK, columns}};
+    Tensor batched_gate_tensor{batched_gate.data(), DType::FP32, {columns}};
+    ops::moe_nvfp4_route(x, weights, batched_ids_tensor, batched_coefficients_tensor,
+                         batched_gate_tensor, 0, static_cast<float*>(batched_logits.p),
+                         static_cast<std::int32_t*>(batched_counter.p));
+
+    for (std::int32_t c = 0; c < columns; ++c) {
+        const Tensor column = x.slice(1, c, 1);
+        Tensor ids{sequential_ids[static_cast<std::size_t>(c)].data(), DType::I32, {kTopK, 1}};
+        Tensor coefficients{sequential_coefficients[static_cast<std::size_t>(c)].data(),
+                            DType::FP32, {kTopK, 1}};
+        Tensor gate{sequential_gate[static_cast<std::size_t>(c)].data(), DType::FP32, {1}};
+        ops::moe_nvfp4_route(column, weights, ids, coefficients, gate, 0,
+                             static_cast<float*>(sequential_logits.p) +
+                                 static_cast<std::size_t>(c) * (kExperts + 1),
+                             static_cast<std::int32_t*>(sequential_counter.p));
+    }
+    cuda_synchronize();
+
+    int failures = 0;
+    const auto batched_ids_host = from_device<std::int32_t>(batched_ids.data(), kTopK * columns);
+    const auto batched_coefficients_host =
+        from_device<float>(batched_coefficients.data(), kTopK * columns);
+    const auto batched_gate_host = from_device<float>(batched_gate.data(), columns);
+    std::vector<std::int32_t> sequential_ids_host;
+    std::vector<float> sequential_coefficients_host;
+    std::vector<float> sequential_gate_host;
+    for (std::int32_t c = 0; c < columns; ++c) {
+        const auto slot = static_cast<std::size_t>(c);
+        const auto ids = from_device<std::int32_t>(sequential_ids[slot].data(), kTopK);
+        const auto coefficients = from_device<float>(sequential_coefficients[slot].data(), kTopK);
+        const auto gate = from_device<float>(sequential_gate[slot].data(), 1);
+        sequential_ids_host.insert(sequential_ids_host.end(), ids.begin(), ids.end());
+        sequential_coefficients_host.insert(sequential_coefficients_host.end(), coefficients.begin(),
+                                            coefficients.end());
+        sequential_gate_host.insert(sequential_gate_host.end(), gate.begin(), gate.end());
+    }
+    failures += verify_exact((std::string(label) + " top-k ids raw bits").c_str(),
+                             batched_ids_host, sequential_ids_host);
+    failures += verify_exact((std::string(label) + " coefficients raw bits").c_str(),
+                             batched_coefficients_host, sequential_coefficients_host);
+    failures += verify_exact((std::string(label) + " shared gate raw bits").c_str(),
+                             batched_gate_host, sequential_gate_host);
+    for (std::int32_t c = 0; c < columns; ++c) {
+        for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+            const std::size_t index = static_cast<std::size_t>(c) * kTopK + rank;
+            if (batched_ids_host[index] != inputs.oracle[static_cast<std::size_t>(c)].ids[rank]) {
+                std::cerr << label << ": token " << c << " rank " << rank
+                          << " disagrees with the independent FP64 oracle\n";
+                ++failures;
+            }
+        }
+    }
+    for (const DeviceBuffer* counter : {&batched_counter, &sequential_counter}) {
+        const auto value = from_device<std::int32_t>(counter->p, 1);
+        if (value[0] != 0) {
+            std::cerr << label << ": fused route counter was not reset\n";
+            ++failures;
+        }
+    }
+    failures += batched_ids.verify_guards(std::string(label) + " batched ids guard");
+    failures += batched_coefficients.verify_guards(std::string(label) + " batched coefficients guard");
+    failures += batched_gate.verify_guards(std::string(label) + " batched gate guard");
+    for (std::size_t c = 0; c < sequential_ids.size(); ++c) {
+        const std::string suffix = std::string(label) + " sequential slot " + std::to_string(c);
+        failures += sequential_ids[c].verify_guards(suffix + " ids guard");
+        failures += sequential_coefficients[c].verify_guards(suffix + " coefficients guard");
+        failures += sequential_gate[c].verify_guards(suffix + " gate guard");
+    }
+    return failures;
+}
+
 struct SlotBank {
     std::vector<std::uint8_t> payload;
     std::vector<float> divisors;
@@ -1242,6 +1361,142 @@ int run_cached_small_t_case(const BatchedFixture& gate_up, const BatchedFixture&
     return failures;
 }
 
+// The multi-column cached path must be raw-bit identical to calling the T==1 path once per
+// column: ids, coefficients, shared gate and the routed destination. Guards and read-only
+// inputs are checked, so an out-of-column scratch write is a failure.
+int run_cached_multi_bitwise_case(const BatchedFixture& gate_up, const BatchedFixture& down,
+                                  const MoeNvfp4Weights& full_weights,
+                                  const std::vector<std::vector<float>>& activation_values,
+                                  DType dtype, const std::string& label) {
+    const std::int32_t tokens = static_cast<std::int32_t>(activation_values.size());
+    std::vector<std::uint16_t> activation_words(static_cast<std::size_t>(tokens) * kHidden);
+    std::vector<std::uint16_t> residual_words(static_cast<std::size_t>(tokens) * kHidden);
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        std::vector<std::uint16_t> token_activation;
+        std::vector<std::uint16_t> token_residual;
+        build_token_words(activation_values[static_cast<std::size_t>(token)], dtype,
+                          token_activation, token_residual);
+        std::copy(token_activation.begin(), token_activation.end(),
+                  activation_words.begin() + static_cast<std::ptrdiff_t>(token) * kHidden);
+        std::copy(token_residual.begin(), token_residual.end(),
+                  residual_words.begin() + static_cast<std::ptrdiff_t>(token) * kHidden);
+    }
+
+    DeviceBuffer device_x = to_device(activation_words);
+    GuardedDeviceBuffer ids_buffer(static_cast<std::size_t>(tokens) * kTopK * sizeof(std::int32_t));
+    GuardedDeviceBuffer coefficients_buffer(static_cast<std::size_t>(tokens) * kTopK * sizeof(float));
+    GuardedDeviceBuffer shared_gate_buffer(static_cast<std::size_t>(tokens) * sizeof(float));
+    Tensor x{device_x.p, dtype, {kHidden, tokens}};
+    Tensor ids{ids_buffer.data(), DType::I32, {kTopK, tokens}};
+    Tensor coefficients{coefficients_buffer.data(), DType::FP32, {kTopK, tokens}};
+    Tensor shared_gate{shared_gate_buffer.data(), DType::FP32, {tokens}};
+    ops::moe_nvfp4_route(x, full_weights, ids, coefficients, shared_gate, 0);
+
+    std::vector<GuardedDeviceBuffer> sequential_ids;
+    std::vector<GuardedDeviceBuffer> sequential_coefficients;
+    std::vector<GuardedDeviceBuffer> sequential_gate;
+    for (std::int32_t column = 0; column < tokens; ++column) {
+        sequential_ids.emplace_back(kTopK * sizeof(std::int32_t));
+        sequential_coefficients.emplace_back(kTopK * sizeof(float));
+        sequential_gate.emplace_back(sizeof(float));
+        Tensor column_ids{sequential_ids.back().data(), DType::I32, {kTopK, 1}};
+        Tensor column_coefficients{sequential_coefficients.back().data(), DType::FP32, {kTopK, 1}};
+        Tensor column_gate{sequential_gate.back().data(), DType::FP32, {1}};
+        ops::moe_nvfp4_route(x.slice(1, column, 1), full_weights, column_ids, column_coefficients,
+                             column_gate, 0);
+    }
+    cuda_synchronize();
+
+    int failures = 0;
+    const auto batched_ids = from_device<std::int32_t>(ids_buffer.data(),
+                                                       static_cast<std::size_t>(tokens) * kTopK);
+    const auto batched_coefficients = from_device<float>(
+        coefficients_buffer.data(), static_cast<std::size_t>(tokens) * kTopK);
+    const auto batched_gate = from_device<float>(shared_gate_buffer.data(), tokens);
+    std::vector<std::int32_t> sequential_ids_host;
+    std::vector<float> sequential_coefficients_host;
+    std::vector<float> sequential_gate_host;
+    for (std::int32_t column = 0; column < tokens; ++column) {
+        const std::size_t slot = static_cast<std::size_t>(column);
+        const auto column_ids = from_device<std::int32_t>(sequential_ids[slot].data(), kTopK);
+        const auto column_coefficients = from_device<float>(sequential_coefficients[slot].data(), kTopK);
+        const auto column_gate = from_device<float>(sequential_gate[slot].data(), 1);
+        sequential_ids_host.insert(sequential_ids_host.end(), column_ids.begin(), column_ids.end());
+        sequential_coefficients_host.insert(sequential_coefficients_host.end(),
+                                            column_coefficients.begin(), column_coefficients.end());
+        sequential_gate_host.insert(sequential_gate_host.end(), column_gate.begin(), column_gate.end());
+    }
+    failures += verify_exact((label + " top-k ids raw bits").c_str(),
+                             batched_ids, sequential_ids_host);
+    failures += verify_exact((label + " coefficients raw bits").c_str(),
+                             batched_coefficients, sequential_coefficients_host);
+    failures += verify_exact((label + " shared gate raw bits").c_str(),
+                             batched_gate, sequential_gate_host);
+
+    const MoeNvfp4RouteView route{ids, coefficients, shared_gate};
+    const SlotBank slots = make_slot_bank(gate_up, down, batched_ids);
+    DeviceBuffer slot_payload = to_device(slots.payload);
+    DeviceBuffer slot_divisors = to_device(slots.divisors);
+    DeviceBuffer slot_lookup = to_device(slots.lookup);
+    const std::size_t slot_bytes = slots.payload.size() / static_cast<std::size_t>(slots.slots);
+    const MoeNvfp4ExpertSlots bank{
+        .payload    = static_cast<const std::uint8_t*>(slot_payload.p),
+        .slot_bytes = slot_bytes,
+        .slot_count = slots.slots,
+        .lookup     = static_cast<const std::int32_t*>(slot_lookup.p),
+        .divisors   = static_cast<const float*>(slot_divisors.p),
+    };
+
+    DeviceBuffer multi_scratch(static_cast<std::size_t>(tokens) * kTopK * kIntermediate *
+                               sizeof(float));
+    DeviceBuffer single_scratch(kTopK * kIntermediate * sizeof(float));
+    const MoeNvfp4ExpertScratch multi_scratch_view{static_cast<float*>(multi_scratch.p)};
+    const MoeNvfp4ExpertScratch single_scratch_view{static_cast<float*>(single_scratch.p)};
+
+    const std::size_t destination_bytes =
+        static_cast<std::size_t>(tokens) * kHidden * sizeof(std::uint16_t);
+    GuardedDeviceBuffer multi_destination(destination_bytes);
+    GuardedDeviceBuffer sequential_destination(destination_bytes);
+    multi_destination.copy_from_host(residual_words.data(), destination_bytes);
+    sequential_destination.copy_from_host(residual_words.data(), destination_bytes);
+    Tensor multi_tensor{multi_destination.data(), dtype, {kHidden, tokens}};
+    ops::moe_routed_nvfp4_cached(x, bank, multi_scratch_view, route, multi_tensor, 0);
+    for (std::int32_t column = 0; column < tokens; ++column) {
+        const std::size_t slot = static_cast<std::size_t>(column);
+        Tensor column_ids{sequential_ids[slot].data(), DType::I32, {kTopK, 1}};
+        Tensor column_coefficients{sequential_coefficients[slot].data(), DType::FP32, {kTopK, 1}};
+        Tensor column_gate{sequential_gate[slot].data(), DType::FP32, {1}};
+        Tensor column_destination{
+            static_cast<std::uint8_t*>(sequential_destination.data()) +
+                static_cast<std::size_t>(column) * kHidden * sizeof(std::uint16_t),
+            dtype, {kHidden, 1}};
+        const MoeNvfp4RouteView column_route{column_ids, column_coefficients, column_gate};
+        ops::moe_routed_nvfp4_cached(x.slice(1, column, 1), bank, single_scratch_view,
+                                     column_route, column_destination, 0);
+    }
+    cuda_synchronize();
+
+    const auto multi_words = from_device<std::uint16_t>(multi_destination.data(),
+                                                        static_cast<std::size_t>(tokens) * kHidden);
+    const auto sequential_words =
+        from_device<std::uint16_t>(sequential_destination.data(),
+                                   static_cast<std::size_t>(tokens) * kHidden);
+    failures += verify_exact((label + " routed output raw bits").c_str(),
+                             multi_words, sequential_words);
+    failures += multi_destination.verify_guards(label + " multi destination guard");
+    failures += sequential_destination.verify_guards(label + " sequential destination guard");
+    failures += ids_buffer.verify_guards(label + " ids guard");
+    failures += coefficients_buffer.verify_guards(label + " coefficients guard");
+    failures += shared_gate_buffer.verify_guards(label + " shared gate guard");
+    for (std::size_t column = 0; column < sequential_ids.size(); ++column) {
+        const std::string suffix = label + " sequential slot " + std::to_string(column);
+        failures += sequential_ids[column].verify_guards(suffix + " ids guard");
+        failures += sequential_coefficients[column].verify_guards(suffix + " coefficients guard");
+        failures += sequential_gate[column].verify_guards(suffix + " gate guard");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1315,6 +1570,9 @@ int main() {
         std::cerr << tie_label << ": rank 10 is not the lower id of the tie pair\n";
         ++failures;
     }
+    failures += run_route_cross_profile_case(inputs, 2, "moe_nvfp4 route T=1 vs T=2");
+    failures += run_route_cross_profile_case(inputs, 4, "moe_nvfp4 route T=1 vs T=4");
+    failures += run_route_cross_profile_case(inputs, 8, "moe_nvfp4 route T=1 vs T=8");
 
     DeviceBuffer device_parent      = to_device(inputs.parent.bits);
     DeviceBuffer device_shared_down = to_device(inputs.shared_down.bits);
@@ -1643,9 +1901,19 @@ int main() {
     const std::vector<std::vector<float>> small_t_activations{
         inputs.activation[0], inputs.activation[1], inputs.activation[2], inputs.activation[3]};
     failures += run_cached_small_t_case(inputs.gate_up, inputs.down, weights, small_t_activations,
-                                        DType::BF16, "moe_nvfp4 cached small-t bf16");
+                                         DType::BF16, "moe_nvfp4 cached small-t bf16");
     failures += run_cached_small_t_case(gate_up_f16, down_f16, weights_f16, small_t_activations,
-                                        DType::FP16, "moe_nvfp4 cached small-t f16");
+                                         DType::FP16, "moe_nvfp4 cached small-t f16");
+    const std::vector<std::vector<float>> t2_activations{
+        inputs.activation[0], inputs.activation[1]};
+    failures += run_cached_multi_bitwise_case(inputs.gate_up, inputs.down, weights, t2_activations,
+                                              DType::BF16, "moe_nvfp4 cached multi bf16 T=2");
+    failures += run_cached_multi_bitwise_case(gate_up_f16, down_f16, weights_f16, t2_activations,
+                                              DType::FP16, "moe_nvfp4 cached multi f16 T=2");
+    failures += run_cached_multi_bitwise_case(inputs.gate_up, inputs.down, weights, small_t_activations,
+                                              DType::BF16, "moe_nvfp4 cached multi bf16 T=4");
+    failures += run_cached_multi_bitwise_case(gate_up_f16, down_f16, weights_f16, small_t_activations,
+                                              DType::FP16, "moe_nvfp4 cached multi f16 T=4");
     failures += run_shared_bitwise_case(weights, inputs.activation[1], DType::BF16,
                                         "moe_nvfp4 shared bf16");
     failures += run_shared_bitwise_case(weights_f16, inputs.activation[2], DType::FP16,

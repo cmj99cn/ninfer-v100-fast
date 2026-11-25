@@ -36,8 +36,9 @@ void nccl_check(ncclResult_t result, const char* what) {
 }
 
 // Moves bytes, so any element type NCCL names is valid. The collective call sites carry BF16
-// or FP16 activations, I32/I64 token and index lanes, and FP32 staging; the mapping is the one place the
-// element type is translated, and an unmapped type fails loudly rather than moving wrong bytes.
+// or FP16 activations, FP32 draft accumulators, I32/I64 token and index lanes, and FP32 staging;
+// the mapping is the one place the element type is translated, and an unmapped type fails loudly
+// rather than moving wrong bytes.
 ncclDataType_t nccl_element_type(DType dtype, const char* op) {
     switch (dtype) {
     case DType::BF16: return ncclBfloat16;
@@ -185,8 +186,9 @@ void allreduce_sum(const std::array<Tensor, kMaximumDevices>& buffer,
     const int tp = ec.tp;
     for (int rank = 0; rank < tp; ++rank) {
         require_contiguous(buffer[rank], kOp, "buffer");
-        require(buffer[rank].dtype == DType::BF16 || buffer[rank].dtype == DType::FP16,
-                std::string(kOp) + ": buffer must be BF16 or FP16");
+        require(buffer[rank].dtype == DType::BF16 || buffer[rank].dtype == DType::FP16 ||
+                    buffer[rank].dtype == DType::FP32,
+                std::string(kOp) + ": buffer must be BF16, FP16, or FP32");
         require(buffer[rank].dtype == buffer[0].dtype,
                 std::string(kOp) + ": buffer dtypes must match");
         require(same_shape<2>(buffer[rank], buffer[0]),

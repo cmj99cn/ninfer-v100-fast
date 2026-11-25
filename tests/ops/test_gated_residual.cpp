@@ -1,5 +1,7 @@
 #include "ninfer/ops/gated_residual.h"
 
+#include "ninfer/ops/linear.h"
+
 #include "core/arena.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/direct_fp16_weight.h"
@@ -752,6 +754,179 @@ int run_mix_bitwise_case(const char* label, std::uint32_t seed) {
     return failures;
 }
 
+int run_mix_cross_profile_bitwise_case(const char* label, std::int32_t columns, std::uint32_t seed,
+                                        bool final_mix, DType dtype, bool four_dim = false) {
+    const std::int32_t channels       = kHidden * kStreams;
+    const std::size_t normal_count    = static_cast<std::size_t>(channels) * columns;
+    const std::size_t block_count     = static_cast<std::size_t>(kHidden) * columns;
+    const std::size_t injection_count = static_cast<std::size_t>(kStreams) * columns;
+
+    std::vector<float> normalized(normal_count);
+    fill_uniform(normalized, seed, -1.0F, 1.0F);
+    round_to_activation(normalized, dtype);
+    const std::vector<std::uint16_t> normalized_bits = encode_activation(normalized, dtype);
+
+    const MixWeights weights =
+        make_mix_weights(final_mix ? kRank : kRank + kStreams, channels, seed + 1U, dtype);
+
+    GuardedDeviceBuffer device_normalized(normal_count * sizeof(std::uint16_t));
+    device_normalized.copy_from_host(normalized_bits.data(), device_normalized.bytes());
+    GuardedDeviceBuffer seq_block(block_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer batched_block(block_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer seq_injection(injection_count * sizeof(float));
+    GuardedDeviceBuffer batched_injection(injection_count * sizeof(float));
+    seq_block.fill(0xff);
+    batched_block.fill(0xff);
+    seq_injection.fill(0xff);
+    batched_injection.fill(0xff);
+
+    const Tensor normalized_tensor =
+        four_dim ? Tensor(device_normalized.data(), dtype, {kHidden, kStreams, columns, 1})
+                 : activation_tensor(device_normalized.data(), dtype, kHidden, kStreams, columns);
+    Tensor seq_block_tensor     = activation_tensor(seq_block.data(), dtype, kHidden, columns);
+    Tensor batched_block_tensor = activation_tensor(batched_block.data(), dtype, kHidden, columns);
+    Tensor seq_injection_tensor(seq_injection.data(), DType::FP32, {kStreams, columns});
+    Tensor batched_injection_tensor(batched_injection.data(), DType::FP32, {kStreams, columns});
+
+    const std::size_t capacity =
+        final_mix
+            ? ops::hc_final_mix_workspace_capacity_bytes(
+                  ops::HcFinalMixWeights{weights.down, weights.up}, 1, columns)
+            : ops::hc_mix_workspace_capacity_bytes(ops::HcMixWeights{weights.down, weights.up}, 1,
+                                                   columns);
+    WorkspaceArena seq_workspace(capacity);
+    WorkspaceArena batched_workspace(capacity);
+
+    for (std::int32_t c = 0; c < columns; ++c) {
+        const Tensor column    = normalized_tensor.slice(2, c, 1);
+        Tensor seq_out         = seq_block_tensor.slice(1, c, 1);
+        Tensor seq_inj         = seq_injection_tensor.slice(1, c, 1);
+        if (final_mix) {
+            ops::hc_final_mix(column, ops::HcFinalMixWeights{weights.down, weights.up},
+                              seq_workspace, seq_out, nullptr);
+        } else {
+            ops::hc_mix(column, ops::HcMixWeights{weights.down, weights.up}, seq_workspace, seq_out,
+                        seq_inj, nullptr);
+        }
+    }
+    if (final_mix) {
+        ops::hc_final_mix(normalized_tensor, ops::HcFinalMixWeights{weights.down, weights.up},
+                          batched_workspace, batched_block_tensor, nullptr);
+    } else {
+        ops::hc_mix(normalized_tensor, ops::HcMixWeights{weights.down, weights.up},
+                    batched_workspace, batched_block_tensor, batched_injection_tensor, nullptr);
+    }
+    cuda_synchronize();
+
+    int failures = 0;
+    failures += verify_exact((std::string(label) + " block raw bits").c_str(),
+                             from_device<std::uint16_t>(seq_block.data(), block_count),
+                             from_device<std::uint16_t>(batched_block.data(), block_count));
+    if (!final_mix) {
+        failures += verify_exact((std::string(label) + " injection raw bits").c_str(),
+                                 from_device<float>(seq_injection.data(), injection_count),
+                                 from_device<float>(batched_injection.data(), injection_count));
+    }
+    failures += verify_exact((std::string(label) + " normalized preserved").c_str(),
+                             from_device<std::uint16_t>(device_normalized.data(), normal_count),
+                             normalized_bits);
+    failures += weights.verify_preserved(label);
+    failures += seq_block.verify_guards(std::string(label) + " seq block");
+    failures += batched_block.verify_guards(std::string(label) + " batched block");
+    return failures;
+}
+
+#ifdef NINFER_VOLTA_BUILD
+int run_mix_general_path_bitwise_case(const char* label, std::int32_t columns, std::uint32_t seed,
+                                       bool final_mix, DType dtype) {
+    const std::int32_t channels       = kHidden * kStreams;
+    const std::size_t normal_count    = static_cast<std::size_t>(channels) * columns;
+    const std::size_t block_count     = static_cast<std::size_t>(kHidden) * columns;
+    const std::size_t injection_count = static_cast<std::size_t>(kStreams) * columns;
+
+    std::vector<float> normalized(normal_count);
+    fill_uniform(normalized, seed, -1.0F, 1.0F);
+    round_to_activation(normalized, dtype);
+
+    const MixWeights weights =
+        make_mix_weights(final_mix ? kRank : kRank + kStreams, channels, seed + 1U, dtype);
+
+    GuardedDeviceBuffer device_normalized(normal_count * sizeof(std::uint16_t));
+    device_normalized.copy_from_host(encode_activation(normalized, dtype).data(),
+                                     device_normalized.bytes());
+    GuardedDeviceBuffer op_block(block_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer ref_block(block_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer op_injection(injection_count * sizeof(float));
+    GuardedDeviceBuffer ref_injection(injection_count * sizeof(float));
+    GuardedDeviceBuffer low(static_cast<std::size_t>(kRank) * columns * sizeof(std::uint16_t));
+    GuardedDeviceBuffer gates(static_cast<std::size_t>(channels) * columns * sizeof(std::uint16_t));
+    op_block.fill(0xff);
+    ref_block.fill(0xff);
+    op_injection.fill(0xff);
+    ref_injection.fill(0xff);
+
+    const Tensor normalized_tensor =
+        activation_tensor(device_normalized.data(), dtype, kHidden, kStreams, columns);
+    Tensor op_block_tensor  = activation_tensor(op_block.data(), dtype, kHidden, columns);
+    Tensor ref_block_tensor = activation_tensor(ref_block.data(), dtype, kHidden, columns);
+    Tensor op_injection_tensor(op_injection.data(), DType::FP32, {kStreams, columns});
+    Tensor ref_injection_tensor(ref_injection.data(), DType::FP32, {kStreams, columns});
+    Tensor low_tensor   = activation_tensor(low.data(), dtype, kRank, columns);
+    Tensor gates_tensor = activation_tensor(gates.data(), dtype, channels, columns);
+
+    const std::size_t capacity =
+        final_mix
+            ? ops::hc_final_mix_workspace_capacity_bytes(
+                  ops::HcFinalMixWeights{weights.down, weights.up}, 1, columns)
+            : ops::hc_mix_workspace_capacity_bytes(ops::HcMixWeights{weights.down, weights.up}, 1,
+                                                   columns);
+    WorkspaceArena workspace(capacity);
+    if (final_mix) {
+        ops::hc_final_mix(normalized_tensor, ops::HcFinalMixWeights{weights.down, weights.up},
+                          workspace, op_block_tensor, nullptr);
+    } else {
+        ops::hc_mix(normalized_tensor, ops::HcMixWeights{weights.down, weights.up}, workspace,
+                    op_block_tensor, op_injection_tensor, nullptr);
+    }
+
+    const Tensor flattened = normalized_tensor.view({channels, columns});
+    if (final_mix) {
+        ops::linear(flattened, weights.down, low_tensor, nullptr);
+    } else {
+        Weight down          = weights.down;
+        down.n               = kRank;
+        down.shape[0]        = kRank;
+        down.padded_shape[0] = kRank;
+        down.payload_bytes   = static_cast<std::uint64_t>(kRank) * channels * 2;
+        ops::linear(flattened, down, low_tensor, nullptr);
+    }
+    ops::detail::hc_mix_silu_launch(low_tensor, kStreams, nullptr);
+    ops::linear(low_tensor, weights.up, gates_tensor, nullptr);
+    if (!final_mix) {
+        const auto* injection_rows = static_cast<const std::uint8_t*>(weights.down.qdata) +
+                                     static_cast<std::size_t>(kRank) * channels * 2;
+        const DType weight_dtype =
+            weights.down.qtype == QType::FP16_CTRL ? DType::FP16 : DType::BF16;
+        ops::detail::hc_mix_injection_launch(injection_rows, weight_dtype, flattened, channels,
+                                             kStreams, ref_injection_tensor, nullptr);
+    }
+    ops::detail::hc_mix_gate_launch(gates_tensor, normalized_tensor, ref_block_tensor, kHidden,
+                                    kStreams, nullptr);
+    cuda_synchronize();
+
+    int failures = 0;
+    failures += verify_exact((std::string(label) + " block raw bits").c_str(),
+                             from_device<std::uint16_t>(op_block.data(), block_count),
+                             from_device<std::uint16_t>(ref_block.data(), block_count));
+    if (!final_mix) {
+        failures += verify_exact((std::string(label) + " injection raw bits").c_str(),
+                                 from_device<float>(op_injection.data(), injection_count),
+                                 from_device<float>(ref_injection.data(), injection_count));
+    }
+    return failures;
+}
+#endif
+
 int run_mix_case(const char* label, std::int32_t columns, std::uint32_t seed, bool final_mix,
                  DType dtype = DType::BF16) {
     const std::int32_t channels  = kHidden * kStreams;
@@ -1055,6 +1230,34 @@ int main() {
     failures += run_combine_norm_case("hc_combine_norm M=7", 7, 2402U, false);
     failures += run_mix_case("hc_mix M=1", 1, 2501U, false);
     failures += run_mix_bitwise_case("hc_mix bitwise M=1", 2511U);
+    failures +=
+        run_mix_cross_profile_bitwise_case("hc_mix T=1 vs T=2", 2, 2512U, false, DType::BF16);
+    failures +=
+        run_mix_cross_profile_bitwise_case("hc_mix T=1 vs T=4", 4, 2513U, false, DType::BF16);
+    failures +=
+        run_mix_cross_profile_bitwise_case("hc_mix T=1 vs T=8", 8, 2514U, false, DType::BF16);
+    failures +=
+        run_mix_cross_profile_bitwise_case("hc_final_mix T=1 vs T=2", 2, 2612U, true, DType::BF16);
+    failures +=
+        run_mix_cross_profile_bitwise_case("hc_final_mix T=1 vs T=4", 4, 2613U, true, DType::BF16);
+    failures +=
+        run_mix_cross_profile_bitwise_case("hc_final_mix T=1 vs T=8", 8, 2614U, true, DType::BF16);
+    failures +=
+        run_mix_cross_profile_bitwise_case("hc_mix f16 T=1 vs T=2", 2, 3512U, false, DType::FP16);
+    failures +=
+        run_mix_cross_profile_bitwise_case("hc_mix f16 T=1 vs T=4", 4, 3513U, false, DType::FP16);
+    failures +=
+        run_mix_cross_profile_bitwise_case("hc_mix f16 T=1 vs T=8", 8, 3514U, false, DType::FP16);
+    failures +=
+        run_mix_cross_profile_bitwise_case("hc_final_mix f16 T=1 vs T=2", 2, 3612U, true, DType::FP16);
+    failures += run_mix_cross_profile_bitwise_case("hc_final_mix f16 T=1 vs T=4", 4, 3613U, true,
+                                                    DType::FP16);
+    failures +=
+        run_mix_cross_profile_bitwise_case("hc_final_mix f16 T=1 vs T=8", 8, 3614U, true, DType::FP16);
+    failures += run_mix_cross_profile_bitwise_case("hc_mix T=1 vs T=4 (4D layout)", 4, 2516U, false,
+                                                   DType::BF16, true);
+    failures += run_mix_cross_profile_bitwise_case("hc_final_mix T=1 vs T=4 (4D layout)", 4, 2616U,
+                                                   true, DType::BF16, true);
     failures += run_combine_norm_bitwise_case("hc_combine_norm bitwise M=1", 1, 2411U, false);
     failures += run_combine_norm_bitwise_case("hc_combine_norm bitwise M=1 in place", 1, 2412U,
                                               true);
@@ -1070,6 +1273,12 @@ int main() {
 #ifdef NINFER_VOLTA_BUILD
     failures += run_mix_case("hc_mix M=7", 7, 2502U, false);
     failures += run_mix_case("hc_final_mix M=7", 7, 2602U, true);
+    failures += run_mix_case("hc_mix M=16", 16, 2503U, false);
+    failures += run_mix_case("hc_final_mix M=16", 16, 2603U, true);
+    failures +=
+        run_mix_general_path_bitwise_case("hc_mix general M=16", 16, 2515U, false, DType::BF16);
+    failures += run_mix_general_path_bitwise_case("hc_final_mix general M=16", 16, 2615U, true,
+                                                  DType::BF16);
 #endif
     failures += run_expand_norm_case("hc_expand_norm f16 M=1", 1, 3101U, DType::FP16);
     failures += run_expand_norm_case("hc_expand_norm f16 M=7", 7, 3102U, DType::FP16);

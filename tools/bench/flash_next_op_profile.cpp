@@ -257,6 +257,15 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
     } else if (const char* cache_mib = std::getenv("NINFER_FLASH_PHASE_CACHE_MIB")) {
         options.expert_cache_mib = static_cast<std::uint64_t>(std::stoull(cache_mib));
     }
+    if (const char* profile = std::getenv("NINFER_FLASH_OP_EXPERT_PROFILE")) {
+        options.expert_cache_profile = profile;
+    }
+
+    std::uint32_t span_t = 1;
+    if (const char* span = std::getenv("NINFER_FLASH_OP_SPAN_T")) {
+        span_t = static_cast<std::uint32_t>(std::stoul(span));
+        if (span_t < 1) { throw std::runtime_error("NINFER_FLASH_OP_SPAN_T must be >= 1"); }
+    }
 
     auto load_plan = Package::plan_load(binder, options, detail::WeightsProfile::Nvfp4);
     const detail::BindingPlan& bindings = load_plan.bindings();
@@ -322,7 +331,13 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
                                                       data.expert_cache_stats(1)};
         begin_round();
         const std::int64_t decode_begin = now_ns();
-        token = trunk.decode(token);
+        if (span_t > 1) {
+            const std::vector<TokenId> span(span_t, token);
+            const std::vector<TokenId> predictions = trunk.decode_span(span);
+            if (!predictions.empty()) { token = predictions.back(); }
+        } else {
+            token = trunk.decode(token);
+        }
         const double decode_ms = static_cast<double>(now_ns() - decode_begin) / 1.0e6;
         for (std::uint32_t rank = 0; rank < kRanks; ++rank) {
             execution.dev[rank]->synchronize();
@@ -389,6 +404,7 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
     std::cout << "  \"artifact\": \"" << path << "\",\n";
     std::cout << "  \"prompt_tokens\": " << prompt_tokens << ",\n";
     std::cout << "  \"decode_tokens\": " << kDecodeTokens << ",\n";
+    std::cout << "  \"span_t\": " << span_t << ",\n";
     std::cout << "  \"warmup_tokens\": " << warmup_tokens << ",\n";
     std::cout << "  \"expert_cache_mib\": " << options.expert_cache_mib << ",\n";
     std::cout << "  \"prefill_ms\": " << prefill_ms << ",\n";

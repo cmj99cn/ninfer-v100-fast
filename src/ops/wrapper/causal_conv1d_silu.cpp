@@ -11,6 +11,8 @@
 namespace ninfer::ops {
 namespace {
 
+constexpr std::int32_t kCausalConvDecodeMaxTokens = 8;
+
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
     bool has_zero = false;
     for (int d = 0; d < 4; ++d) {
@@ -168,6 +170,9 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
                                               stream);
     } else if (x.ne[1] == 1) {
         detail::causal_conv1d_decode_launch(x, weight, conv_state_in, conv_state_out, out, stream);
+    } else if (x.ne[1] >= 2 && x.ne[1] <= kCausalConvDecodeMaxTokens) {
+        detail::causal_conv1d_decode_multi_launch(x, weight, conv_state_in, conv_state_out, out,
+                                                  stream);
     } else if (x.ne[1] <= detail::kCausalConvParallelMaxTokens) {
         detail::causal_conv1d_smallt_launch(x, weight, conv_state_in, conv_state_out, out, stream);
     } else if (x.ne[1] <= detail::kCausalConvSequenceMaxTokens) {
@@ -186,6 +191,8 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_stat
     require_non_empty_accessible(x, weight, conv_state, out);
     if (x.ne[1] == 1) {
         detail::causal_conv1d_decode_launch(x, weight, conv_state, conv_state, out, stream);
+    } else if (x.ne[1] >= 2 && x.ne[1] <= kCausalConvDecodeMaxTokens) {
+        detail::causal_conv1d_decode_multi_launch(x, weight, conv_state, conv_state, out, stream);
     } else if (x.ne[1] <= detail::kCausalConvParallelMaxTokens) {
         detail::causal_conv1d_smallt_launch(x, weight, conv_state, conv_state, out, stream);
     } else if (x.ne[1] <= detail::kCausalConvSequenceMaxTokens) {
