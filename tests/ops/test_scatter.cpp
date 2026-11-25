@@ -474,6 +474,7 @@ int main() {
     failures += stage_gdn_case();
     failures += stage_gdn_span_case(2);
     failures += stage_gdn_span_case(4);
+    failures += extract_gdn_columns_case(1);
     failures += extract_gdn_columns_case(2);
     failures += extract_gdn_columns_case(4);
     std::cout << (failures ? "FAIL" : "OK")

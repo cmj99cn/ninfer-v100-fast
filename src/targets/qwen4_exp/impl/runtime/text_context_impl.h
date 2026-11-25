@@ -913,13 +913,7 @@ inline void TextTrunk::run_gdn(std::size_t layer, std::int32_t T,
         NINFER_QWEN4EXP_DIAG_MARK("gdn_conv");
 
         NINFER_QWEN4EXP_DIAG_OP_BEGIN("gdn_extract");
-        if (T == 1) {
-            ops::extract_bf16_columns(conv_out, 0, q, stream_for(rank));
-            ops::extract_bf16_columns(conv_out, key_width, k, stream_for(rank));
-            ops::extract_bf16_columns(conv_out, 2 * key_width, v, stream_for(rank));
-        } else {
-            ops::extract_gdn_columns(conv_out, q, k, v, stream_for(rank));
-        }
+        ops::extract_gdn_columns(conv_out, q, k, v, stream_for(rank));
         NINFER_QWEN4EXP_DIAG_OP_END("gdn_extract");
 
         Tensor o  = activations_[slot]->alloc(kTextActivationDtype, {value_width, T});
