@@ -1571,6 +1571,7 @@ int main() {
         ++failures;
     }
     failures += run_route_cross_profile_case(inputs, 2, "moe_nvfp4 route T=1 vs T=2");
+    failures += run_route_cross_profile_case(inputs, 3, "moe_nvfp4 route T=1 vs T=3");
     failures += run_route_cross_profile_case(inputs, 4, "moe_nvfp4 route T=1 vs T=4");
     failures += run_route_cross_profile_case(inputs, 8, "moe_nvfp4 route T=1 vs T=8");
 

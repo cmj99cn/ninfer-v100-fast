@@ -130,10 +130,9 @@ __device__ __forceinline__ void route_row_dot_multi(const std::uint32_t* weight_
 __device__ __forceinline__ void route_select(const float* __restrict__ logits,
                                               std::int32_t* __restrict__ ids,
                                               float* __restrict__ coefficients,
-                                              float* __restrict__ shared_gate) {
+                                              float* __restrict__ shared_gate,
+                                              float* __restrict__ selected_value) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
-    __shared__ float selected_value[kMoeTopK];
-
     float values[kRouteSlots];
 #pragma unroll
     for (int slot = 0; slot < kRouteSlots; ++slot) {
@@ -248,7 +247,8 @@ __global__ __launch_bounds__(kRouteWarpsPerCta * 32) void moe_nvfp4_route_logits
 __global__ __launch_bounds__(32) void moe_nvfp4_route_select_kernel(
     const float* __restrict__ logits, std::int32_t* __restrict__ ids,
     float* __restrict__ coefficients, float* __restrict__ shared_gate) {
-    route_select(logits, ids, coefficients, shared_gate);
+    __shared__ float selected_value[kMoeTopK];
+    route_select(logits, ids, coefficients, shared_gate, selected_value);
 }
 
 template <class A>
@@ -268,13 +268,14 @@ __global__ __launch_bounds__(kRouteWarpsPerCta * 32) void moe_nvfp4_route_fused_
     __threadfence();
 
     __shared__ int is_last;
+    __shared__ float selected_value[kMoeTopK];
     if (threadIdx.x == 0) {
         is_last = atomicAdd(counter, 1) == kRouteCtas - 1 ? 1 : 0;
     }
     __syncthreads();
     if (is_last == 0) { return; }
 
-    if (warp == 0) { route_select(logits, ids, coefficients, shared_gate); }
+    if (warp == 0) { route_select(logits, ids, coefficients, shared_gate, selected_value); }
     if (threadIdx.x == 0) { *counter = 0; }
 }
 
@@ -309,13 +310,11 @@ __global__ __launch_bounds__(kRouteWarpsPerCta * 32) void moe_nvfp4_route_fused_
     __syncthreads();
     if (is_last == 0) { return; }
 
-    if (warp == 0) {
-#pragma unroll
-        for (int column = 0; column < Columns; ++column) {
-            route_select(logits + static_cast<std::size_t>(column) * kRouteRows,
-                         ids + column * kMoeTopK, coefficients + column * kMoeTopK,
-                         shared_gate + column);
-        }
+    __shared__ float selected_values[Columns][kMoeTopK];
+    if (warp < Columns) {
+        route_select(logits + static_cast<std::size_t>(warp) * kRouteRows,
+                     ids + warp * kMoeTopK, coefficients + warp * kMoeTopK,
+                     shared_gate + warp, selected_values[warp]);
     }
     if (threadIdx.x == 0) { *counter = 0; }
 }
