@@ -97,6 +97,12 @@ add_test(NAME ninfer_flash_next_mtp_draft_artifact_test
 set_tests_properties(ninfer_flash_next_mtp_draft_artifact_test PROPERTIES
   SKIP_RETURN_CODE 77
   ENVIRONMENT "NINFER_FLASH_NEXT_ARTIFACT=/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer;NINFER_MTP_HIDDEN=${CMAKE_SOURCE_DIR}/.superpowers/sdd/2026-11-16-flash-next-m3-mtp/assets/mtp_hidden_8tok.f16")
+ninfer_add_test(ninfer_flash_next_mtp_expert_oracle_test
+  SOURCES targets/qwen3_8_flash_next/test_mtp_expert_oracle.cpp
+  LIBRARIES ninfer_flash_next_package)
+set_tests_properties(ninfer_flash_next_mtp_expert_oracle_test PROPERTIES SKIP_RETURN_CODE 77)
+target_link_libraries(ninfer_flash_next_mtp_expert_oracle_test PRIVATE CUDA::cudart)
+
 ninfer_add_test(ninfer_flash_next_mtp_draft_confidence_test
   SOURCES targets/qwen3_8_flash_next/test_mtp_draft_confidence.cpp
   LIBRARIES ninfer_flash_next_package)
@@ -302,6 +308,15 @@ target_include_directories(ninfer_flash_next_op_profile PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party
   ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(ninfer_flash_next_op_profile PRIVATE ninfer_flash_next_package CUDA::cudart)
+
+add_executable(ninfer_flash_next_draft_step_profile
+  ${PROJECT_SOURCE_DIR}/tools/bench/draft_step_profile.cpp)
+target_include_directories(ninfer_flash_next_draft_step_profile PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party
+  ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(ninfer_flash_next_draft_step_profile PRIVATE ninfer_flash_next_package CUDA::cudart)
 
 # FP64-oracle test for the fused Flash-Next GDN qkvz W8 decode launcher.
 ninfer_add_test(ninfer_flash_next_gdn_qkvz_decode_test
