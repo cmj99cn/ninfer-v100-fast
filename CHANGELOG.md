@@ -17,13 +17,26 @@ runtime.
 
 ## [Unreleased] - feat/qwen3-8-flash-next（开发中）
 
-分支开发条目，基于 v0.2.5；未 bump 版本号、不是 release。Flash-Next 是开发中 target，MTP 优化
-尚未达成 120 tok/s 目标，也未超过 base。
+分支开发条目，基于 v0.2.5；未 bump 版本号、不是 release。Flash-Next 是开发中 target。
+MTP 现已快过 base **1.56×**（70.54 → 110.3–110.5 tok/s）；120 tok/s 目标仍未达成（非 2×），
+起点 30.33 tok/s（fold commit 接线前）到本轮 110，约 3.6×。
 
-### Added
+### 本轮 MTP 接线与优化（2026-11-25，commit `b0b79c4b`）
 
-- 新增 Flash-Next target（开发中）。对应提交 `91b45ae5` "perf(flash-next): optimize MTP with
-  quantized draft, D2D snapshot and expert profile"。
+新增条目：`perf(flash-next): wire MTP fold commit and optimize verify with batched small-T kernels`。
+
+- GDN replay fold commit 转为生产路径（Tasks 1–10，bit-exact 验证通过）。
+- verify 多列权重复用 kernel（hc_mix / linear / W8 / route / conv / gdn_proj / GDN stage+extract）。
+- draft TP2 角色拆分；sink 流同步。
+- Q4 proposal/head 设为默认（artifact 自带同源权重）；`NINFER_DIAG_FP16_DRAFT_HEAD=1` 保留作对照。
+- draft 置信度 + `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8` 提前终止。
+- 用户裁决：接受 Q4 为默认——draft 是提案、正确性由 verify 保证；chain oracle 由
+  `{220,27967,813}` 改为 `{220,27967,53}`（Q4 语义），greedy 等价（MTP on/off）逐 token 一致。
+
+### Added（早期基础，commit `91b45ae5`）
+
+- 新增 Flash-Next target（开发中）。`perf(flash-next): optimize MTP with quantized draft, D2D
+  snapshot and expert profile`。
 - draft bank FP8 量化常驻，占用从 5.03GB 降到 2.52GB。
 - 专家画像 `--expert-cache-profile` 接入 bench（画像由 Strata 同模型 `expert-profile.bin` 转换）。
 - MoE/shared T≤4 oracle 测试。
@@ -32,30 +45,41 @@ runtime.
 
 - MTP 状态事务从 pageable host 往返改为 device-to-device 异步快照。
 - cached routed/shared MoE 与 FP16 linear 扩展到 T≤4；新增 GDN qkvz T≤4 的 bit-exact
-  decode kernel；注册 36 层 GDN replay fold 几何。
+  decode kernel；注册 36 层 GDN replay fold 几何（本轮已转为生产路径）。
 
 ### Performance
 
-评测条件：2×V100 TP2，cache 15000 + expert profile，0 miss，128-token、2 reps。
+评测条件：2×V100 TP2，cache 15000 + expert profile 0 miss，128-token、2 reps、greedy；
+最终配置 = Q4 proposal/head 默认 + draft=3 + `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8`。
 
-- base：70.54 tok/s。
-- MTP draft=1 顺序 verify：51.78 tok/s，acceptance 0.881。
-- MTP draft=3：42.9 tok/s。
-- batch verify（实验，已回退）：27.0 tok/s，acceptance 0.56。
-- 无 profile 时 MTP 13.6–14 tok/s；专家画像把 hit 0.85→1.0、吞吐 14→51.78 tok/s。
-- MTP 落后 base 27%，120 tok/s 目标未达成。
+- base 无 spec：70.54 tok/s；起点（fold commit 接线前）：30.33 tok/s。
+- **最终配置：110.3–110.5 tok/s**（3 次实测 110.39 / 110.53 / 110.28），acceptance
+  **0.860–0.861**，**1.56× base**，相对起点约 **3.6×**。
+- 历史值（已被取代，保留记录）：draft=1 51.78 tok/s / 0.881（当时落后 base 约 27%）、
+  draft=3 42.9 tok/s / 0.772（min_p=0）、batch verify 27.0 tok/s / 0.56（已回退）、
+  无 profile 13.6–14 tok/s。
+- 120 tok/s 目标仍未达成（1.56×，非 2×）；「MTP 落后 base / 负收益」的旧结论已失效。
+- 口径澄清：120 / 99% 来自随机采样饱和口径，greedy 下不可达；上述 1.56× 为 greedy
+  committed tok/s，不与随机采样 saturation 数字混用。
 
 ### Known limitations
 
-- Flash-Next 与 MTP 优化均为开发中，未作为新版本发布；MTP 未超过 base，120 tok/s 目标未达成。
+- Flash-Next 与 MTP 优化均为开发中，未作为新版本发布；120 tok/s 目标仍未达成。
 - 并行架构未改：主模型保持 TP2。1cat-vllm（TP2）与 Strata（层分 PP）的 MTP 均 >100 tok/s，
-  本分支尚未做到。
-- 负结果与回退：CUDA Graph 对 MTP 无效；GDN replay fold 链路更慢，已回退；batch verify
-  数值不等价（PLE/GDN 状态漂移），已回退到顺序 verify。
+  本分支现已达到 ~110 tok/s，与 Strata 同档。
+- CUDA Graph 负收益结论保留，根因已定位：sm_70 上 `cudaGraphLaunch` 的 O(N) 逐节点提交成本
+  （3,054 节点 → ~0.6 ms/round）超过可削的、已被设备执行掩盖的 host 间隙；Strata 同为 V100
+  能用 graph 靠 kernel 内 t 维权复用（eager 侧属性），该收益我们已在 eager 侧领取。
+- 负结果历史保留：batch verify `decode_span` 数值不等价（PLE/GDN 状态漂移，已回退）；
+  层分 / 去 allreduce、staged routed GEMV、FP8 MTP 等已回退。GDN replay fold 此前
+  11.36 tok/s 的回退记录已过时——fold commit 现已是生产路径，bit-exact 验证通过。
 
 ### Verification
 
-- 38/38 测试通过；NLL greedy 11751。
+- 构建 OK，`git diff --check` 干净；mtp_verify / fold_commit / mtp_state / gdn_replay_storage
+  通过；draft / chain / confidence / greedy_equivalence 因缺隐藏 fixture `NINFER_MTP_HIDDEN`
+  SKIP（内核 oracle 仍运行）。
+- 历史：38/38 测试通过；NLL greedy 11751。
 
 ## [0.2.5] - 2026-11-13
 
