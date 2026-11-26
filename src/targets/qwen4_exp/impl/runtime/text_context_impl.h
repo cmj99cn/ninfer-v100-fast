@@ -11,6 +11,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gated_residual.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/hyper_connection_stream_mean.h"
 #include "ninfer/ops/sigmoid_gated_rmsnorm.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/moe_nvfp4.h"
@@ -748,6 +749,24 @@ inline void TextTrunk::set_residual_sink(int rank, void* data, std::size_t bytes
     residual_sink_bytes_[static_cast<std::size_t>(rank)] = bytes;
 }
 
+inline void TextTrunk::set_feature_tap(std::span<const std::int32_t> layers, void* data,
+                                       std::size_t bytes, std::uint32_t window) noexcept {
+    feature_tap_count_ = static_cast<std::int32_t>(
+        std::min<std::size_t>(layers.size(), feature_tap_layers_.size()));
+    for (std::int32_t index = 0; index < feature_tap_count_; ++index) {
+        feature_tap_layers_[static_cast<std::size_t>(index)] = layers[static_cast<std::size_t>(index)];
+    }
+    feature_tap_data_   = data;
+    feature_tap_bytes_  = bytes;
+    feature_tap_window_ = window;
+}
+
+inline void TextTrunk::clear_feature_tap() noexcept {
+    feature_tap_count_ = 0;
+    feature_tap_data_  = nullptr;
+    feature_tap_bytes_ = 0;
+}
+
 inline void TextTrunk::set_gdn_state_action(GdnStateAction action) noexcept {
     gdn_state_action_ = action;
 }
@@ -1470,6 +1489,38 @@ inline TokenId TextTrunk::forward(std::span<const TokenId> tokens,
                                      stream_for(rank));
                 NINFER_QWEN4EXP_DIAG_OP_END("layer_end_combine");
                 NINFER_QWEN4EXP_DIAG_MARK("layer_end");
+            });
+        }
+        if (feature_tap_data_ != nullptr) {
+            for_each_rank([&](int rank) {
+                if (rank != 0) { return; }
+                for (std::int32_t tap = 0; tap < feature_tap_count_; ++tap) {
+                    if (feature_tap_layers_[static_cast<std::size_t>(tap)] !=
+                        static_cast<std::int32_t>(layer)) {
+                        continue;
+                    }
+                    const Tensor& source = residual[0];
+                    const std::int32_t full  = source.ne[2];
+                    const std::int32_t width = std::min<std::int32_t>(
+                        full, static_cast<std::int32_t>(feature_tap_window_));
+                    const std::int32_t first = full - width;
+                    const std::int32_t hidden = source.ne[0];
+                    const std::int32_t batch  = source.ne[3];
+                    Tensor out;
+                    out.data = static_cast<std::byte*>(feature_tap_data_) +
+                               static_cast<std::size_t>(tap) * hidden * 2;
+                    out.dtype = DType::BF16;
+                    out.ne[0] = hidden;
+                    out.ne[1] = width;
+                    out.ne[2] = batch;
+                    out.ne[3] = 1;
+                    out.nb[0] = 2;
+                    out.nb[1] = static_cast<std::int64_t>(feature_tap_count_) * hidden * 2;
+                    out.nb[2] = static_cast<std::int64_t>(feature_tap_count_) * hidden * width * 2;
+                    out.nb[3] = 0;
+                    ops::hyper_connection_stream_mean(source.slice(2, first, width), out,
+                                                      stream_for(0));
+                }
             });
         }
 #ifdef NINFER_QWEN4EXP_LAYER_DUMP

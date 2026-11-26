@@ -82,6 +82,10 @@ enum class SpeculativeBackend : std::uint8_t {
     None,
     Mtp,
     DFlash,
+    // Flash-Next's companion drafter. Its weights live in a separate artifact selected by
+    // EngineOptions::speculative_draft_artifact; unlike MTP it is not embedded in the main
+    // artifact. Appended so the existing enumerator values stay stable.
+    DFlash2,
 };
 
 struct SpeculativeOptions {
@@ -145,6 +149,9 @@ struct EngineOptions {
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    // Companion artifact holding the DFlash2 drafter weights. Required when
+    // `speculative.backend == SpeculativeBackend::DFlash2` and ignored by every other backend.
+    std::filesystem::path speculative_draft_artifact;
     PrefixCacheOptions prefix_cache;
     // Expert residency cache for the qwen3.8-flash-next package, in MiB per rank. `0` selects the
     // automatic plan: the measured routing-skew coverage target, or the device memory the Engine

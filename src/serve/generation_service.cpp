@@ -249,6 +249,7 @@ ninfer::EngineOptions GenerationService::make_engine_options(const std::vector<i
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
+    engine_options.speculative_draft_artifact = options_.draft_model;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;

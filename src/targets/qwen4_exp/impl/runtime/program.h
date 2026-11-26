@@ -1,11 +1,13 @@
 #pragma once
 
+#include "core/cyclic_kv_cache.h"
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
 #include "targets/qwen4_exp/impl/runtime/instance.h"
 #include "targets/qwen4_exp/impl/runtime/layouts.h"
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 #include "targets/qwen4_exp/impl/runtime/workspace_recipe.h"
+#include "targets/qwen3_8_flash_next/impl/dflash2_draft.h"
 
 #include <array>
 #include <cstddef>
@@ -31,6 +33,7 @@ struct RequestPlanImpl<NINFER_QWEN4EXP_VARIANT> {
 
 namespace ninfer::targets::qwen3_8_flash_next::detail {
 class MtpDraft;
+class DFlash2Draft;
 }
 
 namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
@@ -120,6 +123,10 @@ private:
     [[nodiscard]] std::uint32_t page_groups_for(std::uint32_t tokens) const noexcept;
     void clear_lane(std::uint32_t lane) noexcept;
     void prefill_chunk(LaneState& state, std::uint32_t begin, std::uint32_t count);
+    void setup_dflash2();
+    void dflash2_capture_committed(std::uint32_t start_position, std::int32_t count);
+    TokenId decode_dflash2(LaneState& state, const runtime::RoundBudget& budget,
+                           std::vector<TokenId>& committed);
 
     WeightsProfile weights_profile_;
     std::array<const ModelView*, kMaximumDevices> models_{};
@@ -138,6 +145,32 @@ private:
     std::unique_ptr<TextTrunk> trunk_;
     std::unique_ptr<GraphDecodeController> graph_;
     std::unique_ptr<ninfer::targets::qwen3_8_flash_next::detail::MtpDraft> mtp_draft_;
+    std::unique_ptr<ninfer::targets::qwen3_8_flash_next::detail::DFlash2Draft> dflash2_draft_;
+    std::unique_ptr<artifact::MaterializedArtifact> dflash2_materialized_;
+    std::unique_ptr<ninfer::targets::qwen3_8_flash_next::detail::DFlash2Operands> dflash2_operands_;
+    std::unique_ptr<ninfer::targets::qwen3_8_flash_next::detail::DFlash2Drafter> dflash2_drafter_;
+    std::unique_ptr<WorkspaceArena> dflash2_work_;
+    std::unique_ptr<WorkspaceArena> dflash2_peer_work_;
+    std::unique_ptr<CyclicKVCache> dflash2_ring_;
+    DeviceBuffer dflash2_ring_backing_;
+    std::vector<std::int32_t> dflash2_tap_layers_;
+    DeviceBuffer dflash2_features_;
+    DeviceBuffer dflash2_positions_;
+    DeviceBuffer dflash2_counts_;
+    DeviceBuffer dflash2_lanes_;
+    DeviceBuffer dflash2_anchors_;
+    DeviceBuffer dflash2_frontiers_;
+    DeviceBuffer dflash2_valid_;
+    DeviceBuffer dflash2_ids_;
+    DeviceBuffer dflash2_block_positions_;
+    DeviceBuffer dflash2_drafts_;
+    DeviceBuffer dflash2_candidates_;
+    DeviceBuffer dflash2_proposal_q_;
+    DeviceBuffer dflash2_confidence_;
+    DeviceBuffer dflash2_sampling_;
+    std::uint32_t dflash2_window_     = 0;
+    std::uint32_t dflash2_feature_width_ = 0;
+    SpeculativeStats dflash2_stats_{};
     std::array<std::unique_ptr<DeviceBuffer>, kMaximumDevices> residual_sinks_;
     std::uint32_t mtp_draft_window_ = 0;
     SpeculativeStats mtp_stats_{};

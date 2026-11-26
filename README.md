@@ -238,6 +238,14 @@ PP + 定制 verify kernel，二者 MTP 都 >100 tok/s，证明 batch verify 在�
 （低置信度 draft 命中 19.2% vs 全 draft 96.5%），2× 需 artifact 层更强/多层 MTP head。120 与
 99% 均来自随机采样口径（详见下节「口径澄清」），greedy 下不可达。
 
+**DFlash2 并行 draft（`--spec dflash2 --draft-model <companion>`）**：本轮移植
+`iamwavecut/ninfer-all` 的 DFlash2 后端（Apache-2.0，commit 9ba1276）。在 2×V100 / TP2 /
+greedy / 512-token prompt / 128 decode / expert cache 15000 MiB / min_p 0.8 下实测
+**DFlash2-4 118.9 tok/s（acceptance 0.937，1.67× base）**，MTP-3 为 112.2 tok/s（0.859），
+plain 为 71.0 tok/s；三者的 greedy token 序列逐 token 相同（无损）。DFlash2 需额外
+`--draft-model` 指向 companion artifact，草稿窗口 2048，eager decode（不做 CUDA Graph），
+TP4 拒绝；它仍低于 120 tok/s，但把 acceptance 从 MTP 的 0.86 提到 0.94。
+
 #### 口径澄清：greedy vs 随机采样（上游证据）
 
 本轮查证上游 `Neroued/ninfer`（同模型 **Qwen3.8-Flash-Next**）的 README 与
@@ -631,6 +639,8 @@ curl http://127.0.0.1:9010/v1/chat/completions \
 - [wamansou/ninfer-tp2-1m](https://github.com/wamansou/ninfer-tp2-1m) — 双卡张量并行与 YaRN 扩展。
 - [jason-ni/ninfer-v100-tp4](https://github.com/jason-ni/ninfer-v100-tp4) — V100 TP4 单进程并行基底（本仓库代码直接来源）。
 - [dollarwong/ninfer-v100](https://github.com/dollarwong/ninfer-v100) — V100 上的 NInfer 单卡部署与跨引擎基准 fork（调研参考，未直接复用其代码）。
+- [iamwavecut/ninfer-all](https://github.com/iamwavecut/ninfer-all) — Flash-Next DFlash2 并行 draft 后端的移植来源（Apache-2.0，commit 9ba1276）。
+- [incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) — Flash-Next DFlash2 草稿模型来源。
 - [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) — 默认模型的 NVFP4 量化权重源。
 - [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) — `.ninfer` 制品格式的参考（本 fork 契约不兼容，仅作格式参照）。
 - Qwen / NInfer 生态的所有贡献者。
@@ -914,6 +924,15 @@ invalid; acceptance is bounded by the single-layer head's step0 capability (low-
 19.2% vs full drafts 96.5%), and 2× needs a stronger / multi-layer MTP head at the artifact layer.
 Both 120 and 99% come from the random-sampling caliber (see the "Caliber Clarification" subsection
 below) and are unreachable under greedy.
+
+**DFlash2 parallel drafting (`--spec dflash2 --draft-model <companion>`)**: this round ports the
+DFlash2 backend from `iamwavecut/ninfer-all` (Apache-2.0, commit 9ba1276). On 2×V100 / TP2 / greedy
+/ 512-token prompt / 128 decode / 15000 MiB expert cache / min_p 0.8 it measures **DFlash2-4 at
+118.9 tok/s (acceptance 0.937, 1.67× base)**, against MTP-3 at 112.2 tok/s (0.859) and plain at
+71.0 tok/s; all three emit token-identical greedy sequences (lossless). DFlash2 additionally needs
+`--draft-model` pointing at the companion artifact, uses a 2048-token draft window, decodes eagerly
+(no CUDA Graph), and rejects TP4; it stays below 120 tok/s but lifts acceptance from MTP's 0.86 to
+0.94.
 
 #### Caliber Clarification: Greedy vs Random Sampling (Upstream Evidence)
 
@@ -1347,6 +1366,8 @@ Compatible with `/v1/chat/completions` (including `tools` function calling) and 
 - [wamansou/ninfer-tp2-1m](https://github.com/wamansou/ninfer-tp2-1m) — dual-GPU tensor parallelism and YaRN extension.
 - [jason-ni/ninfer-v100-tp4](https://github.com/jason-ni/ninfer-v100-tp4) — V100 TP4 single-process parallel base (direct source of this repository's code).
 - [dollarwong/ninfer-v100](https://github.com/dollarwong/ninfer-v100) — NInfer single-GPU deployment and cross-engine benchmark fork on V100 (research reference; its code was not directly reused).
+- [iamwavecut/ninfer-all](https://github.com/iamwavecut/ninfer-all) — source of the ported Flash-Next DFlash2 parallel-drafting backend (Apache-2.0, commit 9ba1276).
+- [incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) — source of the Flash-Next DFlash2 drafter model.
 - [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) — NVFP4 quantized weight source for the default model.
 - [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) — reference for the `.ninfer` artifact format (incompatible with this fork's contract; format reference only).
 - All contributors to the Qwen / NInfer ecosystem.

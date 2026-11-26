@@ -1,6 +1,7 @@
 #include "ninfer/engine.h"
 
 #include "core/device.h"
+#include "product/speculative_options.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/concurrent_executor.h"
@@ -359,7 +360,11 @@ public:
     Executor executor;
 };
 
-Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
+Engine::Engine(EngineOptions options) {
+    product::validate_speculative_draft_artifact(options.speculative,
+                                                 options.speculative_draft_artifact);
+    impl_ = std::make_shared<Impl>(std::move(options));
+}
 
 Engine::~Engine()                            = default;
 Engine::Engine(Engine&&) noexcept            = default;

@@ -78,6 +78,28 @@ add_test(NAME ninfer_flash_next_roles_artifact_test
   COMMAND ninfer_flash_next_roles_test artifact)
 set_tests_properties(ninfer_flash_next_roles_artifact_test PROPERTIES SKIP_RETURN_CODE 77)
 # Host-only: no artifact, no device. The TP2 shard map of the text roles.
+ninfer_add_test(ninfer_flash_next_dflash2_options_test
+  SOURCES targets/qwen3_8_flash_next/test_dflash2_options.cpp
+  LIBRARIES ninfer_engine)
+ninfer_add_test(ninfer_flash_next_dflash2_load_test
+  SOURCES targets/qwen3_8_flash_next/test_dflash2_load.cpp
+  LIBRARIES ninfer_flash_next_package)
+set_tests_properties(ninfer_flash_next_dflash2_load_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_flash_next_dflash2_load_artifact_test
+  COMMAND ninfer_flash_next_dflash2_load_test)
+set_tests_properties(ninfer_flash_next_dflash2_load_artifact_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  ENVIRONMENT "NINFER_DFLASH2_ARTIFACT=/home/cmj/models/Qwen3.8-Flash-Next-DFlash2-Infernix/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix")
+ninfer_add_test(ninfer_flash_next_dflash2_draft_test
+  SOURCES targets/qwen3_8_flash_next/test_dflash2_draft.cpp
+  LIBRARIES ninfer_flash_next_package)
+target_link_libraries(ninfer_flash_next_dflash2_draft_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_flash_next_dflash2_draft_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_flash_next_dflash2_draft_artifact_test
+  COMMAND ninfer_flash_next_dflash2_draft_test)
+set_tests_properties(ninfer_flash_next_dflash2_draft_artifact_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  ENVIRONMENT "NINFER_DFLASH2_ARTIFACT=/home/cmj/models/Qwen3.8-Flash-Next-DFlash2-Infernix/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix")
 ninfer_add_test(ninfer_flash_next_sharding_test
   SOURCES targets/qwen3_8_flash_next/test_sharding.cpp
   LIBRARIES ninfer_flash_next_package)
@@ -765,6 +787,21 @@ ninfer_add_op_test(ninfer_dflash_conv_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_dflash_selector_test
   SOURCES ops/test_dflash_selector.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_candidate_selector_test
+  SOURCES ops/test_candidate_selector.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dynamic_grouped_conv_test
+  SOURCES ops/test_dynamic_grouped_conv.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_context_kv_materialize_test
+  SOURCES ops/test_context_kv_materialize.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dflash2_fused_test
+  SOURCES ops/test_dflash2_fused.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_hyper_connection_stream_mean_test
+  SOURCES ops/test_hyper_connection_stream_mean.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_kv_cache_append_prefix_test
   SOURCES ops/test_kv_cache_append_prefix.cpp

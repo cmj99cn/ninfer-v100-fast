@@ -38,9 +38,11 @@ template's default. An artifact whose template does not expose effort rejects th
 
 GPU residency is frozen when the Engine starts:
 
-- no `--spec` omits MTP/DFlash weights and state and the optimized proposal head;
-- `--spec mtp` loads only MTP, while `--spec dflash` loads the artifact's optional text-only
-  DFlash package and omits MTP;
+- no `--spec` (or `--spec none`) omits all speculative weights and state and the optimized
+  proposal head;
+- `--spec mtp` loads only MTP, `--spec dflash` loads the artifact's optional text-only DFlash
+  package, and `--spec dflash2` loads the standalone companion named by `--draft-model`; each
+  omits the other speculative weights;
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
   request-transient allocation;
@@ -109,9 +111,15 @@ long-decode, and long-context inputs.
 
 ## Speculative decoding
 
-Speculative decoding is disabled by default. Select MTP with one to five draft positions; the
-V100X2 profile qualifies at most three. Text-only DFlash supports one to fifteen on 35B-A3B, or
-one to seven on Qwen3.8-27B artifacts containing the optional DFlash2 package. The official NVFP4 v3 container includes that package.
+Speculative decoding is disabled by default; `--spec none` is equivalent to omitting it. Select
+MTP with one to five draft positions; the V100X2 profile qualifies at most three. Text-only DFlash
+supports one to fifteen on 35B-A3B, or one to seven on Qwen3.8-27B artifacts containing the
+optional DFlash2 package. The official NVFP4 v3 container includes that package. The standalone
+Flash-Next DFlash2 companion is selected with `--spec dflash2 --draft-model PATH` and accepts one
+to seven draft positions (four when `--draft-tokens` is omitted); `--draft-model` is required for
+that backend and ignored by the others. The companion keeps its own 2048-token context ring beside
+the target's 262144-token KV capacity, so decode runs eagerly rather than under CUDA Graph capture.
+On the V100X2 profile DFlash2 currently drafts and validates on TP1 and TP2 only.
 `--lm-head-draft` selects the optimized proposal head and requires a selected backend:
 
 ```bash
@@ -141,7 +149,16 @@ build/apps/ninfer /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
   --spec dflash --draft-tokens 7
 ```
 
-MTP and DFlash cannot be enabled together, and DFlash cannot enable Vision. Qwen3.8 DFlash2's
+For the standalone Flash-Next DFlash2 companion:
+
+```bash
+build/apps/ninfer models/qwen3_8_flash_next.ninfer \
+  --tp 2 --devices 0,1 --max-context 16384 --max-new 512 --greedy --no-thinking \
+  --spec dflash2 --draft-tokens 7 \
+  --draft-model models/Qwen3.8-Flash-Next-DFlash2-Infernix/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix
+```
+
+The speculative backends are mutually exclusive, and DFlash cannot enable Vision. Qwen3.8 DFlash2's
 lattice selector always consumes the full target vocabulary; the optimized MTP shortlist is not
 its proposal path. The NVFP4 v3 drafter adds about 2.074 GiB of resident weights per TP rank.
 The demonstrated legacy DFlash V100X2 configuration fits at 98304 capacity/chunk1024; DFlash at
@@ -175,8 +192,9 @@ rejected by `ninfer`.
 | `--affinity-slack-tokens N` (serve only) | soft-affinity bonus for an idle home instance during pool routing | `2048` |
 | `--fairness-aging-ms N` (serve only) | queue-head aging threshold before it bypasses deeper prefixes | `1000` |
 | `--kv-dtype bf16\|int8\|iq4nl` | KV-cache storage; `iq4nl` selects IQ4_NL group-32 and is accepted only by the Volta sm_70 build | `bf16` |
-| `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5` (V100X2 qualifies at most `3`); DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
+| `--spec none\|mtp\|dflash\|dflash2` | speculative backend; `none` keeps speculation off | off |
+| `--draft-model PATH` | standalone DFlash2 companion artifact; required by `--spec dflash2` | unset |
+| `--draft-tokens N` | MTP `1..5` (V100X2 qualifies at most `3`); DFlash `1..7` on 27B, `1..15` on 35B-A3B; DFlash2 `1..7` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--prefix-cache` | enable the hybrid content-addressed prefix cache (block-granular KV reuse plus GDN state snapshots; device tier, optionally host-backed) | off |

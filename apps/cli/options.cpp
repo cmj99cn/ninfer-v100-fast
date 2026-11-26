@@ -124,7 +124,8 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--rope native|yarn] [--yarn-factor F] [--yarn-origin O]\n"
 "       [--device N] [--tp 1|2|4] [--devices N,N,...]\n"
-            "              [--kv-dtype bf16|int8|iq4nl] [--spec mtp|dflash --draft-tokens N]\n"
+            "              [--kv-dtype bf16|int8|iq4nl]\n"
+            "              [--spec none|mtp|dflash|dflash2 --draft-tokens N] [--draft-model PATH]\n"
             "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -145,12 +146,14 @@ std::string usage_text(const char* argv0) {
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n"
            "--tp selects the tensor-parallel degree (default 1); --tp 2 or --tp 4 splits the "
-           "model across that many GPUs and requires --devices; it supports --spec mtp, and "
-           "--spec dflash at --tp 2, and --vision (the Vision tower runs sharded across the "
-           "group).\n"
+           "model across that many GPUs and requires --devices; it supports --spec mtp, "
+           "--spec dflash at --tp 2, --spec dflash2 with --draft-model, and --vision (the "
+           "Vision tower runs sharded across the group).\n"
            "--devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
            "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
            "primary device.\n"
+           "--spec dflash2 loads the standalone companion named by --draft-model (required); "
+           "--draft-tokens accepts 1..7 and defaults to 4, and decode runs eagerly.\n"
            "--rope selects the rotary regime (default native, the checkpoint\'s own RoPE and its\n"
            "registered 262144-position ceiling). --rope yarn applies YaRN frequency correction and\n"
            "raises the --max-context ceiling to --yarn-origin x --yarn-factor (at most 1048576);\n"
@@ -228,6 +231,8 @@ Options parse_options(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--draft-model") {
+            options.draft_model = value(arg);
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--raw-output") {
@@ -335,7 +340,12 @@ Options parse_options(int argc, char** argv) {
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
+    if (options.speculative.backend == SpeculativeBackend::DFlash2 &&
+        options.speculative.draft_tokens == 0) {
+        options.speculative.draft_tokens = 4;
+    }
     product::validate_speculative_cli_options(options.speculative);
+    product::validate_speculative_draft_artifact(options.speculative, options.draft_model);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");
     }

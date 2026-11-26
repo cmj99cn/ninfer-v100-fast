@@ -85,9 +85,16 @@ add_library(ninfer_ops STATIC
   ops/launcher/causal_conv1d.cu
   ops/launcher/dflash_conv.cu
   ops/launcher/dflash_selector.cu
+  ops/launcher/candidate_selector.cu
+  ops/launcher/context_kv_materialize.cu
+  ops/launcher/dynamic_grouped_conv.cu
+  ops/launcher/dflash2_attn_input.cu
+  ops/launcher/dflash2_linear_swiglu.cu
+  ops/kernel/dflash2_gemm.cu
   ops/launcher/embed_gather.cu
   ops/launcher/gdn_gating.cu
   ops/launcher/gelu.cu
+  ops/launcher/hyper_connection_stream_mean.cu
   ops/launcher/bidirectional_gqa_attention.cu
   ops/launcher/swa.cu
   ops/launcher/gqa_attention_decode.cu
@@ -271,11 +278,17 @@ add_library(ninfer_ops STATIC
   ops/wrapper/causal_conv1d_silu.cpp
   ops/wrapper/dflash_conv.cpp
   ops/wrapper/dflash_selector.cpp
+  ops/wrapper/candidate_selector.cpp
+  ops/wrapper/context_kv_materialize.cpp
+  ops/wrapper/dynamic_grouped_conv.cpp
+  ops/wrapper/dflash2_attn_input.cpp
+  ops/wrapper/dflash2_linear_swiglu.cpp
   ops/wrapper/embedding.cpp
   ops/wrapper/gdn_gating.cpp
   ops/wrapper/gdn_gating_proj.cpp
   ops/wrapper/gdn_input_proj.cpp
   ops/wrapper/gelu.cpp
+  ops/wrapper/hyper_connection_stream_mean.cpp
   ops/wrapper/bidirectional_gqa_attention.cpp
   ops/wrapper/swa.cpp
   ops/wrapper/gqa_attention.cpp

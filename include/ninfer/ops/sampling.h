@@ -17,6 +17,9 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeSpeculativeAccept     = 2,
     kSamplePurposeSpeculativeCorrection = 3,
     kSamplePurposeSpeculativeBonus      = 4,
+    // DFlash2 conditional candidate-selector draw. Its key is (seed, absolute draft position,
+    // this purpose, 0); it never shares a draw with the MTP/verify purposes above.
+    kSamplePurposeDFlash2Proposal       = 5,
 };
 
 // Device-resident sampling parameters. token_counts is an optional device I32

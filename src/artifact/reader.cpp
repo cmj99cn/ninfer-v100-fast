@@ -961,8 +961,11 @@ struct V3Identity {
     std::string_view weights_id;
 };
 
-constexpr std::array<V3Identity, 1> kContainerV3Identities = {{
+constexpr std::array<V3Identity, 2> kContainerV3Identities = {{
     {"qwen3.8-flash-next", "qwen3.8-flash-next", "nvfp4"},
+    // The standalone DFlash2 drafter package is a real v3 container but carries only the
+    // dflash2 component and no frontend resources, so it gets its own non-loadable identity.
+    {"Qwen3.8-Flash-Next-DFlash2-Infernix", "qwen3.8-flash-next-dflash2", "dflash2"},
 }};
 
 using ObjectIndex =

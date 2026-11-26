@@ -210,7 +210,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|iq4nl] [--spec mtp|dflash --draft-tokens N] "
+            "[--kv-dtype bf16|int8|iq4nl] "
+            "[--spec none|mtp|dflash|dflash2 --draft-tokens N] [--draft-model PATH] "
+
            "[--default-max-tokens N] "
              "[--vision] [--cuda-graph|--no-cuda-graph] [--no-prefix-reuse] [--prefix-cache] "
               "[--host-cache-mib N] [--expert-cache-mib auto|N] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
@@ -229,7 +231,11 @@ std::string serve_usage_text(const char* argv0) {
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
-           "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
+            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
+            "       --spec dflash2 requires --draft-model PATH naming the standalone DFlash2\n"
+            "       companion artifact; --draft-tokens is 1..7 (default 4); mtp/dflash keep\n"
+            "       their own bounds\n"
+
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
@@ -445,6 +451,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--draft-model") {
+            options.draft_model = require_value("--draft-model");
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
@@ -627,7 +635,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
+    if (options.speculative.backend == SpeculativeBackend::DFlash2 &&
+        options.speculative.draft_tokens == 0) {
+        options.speculative.draft_tokens = 4;
+    }
     product::validate_speculative_cli_options(options.speculative);
+    product::validate_speculative_draft_artifact(options.speculative, options.draft_model);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");
     }

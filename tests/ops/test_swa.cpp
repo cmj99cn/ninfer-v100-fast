@@ -402,6 +402,9 @@ int main() {
     failures += run_case(2, 2048, InputProfile::WindowBoundary, -1, 2048);
     failures += run_case(8, 4098, InputProfile::Random, -1, 2048);
     failures += run_case(8, 85000, InputProfile::Random, -1, 2048);
+    // DFlash2 parity: the drafter's window-2048 ring at its trained 32Q/8KV/D128 geometry,
+    // checked by the same independent FP64 oracle as every other window.
+    failures += run_case(7, 300, InputProfile::Random, -1, 2048);
     failures += run_batch_case();
     failures += run_batch_case(2048);
 

@@ -89,6 +89,25 @@ int main() {
     failures += check(dflash.speculative.proposal_head == ninfer::ProposalHead::Optimized,
                       "--lm-head-draft did not select the optimized proposal head");
 
+    const ServeOptions dflash2 =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+               "--draft-model", "draft.infernix"});
+    failures += check(dflash2.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                          dflash2.speculative.draft_tokens == 7 &&
+                          dflash2.draft_model == "draft.infernix",
+                      "--spec dflash2/--draft-model did not reach ServeOptions");
+
+    bool dflash2_without_model_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7"});
+    } catch (const std::invalid_argument& error) {
+        dflash2_without_model_rejected =
+            std::string(error.what()).find("--spec dflash2 requires --draft-model <path>") !=
+            std::string::npos;
+    }
+    failures += check(dflash2_without_model_rejected,
+                      "--spec dflash2 without --draft-model was accepted");
+
     bool dflash_vision_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15",

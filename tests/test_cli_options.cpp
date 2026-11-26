@@ -23,6 +23,7 @@
 #include "ninfer/types.h"
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -96,18 +97,44 @@ void check_ignore_eos() {
           "--stop was lost alongside --ignore-eos");
 }
 
+void check_speculative_companion() {
+    const ninfer::cli::Options dflash2 = parse_cli(
+        with({"--spec", "dflash2", "--draft-tokens", "7", "--draft-model", "draft.infernix"}));
+    check(dflash2.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+              dflash2.speculative.draft_tokens == 7U &&
+              dflash2.draft_model == "draft.infernix",
+          "--spec dflash2/--draft-model did not reach the CLI options");
+
+    bool missing_model_rejected = false;
+    try {
+        (void)parse_cli(with({"--spec", "dflash2", "--draft-tokens", "7"}));
+    } catch (const std::invalid_argument& error) {
+        missing_model_rejected =
+            std::string(error.what()).find("--spec dflash2 requires --draft-model <path>") !=
+            std::string::npos;
+    }
+    check(missing_model_rejected, "--spec dflash2 without --draft-model was accepted");
+
+    const ninfer::cli::Options disabled = parse_cli(with({"--spec", "none"}));
+    check(disabled.speculative.backend == ninfer::SpeculativeBackend::None,
+          "--spec none did not select the disabled backend");
+}
+
 // The option surface is a contract with the operator, not only with the parser: an option that
 // parses but is undocumented is an option nobody finds.
 void check_documented() {
     const std::string usage = ninfer::cli::usage_text("ninfer");
     check(usage.find("--ignore-eos") != std::string::npos,
           "--ignore-eos is missing from the CLI usage text");
+    check(usage.find("--draft-model") != std::string::npos,
+          "--draft-model is missing from the CLI usage text");
 }
 
 } // namespace
 
 int main() {
     check_ignore_eos();
+    check_speculative_companion();
     check_documented();
     if (failures != 0) {
         std::cerr << failures << " CLI option check(s) failed\n";

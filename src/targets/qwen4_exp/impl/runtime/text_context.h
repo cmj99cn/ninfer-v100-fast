@@ -272,6 +272,14 @@ public:
 
     void set_residual_sink(int rank, void* data, std::size_t bytes) noexcept;
 
+    // Captures the mean of the four hyper-connection streams after each tapped layer into a
+    // BF16 feature buffer [taps * hidden, columns] owned by the caller. Columns beyond
+    // `window` are dropped from the front, so only the most recent window of one forward is
+    // written. The tap is a read-only side output: it does not alter any model result.
+    void set_feature_tap(std::span<const std::int32_t> layers, void* data, std::size_t bytes,
+                         std::uint32_t window) noexcept;
+    void clear_feature_tap() noexcept;
+
     // A speculative verify span records its GDN transition instead of committing it. Each rank
     // writes its own head/channel shard into that rank's records owned by TextState. The same
     // action switches QSA/PLE/residual recording into the matching per-rank verification buffers.
@@ -355,6 +363,11 @@ private:
     GdnStateAction gdn_state_action_   = GdnStateAction::UpdateInPlace;
     std::array<void*, kMaximumDevices> residual_sinks_{};
     std::array<std::size_t, kMaximumDevices> residual_sink_bytes_{};
+    std::array<std::int32_t, 8> feature_tap_layers_{};
+    std::int32_t feature_tap_count_      = 0;
+    void* feature_tap_data_              = nullptr;
+    std::size_t feature_tap_bytes_       = 0;
+    std::uint32_t feature_tap_window_    = 0;
 };
 
 } // namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS

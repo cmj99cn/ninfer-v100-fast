@@ -1,5 +1,7 @@
 #include <ninfer/engine.h>
 
+#include "product/speculative_options.h"
+
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
@@ -46,6 +48,7 @@ struct Options {
     bool graph = false;
     std::string spec            = "none";
     std::uint32_t draft_tokens  = 0;
+    std::string draft_model;
     std::vector<TokenId> target_tokens;
     std::string expert_cache_profile;
 };
@@ -130,6 +133,8 @@ Options parse_options(int argc, char** argv) {
             options.spec = next();
         } else if (arg == "--draft-tokens") {
             options.draft_tokens = static_cast<std::uint32_t>(std::stoul(next()));
+        } else if (arg == "--draft-model") {
+            options.draft_model = next();
         } else if (arg == "--target-tokens") {
             options.target_tokens = parse_ids(next());
         } else if (arg == "--expert-cache-profile") {
@@ -139,12 +144,13 @@ Options parse_options(int argc, char** argv) {
         }
     }
     require(!options.artifact.empty(), "an artifact path is required");
-    require(options.spec == "none" || options.spec == "mtp", "--spec must be none or mtp");
-    if (options.spec == "mtp") {
-        require(options.draft_tokens > 0, "--spec mtp requires a positive --draft-tokens");
-    } else {
-        require(options.draft_tokens == 0, "--draft-tokens requires --spec mtp");
-    }
+    const ninfer::SpeculativeBackend backend =
+        ninfer::product::parse_speculative_backend(options.spec);
+    ninfer::SpeculativeOptions speculative;
+    speculative.backend      = backend;
+    speculative.draft_tokens = options.draft_tokens;
+    ninfer::product::validate_speculative_cli_options(speculative);
+    ninfer::product::validate_speculative_draft_artifact(speculative, options.draft_model);
     require(options.decode_tokens > 0, "the decode token budget must be positive");
     require(options.reps > 0, "the repetition count must be positive");
     require(options.warmup >= 0, "the warmup count must be non-negative");
@@ -164,9 +170,10 @@ EngineOptions engine_options(const Options& options) {
     engine.use_cuda_graph   = options.graph;
     engine.expert_cache_mib = options.expert_cache_mib;
     engine.expert_cache_profile = options.expert_cache_profile;
-    if (options.spec == "mtp") {
-        engine.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
-        engine.speculative.draft_tokens = options.draft_tokens;
+    engine.speculative.backend      = ninfer::product::parse_speculative_backend(options.spec);
+    engine.speculative.draft_tokens = options.draft_tokens;
+    if (engine.speculative.backend == ninfer::SpeculativeBackend::DFlash2) {
+        engine.speculative_draft_artifact = options.draft_model;
     }
     return engine;
 }
@@ -211,11 +218,21 @@ double log_softmax_nll(const std::vector<std::uint16_t>& words, TokenId token) {
     return log_partition - half_words_to_float(words[static_cast<std::size_t>(token)]);
 }
 
+const char* backend_name(ninfer::SpeculativeBackend backend) {
+    switch (backend) {
+    case ninfer::SpeculativeBackend::Mtp: return "mtp";
+    case ninfer::SpeculativeBackend::DFlash: return "dflash";
+    case ninfer::SpeculativeBackend::DFlash2: return "dflash2";
+    case ninfer::SpeculativeBackend::None: break;
+    }
+    return "none";
+}
+
 Json acceptance_json(const GenerationResult& result) {
     const auto& stats = result.speculative;
     const double drafted = static_cast<double>(stats.drafted_tokens);
     return Json{
-        {"backend", stats.enabled ? "mtp" : "none"},
+        {"backend", stats.enabled ? backend_name(stats.backend) : "none"},
         {"rounds", stats.rounds},
         {"drafted_tokens", stats.drafted_tokens},
         {"accepted_tokens", stats.accepted_tokens},
@@ -410,7 +427,7 @@ Json run_bench(const Options& options) {
         {"reps", options.reps},
         {"warmup", options.warmup},
         {"sampling", "greedy"},
-        {"acceptance", options.spec == "mtp" ? "measured" : "N/A"},
+        {"acceptance", options.spec == "mtp" || options.spec == "dflash2" ? "measured" : "N/A"},
         {"engine",
          {{"tp", 2},
           {"devices", {0, 1}},

@@ -3,6 +3,7 @@ add_library(ninfer_flash_next_package STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/variant.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/leaves.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/mtp_draft.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/dflash2_draft.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/mtp_draft_kernels.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/speculative.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/state_transaction.cpp

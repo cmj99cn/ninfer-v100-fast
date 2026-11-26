@@ -62,6 +62,8 @@ struct ServeOptions {
     std::vector<int> devices;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    // Companion artifact for --spec dflash2; required by that backend.
+    std::string draft_model;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;

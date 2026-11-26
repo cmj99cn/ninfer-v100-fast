@@ -70,6 +70,12 @@ W8Launch select_w8_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t
             return launch_w8_mma_r64_c128;
         }
         break;
+    case 12800:
+        // Flash-Next DFlash2 feature projection: the five tapped 2560-wide target blocks. The
+        // generic tensor-core route is exact; on sm_70 select_w8_launch redirects it to the
+        // general warp-per-row SIMT kernel.
+        if (n == 2560) { return launch_w8_mma_r64_c128; }
+        break;
     case 5120:
         switch (n) {
         case 4096:

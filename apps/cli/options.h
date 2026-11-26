@@ -36,6 +36,8 @@ struct Options {
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    // Companion artifact for --spec dflash2; required by that backend.
+    std::filesystem::path draft_model;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
     // Hybrid content-addressed prefix cache. `prefix_cache` enables it explicitly; a positive

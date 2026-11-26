@@ -1,5 +1,9 @@
 #pragma once
 
+#include "artifact/materializer.h"
+#include "core/cyclic_kv_cache.h"
+#include "core/layout.h"
+#include "ninfer/ops/linear.h"
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
 #include "targets/qwen4_exp/impl/runtime/instance.h"
@@ -8,6 +12,7 @@
 #include "targets/qwen4_exp/impl/runtime/program.h"
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 #include "targets/qwen3_8_flash_next/impl/mtp_draft.h"
+#include "targets/qwen3_8_flash_next/impl/dflash2_draft.h"
 #include "targets/qwen3_8_flash_next/impl/speculative.h"
 
 #include <algorithm>
@@ -66,12 +71,19 @@ ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevi
 
     const bool mtp_enabled = options_.speculative.backend == SpeculativeBackend::Mtp &&
                              options_.speculative.draft_tokens > 0;
+    namespace flash = ninfer::targets::qwen3_8_flash_next::detail;
+    const bool dflash2_enabled = options_.speculative.backend == SpeculativeBackend::DFlash2 &&
+                                 options_.speculative.draft_tokens > 0;
     std::uint32_t replay_width = 1;
     if (mtp_enabled) {
         mtp_draft_window_ = std::min<std::uint32_t>(
-            options_.speculative.draft_tokens,
-            ninfer::targets::qwen3_8_flash_next::detail::MtpConfig::maximum_draft_window);
+            options_.speculative.draft_tokens, flash::MtpConfig::maximum_draft_window);
         replay_width = mtp_draft_window_ + 1U;
+    }
+    if (dflash2_enabled) {
+        dflash2_window_ = std::min<std::uint32_t>(
+            options_.speculative.draft_tokens, flash::DFlash2Geometry::maximum_draft_window);
+        replay_width = std::max(replay_width, dflash2_window_ + 1U);
     }
 
     for (int rank = 0; rank < execution_.tp; ++rank) {
@@ -106,11 +118,178 @@ ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevi
         mtp_stats_.backend      = SpeculativeBackend::Mtp;
         mtp_stats_.enabled      = true;
         mtp_stats_.draft_window = mtp_draft_window_;
-    } else if (options_.use_cuda_graph) {
+    } else if (options_.use_cuda_graph && !dflash2_enabled) {
         graph_ = std::make_unique<GraphDecodeController>(
             execution_, state_ptrs_, activation_ptrs_, workspace_ptrs_, execution_.tp);
     }
+    if (dflash2_enabled) { setup_dflash2(); }
     CUDA_CHECK(cudaSetDevice(execution_.dev[0]->device));
+}
+
+void ProgramImplCore::setup_dflash2() {
+    namespace flash = ninfer::targets::qwen3_8_flash_next::detail;
+    if (options_.speculative_draft_artifact.empty()) {
+        throw std::invalid_argument("--spec dflash2 requires --draft-model <path>");
+    }
+    if (execution_.tp > 2) {
+        throw std::invalid_argument("DFlash2 supports tensor-parallel width one or two only");
+    }
+    constexpr std::int32_t kHidden = flash::DFlash2Geometry::hidden;
+    constexpr std::int32_t kLayers = flash::DFlash2Geometry::layers;
+
+    const ScopedDevice scope(execution_.dev[0]->device);
+    dflash2_draft_ = std::make_unique<flash::DFlash2Draft>(
+        options_.speculative_draft_artifact, flash::DFlash2Placement::Device);
+    dflash2_materialized_ = std::make_unique<artifact::MaterializedArtifact>(
+        artifact::materialize(dflash2_draft_->reader(), dflash2_draft_->plan(),
+                              *execution_.dev[0]));
+    dflash2_operands_ = std::make_unique<flash::DFlash2Operands>(
+        flash::bind_dflash2_operands(*dflash2_draft_, *dflash2_materialized_, 0));
+    // The target's token rows are replicated on every rank; the target's head is sharded at TP2
+    // and reached through the collective in the head callback below.
+    dflash2_operands_->embedding = models_[0]->embedding;
+
+    // The companion's context ring: one cyclic layer per drafter layer, one lane per sequence.
+    LayoutBuilder builder;
+    const CyclicKVCacheLayout ring_layout = plan_cyclic_kv_cache(
+        builder, static_cast<std::uint32_t>(kLayers), flash::DFlash2Geometry::window,
+        flash::DFlash2Geometry::kv_heads, flash::DFlash2Geometry::head_dim,
+        flash::DFlash2Geometry::lane_capacity);
+    const std::size_t ring_bytes = builder.finish(256, "DFlash2 ring");
+    dflash2_ring_backing_ = DeviceBuffer(ring_bytes);
+    dflash2_ring_ = std::make_unique<CyclicKVCache>(
+        DeviceSpan{dflash2_ring_backing_.p, dflash2_ring_backing_.bytes}, ring_layout);
+    std::vector<CyclicKVCacheLayerView> ring;
+    ring.reserve(static_cast<std::size_t>(kLayers));
+    for (std::int32_t layer = 0; layer < kLayers; ++layer) {
+        ring.push_back(dflash2_ring_->layer_view(static_cast<std::uint32_t>(layer)));
+    }
+
+    // Feature capture: the tap writes the mean of the four hyper-connection streams of each
+    // tapped target layer; only the most recent ring window of one forward is kept.
+    dflash2_tap_layers_.clear();
+    for (const std::uint32_t layer : dflash2_draft_->target_layer_ids()) {
+        dflash2_tap_layers_.push_back(static_cast<std::int32_t>(layer));
+    }
+    dflash2_feature_width_ = std::max<std::uint32_t>(
+        8U, std::min<std::uint32_t>(plan_->prefill_chunk, flash::DFlash2Geometry::window));
+    const std::size_t feature_elements = static_cast<std::size_t>(dflash2_tap_layers_.size()) *
+                                         static_cast<std::size_t>(kHidden) *
+                                         static_cast<std::size_t>(dflash2_feature_width_);
+    dflash2_features_     = DeviceBuffer(feature_elements * sizeof(std::uint16_t));
+    dflash2_positions_    = DeviceBuffer(static_cast<std::size_t>(dflash2_feature_width_) * 4);
+    dflash2_counts_       = DeviceBuffer(4);
+    dflash2_lanes_        = DeviceBuffer(4);
+    dflash2_anchors_      = DeviceBuffer(4);
+    dflash2_frontiers_    = DeviceBuffer(4);
+    dflash2_valid_        = DeviceBuffer(4);
+    dflash2_ids_          = DeviceBuffer(8 * 4);
+    dflash2_block_positions_ = DeviceBuffer(8 * 4);
+    dflash2_drafts_       = DeviceBuffer(7 * 4);
+    dflash2_candidates_   = DeviceBuffer(16 * 7 * 4);
+    dflash2_proposal_q_   = DeviceBuffer(16 * 7 * 4);
+    dflash2_confidence_   = DeviceBuffer(7 * 4);
+    dflash2_sampling_     = DeviceBuffer(sizeof(ops::SamplingConfig));
+
+    // The target's head. At TP2 each rank projects its own vocabulary shard from a copy of the
+    // block's final hidden and rank 0 gathers the full logits for the selector.
+    const Weight& local_head = models_[0]->output_head;
+    // The head callback's own planes: the rank-0 linear workspace and, at TP2, its vocabulary
+    // shard output. The full-vocabulary logits plane is already counted by the drafter's tail.
+    const std::size_t head_planes =
+        static_cast<std::size_t>(TextConfig::vocab / execution_.tp) * 8 * sizeof(std::uint16_t);
+    const std::size_t head_workspace =
+        ops::linear_workspace_capacity_bytes(local_head.qtype, local_head.n, local_head.k,
+                                             ops::LinearPolicy::A16Only, 1, 8) +
+        head_planes;
+    const std::size_t materialize_workspace = flash::DFlash2Drafter::materialize_workspace_bytes(
+        1, static_cast<std::int32_t>(dflash2_feature_width_));
+    const std::size_t propose_workspace = flash::DFlash2Drafter::propose_workspace_bytes(
+        1, static_cast<std::int32_t>(flash::DFlash2Geometry::maximum_draft_window + 1),
+        plan_->capacity, head_workspace);
+    dflash2_work_ = std::make_unique<WorkspaceArena>(
+        std::max(materialize_workspace, propose_workspace) + (1U << 20));
+    if (execution_.tp > 1) {
+        const Weight& peer_head = models_[1]->output_head;
+        const std::size_t peer_head_workspace = ops::linear_workspace_capacity_bytes(
+            peer_head.qtype, peer_head.n, peer_head.k, ops::LinearPolicy::A16Only, 1, 8);
+        const std::size_t peer_planes =
+            (static_cast<std::size_t>(kHidden) + static_cast<std::size_t>(peer_head.n) +
+             static_cast<std::size_t>(TextConfig::vocab)) * 8 * 2;
+        const ScopedDevice peer_device(execution_.dev[1]->device);
+        dflash2_peer_work_ =
+            std::make_unique<WorkspaceArena>(peer_head_workspace + peer_planes + (1U << 16));
+    }
+
+    flash::DFlash2Head head = [this](const Tensor& hidden, Tensor& logits, WorkspaceArena& work,
+                                     cudaStream_t stream) {
+        const std::int32_t columns = hidden.ne[1];
+        if (execution_.tp == 1) {
+            ops::linear(hidden, models_[0]->output_head, logits, ops::LinearPolicy::A16Only, work,
+                        stream);
+            return;
+        }
+        // Each rank projects its own vocabulary shard from a copy of the block's hidden; rank 0
+        // then gathers the shards for the selector. Every join is stream-ordered on the rank
+        // streams, so no host synchronization is required.
+        const std::int32_t per_rank = TextConfig::vocab / execution_.tp;
+        std::array<Tensor, kMaximumDevices> part{};
+        part[0] = work.alloc(DType::BF16, {per_rank, columns});
+        ops::linear(hidden, models_[0]->output_head, part[0], ops::LinearPolicy::A16Only, work,
+                    stream);
+        auto peer_scope            = dflash2_peer_work_->scope();
+        Tensor peer_hidden         = dflash2_peer_work_->alloc(DType::BF16, {hidden.ne[0], columns});
+        part[1]                    = dflash2_peer_work_->alloc(DType::BF16, {per_rank, columns});
+        const std::int32_t vocab   = static_cast<std::int32_t>(TextConfig::vocab);
+        Tensor peer_destination    = dflash2_peer_work_->alloc(DType::BF16, {1, vocab});
+        {
+            std::array<Tensor, kMaximumDevices> destination{};
+            destination[1] = peer_hidden;
+            ops::broadcast_rank0(hidden, destination, execution_, *comms_);
+        }
+        {
+            const ScopedDevice peer_device(execution_.dev[1]->device);
+            ops::linear(peer_hidden, models_[1]->output_head, part[1], ops::LinearPolicy::A16Only,
+                        *dflash2_peer_work_, states_[1]->stream());
+        }
+        // The proposal logits are consumed on rank 0 only. Gather one vocabulary column at a time
+        // through the established row gather (rank 0's head does the same at TP2).
+        const std::size_t element = sizeof(std::uint16_t);
+        for (std::int32_t column = 0; column < columns; ++column) {
+            std::array<Tensor, kMaximumDevices> destination{};
+            std::array<Tensor, kMaximumDevices> source{};
+            destination[0] =
+                Tensor(static_cast<std::byte*>(logits.data) + static_cast<std::size_t>(column) * vocab * element,
+                       DType::BF16, {1, vocab});
+            destination[1] = peer_destination;
+            source[0] =
+                Tensor(static_cast<std::byte*>(part[0].data) + static_cast<std::size_t>(column) * per_rank * element,
+                       DType::BF16, {1, per_rank});
+            source[1] =
+                Tensor(static_cast<std::byte*>(part[1].data) + static_cast<std::size_t>(column) * per_rank * element,
+                       DType::BF16, {1, per_rank});
+            ops::allgather_rows(destination, source, execution_, *comms_);
+        }
+    };
+
+    dflash2_drafter_ = std::make_unique<flash::DFlash2Drafter>(
+        *dflash2_operands_, static_cast<std::int32_t>(dflash2_draft_->vocab()),
+        static_cast<std::int32_t>(dflash2_draft_->vocab()), std::move(ring), plan_->capacity,
+        std::move(head));
+
+    ops::SamplingConfig sampling{};
+    sampling.temperature = 0.0F;
+    dflash2_sampling_.copy_from_host(&sampling, sizeof(sampling));
+    const std::int32_t lane = 0;
+    const std::int32_t count = 0;
+    dflash2_lanes_.copy_from_host(&lane, sizeof(lane));
+    dflash2_counts_.copy_from_host(&count, sizeof(count));
+
+    trunk_->set_feature_tap(dflash2_tap_layers_, dflash2_features_.p, dflash2_features_.bytes,
+                            flash::DFlash2Geometry::window);
+    dflash2_stats_.backend      = SpeculativeBackend::DFlash2;
+    dflash2_stats_.enabled      = true;
+    dflash2_stats_.draft_window = dflash2_window_;
 }
 
 runtime::RequestPlanSummary ProgramImplCore::make_summary(std::uint32_t prompt_tokens,
@@ -146,10 +325,16 @@ void ProgramImplCore::clear_lane(std::uint32_t lane) noexcept {
 
 void ProgramImplCore::prefill_chunk(LaneState& state, std::uint32_t begin, std::uint32_t count) {
     const std::span<const TokenId> chunk{state.context.prompt_tokens.data() + begin, count};
+    const std::uint32_t base = states_[0]->next_position();
     last_stage_capture() = &logits_capture_;
     const TokenId sampled = trunk_->prefill(chunk);
     if (begin + count == state.context.prompt_tokens.size()) {
         state.context.next_input = sampled;
+    }
+    if (dflash2_drafter_ != nullptr) {
+        const std::uint32_t captured = std::min<std::uint32_t>(
+            count, ninfer::targets::qwen3_8_flash_next::detail::DFlash2Geometry::window);
+        dflash2_capture_committed(base + count - captured, static_cast<std::int32_t>(captured));
     }
 }
 
@@ -262,10 +447,17 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     const std::uint32_t chunk = std::min(plan_->prefill_chunk,
                                          static_cast<std::uint32_t>(tokens.size()));
     const auto prefill_start = std::chrono::steady_clock::now();
+    const std::uint32_t prefill_base = states_[0]->next_position();
     last_stage_capture() = &logits_capture_;
     const TokenId sampled = trunk_->prefill(std::span<const TokenId>{tokens.data(), chunk});
     const double prefill_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_start).count();
+    if (dflash2_drafter_ != nullptr) {
+        const std::uint32_t captured = std::min<std::uint32_t>(
+            chunk, ninfer::targets::qwen3_8_flash_next::detail::DFlash2Geometry::window);
+        dflash2_capture_committed(prefill_base + chunk - captured,
+                                  static_cast<std::int32_t>(captured));
+    }
 
     LaneState& state = lanes_[lane];
     state.timings    = GenerationTimings{};
@@ -328,6 +520,141 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t l
     return result;
 }
 
+void ProgramImplCore::dflash2_capture_committed(std::uint32_t start_position, std::int32_t count) {
+    if (count <= 0) { return; }
+    namespace flash = ninfer::targets::qwen3_8_flash_next::detail;
+    if (static_cast<std::uint32_t>(count) > dflash2_feature_width_) {
+        throw std::logic_error("DFlash2 committed feature width exceeds the capture buffer");
+    }
+    const ScopedDevice scope(execution_.dev[0]->device);
+    cudaStream_t stream = states_[0]->stream();
+    // The tap and the target forward that produced these features run on this non-blocking
+    // stream; drain it before reading the feature buffer through the small host control copies.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(count));
+    for (std::int32_t index = 0; index < count; ++index) {
+        positions[static_cast<std::size_t>(index)] =
+            static_cast<std::int32_t>(start_position + static_cast<std::uint32_t>(index));
+    }
+    dflash2_positions_.copy_from_host(positions.data(),
+                                      static_cast<std::size_t>(count) * sizeof(std::int32_t));
+    dflash2_counts_.copy_from_host(&count, sizeof(count));
+    flash::DFlash2ContextCall call{};
+    call.features  = Tensor(dflash2_features_.p, DType::BF16,
+                            {flash::DFlash2Geometry::feature_rows, count});
+    call.positions = Tensor(dflash2_positions_.p, DType::I32, {count, 1});
+    call.counts    = Tensor(dflash2_counts_.p, DType::I32, {1});
+    call.lanes     = Tensor(dflash2_lanes_.p, DType::I32, {1});
+    call.min_count = static_cast<std::uint32_t>(count);
+    call.max_count = static_cast<std::uint32_t>(count);
+    auto work_scope = dflash2_work_->scope();
+    dflash2_drafter_->materialize(call, *dflash2_work_, stream);
+}
+
+TokenId ProgramImplCore::decode_dflash2(LaneState& state, const runtime::RoundBudget& budget,
+                                        std::vector<TokenId>& committed) {
+    namespace flash = ninfer::targets::qwen3_8_flash_next::detail;
+    committed.clear();
+    const ScopedDevice scope(execution_.dev[0]->device);
+    cudaStream_t stream = states_[0]->stream();
+    const std::uint32_t frontier = states_[0]->next_position();
+    const std::uint32_t drafts =
+        flash::verify_extent(dflash2_window_, dflash2_window_, budget, frontier,
+                             plan_->kv_capacity);
+    std::uint32_t accepted = 0;
+    std::uint32_t verified_drafts = drafts;
+    TokenId token          = 0;
+    if (drafts == 0) {
+        last_stage_capture() = &logits_capture_;
+        token                = trunk_->decode(state.context.next_input);
+        committed.push_back(token);
+        dflash2_capture_committed(frontier, 1);
+    } else {
+        const std::int32_t k          = static_cast<std::int32_t>(drafts);
+        const std::int32_t columns    = k + 1;
+        const std::int32_t anchor     = static_cast<std::int32_t>(state.context.next_input);
+        const std::int32_t base       = static_cast<std::int32_t>(frontier);
+        const std::int32_t lane       = 0;
+        // The target forward that filled the ring also ran on this non-blocking stream; drain it
+        // before the synchronous small control copies.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        dflash2_anchors_.copy_from_host(&anchor, sizeof(anchor));
+        dflash2_frontiers_.copy_from_host(&base, sizeof(base));
+        dflash2_valid_.copy_from_host(&columns, sizeof(columns));
+        dflash2_lanes_.copy_from_host(&lane, sizeof(lane));
+
+        flash::DFlash2ProposalCall call{};
+        call.anchors       = Tensor(dflash2_anchors_.p, DType::I32, {1});
+        call.frontiers     = Tensor(dflash2_frontiers_.p, DType::I32, {1});
+        call.valid_columns = Tensor(dflash2_valid_.p, DType::I32, {1});
+        call.lanes         = Tensor(dflash2_lanes_.p, DType::I32, {1});
+        call.configs       = static_cast<const ops::SamplingConfig*>(dflash2_sampling_.p);
+        call.batch         = 1;
+        call.width         = columns;
+        call.ids           = Tensor(dflash2_ids_.p, DType::I32, {columns, 1});
+        call.positions     = Tensor(dflash2_block_positions_.p, DType::I32, {columns, 1});
+        call.drafts        = Tensor(dflash2_drafts_.p, DType::I32, {k, 1});
+        call.candidates    = Tensor(dflash2_candidates_.p, DType::I32, {16, k, 1});
+        call.proposal_q    = Tensor(dflash2_proposal_q_.p, DType::FP32, {16, k, 1});
+        call.confidence    = Tensor(dflash2_confidence_.p, DType::FP32, {k, 1});
+        {
+            auto work_scope = dflash2_work_->scope();
+            dflash2_drafter_->propose(call, *dflash2_work_, stream);
+        }
+        std::vector<TokenId> proposals(static_cast<std::size_t>(k));
+        std::vector<float> confidence(static_cast<std::size_t>(k));
+        CUDA_CHECK(cudaMemcpyAsync(proposals.data(), dflash2_drafts_.p,
+                                   static_cast<std::size_t>(k) * sizeof(TokenId),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(confidence.data(), dflash2_confidence_.p,
+                                   static_cast<std::size_t>(k) * sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // The selector marks how far the conditional chain is worth extending. As with the MTP
+        // chain, a positive min_p keeps the first step and stops before the first weak one.
+        const float min_p = flash::draft_min_p();
+        std::size_t keep  = static_cast<std::size_t>(k);
+        if (min_p > 0.0F) {
+            keep = 1;
+            while (keep < static_cast<std::size_t>(k) && confidence[keep - 1] >= min_p) { ++keep; }
+        }
+        proposals.resize(keep);
+        verified_drafts = static_cast<std::uint32_t>(keep);
+
+        std::vector<TokenId> verify_tokens;
+        verify_tokens.reserve(static_cast<std::size_t>(columns));
+        verify_tokens.push_back(state.context.next_input);
+        verify_tokens.insert(verify_tokens.end(), proposals.begin(), proposals.end());
+
+        const TextTrunk::VerificationBaseline baseline =
+            trunk_->capture_verification_baseline();
+        struct ActionGuard {
+            TextTrunk* trunk;
+            ~ActionGuard() { trunk->set_gdn_state_action(GdnStateAction::UpdateInPlace); }
+        } guard{trunk_.get()};
+        trunk_->set_gdn_state_action(GdnStateAction::RecordForReplay);
+        last_stage_capture() = &logits_capture_;
+        const std::vector<TokenId> predictions = trunk_->decode_span(verify_tokens);
+        accepted = flash::accepted_prefix(proposals, predictions);
+        committed = flash::commit_tokens(proposals, predictions);
+        if (committed.empty()) { committed.push_back(predictions.front()); }
+        trunk_->commit_verified_span(verify_tokens, accepted + 1, baseline);
+        dflash2_capture_committed(frontier, static_cast<std::int32_t>(accepted + 1));
+    }
+    dflash2_stats_.rounds += 1;
+    dflash2_stats_.drafted_tokens += verified_drafts;
+    dflash2_stats_.accepted_tokens += accepted;
+    if (dflash2_stats_.accepted_per_position.size() < dflash2_window_) {
+        dflash2_stats_.accepted_per_position.resize(dflash2_window_, 0);
+    }
+    for (std::uint32_t at = 0; at < accepted && at < dflash2_window_; ++at) {
+        dflash2_stats_.accepted_per_position[at] += 1;
+    }
+    token = committed.back();
+    return token;
+}
+
 runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
     std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets) {
     if (lanes.size() != budgets.size()) {
@@ -353,7 +680,15 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_batch(
         const auto decode_start  = std::chrono::steady_clock::now();
         const std::size_t tokens_before = round_tokens_.size();
         TokenId token = 0;
-        if (mtp_draft_ != nullptr) {
+        if (dflash2_drafter_ != nullptr) {
+            std::vector<TokenId> committed;
+            token = decode_dflash2(state, budget, committed);
+            for (const TokenId emitted : committed) {
+                state.last_round_token     = emitted;
+                state.has_last_round_token = true;
+                round_tokens_.push_back(emitted);
+            }
+        } else if (mtp_draft_ != nullptr) {
             namespace flash = ninfer::targets::qwen3_8_flash_next::detail;
             const std::uint32_t frontier = states_[0]->next_position();
             const std::uint32_t drafts =
@@ -539,7 +874,7 @@ ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
 SpeculativeStats
 ProgramImplCore::speculative_stats_lane(std::uint32_t lane) const noexcept {
     (void)lane;
-    return mtp_stats_;
+    return dflash2_drafter_ != nullptr ? dflash2_stats_ : mtp_stats_;
 }
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {
