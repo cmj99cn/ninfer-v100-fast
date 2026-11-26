@@ -386,7 +386,7 @@ void moe_nvfp4_cached_gate_up_launch(const Tensor& x, const std::uint8_t* slots,
                                      const MoeNvfp4Probe* probe, cudaStream_t stream) {
     if (x.ne[1] < 1 || x.ne[1] > kMoeMaxSmallT || scratch.activation == nullptr ||
         route.ids == nullptr) {
-        throw std::invalid_argument("moe_nvfp4: the cached gate_up path needs one to four tokens");
+        throw std::invalid_argument("moe_nvfp4: the cached gate_up path needs one to eight tokens");
     }
     const MoeNvfp4Probe probe_value = probe != nullptr ? *probe : MoeNvfp4Probe{};
     const std::int32_t expert_begin = probe_value.expert_begin;
@@ -411,7 +411,7 @@ void moe_nvfp4_cached_down_launch(const std::uint8_t* slots, std::uint64_t slot_
                                   Tensor& destination, cudaStream_t stream) {
     if (destination.ne[1] < 1 || destination.ne[1] > kMoeMaxSmallT ||
         scratch.activation == nullptr || route.ids == nullptr) {
-        throw std::invalid_argument("moe_nvfp4: the cached down path needs one to four tokens");
+        throw std::invalid_argument("moe_nvfp4: the cached down path needs one to eight tokens");
     }
     const dim3 down_grid(kMoeHidden / kMoeDecodeDownTile, destination.ne[1]);
     if (destination.dtype == DType::FP16) {

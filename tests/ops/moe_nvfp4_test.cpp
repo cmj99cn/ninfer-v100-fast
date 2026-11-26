@@ -1188,8 +1188,12 @@ int run_shared_small_t_case(const direct_bf16_weight::HostWeight& parent,
         cuda_synchronize();
 
         const MoeNvfp4RouteView route{ids, coefficients, shared_gate};
-        DeviceBuffer scratch(static_cast<std::size_t>(tokens) * kIntermediate * sizeof(float));
-        const MoeNvfp4ExpertScratch scratch_view{static_cast<float*>(scratch.p)};
+        const std::size_t scratch_values =
+            static_cast<std::size_t>(tokens) * kIntermediate;
+        GuardedDeviceBuffer scratch(scratch_values * sizeof(float));
+        const std::vector<float> sentinel(scratch_values, -12345.0F);
+        scratch.copy_from_host(sentinel.data(), sentinel.size() * sizeof(float));
+        const MoeNvfp4ExpertScratch scratch_view{static_cast<float*>(scratch.data())};
 
         const std::size_t destination_bytes =
             static_cast<std::size_t>(tokens) * kHidden * sizeof(std::uint16_t);
@@ -1203,6 +1207,16 @@ int run_shared_small_t_case(const direct_bf16_weight::HostWeight& parent,
         ops::moe_shared_nvfp4(x, full_weights, scratch_view, route, parallel_destination, 0);
         ops::moe_shared_nvfp4(x, full_weights, MoeNvfp4ExpertScratch{}, route, serial_destination, 0);
         cuda_synchronize();
+
+        const auto scratch_words = from_device<float>(scratch.data(), scratch_values);
+        const std::size_t written =
+            static_cast<std::size_t>(std::count_if(scratch_words.begin(), scratch_words.end(),
+                                                   [](float value) { return value != -12345.0F; }));
+        if (written < scratch_values / 2U) {
+            std::cerr << case_label << ": the parallel shared path did not use the activation "
+                      << "scratch (" << written << "/" << scratch_values << ")\n";
+            ++failures;
+        }
 
         const std::vector<double> gates =
             read_f32(shared_gate_buffer.data(), static_cast<std::size_t>(tokens));
@@ -1249,9 +1263,9 @@ int run_shared_small_t_case(const direct_bf16_weight::HostWeight& parent,
         failures += verify_reduction(case_label + " serial", serial_values, expected, criterion);
         failures += parallel.verify_guards(case_label + " parallel guard");
         failures += serial.verify_guards(case_label + " serial guard");
+        failures += scratch.verify_guards(case_label + " scratch guard");
     };
-    run_tokens(2);
-    run_tokens(4);
+    run_tokens(static_cast<std::int32_t>(activation_values.size()));
     return failures;
 }
 
@@ -1447,10 +1461,13 @@ int run_cached_multi_bitwise_case(const BatchedFixture& gate_up, const BatchedFi
         .divisors   = static_cast<const float*>(slot_divisors.p),
     };
 
-    DeviceBuffer multi_scratch(static_cast<std::size_t>(tokens) * kTopK * kIntermediate *
-                               sizeof(float));
+    const std::size_t multi_scratch_values =
+        static_cast<std::size_t>(tokens) * kTopK * kIntermediate;
+    GuardedDeviceBuffer multi_scratch(multi_scratch_values * sizeof(float));
+    const std::vector<float> sentinel(multi_scratch_values, -12345.0F);
+    multi_scratch.copy_from_host(sentinel.data(), sentinel.size() * sizeof(float));
     DeviceBuffer single_scratch(kTopK * kIntermediate * sizeof(float));
-    const MoeNvfp4ExpertScratch multi_scratch_view{static_cast<float*>(multi_scratch.p)};
+    const MoeNvfp4ExpertScratch multi_scratch_view{static_cast<float*>(multi_scratch.data())};
     const MoeNvfp4ExpertScratch single_scratch_view{static_cast<float*>(single_scratch.p)};
 
     const std::size_t destination_bytes =
@@ -1476,6 +1493,16 @@ int run_cached_multi_bitwise_case(const BatchedFixture& gate_up, const BatchedFi
     }
     cuda_synchronize();
 
+    const auto scratch_words = from_device<float>(multi_scratch.data(), multi_scratch_values);
+    const std::size_t written =
+        static_cast<std::size_t>(std::count_if(scratch_words.begin(), scratch_words.end(),
+                                               [](float value) { return value != -12345.0F; }));
+    if (written < multi_scratch_values / 2U) {
+        std::cerr << label << ": the parallel cached path did not use the activation scratch ("
+                  << written << "/" << multi_scratch_values << ")\n";
+        ++failures;
+    }
+
     const auto multi_words = from_device<std::uint16_t>(multi_destination.data(),
                                                         static_cast<std::size_t>(tokens) * kHidden);
     const auto sequential_words =
@@ -1483,6 +1510,7 @@ int run_cached_multi_bitwise_case(const BatchedFixture& gate_up, const BatchedFi
                                    static_cast<std::size_t>(tokens) * kHidden);
     failures += verify_exact((label + " routed output raw bits").c_str(),
                              multi_words, sequential_words);
+    failures += multi_scratch.verify_guards(label + " multi scratch guard");
     failures += multi_destination.verify_guards(label + " multi destination guard");
     failures += sequential_destination.verify_guards(label + " sequential destination guard");
     failures += ids_buffer.verify_guards(label + " ids guard");
@@ -1901,10 +1929,24 @@ int main() {
                                         inputs.activation[2], DType::FP16, "moe_nvfp4 cached f16");
     const std::vector<std::vector<float>> small_t_activations{
         inputs.activation[0], inputs.activation[1], inputs.activation[2], inputs.activation[3]};
+    const std::vector<std::vector<float>> t6_activations{
+        inputs.activation[0], inputs.activation[1], inputs.activation[2],
+        inputs.activation[3], inputs.activation[4], inputs.activation[5]};
+    const std::vector<std::vector<float>> t8_activations{
+        inputs.activation[0], inputs.activation[1], inputs.activation[2], inputs.activation[3],
+        inputs.activation[4], inputs.activation[5], inputs.activation[6], inputs.activation[7]};
     failures += run_cached_small_t_case(inputs.gate_up, inputs.down, weights, small_t_activations,
                                          DType::BF16, "moe_nvfp4 cached small-t bf16");
     failures += run_cached_small_t_case(gate_up_f16, down_f16, weights_f16, small_t_activations,
                                          DType::FP16, "moe_nvfp4 cached small-t f16");
+    failures += run_cached_small_t_case(inputs.gate_up, inputs.down, weights, t6_activations,
+                                         DType::BF16, "moe_nvfp4 cached small-t bf16 T=6");
+    failures += run_cached_small_t_case(gate_up_f16, down_f16, weights_f16, t6_activations,
+                                         DType::FP16, "moe_nvfp4 cached small-t f16 T=6");
+    failures += run_cached_small_t_case(inputs.gate_up, inputs.down, weights, t8_activations,
+                                         DType::BF16, "moe_nvfp4 cached small-t bf16 T=8");
+    failures += run_cached_small_t_case(gate_up_f16, down_f16, weights_f16, t8_activations,
+                                         DType::FP16, "moe_nvfp4 cached small-t f16 T=8");
     const std::vector<std::vector<float>> t2_activations{
         inputs.activation[0], inputs.activation[1]};
     failures += run_cached_multi_bitwise_case(inputs.gate_up, inputs.down, weights, t2_activations,
@@ -1915,16 +1957,42 @@ int main() {
                                               DType::BF16, "moe_nvfp4 cached multi bf16 T=4");
     failures += run_cached_multi_bitwise_case(gate_up_f16, down_f16, weights_f16, small_t_activations,
                                               DType::FP16, "moe_nvfp4 cached multi f16 T=4");
+    failures += run_cached_multi_bitwise_case(inputs.gate_up, inputs.down, weights, t6_activations,
+                                               DType::BF16, "moe_nvfp4 cached multi bf16 T=6");
+    failures += run_cached_multi_bitwise_case(gate_up_f16, down_f16, weights_f16, t6_activations,
+                                               DType::FP16, "moe_nvfp4 cached multi f16 T=6");
+    failures += run_cached_multi_bitwise_case(inputs.gate_up, inputs.down, weights, t8_activations,
+                                               DType::BF16, "moe_nvfp4 cached multi bf16 T=8");
+    failures += run_cached_multi_bitwise_case(gate_up_f16, down_f16, weights_f16, t8_activations,
+                                               DType::FP16, "moe_nvfp4 cached multi f16 T=8");
     failures += run_shared_bitwise_case(weights, inputs.activation[1], DType::BF16,
                                         "moe_nvfp4 shared bf16");
     failures += run_shared_bitwise_case(weights_f16, inputs.activation[2], DType::FP16,
                                         "moe_nvfp4 shared f16");
     failures += run_shared_small_t_case(inputs.parent, inputs.shared_down, weights,
-                                        small_t_activations, DType::BF16,
-                                        "moe_nvfp4 shared small-t bf16");
+                                         t2_activations, DType::BF16,
+                                         "moe_nvfp4 shared small-t bf16 T=2");
     failures += run_shared_small_t_case(inputs.parent, inputs.shared_down, weights_f16,
-                                        small_t_activations, DType::FP16,
-                                        "moe_nvfp4 shared small-t f16");
+                                         t2_activations, DType::FP16,
+                                         "moe_nvfp4 shared small-t f16 T=2");
+    failures += run_shared_small_t_case(inputs.parent, inputs.shared_down, weights,
+                                         small_t_activations, DType::BF16,
+                                         "moe_nvfp4 shared small-t bf16");
+    failures += run_shared_small_t_case(inputs.parent, inputs.shared_down, weights_f16,
+                                         small_t_activations, DType::FP16,
+                                         "moe_nvfp4 shared small-t f16");
+    failures += run_shared_small_t_case(inputs.parent, inputs.shared_down, weights,
+                                         t6_activations, DType::BF16,
+                                         "moe_nvfp4 shared small-t bf16 T=6");
+    failures += run_shared_small_t_case(inputs.parent, inputs.shared_down, weights_f16,
+                                         t6_activations, DType::FP16,
+                                         "moe_nvfp4 shared small-t f16 T=6");
+    failures += run_shared_small_t_case(inputs.parent, inputs.shared_down, weights,
+                                         t8_activations, DType::BF16,
+                                         "moe_nvfp4 shared small-t bf16 T=8");
+    failures += run_shared_small_t_case(inputs.parent, inputs.shared_down, weights_f16,
+                                         t8_activations, DType::FP16,
+                                         "moe_nvfp4 shared small-t f16 T=8");
     failures += run_probe_cases();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " moe_nvfp4 correctness\n";
