@@ -35,7 +35,7 @@
 | B2 | device router top-k 去 host D2H+sync | 0.10–0.25/step | **已排除（实测前提不成立）** | `b1-b2-draft-report.md`：router sync host 阻塞实测仅 0.0050 ms/step，外推的 0.15–0.30 bubble 不存在；top-k+10 槽分发无收益且有舍入/选集风险。 |
 | B3 | 跨轮门控（上轮 step-0 置信度低则 K=0） | 条件性 | **已排除** | `verify-b1-b3-feasibility.md`：无 step-0 分布统计；Q4 0.8929/FP16 0.9380 均 > 0.8；min_p=0.8 下条件收益 = 0。 |
 | B4 | draft head 词表子集（Strata 106299） | 0.07–0.23/step | **已排除** | Q4 全词表已 0.397 ms（带宽地板），子集再省有限；且 greedy argmax 在子集上会改 token，需改 artifact 语义。 |
-| B5 | 更大 draft window（5/7） | 负 | **已排除** | 实测 window=5 → 20 tok/s（draft 步数线性增长压垮收益）。 |
+| B5 | 更大 draft window（5/7） | 负 | **根因已修正（提交 5286f982）** | `debug-b5-rootcause.md`：旧"20 tok/s"根因错（不是步数线性，drafted/round 仅+14%）；真因是 T>4 越过 kMoeMaxSmallT=4 触发 MoE 10× 回退。修复后 window=5→106.3、window=7→102.5，但 acceptance 降到 0.79/0.78，仍低于 window=3 的 113。扩窗口不是 2× 路径。 |
 | B6 | Q4 proposal head | 2.8/step | **已做** | 110 tok/s 的主要来源；oracle 已更新为 Q4 语义，FP16 开关保留。 |
 | B7 | confidence min_p 提前终止 | 0.4/step | **已做** | 88→110 路径的一部分。 |
 
