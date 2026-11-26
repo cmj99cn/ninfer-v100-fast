@@ -15,13 +15,19 @@
 - **模型与术语**：Flash-Next 即 **Qwen3.8-Flash-Next**（Qwen4Exp 系列），亦可写作
   `qwen3.8-flash-next`；48 层（36 GDN + 12 QSA）、512 routed experts、NVFP4 权重 +
   FP8 draft bank、TP2、INT8 KV、262144 上下文。
-- **本轮 MTP 结论（诚实记录）**：Flash-Next MTP 现已快过 base——base no-spec **70.54 tok/s**；
+- **本轮 MTP 结论（诚实记录）**：Flash-Next MTP 现已快过 base——base no-spec **70.73–70.82 tok/s**；
   最终配置（Q4 proposal/head 默认 + draft=3 + `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8` + 专家画像
-  0 miss，TP2 / greedy / 128 token / 2 reps）实测 **110.3–110.5 tok/s**、acceptance **0.860–0.861**，
-  即 **1.56× base**。**120 tok/s 目标仍未达成**（1.56×，非 2×）；但「MTP 落后 base / 负收益」的
-  旧结论已失效——起点是 30.33 tok/s（fold commit 接线前），本轮 30 → 110 提升约 **3.6×**。
-  120 / 99% 属随机采样口径，greedy 下不可达（见「口径澄清」）。详见「当前进度 → Flash-Next
-  分支实测」与「速度」节。
+  0 miss，TP2 / `sm_70` / CUDA 12.8 / greedy / eager 单请求 / window=3 / 128 token / 2 reps）多次实测
+  **111–113 tok/s**、acceptance **0.858–0.862**，即 **1.60× base**。历史 110.3–110.5 tok/s /
+  0.860–0.861 是同一配置的早期实测，属正常波动，不写死单点；早期 base 记录 70.54 tok/s 同样保留
+  作历史。**120 tok/s 目标仍未达成**（2× base = 141，本轮约 1.60×，非 2×）。acceptance 的根因是
+  min_p=0.8 下低置信度 draft 本身就错：只发 1 个 draft 的轮次命中 **41/213 = 19.2%**，发 3 个
+  draft 的轮次命中 **1014/1051 = 96.5%**，整体 step0 1086/1366 = 79.5%——是经济权衡不是 bug，
+  不改 artifact 无法突破 0.79，2× 需要 artifact 层更强/多层 MTP head。「MTP 落后 base / 负收益」
+  的旧结论已失效——起点是 30.33 tok/s（fold commit 接线前），本轮 30 → 约 113 提升约 **3.6×**。
+  注意变量名必须完整写成 `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8`；漏掉 `NEXT` 会静默退回默认 0，
+  使跨时段 A/B 口径失效。120 / 99% 属随机采样口径，greedy 下不可达（见「口径澄清」）。详见
+  「当前进度 → Flash-Next 分支实测」与「速度」节。
 
 ---
 
@@ -138,25 +144,36 @@ Flash-Next 即 **Qwen3.8-Flash-Next**（Qwen4Exp 系列，亦写作 `qwen3.8-fla
 262144 上下文。artifact 为
 `/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer`（v3 容器，108 GB，分 4 个 part）。
 
-**实测条件**：2×V100-SXM2-32GB、TP2、`sm_70`、128-token、2 reps、cache 15000 MiB + 专家画像
-（expert profile）、0 miss、greedy。最终配置为 Q4 proposal/head 默认 + draft=3 +
-`NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8` + 专家画像 0 miss。
+**实测条件**：2×V100-SXM2-32GB、TP2、`sm_70`、CUDA 12.8、greedy、eager 单请求，128-token、
+2 reps、cache 15000 MiB + 专家画像（expert profile）、0 miss、window=3。最终配置为 Q4 proposal/head
+默认 + draft=3 + `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8` + 专家画像 0 miss（变量名必须完整；漏掉 `NEXT`
+会静默退回默认 0，见下文环境变量事故）。
 
 | 配置 | 吞吐（tok/s） | acceptance | 状态 |
 |---|---:|---:|---|
-| base no-spec | **70.54** | — | 参照基线 |
+| base no-spec | **70.73–70.82** | — | 多次实测参照基线（早期单点 70.54） |
 | 起点（fold commit 接线前） | 30.33 | — | 本轮起点；MTP 尚未接线 |
-| MTP 最终配置（Q4 + draft=3 + min_p=0.8 + profile） | **110.3–110.5** | 0.860–0.861 | 3 次实测 110.39 / 110.53 / 110.28；**1.56× base** |
+| MTP 最终配置（Q4 + draft=3 + min_p=0.8 + profile） | **111–113** | 0.858–0.862 | 多次实测；**1.60× base** |
+| 同配置早期实测（正常波动） | 110.3–110.5 | 0.860–0.861 | 保留历史，不写死单点 |
 | MTP draft=1 + profile（旧最佳，已被最终配置取代） | 51.78 | 0.881 | 历史记录：当时落后 base 约 27%，已失效 |
-| MTP draft=3 + profile（min_p=0） | 42.9 | 0.772 | 历史记录：加 min_p=0.8 与 Q4 后提升 |
+| MTP draft=3 + profile（min_p=0/变量名漏 `NEXT`） | 42.9 | 0.772 | 历史记录：加 min_p=0.8 与 Q4 后提升；漏字写法会使生效值静默变为 0 |
 | MTP batch verify（`decode_span` 实验，已回退） | 27.0 | 0.56 | 数值不等价，已回退 |
 
-**结论（诚实记录）**：最终配置 **110.3–110.5 tok/s**（3 次实测）、acceptance **0.860–0.861**，相对
-base 70.54 为 **1.56×**；「MTP 落后 base 约 27%」的旧结论已失效——起点 30.33 tok/s（fold commit
-接线前）到本轮 110，提升约 **3.6×**。**120 tok/s 目标仍未达成**（1.56×，非 2×），不得解读为已
-达成 2×。无 profile 时 MTP 仅 **13.6–14 tok/s**（cache hit 0.85、约 1.5 万次 miss）；专家画像
-（从 Strata 同模型 `expert-profile.bin` 转换到 `tools/bench/expert-profile-flash-next.txt`）把 hit
-提到 1.0、0 miss，是早期关键一步。
+**结论（诚实记录）**：最终配置多次实测 **111–113 tok/s**、acceptance **0.858–0.862**，相对
+base **70.73–70.82** 约 **1.60×**；早期同配置 110.3–110.5 tok/s / 0.860–0.861 属正常波动，不是
+另一个配置，「MTP 落后 base 约 27%」的旧结论已失效——起点 30.33 tok/s（fold commit 接线前）到
+本轮约 113，提升约 **3.6×**。**120 tok/s 目标仍未达成**（2× base = 141，约 1.60×，非 2×），不得
+解读为已达成 2×。acceptance 确凿根因（`debug-step0-acceptance.md`，L4）：`accepted_per_position`
+是条件计数，表面「0.79→0.93→0.97 递增」是 min_p 早停的选择偏差，真实 step1 条件率 0.876；
+min_p=0.8 下低置信度 draft 本身是错的——只发 1 个 draft（置信 <0.8）的轮次命中 **41/213 =
+19.2%**，发 3 个 draft 的轮次命中 **1014/1051 = 96.5%**，整体 step0 1086/1366 = 79.5%；这是
+经济权衡不是 bug。Q4 量化不是原因：96 步 Q4 vs FP16 argmax 一致率 **89/96 = 92.7%**，端到端
+accepted_tokens Q4 3071 vs FP16 3072。已证伪的其他原因：draft QSA 漂移（正确口径 Δacc 0.0012）、
+T=6 verify 数值回退（bit-exact）、head 量化（NVFP4/Q4 无增益、FP16 净负吞吐）。结论：不改 artifact
+无法突破 0.79，2× 需要 artifact 层更强/多层 MTP head（artifact 契约变更）。无 profile 时 MTP 仅
+**13.6–14 tok/s**（cache hit 0.85、约 1.5 万次 miss）；专家画像（从 Strata 同模型
+`expert-profile.bin` 转换到 `tools/bench/expert-profile-flash-next.txt`）把 hit 提到 1.0、0 miss，
+是早期关键一步。
 
 **本轮实现（commit `b0b79c4b`）**：GDN replay fold commit 转为生产路径（Tasks 1–10，bit-exact
 验证通过，取代此前「11.36 tok/s 已回退」的记录）；verify 多列权重复用 kernel
@@ -173,39 +190,52 @@ gdn_replay_storage 通过，draft / chain / confidence / greedy_equivalence 因�
 由 `{220,27967,813}` 改为 `{220,27967,53}`（Q4 语义），greedy 等价（MTP on/off）逐 token 一致；
 FP16 对照开关 `NINFER_DIAG_FP16_DRAFT_HEAD=1` 保留，恢复 `{220,27967,813}`。
 
-**未达成 / 负结果（标注现状）**：
-- **CUDA Graph 对 MTP 无效**（51.85 vs 51.78；整轮图 A/B −4.4%）：根因已定位并保留结论——sm_70 上
-  `cudaGraphLaunch` 的 O(N) 逐节点 CPU 提交成本（3,054 节点 → ~0.6 ms/round）超过它省下的、已被
-  设备执行掩盖的 host 间隙；Strata 同为 V100 却能用 graph，靠的是 kernel 内 t 维权复用（eager 侧
-  属性），该收益我们的多列 kernel 已在 eager 侧领取。负收益原因已查明，非 kernel 更慢。
+**未达成 / 负结果（标注现状；已证伪项保留但不作为下一步杠杆）**：
+- **acceptance 已证伪的原因（不重复尝试）**：draft head QSA 跨轮漂移（正确口径重做 ON/OFF
+  Δacc 0.0012）、T=6 verify 数值回退（bit-exact）、head 量化（NVFP4/Q4 无增益、FP16 净负吞吐）。
+  draft expert 7-kernel 合并（`debug-b1-rootcause.md`）与跨轮 gating（`debug-b3-signal.md`）也已实测
+  排除，不再是增量杠杆。
+- **B5 悬崖已修复（commit `5286f982`）**：`kMoeMaxSmallT` 4→8，window≥5 的 MoE 10× 回退已消除，
+  window=5 从 20.9 → 106.3 tok/s；但 acceptance 降到 0.79，仍低于 window=3，故 window=3 不变。
+- **环境变量拼写事故（`debug-acceptance-drift.md`）**：一次实验误用 `NINFER_FLASH_DRAFT_MIN_P`
+  （漏 `NEXT`）使生效 min_p=0，多个跨时段 A/B 口径失效；gate JSON 不记录生效 min_p，所有 A/B
+  必须显式记录变量名 `NINFER_FLASH_NEXT_DRAFT_MIN_P` 与取值 0.8。
+- **根因审计（`analysis-rootcause-audit.md` UPDATE）**：27 个已排除项中 L4=6、仍 21 项 <L4；
+  「已排除」≠「找到根因」，已对最高风险项回填。
+- **CUDA Graph 对 MTP 无效**（51.85 vs 51.78；整轮图 A/B −4.4%）：根因已定位并保留结论——sm_70
+  pre-Ampere 上 `cudaGraphLaunch` 的 O(N) 逐节点 CPU 提交成本（3,054 节点 → ~0.6 ms/round）超过
+  它省下的、已被设备执行掩盖的 host 间隙；Strata 同为 V100 却能用 graph，靠的是 kernel 内 t 权
+  复用（eager 侧属性），该收益我们的多列 kernel 已在 eager 侧领取。负收益原因已查明，非 kernel 更慢。
 - **GDN replay fold 链路**：此前 11.36 tok/s < 14 的回退记录已过时——fold commit 现已是生产路径
   （Tasks 1–10），bit-exact 验证通过。
 - **batch verify `decode_span`**：数值不等价（acceptance 0.56），已回退；greedy 下严格 argmax
   判定要求 bit-exact，这项仍成立。
 - 层分 / 并行架构未改（主模型保持 TP2）。
 
-**下一步**：120 tok/s（2× base，141）仍未达成，剩余差距来自 HBM 地板 + 单 head 顺序 draft；
-draft expert 7-kernel 合并、跨轮 gating 等为增量杠杆，要到 2× 需结构上更便宜的 draft head 或
-多 head/并行 draft artifact。greedy 语义下概率 rejection sampling 不可替代 bit-exact（数学上
-退化为严格比较）；口径澄清保持不变：120 / 99% 来自随机采样，greedy 下不可达。
+**下一步**：120 tok/s（2× base = 141）仍未达成；不改 artifact 无法突破 step0 0.79，2× 需要
+artifact 层更强/多层 MTP head（artifact 契约变更），不是靠已排除的工程杠杆。greedy 语义下概率
+rejection sampling 不可替代 bit-exact（数学上退化为严格比较）；口径澄清保持不变：120 / 99%
+来自随机采样，greedy 下不可达。
 
 **三方 MTP 对比（谨慎口径）**：下表只收录有明确来源的数字。各行硬件同为 2×V100-SXM2-32GB，
 但并行方式与 verify 实现不同，跨行只能作方向性对照，不能当作严格同配置 A/B。
 
 | 引擎 / target | 并行 | no-spec（tok/s） | MTP（tok/s） | 来源 |
 |---|---|---:|---|---|
-| ninfer Flash-Next（本分支，开发中） | TP2 | 70.54 | **110.4**（draft=3 + Q4 + min_p=0.8，acc 0.860） | 本分支实测，cache 15000 MiB + expert profile，0 miss，128 token / 2 reps |
+| ninfer Flash-Next（本分支，开发中） | TP2 | 70.73–70.82 | **111–113**（draft=3 + Q4 + `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8`，acc 0.858–0.862，约 1.60×） | 本分支多次实测，cache 15000 MiB + expert profile，0 miss，window=3，greedy，128 token / 2 reps |
 | ninfer 27B（main v0.2.5 发布） | TP2 | 51.0 | 104.7（draft=3，2.74 tok/round，58% accept） | README 速度表 / `docs/vs-1cat-2026-10-16.md:67` |
 | 1cat-vllm | TP2 | 49.6 | 无权威数据 | `docs/vs-1cat-2026-10-16.md:40,67`（仅 no-spec）。本地 `speed_1cat_nvfp4_mtp.json` 文件名带 `mtp` 但无 spec 字段，不足以作为 1cat MTP 数字 |
 | Strata（层分 PP） | 层分 PP | 未单独给出 | ~110（`--spec 4 --mtp`，层分 PP） | Strata `NEXT_SESSION_HANDOFF.md:229-236` |
 
 **关键洞察**：同一 ninfer 引擎、同一硬件（2×V100 TP2）下，27B 的 MTP 是 **2× 正收益**
-（51.0 → 104.7），Flash-Next 也曾是**负收益**（70.54 → 51.78）；本轮接线与优化后，Flash-Next MTP
-达到 **1.56× 正收益**（70.54 → 110.4），已与 Strata（~110，层分 PP）同档。差异不在引擎、硬件或
-并行方式，而在 Flash-Next runtime（`qwen4_exp`）的 MTP/verify 路径——现已通过 GDN replay fold
-commit、verify 多列权重复用 kernel、draft TP2 角色拆分、Q4 proposal/head 与 min_p 提前终止补齐。
-1cat-vllm 用 TP2 + vLLM spec 框架，Strata 用层分 PP + 定制 verify kernel，二者 MTP 都 >100 tok/s，
-证明 batch verify 在此硬件可行。**120 tok/s 仍未达成**，但「MTP 落后 base」的旧结论已失效；120 与
+（51.0 → 104.7），Flash-Next 也曾是**负收益**（70.73–70.82 → 51.78，早期记录为 70.54）；本轮
+接线与优化后，Flash-Next MTP 达到约 **1.60× 正收益**（70.73–70.82 → 111–113），已与 Strata
+（~110，层分 PP）同档。差异不在引擎、硬件或并行方式，而在 Flash-Next runtime（`qwen4_exp`）的
+MTP/verify 路径——现已通过 GDN replay fold commit、verify 多列权重复用 kernel、draft TP2 角色
+拆分、Q4 proposal/head 与 min_p 提前终止补齐。1cat-vllm 用 TP2 + vLLM spec 框架，Strata 用层分
+PP + 定制 verify kernel，二者 MTP 都 >100 tok/s，证明 batch verify 在此硬件可行。**120 tok/s
+仍未达成**，但「MTP 落后 base」的旧结论已失效；acceptance 受单层 head 的 step0 能力上限约束
+（低置信度 draft 命中 19.2% vs 全 draft 96.5%），2× 需 artifact 层更强/多层 MTP head。120 与
 99% 均来自随机采样口径（详见下节「口径澄清」），greedy 下不可达。
 
 #### 口径澄清：greedy vs 随机采样（上游证据）
@@ -224,14 +254,14 @@ commit、verify 多列权重复用 kernel、draft TP2 角色拆分、Q4 proposal
   （用户裁决：draft 是提案、正确性由 verify 保证），`NINFER_DIAG_FP16_DRAFT_HEAD=1` 保留作对照。
 - **两种 acceptance 的定义不同**：本 bench 为 greedy（temperature 0）+ 严格 argmax 前缀比较
   （`speculative.cpp:40-46`），greedy acceptance = P(argmax_draft == argmax_target)；随机采样
-  acceptance = Σmin(p,q) = 1-TV(p,q)，q≈p 时 top-2 近邻翻转也可接受，因而接近 1。此前 draft=1
+   acceptance = Σmin(p,q) = 1-TV(p,q)，q≈p 时 top-2 近邻翻转也可接受，因而接近 1。此前 draft=1
   的 0.881 与上游 greedy Structured 91% 同口径、很接近；Q4 默认后最终配置 acceptance 为
-  **0.860**，仍在同一 greedy 口径区间（相对 FP16 对照的 0.870 略降约 0.01）。
+   **0.858–0.862**（早期单点 0.860），仍在同一 greedy 口径区间（相对 FP16 对照的约 0.87 略降）。
 - **结论**：120 tok/s 目标来自 27B greedy MTP3 的 104.7；上游 Flash-Next 单请求 greedy 最高
   66.8（单 Spark structured）/ 107.2（双 Spark structured），>100 的 saturation 数字属于随机采样。
-  greedy 契约下 99% acceptance 不可达；**120 tok/s 仍未达成**（本轮 1.56×，非 2×）。「MTP 不超
-  base / 落后 27%」的旧结论已被本轮实测推翻（70.54 → 110.4，1.56×），保留该历史数字仅为记录，
-  不得解读为 verify 路径存在确定性缺陷。
+  greedy 契约下 99% acceptance 不可达；**120 tok/s 仍未达成**（本轮约 1.60×，非 2×）。「MTP 不超
+  base / 落后 27%」的旧结论已被本轮实测推翻（70.73–70.82 → 111–113，约 1.60×），保留该历史
+  数字仅为记录，不得解读为 verify 路径存在确定性缺陷。
 
 ### 测试参数
 
@@ -305,23 +335,26 @@ MTP 为各点 **2.0–2.7×**，接受率 **52–66%**（2.5–3.0 tok/round）�
 
 #### Flash-Next 分支实测速度（开发中，非发布产品）
 
-条件：2×V100-SXM2-32GB、TP2、`sm_70`、128-token、2 reps、cache 15000 MiB + 专家画像（0 miss）、
-greedy；最终配置 = Q4 proposal/head 默认 + draft=3 + `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8`。
+条件：2×V100-SXM2-32GB、TP2、`sm_70`、CUDA 12.8、greedy、eager 单请求、window=3，128-token、
+2 reps、cache 15000 MiB + 专家画像（0 miss）；最终配置 = Q4 proposal/head 默认 + draft=3 +
+`NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8`（变量名必须完整，漏 `NEXT` 会静默退回默认 0）。
 artifact：`/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer`。
 
 | 配置 | 吞吐（tok/s） | acceptance | 状态 |
 |---|---:|---:|---|
-| base no-spec | **70.54** | — | 参照基线 |
+| base no-spec | **70.73–70.82** | — | 多次实测参照基线（早期单点 70.54） |
 | 起点（fold commit 接线前） | 30.33 | — | 本轮起点 |
-| MTP 最终配置（Q4 + draft=3 + min_p=0.8 + profile） | **110.3–110.5** | 0.860–0.861 | 3 次实测；**1.56× base** |
+| MTP 最终配置（Q4 + draft=3 + min_p=0.8 + profile） | **111–113** | 0.858–0.862 | 多次实测；**1.60× base** |
+| 同配置早期实测（正常波动） | 110.3–110.5 | 0.860–0.861 | 保留历史，不写死单点 |
 | MTP draft=1 + profile（旧最佳，已取代） | 51.78 | 0.881 | 历史记录：当时落后 base 约 27%，已失效 |
-| MTP draft=3 + profile（min_p=0） | 42.9 | 0.772 | 历史记录 |
+| MTP draft=3 + profile（min_p=0/变量名漏 `NEXT`） | 42.9 | 0.772 | 历史记录；漏字写法使生效值静默变为 0 |
 | MTP batch verify（`decode_span` 实验，已回退） | 27.0 | 0.56 | 数值不等价 |
 
-**MTP 现快过 base 56%（70.54 → 110.3–110.5），但 120 tok/s 目标仍未达成（1.56×，非 2×）**
-（与上表数字一致，不重复计入 main 发布口径）。起点 30.33 tok/s 到本轮 110，提升约 **3.6×**。
+**MTP 现快过 base 约 60%（70.73–70.82 → 111–113），但 120 tok/s 目标仍未达成（约 1.60×，非 2×）**
+（与上表数字一致，不重复计入 main 发布口径）。起点 30.33 tok/s 到本轮约 113，提升约 **3.6×**。
 背景、口径澄清与负结果现状（无 profile 时 13.6–14 tok/s、CUDA Graph 负收益根因、GDN replay fold
-已转正、下一步与社区对比）见「当前进度 → Flash-Next 分支实测」。
+已转正、B5 `kMoeMaxSmallT` 4→8 悬崖修复、环境变量拼写事故、acceptance 根因与下一步）见
+「当前进度 → Flash-Next 分支实测」。
 
 ### 质量（BFCL 多轮工具调用，已解决）
 
@@ -631,14 +664,22 @@ target, not a released product**.
   `qwen3.8-flash-next`): 48 layers (36 GDN + 12 QSA), 512 routed experts, NVFP4 weights + FP8 draft
   bank, TP2, INT8 KV, 262144 context.
 - **Current MTP result (recorded honestly)**: Flash-Next MTP now beats base—base no-spec
-  **70.54 tok/s**; the final config (Q4 proposal/head default + draft=3 +
-  `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8` + expert profile, 0 miss, TP2 / greedy / 128 token / 2 reps)
-  measures **110.3–110.5 tok/s** with acceptance **0.860–0.861**, i.e. **1.56× base**. The
-  **120 tok/s goal is still not met** (1.56×, not 2×); but the old "MTP behind base / net loss"
-  conclusion is invalid—the starting point was 30.33 tok/s (before fold-commit wiring), and this
-  round improves 30 → 110, about **3.6×**. 120 / 99% are random-sampling caliber and unreachable
-  under greedy (see "Caliber Clarification"). See "Current Status → Flash-Next Branch Measurements"
-  and the "Speed" section.
+  **70.73–70.82 tok/s**; the final config (Q4 proposal/head default + draft=3 +
+  `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8` + expert profile, 0 miss, TP2 / `sm_70` / CUDA 12.8 / greedy /
+  eager single request / window=3 / 128 token / 2 reps) measures **111–113 tok/s** with acceptance
+  **0.858–0.862**, i.e. **1.60× base**. The earlier 110.3–110.5 tok/s / 0.860–0.861 and base 70.54
+  tok/s are same-config early measurements within normal fluctuation, kept for the record rather than
+  as a single point. The **120 tok/s goal is still not met** (2× base = 141, about 1.60×, not 2×).
+  The acceptance root cause is that low-confidence drafts are themselves wrong under min_p=0.8:
+  rounds emitting only one draft hit **41/213 = 19.2%**, rounds emitting three drafts hit
+  **1014/1051 = 96.5%**, overall step0 1086/1366 = 79.5%—an economic tradeoff, not a bug; without an
+  artifact change 0.79 cannot be broken, and 2× needs a stronger / multi-layer MTP head at the
+  artifact layer. The old "MTP behind base / net loss" conclusion is invalid—the starting point was
+  30.33 tok/s (before fold-commit wiring), and this round improves 30 → ~113, about **3.6×**. The
+  variable must be spelled in full as `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8`; omitting `NEXT` silently
+  falls back to the default 0 and invalidates cross-time A/B comparisons. 120 / 99% are random-sampling
+  caliber and unreachable under greedy (see "Caliber Clarification"). See "Current Status → Flash-Next
+  Branch Measurements" and the "Speed" section.
 
 ---
 
@@ -763,27 +804,41 @@ release data above. Flash-Next is **Qwen3.8-Flash-Next** (Qwen4Exp series, also 
 bank, TP2, INT8 KV, 262144 context. Artifact:
 `/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer` (v3 container, 108 GB in 4 parts).
 
-**Conditions**: 2×V100-SXM2-32GB, TP2, `sm_70`, 128-token, 2 reps, cache 15000 MiB + expert profile,
-0 miss, greedy. Final config = Q4 proposal/head default + draft=3 +
-`NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8` + expert profile, 0 miss.
+**Conditions**: 2×V100-SXM2-32GB, TP2, `sm_70`, CUDA 12.8, greedy, eager single request, window=3,
+128-token, 2 reps, cache 15000 MiB + expert profile, 0 miss. Final config = Q4 proposal/head default
++ draft=3 + `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8` + expert profile, 0 miss (the variable name must be
+complete; omitting `NEXT` silently falls back to the default 0, see the environment-variable incident
+below).
 
 | Configuration | Throughput (tok/s) | acceptance | Status |
 |---|---:|---:|---|
-| base no-spec | **70.54** | — | reference baseline |
+| base no-spec | **70.73–70.82** | — | multi-run reference baseline (early single point 70.54) |
 | Starting point (before fold-commit wiring) | 30.33 | — | effort start; MTP not wired |
-| MTP final config (Q4 + draft=3 + min_p=0.8 + profile) | **110.3–110.5** | 0.860–0.861 | 3 runs: 110.39 / 110.53 / 110.28; **1.56× base** |
+| MTP final config (Q4 + draft=3 + min_p=0.8 + profile) | **111–113** | 0.858–0.862 | multi-run; **1.60× base** |
+| Same config, early measurements (normal fluctuation) | 110.3–110.5 | 0.860–0.861 | retained, not a single point |
 | MTP draft=1 + profile (old best, superseded) | 51.78 | 0.881 | historical: was 27% behind base, now invalid |
-| MTP draft=3 + profile (min_p=0) | 42.9 | 0.772 | historical: improved by min_p=0.8 + Q4 |
+| MTP draft=3 + profile (min_p=0 / variable name missing `NEXT`) | 42.9 | 0.772 | historical: improved by min_p=0.8 + Q4; the misspelling silently sets the effective value to 0 |
 | MTP batch verify (`decode_span` experiment, rolled back) | 27.0 | 0.56 | numerically inequivalent, rolled back |
 
-**Conclusion (recorded honestly)**: the final config measures **110.3–110.5 tok/s** (3 runs) with
-acceptance **0.860–0.861**, i.e. **1.56×** base 70.54; the old "MTP about 27% behind base" conclusion
-is invalid—the starting point was 30.33 tok/s (before fold-commit wiring), and this round improves
-30 → 110, about **3.6×**. **The 120 tok/s goal is still not met** (1.56×, not 2×), and must not be
-read as having reached 2×. Without a profile, MTP reaches only **13.6–14 tok/s** (cache hit 0.85,
-about 15,000 misses); the expert profile (converted from Strata's `expert-profile.bin` for the same
-model to `tools/bench/expert-profile-flash-next.txt`) raises the hit rate to 1.0 / 0 miss, an early
-key step.
+**Conclusion (recorded honestly)**: the final config measures **111–113 tok/s** with acceptance
+**0.858–0.862**, i.e. about **1.60×** base **70.73–70.82**; earlier same-config 110.3–110.5 tok/s /
+0.860–0.861 are normal fluctuation, not a different configuration, and the old "MTP about 27% behind
+base" conclusion is invalid—the starting point was 30.33 tok/s (before fold-commit wiring), and this
+round improves 30 → ~113, about **3.6×**. **The 120 tok/s goal is still not met** (2× base = 141,
+about 1.60×, not 2×), and must not be read as having reached 2×. The acceptance root cause
+(`debug-step0-acceptance.md`, L4): `accepted_per_position` is a conditional count; the apparent
+"0.79→0.93→0.97 rise" is min_p early-stop selection bias, and the true step1 conditional rate is
+0.876. Under min_p=0.8 low-confidence drafts are themselves wrong—rounds emitting only one draft hit
+**41/213 = 19.2%**, rounds emitting three drafts hit **1014/1051 = 96.5%**, overall step0 1086/1366 =
+79.5%; this is an economic tradeoff, not a bug. Q4 quantization is not the cause: 96-step Q4 vs FP16
+argmax agreement **89/96 = 92.7%**, end-to-end accepted_tokens Q4 3071 vs FP16 3072. Disproven
+acceptance causes: draft QSA drift (correct-caliber Δacc 0.0012), T=6 verify numerical regression
+(bit-exact), head quantization (NVFP4/Q4 no gain, FP16 net-negative throughput). Conclusion: 0.79
+cannot be broken without an artifact change; 2× needs a stronger / multi-layer MTP head at the
+artifact layer (artifact contract change). Without a profile, MTP reaches only **13.6–14 tok/s**
+(cache hit 0.85, about 15,000 misses); the expert profile (converted from Strata's `expert-profile.bin`
+for the same model to `tools/bench/expert-profile-flash-next.txt`) raises the hit rate to 1.0 / 0 miss,
+an early key step.
 
 **This round's implementation (commit `b0b79c4b`)**: GDN replay fold commit moved to the production
 path (Tasks 1–10, bit-exact verified, superseding the old "11.36 tok/s rolled back" record); verify
@@ -802,11 +857,25 @@ is guaranteed by verify; the chain oracle changes from `{220,27967,813}` to `{22
 semantics), greedy equivalence (MTP on/off) is token-by-token identical; the FP16 control switch
 `NINFER_DIAG_FP16_DRAFT_HEAD=1` is retained and restores `{220,27967,813}`.
 
-**Unmet / negative results (status annotated)**:
+**Unmet / negative results (status annotated; disproven items retained but no longer levers)**:
+- **Disproven acceptance causes (do not retry)**: draft-head QSA cross-round drift (correct-caliber
+  rerun ON/OFF Δacc 0.0012), T=6 verify numerical regression (bit-exact), head quantization
+  (NVFP4/Q4 no gain, FP16 net-negative throughput). Draft expert 7-kernel merging
+  (`debug-b1-rootcause.md`) and cross-round gating (`debug-b3-signal.md`) are also measured and
+  excluded, and are no longer incremental levers.
+- **B5 cliff fixed (commit `5286f982`)**: `kMoeMaxSmallT` 4→8 removed the window≥5 MoE 10× fallback;
+  window=5 goes from 20.9 → 106.3 tok/s, but acceptance drops to 0.79, still below window=3, so
+  window=3 stays.
+- **Environment-variable spelling incident (`debug-acceptance-drift.md`)**: one experiment used
+  `NINFER_FLASH_DRAFT_MIN_P` (missing `NEXT`), silently setting the effective min_p to 0 and
+  invalidating several cross-time A/B comparisons; gate JSON does not record the effective min_p, so
+  every A/B must explicitly record the variable name `NINFER_FLASH_NEXT_DRAFT_MIN_P` and its value 0.8.
+- **Root-cause audit (`analysis-rootcause-audit.md` UPDATE)**: of 27 excluded items, L4 = 6 and 21
+  remain <L4; "excluded" ≠ "root cause found", and the highest-risk items have been backfilled.
 - **CUDA Graph gives no benefit for MTP** (51.85 vs 51.78; whole-round graph A/B −4.4%): root cause
-  located and conclusion retained—on sm_70 `cudaGraphLaunch`'s O(N) per-node CPU submission cost
-  (3,054 nodes → ~0.6 ms/round) exceeds the host gaps it removes, which are already hidden by device
-  execution; Strata uses graph on the same V100 by relying on kernel-internal t-weight reuse (an
+  located and conclusion retained—on sm_70 pre-Ampere `cudaGraphLaunch`'s O(N) per-node CPU submission
+  cost (3,054 nodes → ~0.6 ms/round) exceeds the host gaps it removes, which are already hidden by
+  device execution; Strata uses graph on the same V100 by relying on kernel-internal t-weight reuse (an
   eager-side property), a benefit our multi-column kernels already capture in eager mode. The
   negative result is explained, not caused by slower kernels.
 - **GDN replay fold path**: the old 11.36 tok/s < 14 rollback record is outdated—fold commit is now
@@ -815,12 +884,11 @@ semantics), greedy equivalence (MTP on/off) is token-by-token identical; the FP1
   argmax under greedy still requires bit-exact comparison.
 - Layer-split / parallel architecture is unchanged (the main model stays at TP2).
 
-**Next steps**: 120 tok/s (2× base, 141) is still not met; the remaining gap comes from the HBM floor
-and a single-head sequential draft. Draft expert 7-kernel merging and cross-round gating are
-incremental levers; reaching 2× needs a structurally cheaper draft head or a multi-head/parallel draft
-artifact. Probabilistic rejection sampling cannot replace bit-exact comparison under greedy
-(mathematically it degenerates to strict comparison); the caliber clarification stands: 120 / 99%
-come from random sampling and are unreachable under greedy.
+**Next steps**: 120 tok/s (2× base = 141) is still not met; without an artifact change step0 0.79
+cannot be broken, and 2× needs a stronger / multi-layer MTP head at the artifact layer (artifact
+contract change), not the already-excluded engineering levers. Probabilistic rejection sampling cannot
+replace bit-exact comparison under greedy (mathematically it degenerates to strict comparison); the
+caliber clarification stands: 120 / 99% come from random sampling and are unreachable under greedy.
 
 **Three-way MTP comparison (strict sourcing)**: the table includes only figures with an explicit
 source. All rows use the same 2×V100-SXM2-32GB hardware, but parallelism and verify implementations
@@ -828,22 +896,24 @@ differ, so cross-row numbers are directional rather than a strict same-configura
 
 | Engine / target | Parallelism | no-spec (tok/s) | MTP (tok/s) | Source |
 |---|---|---:|---|---|
-| ninfer Flash-Next (this branch, in development) | TP2 | 70.54 | **110.4** (draft=3 + Q4 + min_p=0.8, acc 0.860) | this branch: cache 15000 MiB + expert profile, 0 miss, 128 token / 2 reps |
+| ninfer Flash-Next (this branch, in development) | TP2 | 70.73–70.82 | **111–113** (draft=3 + Q4 + `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8`, acc 0.858–0.862, about 1.60×) | this branch, multi-run: cache 15000 MiB + expert profile, 0 miss, window=3, greedy, 128 token / 2 reps |
 | ninfer 27B (main v0.2.5 release) | TP2 | 51.0 | 104.7 (draft=3, 2.74 tok/round, 58% accept) | README speed table / `docs/vs-1cat-2026-10-16.md:67` |
 | 1cat-vllm | TP2 | 49.6 | no authoritative data | `docs/vs-1cat-2026-10-16.md:40,67` (no-spec only). Local `speed_1cat_nvfp4_mtp.json` has `mtp` in its name but no spec field, so it cannot back a 1cat MTP figure |
 | Strata (layer-split PP) | layer-split PP | not given separately | ~110 (`--spec 4 --mtp`, layer-split PP) | Strata `NEXT_SESSION_HANDOFF.md:229-236` |
 
 **Key insight**: with the same ninfer engine and the same hardware (2×V100 TP2), 27B MTP is a **2×
-win** (51.0 -> 104.7), and Flash-Next was once a **net loss** (70.54 -> 51.78); after this round's
-wiring and optimization, Flash-Next MTP reaches a **1.56× win** (70.54 -> 110.4), on par with Strata
-(~110, layer-split PP). The difference is not the engine, hardware, or parallelism — it is
-Flash-Next's runtime (`qwen4_exp`) MTP/verify path, now completed via GDN replay fold commit, verify
-multi-column weight-reuse kernels, draft TP2 role split, Q4 proposal/head, and min_p early stop.
-1cat-vllm uses TP2 + the vLLM spec framework and Strata uses layer-split PP + a custom verify kernel;
-both exceed 100 tok/s with MTP, showing batch verify is feasible on this hardware. **120 tok/s is
-still not met**, but the "MTP behind base" conclusion is invalid; both 120 and 99% come from the
-random-sampling caliber (see the "Caliber Clarification" subsection below) and are unreachable under
-greedy.
+win** (51.0 -> 104.7), and Flash-Next was once a **net loss** (70.73–70.82 -> 51.78, early record
+70.54); after this round's wiring and optimization, Flash-Next MTP reaches about a **1.60× win**
+(70.73–70.82 -> 111–113), on par with Strata (~110, layer-split PP). The difference is not the
+engine, hardware, or parallelism — it is Flash-Next's runtime (`qwen4_exp`) MTP/verify path, now
+completed via GDN replay fold commit, verify multi-column weight-reuse kernels, draft TP2 role split,
+Q4 proposal/head, and min_p early stop. 1cat-vllm uses TP2 + the vLLM spec framework and Strata uses
+layer-split PP + a custom verify kernel; both exceed 100 tok/s with MTP, showing batch verify is
+feasible on this hardware. **120 tok/s is still not met**, but the "MTP behind base" conclusion is
+invalid; acceptance is bounded by the single-layer head's step0 capability (low-confidence drafts hit
+19.2% vs full drafts 96.5%), and 2× needs a stronger / multi-layer MTP head at the artifact layer.
+Both 120 and 99% come from the random-sampling caliber (see the "Caliber Clarification" subsection
+below) and are unreachable under greedy.
 
 #### Caliber Clarification: Greedy vs Random Sampling (Upstream Evidence)
 
@@ -866,15 +936,15 @@ greedy contract.
   P(argmax_draft == argmax_target); random-sampling acceptance is Σmin(p,q) = 1-TV(p,q), where a
   top-2 neighbor flip is still accepted when q≈p, so the value approaches 1. The earlier draft=1
   0.881 was the same caliber as upstream's greedy Structured 91% and very close to it; with Q4 as
-  default the final config's acceptance is **0.860**, still in the same greedy caliber (about 0.01
-  below the 0.870 FP16 control).
+  default the final config's acceptance is **0.858–0.862** (early single point 0.860), still in the
+  same greedy caliber (slightly below the ~0.87 FP16 control).
 - **Conclusion**: the 120 tok/s goal came from the 27B greedy MTP3 figure of 104.7; upstream
   Flash-Next single-request greedy tops out at 66.8 (single Spark structured) / 107.2 (dual Spark
   structured), while the >100 saturation figures use random sampling. Under the greedy contract 99%
-  acceptance is unreachable; **120 tok/s is still not met** (1.56× this round, not 2×). The old
+  acceptance is unreachable; **120 tok/s is still not met** (about 1.60× this round, not 2×). The old
   "MTP not beating base / 27% behind" conclusion has been overturned by this round's measurements
-  (70.54 -> 110.4, 1.56×); the historical figures are retained for the record only and must not be
-  read as a deterministic defect in the verify path.
+  (70.73–70.82 -> 111–113, about 1.60×); the historical figures are retained for the record only and
+  must not be read as a deterministic defect in the verify path.
 
 ### Test Parameters
 
@@ -950,26 +1020,29 @@ increases by about 0.15s (draft initialization). Measured with the f16embed arti
 
 #### Flash-Next Branch Measurements Speed (in development, not a released product)
 
-Conditions: 2×V100-SXM2-32GB, TP2, `sm_70`, 128-token, 2 reps, cache 15000 MiB + expert profile
-(0 miss), greedy; final config = Q4 proposal/head default + draft=3 +
-`NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8`. Artifact:
+Conditions: 2×V100-SXM2-32GB, TP2, `sm_70`, CUDA 12.8, greedy, eager single request, window=3,
+128-token, 2 reps, cache 15000 MiB + expert profile (0 miss); final config = Q4 proposal/head default
++ draft=3 + `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8` (the variable name must be complete; omitting `NEXT`
+silently falls back to the default 0). Artifact:
 `/home/cmj/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer`.
 
 | Configuration | Throughput (tok/s) | acceptance | Status |
 |---|---:|---:|---|
-| base no-spec | **70.54** | — | reference baseline |
+| base no-spec | **70.73–70.82** | — | multi-run reference baseline (early single point 70.54) |
 | Starting point (before fold-commit wiring) | 30.33 | — | effort start |
-| MTP final config (Q4 + draft=3 + min_p=0.8 + profile) | **110.3–110.5** | 0.860–0.861 | 3 runs; **1.56× base** |
+| MTP final config (Q4 + draft=3 + min_p=0.8 + profile) | **111–113** | 0.858–0.862 | multi-run; **1.60× base** |
+| Same config, early measurements (normal fluctuation) | 110.3–110.5 | 0.860–0.861 | retained, not a single point |
 | MTP draft=1 + profile (old best, superseded) | 51.78 | 0.881 | historical: was 27% behind base, now invalid |
-| MTP draft=3 + profile (min_p=0) | 42.9 | 0.772 | historical |
+| MTP draft=3 + profile (min_p=0 / variable name missing `NEXT`) | 42.9 | 0.772 | historical; the misspelling silently sets the effective value to 0 |
 | MTP batch verify (`decode_span` experiment, rolled back) | 27.0 | 0.56 | numerically inequivalent |
 
-**MTP now beats base by 56% (70.54 → 110.3–110.5), but the 120 tok/s goal is still not met
-(1.56×, not 2×)** (same numbers as the CN table above, not counted in the main release figures).
-The starting point was 30.33 tok/s and this round reaches 110, about **3.6×**. For background, the
+**MTP now beats base by about 60% (70.73–70.82 → 111–113), but the 120 tok/s goal is still not met
+(about 1.60×, not 2×)** (same numbers as the CN table above, not counted in the main release figures).
+The starting point was 30.33 tok/s and this round reaches ~113, about **3.6×**. For background, the
 caliber clarification, and the status of negative results (13.6–14 tok/s without a profile, CUDA
-Graph negative-result root cause, GDN replay fold now in production, next steps and community
-comparison), see "Current Status → Flash-Next Branch Measurements".
+Graph negative-result root cause, GDN replay fold now in production, B5 `kMoeMaxSmallT` 4→8 cliff fix,
+environment-variable spelling incident, acceptance root cause and next steps), see "Current Status →
+Flash-Next Branch Measurements".
 
 ### Quality (BFCL multi-turn tool calling, resolved)
 

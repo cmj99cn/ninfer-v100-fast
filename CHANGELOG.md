@@ -18,8 +18,36 @@ runtime.
 ## [Unreleased] - feat/qwen3-8-flash-next（开发中）
 
 分支开发条目，基于 v0.2.5；未 bump 版本号、不是 release。Flash-Next 是开发中 target。
-MTP 现已快过 base **1.56×**（70.54 → 110.3–110.5 tok/s）；120 tok/s 目标仍未达成（非 2×），
-起点 30.33 tok/s（fold commit 接线前）到本轮 110，约 3.6×。
+MTP 现已快过 base 约 **1.60×**（70.73–70.82 → 111–113 tok/s）；120 tok/s 目标仍未达成
+（非 2×），起点 30.33 tok/s（fold commit 接线前）到本轮约 113，约 3.6×。
+
+### 2026-11-26 后续：B5 悬崖修复、MTP acceptance 根因确证与流程更正
+
+新增条目：`fix(moe_nvfp4): extend small-T split kernel to T<=8`（commit `5286f982`）及配套文档更正。
+
+- **B5 MoE T≤8 悬崖修复**：`kMoeMaxSmallT` 4→8，消除 window≥5 时 `T=draft_window+1=6/8`
+  越过阈值导致的 MoE 单 CTA 10× 回退；window=5 从 20.9 → 106.3 tok/s，但 acceptance 降到
+  0.79、仍低于 window=3，故生产 window=3 不变。T=6/8 raw-bit / FP64 oracle 验证通过。
+- **MTP acceptance 根因确证**（`debug-step0-acceptance.md`，L4）：`accepted_per_position` 是条件
+  计数，表面「0.79→0.93→0.97 递增」是 min_p 早停的选择偏差，真实 step1 条件率 0.876；
+  min_p=0.8 下低置信度 draft 本身就错——只发 1 个 draft（置信 <0.8）的轮次命中 **41/213 =
+  19.2%**，发 3 个 draft 的轮次命中 **1014/1051 = 96.5%**，整体 step0 1086/1366 = 79.5%，
+  是经济权衡不是 bug。Q4 量化不是原因：96 步 Q4 vs FP16 argmax 一致率 **89/96 = 92.7%**，
+  端到端 accepted_tokens Q4 3071 vs FP16 3072。已证伪的其他原因：draft QSA 漂移（正确口径
+  Δacc 0.0012）、T=6 verify 数值回退（bit-exact）、head 量化（NVFP4/Q4 无增益、FP16 净负吞吐）；
+  draft expert 7-kernel 合并与跨轮 gating 也已实测排除。结论：不改 artifact 无法突破 0.79，
+  2× 需 artifact 层更强/多层 MTP head（artifact 契约变更）。
+- **根因审计与文档更正**：`analysis-rootcause-audit.md` UPDATE 对 27 个已排除项重分级，L4=6、
+  仍 21 项 <L4；明确「排除≠找到根因」并对最高风险项回填。README / `NEXT_SESSION_HANDOFF.md` /
+  本文件的性能口径统一为 base 70.73–70.82、MTP 111–113、acc 0.858–0.862、约 1.60×；
+  110.3–110.5 / 0.860–0.861 / base 70.54 标为同配置早期实测的正常波动，不写死单点。
+- **环境变量拼写事故的流程教训**（`debug-acceptance-drift.md`）：一次实验误用
+  `NINFER_FLASH_DRAFT_MIN_P`（漏 `NEXT`）使生效 min_p=0，多个跨时段 A/B 口径失效；gate JSON
+  不记录生效 min_p，所有 A/B 必须显式记录完整变量名 `NINFER_FLASH_NEXT_DRAFT_MIN_P` 与取值 0.8。
+- CUDA Graph 负收益根因补记（`analysis-graph-negative-rootcause.md`）：sm_70 pre-Ampere
+  `cudaGraphLaunch` 的 O(N) 逐节点提交（3,054 节点 ≈ 0.6 ms/round）超过可削的、已被设备执行
+  掩盖的 host 间隙；Strata 同为 V100 能用 graph 靠 kernel 内 t 权复用（eager 侧属性），
+  该收益我们已在 eager 侧领取。
 
 ### 本轮 MTP 接线与优化（2026-11-25，commit `b0b79c4b`）
 
@@ -49,27 +77,33 @@ MTP 现已快过 base **1.56×**（70.54 → 110.3–110.5 tok/s）；120 tok/s 
 
 ### Performance
 
-评测条件：2×V100 TP2，cache 15000 + expert profile 0 miss，128-token、2 reps、greedy；
-最终配置 = Q4 proposal/head 默认 + draft=3 + `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8`。
+评测条件：2×V100-SXM2-32GB / TP2 / `sm_70` / CUDA 12.8 / greedy / eager 单请求 / window=3，
+cache 15000 MiB + expert profile 0 miss，128-token、2 reps；最终配置 = Q4 proposal/head 默认 +
+draft=3 + `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8`（变量名必须完整，漏 `NEXT` 会静默退回默认 0）。
 
-- base 无 spec：70.54 tok/s；起点（fold commit 接线前）：30.33 tok/s。
-- **最终配置：110.3–110.5 tok/s**（3 次实测 110.39 / 110.53 / 110.28），acceptance
-  **0.860–0.861**，**1.56× base**，相对起点约 **3.6×**。
+- base 无 spec：70.73–70.82 tok/s（早期单点 70.54）；起点（fold commit 接线前）：30.33 tok/s。
+- **最终配置：111–113 tok/s**（多次实测），acceptance **0.858–0.862**，约 **1.60× base**，
+  相对起点约 **3.6×**。
+- 同配置早期实测（正常波动，保留不写死单点）：110.3–110.5 tok/s / 0.860–0.861。
 - 历史值（已被取代，保留记录）：draft=1 51.78 tok/s / 0.881（当时落后 base 约 27%）、
-  draft=3 42.9 tok/s / 0.772（min_p=0）、batch verify 27.0 tok/s / 0.56（已回退）、
-  无 profile 13.6–14 tok/s。
-- 120 tok/s 目标仍未达成（1.56×，非 2×）；「MTP 落后 base / 负收益」的旧结论已失效。
-- 口径澄清：120 / 99% 来自随机采样饱和口径，greedy 下不可达；上述 1.56× 为 greedy
+  draft=3 42.9 tok/s / 0.772（min_p=0/变量名漏 `NEXT`）、batch verify 27.0 tok/s / 0.56
+  （已回退）、无 profile 13.6–14 tok/s。
+- 120 tok/s 目标仍未达成（2× base = 141，约 1.60×，非 2×）；「MTP 落后 base / 负收益」的
+  旧结论已失效。acceptance 根因见上方 2026-11-26 条目：低置信度 draft 命中 19.2% vs 全
+  draft 96.5%，不改 artifact 无法突破 0.79。
+- 口径澄清：120 / 99% 来自随机采样饱和口径，greedy 下不可达；上述约 1.60× 为 greedy
   committed tok/s，不与随机采样 saturation 数字混用。
 
 ### Known limitations
 
-- Flash-Next 与 MTP 优化均为开发中，未作为新版本发布；120 tok/s 目标仍未达成。
+- Flash-Next 与 MTP 优化均为开发中，未作为新版本发布；120 tok/s 目标仍未达成，2× 需
+  artifact 层更强/多层 MTP head（artifact 契约变更），已排除的工程杠杆不再列为下一步。
 - 并行架构未改：主模型保持 TP2。1cat-vllm（TP2）与 Strata（层分 PP）的 MTP 均 >100 tok/s，
-  本分支现已达到 ~110 tok/s，与 Strata 同档。
-- CUDA Graph 负收益结论保留，根因已定位：sm_70 上 `cudaGraphLaunch` 的 O(N) 逐节点提交成本
-  （3,054 节点 → ~0.6 ms/round）超过可削的、已被设备执行掩盖的 host 间隙；Strata 同为 V100
-  能用 graph 靠 kernel 内 t 维权复用（eager 侧属性），该收益我们已在 eager 侧领取。
+  本分支现已达到 111–113 tok/s，与 Strata 同档。
+- CUDA Graph 负收益结论保留，根因已定位：sm_70 pre-Ampere 上 `cudaGraphLaunch` 的 O(N)
+  逐节点提交成本（3,054 节点 → ~0.6 ms/round）超过可削的、已被设备执行掩盖的 host 间隙；
+  Strata 同为 V100 能用 graph 靠 kernel 内 t 权复用（eager 侧属性），该收益我们已在 eager
+  侧领取。
 - 负结果历史保留：batch verify `decode_span` 数值不等价（PLE/GDN 状态漂移，已回退）；
   层分 / 去 allreduce、staged routed GEMV、FP8 MTP 等已回退。GDN replay fold 此前
   11.36 tok/s 的回退记录已过时——fold commit 现已是生产路径，bit-exact 验证通过。
