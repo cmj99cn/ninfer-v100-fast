@@ -131,3 +131,15 @@ T=6 verify per-op（两卡合计 ms/round，括号为 T6/T1 缩放）：
   （2026-11-26 复核）、gdn_out RowsPerCta（allreduce 主导；其低 GB/s 是 `row_parallel_linear`
   的 K 切 + TP2 allreduce，不是 GEMM）、moe_reduce（关全部 allreduce 仅 +3.5%）、CUDA Graph
   （sm_70 O(N) 节点）、双 stream（A4/A5/A6）、launch-merge（兑现率低）。
+
+## 质量验证（2026-11-27）
+
+用户要求"像 27B 一样跑同一套 BFCL 质量测试集"。结论：**无法在 Flash-Next 上运行该套测试**，根因是能力边界而非本轮改动：
+- 27B 的 BFCL-v3 `multi_turn_base` 走 `ninfer-serve` 的 `/v1/chat/completions` + `tools`，依赖 family 的 chat-template frontend（`src/targets/qwen3_6/impl/frontend/processor.h` 的 `Processor`/`CompiledChatTemplate`）。
+- Flash-Next（qwen4_exp）的 `Frontend::prepare()` 故意抛 `logic_error`（`src/targets/qwen4_exp/impl/frontend/frontend.cpp:64`），只实现 `prepare_tokens()`（裸 token id）。实测起服务后任何 chat 请求都返回该错误。
+- README 将 Flash-Next 标为"开发中，非发布产品"，serving/chat 不在其能力范围；不应为此临时拼 chat template（超出契约且无可比基线）。
+
+可执行的等价质量证据（已完成）：
+- DFlash2-5 与 plain greedy 在 512/128 上逐 token 相同（lossless），且改动前后相同。
+- `ninfer_flash_next_text_nll` capital5（5 token）：改动前 HEAD `5ac8666c` 与本轮 HEAD `7cc80a2f` 均为 `greedy_first=11751`、`greedy_next=11751`、`top1_matches=2`、`mean_nll=3.73905609471`（各 2–3 次稳定复现）。**本轮优化质量零变化**；该 NLL 值与更早记录的 3.7311 的差来自更早的 prefill/config 路径，非本轮。
+- 所有 oracle 测试（fused/draft/moe_nvfp4/mtp_*/load/options）绿。
