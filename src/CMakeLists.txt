@@ -404,6 +404,16 @@ add_library(ninfer_text STATIC
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
 
+# Shared Qwen tokenizer and chat-template compiler. Family frontends own the resource bytes, the
+# compiled template instance and their output semantics; this library owns only the mechanical
+# byte-level BPE and the recognised Qwen template renderers.
+add_library(ninfer_qwen_frontend STATIC
+  frontend/chat_template.cpp
+  frontend/digest.cpp
+  frontend/tokenizer.cpp)
+ninfer_internal_includes(ninfer_qwen_frontend)
+target_link_libraries(ninfer_qwen_frontend PUBLIC ninfer_text)
+
 if(NINFER_SKIP_FFMPEG)
   # Test-only builds without libav headers: provide an empty archive so targets that
   # link ninfer_media_decode still resolve. No symbol from decode.cpp is referenced
@@ -467,6 +477,7 @@ target_link_libraries(ninfer_engine
     ninfer_artifact
     ninfer_core
     ninfer_ops
+    ninfer_qwen_frontend
     ninfer_text
     ninfer_media_decode
     ninfer_flash_next_package)

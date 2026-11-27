@@ -1,6 +1,6 @@
-#include "targets/qwen3_6/impl/frontend/chat_template.h"
+#include "frontend/chat_template.h"
 
-#include "targets/qwen3_6/impl/frontend/digest.h"
+#include "frontend/digest.h"
 
 #include <nlohmann/json.hpp>
 
@@ -10,7 +10,7 @@
 #include <string>
 #include <string_view>
 
-namespace ninfer::targets::qwen3_6::frontend_internal {
+namespace ninfer::qwen_frontend {
 namespace {
 
 using OrderedJson = nlohmann::ordered_json;
@@ -30,6 +30,15 @@ constexpr Sha256Digest kReasoningEffortTemplateDigest{
 constexpr Sha256Digest kMultiStepToolTemplateDigest{
     0x5e, 0x65, 0x32, 0xb9, 0xcf, 0xcf, 0x3d, 0xbf, 0x94, 0x55, 0xb9, 0xc4, 0xfe, 0x97, 0xaa, 0xf4,
     0xd6, 0x10, 0x64, 0x88, 0x78, 0x71, 0xb0, 0xaa, 0xeb, 0x82, 0x4f, 0x05, 0x0f, 0x5c, 0xff, 0xd5,
+};
+
+// The Flash-Next (qwen4_exp) package ships a template derived from the multi-step-tool reasoning
+// effort template. It adds raw-jinja-only reasoning-effort aliases, positional system/developer
+// turns and `continue_final_message`; the aliases and continuation flag are not part of the public
+// PromptOptions surface, so the rendered conversation follows the multi-step-tool semantics below.
+constexpr Sha256Digest kFlashNextTemplateDigest{
+    0x4e, 0x9a, 0x95, 0xab, 0x9d, 0xc3, 0x9c, 0xa4, 0x1b, 0x7f, 0x99, 0xeb, 0x9f, 0xfc, 0x24, 0x57,
+    0x2f, 0xe8, 0x97, 0xb6, 0x4b, 0x31, 0x6c, 0x08, 0xc7, 0xac, 0x26, 0xf8, 0x40, 0xe0, 0xc3, 0xe0,
 };
 
 constexpr std::string_view kLowReasoningInstructions =
@@ -172,6 +181,23 @@ constexpr std::string_view kToolInstructions =
     "knowledge and do not tell the user about function calls\n"
     "</IMPORTANT>";
 
+// Jinja's `tojson` filter HTML-escapes these four characters inside the serialized JSON strings,
+// so its output is safe to embed verbatim in a template. nlohmann's dump() leaves them intact.
+std::string escape_tojson_string(std::string dumped) {
+    std::string escaped;
+    escaped.reserve(dumped.size());
+    for (const char character : dumped) {
+        switch (character) {
+        case '<': escaped += "\\u003c"; break;
+        case '>': escaped += "\\u003e"; break;
+        case '&': escaped += "\\u0026"; break;
+        case '\'': escaped += "\\u0027"; break;
+        default: escaped += character; break;
+        }
+    }
+    return escaped;
+}
+
 std::string tojson_text(const OrderedJson& value) {
     if (value.is_array()) {
         std::string rendered = "[";
@@ -187,13 +213,14 @@ std::string tojson_text(const OrderedJson& value) {
         std::size_t index    = 0;
         for (auto it = value.begin(); it != value.end(); ++it, ++index) {
             if (index != 0) { rendered += ", "; }
-            rendered += OrderedJson(it.key()).dump();
+            rendered += escape_tojson_string(OrderedJson(it.key()).dump());
             rendered += ": ";
             rendered += tojson_text(it.value());
         }
         rendered += "}";
         return rendered;
     }
+    if (value.is_string()) { return escape_tojson_string(value.dump()); }
     return value.dump();
 }
 
@@ -322,7 +349,7 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
     if (digest == kReasoningEffortTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort);
     }
-    if (digest == kMultiStepToolTemplateDigest) {
+    if (digest == kMultiStepToolTemplateDigest || digest == kFlashNextTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffortMultiStepTool);
     }
     throw std::invalid_argument("unsupported frontend/chat_template.jinja (sha256 " +
@@ -490,4 +517,4 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};
 }
 
-} // namespace ninfer::targets::qwen3_6::frontend_internal
+} // namespace ninfer::qwen_frontend

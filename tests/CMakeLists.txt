@@ -81,6 +81,16 @@ set_tests_properties(ninfer_flash_next_roles_artifact_test PROPERTIES SKIP_RETUR
 ninfer_add_test(ninfer_flash_next_dflash2_options_test
   SOURCES targets/qwen3_8_flash_next/test_dflash2_options.cpp
   LIBRARIES ninfer_engine)
+ninfer_add_test(ninfer_flash_next_dflash2_request_sampling_test
+  SOURCES targets/qwen3_8_flash_next/test_dflash2_request_sampling.cpp
+  LIBRARIES ninfer_core)
+# Minimal-GPU: a synthetic-artifact Program exercises the real request-sampling hand-off from
+# ResolvedExecutionOptions through both plan impls into the LaneState used by decode_dflash2.
+ninfer_add_test(ninfer_flash_next_dflash2_request_sampling_plan_test
+  SOURCES targets/qwen3_8_flash_next/test_dflash2_request_sampling_plan.cpp
+  LIBRARIES ninfer_flash_next_package ninfer_engine)
+target_link_libraries(ninfer_flash_next_dflash2_request_sampling_plan_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_flash_next_dflash2_request_sampling_plan_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_flash_next_dflash2_load_test
   SOURCES targets/qwen3_8_flash_next/test_dflash2_load.cpp
   LIBRARIES ninfer_flash_next_package)
@@ -404,6 +414,14 @@ target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 set_tests_properties(ninfer_qwen3_6_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
+# Flash-Next chat-template input, checked against an independent Jinja2 + HF tokenizers fixture.
+ninfer_add_test(ninfer_qwen4_exp_frontend_test
+  SOURCES targets/qwen4_exp/test_frontend.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_flash_next_package ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen4_exp_frontend_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen4_exp/export)
+set_tests_properties(ninfer_qwen4_exp_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)

@@ -43,6 +43,7 @@ struct FrontendResources {
 struct PreparedPromptData {
     std::vector<TokenId> token_ids;
     std::vector<std::uint64_t> block_hashes;
+    bool starts_in_reasoning = false;
 };
 
 class PreparedPrompt {
@@ -69,9 +70,10 @@ private:
 
 class OutputSession {
 public:
-    OutputSession() noexcept = default;
-    OutputSession(OutputSession&&) noexcept = default;
-    OutputSession& operator=(OutputSession&&) noexcept = default;
+    OutputSession() noexcept;
+    ~OutputSession();
+    OutputSession(OutputSession&&) noexcept;
+    OutputSession& operator=(OutputSession&&) noexcept;
 
     OutputSession(const OutputSession&)            = delete;
     OutputSession& operator=(const OutputSession&) = delete;
@@ -84,19 +86,21 @@ public:
     [[nodiscard]] std::uint32_t reasoning_tokens() const;
 
 private:
-    std::vector<TokenId> stop_token_ids_;
+    class Impl;
+    explicit OutputSession(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
 
     friend class Frontend;
 };
 
 class Frontend {
 public:
-    Frontend() noexcept = default;
-    Frontend(const Frontend&)            = default;
-    Frontend& operator=(const Frontend&) = default;
-    Frontend(Frontend&&) noexcept        = default;
-    Frontend& operator=(Frontend&&) noexcept = default;
-    ~Frontend()                            = default;
+    Frontend() noexcept;
+    Frontend(const Frontend&);
+    Frontend& operator=(const Frontend&);
+    Frontend(Frontend&&) noexcept;
+    Frontend& operator=(Frontend&&) noexcept;
+    ~Frontend();
 
     [[nodiscard]] PreparedPrompt prepare(PromptInput input,
                                          const PreparationControl& control = {}) const;
@@ -112,8 +116,9 @@ public:
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
 
 private:
-    FrontendResources resources_;
-    FrontendOptions options_;
+    class Impl;
+    explicit Frontend(std::shared_ptr<const Impl> impl) noexcept;
+    std::shared_ptr<const Impl> impl_;
 
     friend Frontend make_frontend(const FrontendResources& resources, FrontendOptions options);
 };

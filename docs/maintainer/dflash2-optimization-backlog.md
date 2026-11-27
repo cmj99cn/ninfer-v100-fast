@@ -134,10 +134,10 @@ T=6 verify per-op（两卡合计 ms/round，括号为 T6/T1 缩放）：
 
 ## 质量验证（2026-11-27）
 
-用户要求"像 27B 一样跑同一套 BFCL 质量测试集"。结论：**无法在 Flash-Next 上运行该套测试**，根因是能力边界而非本轮改动：
-- 27B 的 BFCL-v3 `multi_turn_base` 走 `ninfer-serve` 的 `/v1/chat/completions` + `tools`，依赖 family 的 chat-template frontend（`src/targets/qwen3_6/impl/frontend/processor.h` 的 `Processor`/`CompiledChatTemplate`）。
-- Flash-Next（qwen4_exp）的 `Frontend::prepare()` 故意抛 `logic_error`（`src/targets/qwen4_exp/impl/frontend/frontend.cpp:64`），只实现 `prepare_tokens()`（裸 token id）。实测起服务后任何 chat 请求都返回该错误。
-- README 将 Flash-Next 标为"开发中，非发布产品"，serving/chat 不在其能力范围；不应为此临时拼 chat template（超出契约且无可比基线）。
+用户要求"像 27B 一样跑同一套 BFCL 质量测试集"。frontend 已补齐 chat/function call 能力后，**Flash-Next 可以在该套 HTTP 路由上评估 BFCL**：
+- 27B 的 BFCL-v3 `multi_turn_base` 走 `ninfer-serve` 的 `/v1/chat/completions` + `tools`，依赖 family 的 chat-template frontend。Flash-Next（qwen4_exp）的 `Frontend::prepare()` 现已实现同一条 chat-template/function-call 渲染路径（共享 `src/frontend/chat_template.cpp`），不再抛 `logic_error`，因此与 27B 走同一套 serving 路由。
+- 复核证据：普通 chat、function call、多轮 tool result 请求均返回 HTTP 200；1 条 BFCL slice 的 accuracy 为 1.0。
+- 口径：20 条用例尚未跑完，n=1 不构成质量结论；**全量 BFCL 评估仍未完成**，不能据此宣称整体质量等价。README 仍将 Flash-Next 标为"开发中，非发布产品"，但这不再阻碍用上述路由做 BFCL 评估。
 
 可执行的等价质量证据（已完成）：
 - DFlash2-5 与 plain greedy 在 512/128 上逐 token 相同（lossless），且改动前后相同。

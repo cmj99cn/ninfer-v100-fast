@@ -5,6 +5,7 @@
 #include "runtime/contract/types.h"
 #include "targets/qwen4_exp/impl/runtime/instance.h"
 #include "targets/qwen4_exp/impl/runtime/layouts.h"
+#include "targets/qwen4_exp/impl/runtime/sampling.h"
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 #include "targets/qwen4_exp/impl/runtime/workspace_recipe.h"
 #include "targets/qwen3_8_flash_next/impl/dflash2_draft.h"
@@ -23,11 +24,13 @@ namespace ninfer::targets::qwen4_exp::detail {
 template <>
 struct RequestBasePlanImpl<NINFER_QWEN4EXP_VARIANT> {
     runtime::RequestPlanSummary summary;
+    ops::SamplingConfig sampling{};
 };
 
 template <>
 struct RequestPlanImpl<NINFER_QWEN4EXP_VARIANT> {
     runtime::RequestPlanSummary summary;
+    ops::SamplingConfig sampling{};
 };
 
 } // namespace ninfer::targets::qwen4_exp::detail
@@ -48,6 +51,7 @@ struct LaneState {
     TextLaneContext context;
     runtime::TransientRegion transient;
     GenerationTimings timings;
+    ops::SamplingConfig sampling{};
     TokenId last_round_token = 0;
     bool has_last_round_token = false;
     bool active = false;

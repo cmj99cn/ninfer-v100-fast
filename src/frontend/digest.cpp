@@ -1,4 +1,4 @@
-#include "targets/qwen3_6/impl/frontend/digest.h"
+#include "frontend/digest.h"
 
 #include <algorithm>
 #include <array>
@@ -8,7 +8,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::targets::qwen3_6::frontend_internal {
+namespace ninfer::qwen_frontend {
 namespace {
 
 constexpr std::array<std::uint32_t, 64> kRound{
@@ -131,4 +131,4 @@ std::string sha256_hex(const Sha256Digest& digest) {
     return result;
 }
 
-} // namespace ninfer::targets::qwen3_6::frontend_internal
+} // namespace ninfer::qwen_frontend

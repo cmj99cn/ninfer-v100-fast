@@ -10,6 +10,7 @@
 #include <cstring>
 #include <iostream>
 #include <numeric>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -79,12 +80,14 @@ int run_topk(int rows, int columns, bool fp32) {
     return failures;
 }
 
-struct SelectorCase {
-    int steps;
-    int batch;
+struct SelectorResult {
+    int failures;
+    std::vector<int> drafts;
+    std::vector<double> proposal_q;
 };
 
-int run_selector(int steps, int batch, float temperature) {
+SelectorResult run_selector(int steps, int batch, float temperature,
+                            std::uint64_t seed = 0x1234567890abcdefull) {
     constexpr int kRank = 256;
     constexpr int kRows = 64;
     std::vector<float> unary(static_cast<std::size_t>(16 * steps * batch));
@@ -130,7 +133,7 @@ int run_selector(int steps, int batch, float temperature) {
     std::vector<SamplingConfig> configs(batch);
     for (int b = 0; b < batch; ++b) {
         configs[b].temperature = temperature;
-        configs[b].seed        = 0x1234567890abcdefull + b;
+        configs[b].seed        = seed + b;
         configs[b].top_k       = 0;
     }
 
@@ -226,14 +229,39 @@ int run_selector(int steps, int batch, float temperature) {
                                  static_cast<const SamplingConfig*>(d_configs.p), drafts_t, q_t,
                                  workspace, nullptr, &confidence_t);
     cuda_synchronize();
-    int failures =
-        verify_exact("candidate_selector drafts", from_device<int>(d_drafts, steps * batch),
-                     expected_drafts);
-    failures += verify_pointwise("candidate_selector proposal_q", from_device_f32(d_q, 16 * steps * batch),
-                                 expected_q, PointwiseCriterion{.absolute = 2e-5, .relative = 2e-4});
+    const std::vector<int> got_drafts = from_device<int>(d_drafts, steps * batch);
+    const std::vector<double> got_q   = from_device_f32(d_q, 16 * steps * batch);
+    int failures = verify_exact("candidate_selector drafts", got_drafts, expected_drafts);
+    failures += verify_pointwise("candidate_selector proposal_q", got_q, expected_q,
+                                  PointwiseCriterion{.absolute = 2e-5, .relative = 2e-4});
     failures += verify_pointwise("candidate_selector confidence",
-                                 from_device_f32(d_confidence, steps * batch), expected_confidence,
-                                 PointwiseCriterion{.absolute = 2e-5, .relative = 2e-4});
+                                  from_device_f32(d_confidence, steps * batch), expected_confidence,
+                                  PointwiseCriterion{.absolute = 2e-5, .relative = 2e-4});
+    return {failures, std::move(got_drafts), std::move(got_q)};
+}
+
+int run_sampling_variation() {
+    constexpr std::uint64_t kSeedA = 0x1111222233334444ull;
+    constexpr std::uint64_t kSeedB = 0x9999888877776666ull;
+    const SelectorResult cool      = run_selector(3, 2, 0.35F, kSeedA);
+    const SelectorResult hot       = run_selector(3, 2, 0.95F, kSeedA);
+    const SelectorResult reseeded  = run_selector(3, 2, 0.35F, kSeedB);
+    int failures = cool.failures + hot.failures + reseeded.failures;
+    bool temperature_changed = false;
+    for (std::size_t i = 0; i < cool.proposal_q.size(); ++i) {
+        if (std::abs(cool.proposal_q[i] - hot.proposal_q[i]) > 1e-4F) {
+            temperature_changed = true;
+            break;
+        }
+    }
+    if (!temperature_changed) {
+        std::cerr << "candidate_selector temperature did not change proposal_q\n";
+        ++failures;
+    }
+    if (cool.drafts == reseeded.drafts) {
+        std::cerr << "candidate_selector seed did not change the drawn drafts\n";
+        ++failures;
+    }
     return failures;
 }
 
@@ -294,10 +322,11 @@ int main() {
     failures += run_topk(1024, 3, false);
     failures += run_topk(248320, 1, false);
     failures += run_topk(777, 2, true);
-    failures += run_selector(3, 2, 0.0f);
-    failures += run_selector(7, 1, 0.0f);
-    failures += run_selector(3, 2, 0.7f);
-    failures += run_selector(7, 2, 0.7f);
+    failures += run_selector(3, 2, 0.0f).failures;
+    failures += run_selector(7, 1, 0.0f).failures;
+    failures += run_selector(3, 2, 0.7f).failures;
+    failures += run_selector(7, 2, 0.7f).failures;
+    failures += run_sampling_variation();
     failures += run_greedy_tie();
     if (failures != 0) {
         std::cerr << "candidate_selector failures=" << failures << '\n';

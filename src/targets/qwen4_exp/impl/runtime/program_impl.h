@@ -453,9 +453,11 @@ RequestBasePlan ProgramImplCore::plan_request_base(const PreparedPrompt& prompt,
         throw std::invalid_argument("qwen4_exp request reservation exceeds the finalized capacity");
     }
 
-    return RequestBasePlan(std::make_unique<RequestBasePlanImpl>(
-        RequestBasePlanImpl{make_summary(prompt_tokens, options.requested_output_tokens,
-                                        plan_->request_transient_capacity_bytes)}));
+    return RequestBasePlan(std::make_unique<RequestBasePlanImpl>(RequestBasePlanImpl{
+        .summary  = make_summary(prompt_tokens, options.requested_output_tokens,
+                                 plan_->request_transient_capacity_bytes),
+        .sampling = translate_sampling(options.sampling),
+    }));
 }
 
 RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
@@ -469,7 +471,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         throw std::logic_error("qwen4_exp lane plan does not match its base plan");
     }
 
-    return RequestPlan(std::make_unique<RequestPlanImpl>(RequestPlanImpl{base.summary()}));
+    return RequestPlan(std::make_unique<RequestPlanImpl>(
+        RequestPlanImpl{.summary = base.summary(), .sampling = base.impl_->sampling}));
 }
 
 bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
@@ -559,6 +562,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     state.timings    = GenerationTimings{};
     state.active     = true;
     state.transient  = std::move(transient);
+    state.sampling   = plan.impl_->sampling;
     state.context.prompt_tokens = std::move(tokens);
     state.context.processed_prompt_tokens = chunk;
     state.timings.prefill_seconds += prefill_seconds;
@@ -692,6 +696,7 @@ TokenId ProgramImplCore::decode_dflash2(LaneState& state, const runtime::RoundBu
         // The target forward that filled the ring also ran on this non-blocking stream; drain it
         // before the synchronous small control copies.
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        dflash2_sampling_.copy_from_host(&state.sampling, sizeof(state.sampling));
         dflash2_anchors_.copy_from_host(&anchor, sizeof(anchor));
         dflash2_frontiers_.copy_from_host(&base, sizeof(base));
         dflash2_valid_.copy_from_host(&columns, sizeof(columns));

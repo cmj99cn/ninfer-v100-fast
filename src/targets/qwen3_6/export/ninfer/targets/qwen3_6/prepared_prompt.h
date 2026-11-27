@@ -2,6 +2,8 @@
 
 #include <ninfer/targets/qwen3_6/frontend.h>
 
+#include "frontend/chat_template.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -67,10 +69,7 @@ struct VisionItem {
     std::vector<TokenSpan> token_spans;
 };
 
-enum class RewriteCheckpointKind : std::uint8_t {
-    TurnClosure,
-    ResponseReplay,
-};
+using ninfer::qwen_frontend::RewriteCheckpointKind;
 
 struct RewriteCheckpointSpec {
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;

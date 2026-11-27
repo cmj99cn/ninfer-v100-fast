@@ -18,7 +18,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace ninfer::targets::qwen3_6::frontend_internal {
+namespace ninfer::qwen_frontend {
 namespace {
 
 using Json    = nlohmann::json;
@@ -746,4 +746,4 @@ bool Tokenizer::has_exact_token_domain(std::size_t size) const noexcept {
                valid_token_ids_.end();
 }
 
-} // namespace ninfer::targets::qwen3_6::frontend_internal
+} // namespace ninfer::qwen_frontend
