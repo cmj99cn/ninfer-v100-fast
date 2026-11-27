@@ -169,3 +169,10 @@ T=6 verify per-op（两卡合计 ms/round，括号为 T6/T1 缩放）：
 | expert misses | 0 | 0 | 无差异 |
 
 prefill 单项确实 −16%，但 decode 变慢 +9%，端到端净 −8%。两者 expert misses 都为 0，故不是缓存抖动；acceptance 分布从"前高后低"变成"均匀"，greedy token 仍全等，说明是 prefill 结束状态的数值微扰传导到 decode/GDN 路径。按 AGENTS.md"端到端为准"与"局部优化不得损害整体"，**恢复默认关闭**（`=0`），保留实现与测量作证据。教训：prefill 与 decode 共享状态，prefill 的数值路径变更必须做端到端 A/B，不能只看 prefill 单项。
+
+## 转向服务端性能（2026-11-27）
+
+预填充与缓冲命中成为首要优化点，见 `docs/maintainer/serving-performance-backlog.md`。
+关键事实：qwen4_exp 前缀复用完全未实现（`prefix_probe`/`has_retained_lane`/`evict_retained_lane` 均为 stub，
+实测 `cached_tokens=0`）；冷专家缓存使 4096 prefill 慢 ~2.5×（130 vs 322 tok/s）；预填充本身线性 ~320 tok/s。
+BFCL 全量因"无前缀复用 + 冷缓存"单轮极慢（0/200 在 7 分钟内未完成），暂停待优化后再跑。
