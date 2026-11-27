@@ -42,15 +42,32 @@ struct W8VoltaMmaSchedule {
     static constexpr int kKStep = 32; // K elements staged per iteration (double-buffered)
     static constexpr int kTTile = 32; // rows of the mma A operand
     static constexpr int kXPad  = 8;  // shared row padding; see the Q4 sibling for why 8 is the
-                                      // hardware floor here rather than a residual conflict.
+                                       // hardware floor here rather than a residual conflict.
     static constexpr int kRowsPerCta = kWarps * 8;
     static constexpr int kThreads    = kWarps * 32;
 };
 
+template <class Act> struct W8VoltaMmaAct;
+
+template <> struct W8VoltaMmaAct<__nv_bfloat16> {
+    __device__ static __forceinline__ half to_half(__nv_bfloat16 value) {
+        return __float2half(__bfloat162float(value));
+    }
+    __device__ static __forceinline__ __nv_bfloat16 round(float value) {
+        return __float2bfloat16(value);
+    }
+};
+
+template <> struct W8VoltaMmaAct<half> {
+    __device__ static __forceinline__ half to_half(half value) { return value; }
+    __device__ static __forceinline__ half round(float value) { return __float2half(value); }
+};
+
+template <class Act = __nv_bfloat16>
 __global__ __launch_bounds__(W8VoltaMmaSchedule::kThreads, 8) void w8_volta_mma_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
-    const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out, int n, int k, int t,
-    int padded_groups, int out_ld) {
+    const Act* __restrict__ x, Act* __restrict__ out, int n, int k, int t, int padded_groups,
+    int out_ld) {
     using S = W8VoltaMmaSchedule;
     constexpr int kGroupK = W8RowSplitStorage::kGroupK;
     constexpr int kCodeB  = W8RowSplitStorage::kCodeBytesPerGroup;
@@ -108,10 +125,10 @@ __global__ __launch_bounds__(W8VoltaMmaSchedule::kThreads, 8) void w8_volta_mma_
     auto commit = [&](const Carry& r, int buf) {
         if (r.xactive) {
             const int idx   = static_cast<int>(threadIdx.x);
-            const auto* src = reinterpret_cast<const __nv_bfloat16*>(&r.xraw);
+            const auto* src = reinterpret_cast<const Act*>(&r.xraw);
             __half tmp[8];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) { tmp[j] = __float2half(__bfloat162float(src[j])); }
+            for (int j = 0; j < 8; ++j) { tmp[j] = W8VoltaMmaAct<Act>::to_half(src[j]); }
             *reinterpret_cast<uint4*>(&x_sh[buf][idx / kVecs][(idx % kVecs) * 8]) =
                 *reinterpret_cast<const uint4*>(tmp);
         }
@@ -169,7 +186,8 @@ __global__ __launch_bounds__(W8VoltaMmaSchedule::kThreads, 8) void w8_volta_mma_
         const int row_t = volta_d_get_i(l);
         const int col_n = n0 + volta_d_get_j(l);
         if (row_t < tcnt && col_n < n) {
-            out[static_cast<std::int64_t>(t0 + row_t) * out_ld + col_n] = __float2bfloat16(d[l]);
+            out[static_cast<std::int64_t>(t0 + row_t) * out_ld + col_n] =
+                W8VoltaMmaAct<Act>::round(d[l]);
         }
     }
 }

@@ -5,9 +5,11 @@
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_pair.h"
+#include "ninfer/ops/linear_split.h"
 
 #include <cuda_fp16.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -139,6 +141,75 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t t, std::uint32_t seed
     return failures;
 }
 
+int run_fused_shape(std::int32_t k, std::int32_t t, std::uint32_t seed) {
+    constexpr std::int32_t kParentRows = 8192;
+    constexpr std::array<std::int32_t, 4> kRows{1024, 1024, 3072, 3072};
+    auto packed = make_w8g32_f16s_weight(kParentRows, k, seed);
+    std::vector<__half> activation(static_cast<std::size_t>(k) * t);
+    std::mt19937 rng(seed + 17U);
+    std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
+    for (auto& value : activation) { value = __float2half_rn(dist(rng)); }
+
+    DeviceBuffer x_bytes(activation.size() * sizeof(__half));
+    x_bytes.copy_from_host(activation.data(), x_bytes.bytes);
+    DeviceBuffer w_bytes(packed.payload.size());
+    w_bytes.copy_from_host(packed.payload.data(), w_bytes.bytes);
+
+    std::array<ops::LinearSplitSegment, 4> segments{};
+    std::array<DeviceBuffer, 4> out_bytes{};
+    std::array<Tensor, 4> outputs{};
+    std::int32_t begin = 0;
+    for (std::size_t s = 0; s < segments.size(); ++s) {
+        segments[s] = {begin, kRows[s]};
+        out_bytes[s] = DeviceBuffer(static_cast<std::size_t>(kRows[s]) * t * sizeof(__half));
+        out_bytes[s].fill(0xCD);
+        outputs[s] = Tensor(out_bytes[s].p, DType::FP16, {kRows[s], t});
+        begin += kRows[s];
+    }
+    if (begin != kParentRows) { return 1; }
+
+    const Tensor x(x_bytes.p, DType::FP16, {k, t});
+    ops::linear_split_fused_f16(x, packed.device_weight(w_bytes.p), segments, outputs, nullptr);
+    if (cudaDeviceSynchronize() != cudaSuccess) { return 1; }
+
+    std::array<std::vector<__half>, 4> actual{};
+    for (std::size_t s = 0; s < actual.size(); ++s) {
+        actual[s].resize(static_cast<std::size_t>(kRows[s]) * t);
+        out_bytes[s].copy_to_host(actual[s].data(), out_bytes[s].bytes);
+    }
+
+    double error_sq = 0.0, reference_sq = 0.0;
+    int failures = 0;
+    const std::array<std::int32_t, 3> column_slots{0, t / 2, t - 1};
+    begin = 0;
+    for (std::size_t s = 0; s < segments.size(); ++s) {
+        const std::array<std::int32_t, 3> row_slots{0, kRows[s] / 2, kRows[s] - 1};
+        for (const std::int32_t row : row_slots) {
+            for (const std::int32_t col : column_slots) {
+                double reference = 0.0;
+                for (std::int32_t i = 0; i < k; ++i) {
+                    reference +=
+                        test::quantized_weight::logical_weight_fp64(packed, begin + row, i) *
+                        static_cast<double>(
+                            __half2float(activation[static_cast<std::size_t>(col) * k + i]));
+                }
+                const double value = static_cast<double>(
+                    __half2float(actual[s][static_cast<std::size_t>(col) * kRows[s] + row]));
+                if (!std::isfinite(value)) { ++failures; continue; }
+                const double error = value - reference;
+                error_sq += error * error;
+                reference_sq += reference * reference;
+            }
+        }
+        begin += kRows[s];
+    }
+    const double relative = std::sqrt(error_sq / std::max(reference_sq, 1e-30));
+    std::cout << "W8_F16_FUSED parent=" << kParentRows << " k=" << k << " t=" << t
+              << " relative_l2=" << relative << '\n';
+    if (relative > 2e-2) { ++failures; }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -165,6 +236,8 @@ int main() {
         failures += run_pair(5120, 1, 970U);
         failures += run_pair(5120, 4, 971U);
         failures += run_pair(5120, 8, 972U);
+        failures += run_fused_shape(2560, 16, 973U);
+        failures += run_fused_shape(2560, 512, 974U);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " W8_F16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

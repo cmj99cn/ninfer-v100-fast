@@ -9,8 +9,10 @@
 
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <span>
+#include <string>
 
 namespace ninfer::targets::qwen3_8_flash_next::detail {
 namespace {
@@ -40,13 +42,21 @@ std::array<ops::LinearSplitSegment, 4> key_value_segments(const Tensor& key, con
 }
 
 std::array<ops::LinearSplitSegment, 4> gdn_segments(const Tensor& query, const Tensor& key,
-                                                    const Tensor& value, const Tensor& z) {
+                                                     const Tensor& value, const Tensor& z) {
     return {{
         {0, query.ne[0]},
         {query.ne[0], key.ne[0]},
         {query.ne[0] + key.ne[0], value.ne[0]},
         {query.ne[0] + key.ne[0] + value.ne[0], z.ne[0]},
     }};
+}
+
+bool prefill_fused_gdn_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_FLASH_PREFILL_GDN_FUSED");
+        return value != nullptr && value[0] != '\0' && std::string(value) != "0";
+    }();
+    return enabled;
 }
 
 } // namespace
@@ -103,6 +113,12 @@ void GdnProjectionLeaf::project(const Tensor& hidden, const GdnProjectionWeights
         ops::detail::w8_gdn_qkvz_decode_launch(hidden, weights.qkvz, query, key, value, z,
                                                 weights.control, weights.a_log, weights.dt_bias,
                                                 g, beta, stream);
+    } else if (prefill_fused_gdn_enabled()) {
+        const auto gdn = gdn_segments(query, key, value, z);
+        std::array<Tensor, 4> outputs{query, key, value, z};
+        ops::linear_split_fused_f16(hidden, weights.qkvz, gdn, outputs, stream);
+        ops::gdn_gating_proj(hidden, weights.control, weights.a_log, weights.dt_bias, workspace,
+                              g, beta, stream);
     } else {
         const auto gdn = gdn_segments(query, key, value, z);
         std::array<Tensor, 4> outputs{query, key, value, z};

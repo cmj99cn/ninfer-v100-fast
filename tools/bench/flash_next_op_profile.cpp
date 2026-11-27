@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <iomanip>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -237,6 +238,93 @@ namespace {
 
 namespace rt = ninfer::targets::qwen4_exp::detail::flash_next_op_profile_runtime;
 
+struct OpTotal {
+    std::array<double, kRanks> rank_ms{};
+    std::array<std::uint64_t, kRanks> calls{};
+};
+using OpTotals = std::map<std::string, OpTotal>;
+
+OpTotals accumulate_totals(const std::vector<TokenReport>& reports) {
+    OpTotals totals;
+    for (const TokenReport& report : reports) {
+        for (std::uint32_t rank = 0; rank < kRanks; ++rank) {
+            for (const auto& [op, aggregate] : report.per_rank[rank]) {
+                OpTotal& total = totals[op];
+                total.rank_ms[rank] += aggregate.device_ms;
+                total.calls[rank] += aggregate.calls;
+            }
+        }
+    }
+    return totals;
+}
+
+double op_bytes_per_token(const std::string& op, std::uint64_t calls_rank0, double n_tokens,
+                          double avg_hits_per_rank) {
+    if (op == "routed") { return avg_hits_per_rank * kPairBytes; }
+    return op_bytes_per_call(op) * static_cast<double>(calls_rank0) / n_tokens;
+}
+
+struct AggregateMetrics {
+    double sum_two_rank_ms    = 0.0;
+    double sum_fixed_bytes    = 0.0;
+};
+
+AggregateMetrics emit_aggregate_body(const OpTotals& totals, std::uint64_t n_tokens,
+                                     double wall_total_ms, double wall_avg_ms,
+                                     double avg_hits_per_rank) {
+    const double n = static_cast<double>(n_tokens);
+    AggregateMetrics metrics;
+    std::cout << "    \"tokens\": " << n_tokens << ",\n";
+    std::cout << "    \"wall_ms_total\": " << wall_total_ms << ",\n";
+    std::cout << "    \"wall_ms_avg\": " << wall_avg_ms << ",\n";
+    std::cout << "    \"ops\": [\n";
+    bool op_first = true;
+    for (const auto& [op, total] : totals) {
+        const double bytes_per_token =
+            op_bytes_per_token(op, total.calls[0], n, avg_hits_per_rank);
+        const double two_rank_ms = total.rank_ms[0] + total.rank_ms[1];
+        const double wall_ms = std::max(total.rank_ms[0], total.rank_ms[1]);
+        const double rank_ms_per_token[kRanks] = {total.rank_ms[0] / n,
+                                                  total.rank_ms[1] / n};
+        double gbps[kRanks] = {0.0, 0.0};
+        for (std::uint32_t rank = 0; rank < kRanks; ++rank) {
+            if (rank_ms_per_token[rank] > 0.0) {
+                gbps[rank] = bytes_per_token / (rank_ms_per_token[rank] * 1.0e-3) / 1.0e9;
+            }
+        }
+        const double floor_850_ms = bytes_per_token / (kBytesPerGBs * 1.0e9) * 1.0e3;
+        const double floor_ratio_r0 =
+            floor_850_ms > 0.0 ? rank_ms_per_token[0] / floor_850_ms : 0.0;
+        const double floor_ratio_r1 =
+            floor_850_ms > 0.0 ? rank_ms_per_token[1] / floor_850_ms : 0.0;
+        if (!op_first) { std::cout << ",\n"; }
+        op_first = false;
+        const double calls_per_token = static_cast<double>(total.calls[0]) / n;
+        std::cout << "      {\"op\": \"" << op << "\", \"calls_total\": [" << total.calls[0]
+                  << ", " << total.calls[1] << "], \"calls_per_token\": " << calls_per_token
+                  << ", \"rank_ms\": [" << total.rank_ms[0] << ", " << total.rank_ms[1]
+                  << "], \"rank_ms_per_token\": [" << rank_ms_per_token[0] << ", "
+                  << rank_ms_per_token[1] << "], \"two_rank_ms\": " << two_rank_ms
+                  << ", \"two_rank_ms_per_token\": " << two_rank_ms / n
+                  << ", \"wall_ms\": " << wall_ms
+                  << ", \"wall_ms_per_token\": " << wall_ms / n
+                  << ", \"bytes_per_token_per_card\": " << bytes_per_token
+                  << ", \"gb_per_s_rank\": [" << gbps[0] << ", " << gbps[1] << "]"
+                  << ", \"floor_850_ms_per_token\": " << floor_850_ms
+                  << ", \"floor_ratio_rank\": [" << floor_ratio_r0 << ", " << floor_ratio_r1
+                  << "]}";
+        metrics.sum_two_rank_ms += two_rank_ms;
+        metrics.sum_fixed_bytes += bytes_per_token;
+    }
+    std::cout << "\n    ],\n";
+    std::cout << "    \"bytes_per_token_per_card_total\": " << metrics.sum_fixed_bytes << ",\n";
+    std::cout << "    \"floor_850_ms_per_token_total\": "
+              << metrics.sum_fixed_bytes / (kBytesPerGBs * 1.0e9) * 1.0e3 << ",\n";
+    std::cout << "    \"sum_two_rank_ms\": " << metrics.sum_two_rank_ms << ",\n";
+    std::cout << "    \"sum_two_rank_ms_per_token\": " << metrics.sum_two_rank_ms / n;
+    return metrics;
+}
+
 void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tokens) {
     ExecutionContext execution({0, 1});
     artifact::Reader reader(path);
@@ -266,6 +354,9 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
         span_t = static_cast<std::uint32_t>(std::stoul(span));
         if (span_t < 1) { throw std::runtime_error("NINFER_FLASH_OP_SPAN_T must be >= 1"); }
     }
+    const char* prefill_flag = std::getenv("NINFER_FLASH_OP_PREFILL");
+    const bool profile_prefill =
+        prefill_flag != nullptr && prefill_flag[0] != '\0' && std::string(prefill_flag) != "0";
 
     auto load_plan = Package::plan_load(binder, options, detail::WeightsProfile::Nvfp4);
     const detail::BindingPlan& bindings = load_plan.bindings();
@@ -305,6 +396,11 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
 
     const std::vector<TokenId> prompt = make_prompt(prompt_tokens);
     const detail::CacheStats cold = data.expert_cache_stats(0);
+    if (profile_prefill) {
+        init_pools();
+        begin_round();
+        g_enabled = true;
+    }
     const std::int64_t prefill_begin = now_ns();
     TokenId token = 0;
     for (std::size_t offset = 0; offset < prompt.size(); offset += kForwardTokens) {
@@ -313,11 +409,18 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
     }
     for (std::uint32_t rank = 0; rank < kRanks; ++rank) { execution.dev[rank]->synchronize(); }
     const double prefill_ms = static_cast<double>(now_ns() - prefill_begin) / 1.0e6;
+    std::optional<TokenReport> prefill_report;
+    if (profile_prefill) {
+        g_enabled = false;
+        prefill_report = collect_token(prefill_ms);
+        destroy_pools();
+        init_pools();
+    }
     for (std::uint32_t index = 0; index < warmup_tokens; ++index) { token = trunk.decode(token); }
     for (std::uint32_t rank = 0; rank < kRanks; ++rank) { execution.dev[rank]->synchronize(); }
     const detail::CacheStats warm = data.expert_cache_stats(0);
 
-    init_pools();
+    if (!profile_prefill) { init_pools(); }
     g_enabled = true;
 
     std::vector<TokenReport> tokens;
@@ -358,23 +461,16 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
 
     // Aggregate over the decode window: per op per rank totals, two-rank sum, wall (max rank),
     // per-card bytes, achieved GB/s and the floor at 850 GB/s.
-    struct OpTotal {
-        std::array<double, kRanks> rank_ms{};
-        std::array<std::uint64_t, kRanks> calls{};
-    };
-    std::map<std::string, OpTotal> totals;
+    const OpTotals totals = accumulate_totals(tokens);
     std::array<double, kRanks> sum_rank_ms{};
+    for (const auto& [op, total] : totals) {
+        for (std::uint32_t rank = 0; rank < kRanks; ++rank) {
+            sum_rank_ms[rank] += total.rank_ms[rank];
+        }
+    }
     std::array<std::uint64_t, kDecodeTokens> token_hits{};
     for (std::uint32_t index = 0; index < kDecodeTokens; ++index) {
         token_hits[index] = hits[index][0] + hits[index][1];
-        for (std::uint32_t rank = 0; rank < kRanks; ++rank) {
-            for (const auto& [op, aggregate] : tokens[index].per_rank[rank]) {
-                OpTotal& total = totals[op];
-                total.rank_ms[rank] += aggregate.device_ms;
-                total.calls[rank] += aggregate.calls;
-                sum_rank_ms[rank] += aggregate.device_ms;
-            }
-        }
     }
     std::uint64_t total_routed_hits = 0;
     for (std::uint32_t index = 0; index < kDecodeTokens; ++index) { total_routed_hits += token_hits[index]; }
@@ -398,6 +494,12 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
     for (std::uint32_t rank = 0; rank < kRanks; ++rank) { avg_misses[rank] /= n_tokens; }
     const double avg_hits_per_rank =
         static_cast<double>(total_routed_hits) / (2.0 * n_tokens);
+    double sum_two_rank_check = 0.0;
+    double sum_fixed_bytes = 0.0;
+    for (const auto& [op, total] : totals) {
+        sum_two_rank_check += total.rank_ms[0] + total.rank_ms[1];
+        sum_fixed_bytes += op_bytes_per_token(op, total.calls[0], n_tokens, avg_hits_per_rank);
+    }
 
     std::cout << std::setprecision(12);
     std::cout << "{\n";
@@ -456,59 +558,15 @@ void run(const char* path, std::uint32_t prompt_tokens, std::uint32_t warmup_tok
     }
     std::cout << "  ],\n";
     std::cout << "  \"aggregate\": {\n";
-    std::cout << "    \"tokens\": " << kDecodeTokens << ",\n";
-    std::cout << "    \"wall_ms_total\": " << wall_total << ",\n";
-    std::cout << "    \"wall_ms_avg\": " << wall_avg << ",\n";
-    std::cout << "    \"ops\": [\n";
-    bool op_first = true;
-    double sum_two_rank_check = 0.0;
-    double sum_fixed_bytes = 0.0;
-    for (const auto& [op, total] : totals) {
-        const double bytes_per_call = op_bytes_per_call(op);
-        const bool is_routed = (op == "routed");
-        const double calls_per_token = static_cast<double>(total.calls[0]) / n_tokens;
-        const double bytes_per_token =
-            is_routed ? avg_hits_per_rank * kPairBytes : bytes_per_call * calls_per_token;
-        const double two_rank_ms = total.rank_ms[0] + total.rank_ms[1];
-        const double wall_ms = std::max(total.rank_ms[0], total.rank_ms[1]);
-        const double rank_ms_per_token[kRanks] = {total.rank_ms[0] / n_tokens,
-                                                  total.rank_ms[1] / n_tokens};
-        double gbps[kRanks] = {0.0, 0.0};
-        for (std::uint32_t rank = 0; rank < kRanks; ++rank) {
-            if (rank_ms_per_token[rank] > 0.0) {
-                gbps[rank] = bytes_per_token / (rank_ms_per_token[rank] * 1.0e-3) / 1.0e9;
-            }
-        }
-        const double floor_850_ms = bytes_per_token / (kBytesPerGBs * 1.0e9) * 1.0e3;
-        const double floor_ratio_r0 =
-            floor_850_ms > 0.0 ? rank_ms_per_token[0] / floor_850_ms : 0.0;
-        const double floor_ratio_r1 =
-            floor_850_ms > 0.0 ? rank_ms_per_token[1] / floor_850_ms : 0.0;
-        if (!op_first) { std::cout << ",\n"; }
-        op_first = false;
-        std::cout << "      {\"op\": \"" << op << "\", \"calls_total\": [" << total.calls[0]
-                  << ", " << total.calls[1] << "], \"calls_per_token\": " << calls_per_token
-                  << ", \"rank_ms\": [" << total.rank_ms[0] << ", " << total.rank_ms[1]
-                  << "], \"rank_ms_per_token\": [" << rank_ms_per_token[0] << ", "
-                  << rank_ms_per_token[1] << "], \"two_rank_ms\": " << two_rank_ms
-                  << ", \"two_rank_ms_per_token\": " << two_rank_ms / n_tokens
-                  << ", \"wall_ms\": " << wall_ms
-                  << ", \"wall_ms_per_token\": " << wall_ms / n_tokens
-                  << ", \"bytes_per_token_per_card\": " << bytes_per_token
-                  << ", \"gb_per_s_rank\": [" << gbps[0] << ", " << gbps[1] << "]"
-                  << ", \"floor_850_ms_per_token\": " << floor_850_ms
-                  << ", \"floor_ratio_rank\": [" << floor_ratio_r0 << ", " << floor_ratio_r1
-                  << "]}";
-        sum_two_rank_check += two_rank_ms;
-        sum_fixed_bytes += bytes_per_token;
+    emit_aggregate_body(totals, kDecodeTokens, wall_total, wall_avg, avg_hits_per_rank);
+    std::cout << "  }";
+    if (prefill_report.has_value()) {
+        const OpTotals prefill_totals = accumulate_totals({*prefill_report});
+        std::cout << ",\n  \"prefill_aggregate\": {\n";
+        emit_aggregate_body(prefill_totals, prompt_tokens, prefill_ms, prefill_ms, 0.0);
+        std::cout << "  }";
     }
-    std::cout << "\n    ],\n";
-    std::cout << "    \"bytes_per_token_per_card_total\": " << sum_fixed_bytes << ",\n";
-    std::cout << "    \"floor_850_ms_per_token_total\": "
-              << sum_fixed_bytes / (kBytesPerGBs * 1.0e9) * 1.0e3 << ",\n";
-    std::cout << "    \"sum_two_rank_ms\": " << sum_two_rank_check << ",\n";
-    std::cout << "    \"sum_two_rank_ms_per_token\": " << sum_two_rank_check / n_tokens
-              << "\n  }\n}\n";
+    std::cout << "\n}\n";
 
     destroy_pools();
 }

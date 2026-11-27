@@ -15,8 +15,9 @@ using W8Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 // fits the W8Launch signature, because the shapes it is selected for supply far more CTAs than
 // the machine holds resident and so need no split-K, and therefore no workspace.
 void launch_w8_volta_mma(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_volta_mma_f16(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 [[nodiscard]] bool w8_volta_mma_supported(std::int32_t n, std::int32_t k,
-                                          std::int32_t t) noexcept;
+                                           std::int32_t t) noexcept;
 
 // Quadpair-split-N form (w8_volta_qpn_gemm.cuh), for the narrow verify widths the 32x8 route
 // pads its A rows away on. Also workspace-free: the CTA's warps split K and reduce in shared.

@@ -3,6 +3,7 @@
 #include "ops/linear/w8/w8_volta_mma_gemm.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 namespace ninfer::ops::detail {
 
@@ -21,20 +22,29 @@ bool w8_volta_mma_supported(std::int32_t n, std::int32_t k, std::int32_t t) noex
     return k >= S::kKStep;
 }
 
-void launch_w8_volta_mma(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+template <class Act>
+void launch_typed(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const std::int32_t n      = out.ne[0];
     const std::int32_t k      = x.ne[0];
     const std::int32_t t      = x.ne[1];
-    const std::int32_t out_ld = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
+    const std::int32_t out_ld = static_cast<std::int32_t>(out.nb[1] / sizeof(Act));
     const std::int32_t padded_groups = w.padded_shape[1] / W8RowSplitStorage::kGroupK;
 
     const dim3 grid(static_cast<unsigned>((n + S::kRowsPerCta - 1) / S::kRowsPerCta),
                     static_cast<unsigned>((t + S::kTTile - 1) / S::kTTile));
-    w8_volta_mma_gemm_kernel<<<grid, S::kThreads, 0, stream>>>(
+    w8_volta_mma_gemm_kernel<Act><<<grid, S::kThreads, 0, stream>>>(
         static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<__nv_bfloat16*>(out.data), n, k, t,
-        padded_groups, out_ld);
+        static_cast<const Act*>(x.data), static_cast<Act*>(out.data), n, k, t, padded_groups,
+        out_ld);
     CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_w8_volta_mma(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_typed<__nv_bfloat16>(x, w, out, stream);
+}
+
+void launch_w8_volta_mma_f16(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_typed<half>(x, w, out, stream);
 }
 
 #endif // NINFER_VOLTA_BUILD

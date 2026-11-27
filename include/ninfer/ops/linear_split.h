@@ -81,7 +81,24 @@ struct LinearSplitSegment {
  *   no persistent state. It supports CUDA Graph capture and replay at bound addresses.
  */
 void linear_split(const Tensor& x, const Weight& w, std::span<const LinearSplitSegment> segments,
-                  std::span<Tensor> outputs, LinearPolicy policy, WorkspaceArena& workspace,
-                  cudaStream_t stream);
+                   std::span<Tensor> outputs, LinearPolicy policy, WorkspaceArena& workspace,
+                   cudaStream_t stream);
+
+/**
+ * Op: linear_split_fused_f16 (sm_70 only)
+ *
+ * Same math, indexing, numeric oracle and effects as linear_split, restricted to W8G32_F16S
+ * RowSplit parents with FP16 activations and outputs and large token counts. Each segment is
+ * issued through the fused-dequant Volta m8n8k4 tensor-core route, which stages each weight row
+ * once for a whole 32-column mma tile instead of replaying it once per 8 output columns. It is
+ * numerically a different implementation profile (FP16 dequant operands, FP32 tensor-core
+ * accumulation) and is validated directly against linear_split's FP64 oracle.
+ *
+ * Requires k divisible by 32 and 8, k >= 32, and a non-empty segment list. Throws on any other
+ * format, dtype or geometry. Uses no workspace and keeps no state.
+ */
+void linear_split_fused_f16(const Tensor& x, const Weight& w,
+                            std::span<const LinearSplitSegment> segments, std::span<Tensor> outputs,
+                            cudaStream_t stream);
 
 } // namespace ninfer::ops

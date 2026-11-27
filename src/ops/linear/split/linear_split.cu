@@ -1,6 +1,7 @@
 #include "ninfer/ops/linear_split.h"
 
 #include "core/device.h"
+#include "ops/linear/w8/w8_launch.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -155,8 +156,8 @@ std::size_t linear_split_workspace_capacity_bytes(
 }
 
 void linear_split(const Tensor& x, const Weight& w, std::span<const LinearSplitSegment> segments,
-                  std::span<Tensor> outputs, LinearPolicy policy, WorkspaceArena& workspace,
-                  cudaStream_t stream) {
+                   std::span<Tensor> outputs, LinearPolicy policy, WorkspaceArena& workspace,
+                   cudaStream_t stream) {
     validate_parent(x, w, outputs, segments);
     for (std::size_t index = 0; index < segments.size(); ++index) {
         const Weight sub = segment_weight(w, segments[index]);
@@ -164,6 +165,33 @@ void linear_split(const Tensor& x, const Weight& w, std::span<const LinearSplitS
         linear(x, sub, outputs[index], policy, workspace, stream);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+void linear_split_fused_f16(const Tensor& x, const Weight& w,
+                            std::span<const LinearSplitSegment> segments, std::span<Tensor> outputs,
+                            cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    validate_parent(x, w, outputs, segments);
+    if (w.qtype != QType::W8G32_F16S || w.layout != QuantLayout::RowSplit ||
+        x.dtype != DType::FP16) {
+        throw std::invalid_argument("linear_split_fused_f16: requires FP16 W8G32 RowSplit");
+    }
+    for (std::size_t index = 0; index < segments.size(); ++index) {
+        const Weight sub = segment_weight(w, segments[index]);
+        if (!detail::w8_volta_mma_supported(sub.n, sub.k, x.ne[1])) {
+            throw std::invalid_argument("linear_split_fused_f16: unsupported segment geometry");
+        }
+        detail::launch_w8_volta_mma_f16(x, sub, outputs[index], stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+#else
+    (void)x;
+    (void)w;
+    (void)segments;
+    (void)outputs;
+    (void)stream;
+    throw std::invalid_argument("linear_split_fused_f16: requires the sm_70 build");
+#endif
 }
 
 } // namespace ninfer::ops

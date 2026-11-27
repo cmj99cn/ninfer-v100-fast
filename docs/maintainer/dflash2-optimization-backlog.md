@@ -143,3 +143,29 @@ T=6 verify per-op（两卡合计 ms/round，括号为 T6/T1 缩放）：
 - DFlash2-5 与 plain greedy 在 512/128 上逐 token 相同（lossless），且改动前后相同。
 - `ninfer_flash_next_text_nll` capital5（5 token）：改动前 HEAD `5ac8666c` 与本轮 HEAD `7cc80a2f` 均为 `greedy_first=11751`、`greedy_next=11751`、`top1_matches=2`、`mean_nll=3.73905609471`（各 2–3 次稳定复现）。**本轮优化质量零变化**；该 NLL 值与更早记录的 3.7311 的差来自更早的 prefill/config 路径，非本轮。
 - 所有 oracle 测试（fused/draft/moe_nvfp4/mtp_*/load/options）绿。
+
+## P1：prefill GDN 投影根因与优化（2026-11-27，已接受，默认开）
+
+根因：`GdnProjectionLeaf::project` 在 T>4 走 `w8_f16_dispatch → launch_w8_simt_r8_c8_f16`，grid.y=T/8，每个 8 列 CTA 都重读整行 qkvz W8 权重（每卡每层 1.43 GB × 64 次，T=512）。决定性实验：prompt T=8→9 计算量 +12.5%，耗时 0.116→0.331 ms/rank/call（+2.85×），按 8 列台阶增长。
+
+优化：扩展已验证的 sm_70 融合 tensor-core W8 GEMM 支持 FP16，新增 `ops::linear_split_fused_f16`；prefill T>4 走该路径，列 tile 8→32、权重每 32 列暂存一次。env `NINFER_FLASH_PREFILL_GDN_FUSED`（**默认开**，`=0` 可关闭对照）。T≤4 / MTP / DFlash2 路径不变。
+
+证据：
+- oracle `ninfer_linear_w8_f16_test` 相对 L2=2.4e-4（阈值 2e-2）；gdn_qkvz/mtp_*/gdn_replay 全绿。
+- 质量（独立复核，capital5）：门关 `mean_nll 3.7391`、门开 `3.7469`（Δ+0.0079 ≤0.01），`greedy_first/greedy_next=11751`、`top1_matches=2` 不变；多 prompt N=128..512 greedy token 全等。
+- A/B：gdn_proj 两卡 663.7→87.0 ms（−86.9%）；prefill 1.753→1.464 s（−16.5%，292→350 tok/s），TTFT −0.289 s；decode tok/s 不变。
+- 决定：按项目 Δ≤0.01 + greedy 不变的门槛接受为默认，以换取 prefill 极致速度；`=0` 保留对照。
+
+### P1 裁决修正（端到端净负，默认恢复关闭）
+
+把 `NINFER_FLASH_PREFILL_GDN_FUSED` 设默认开后做受控 A/B（同二进制、门 0 vs 1、reps 2、DFlash2-5）：
+
+| 指标 | 门关 (=0) | 门开 (=1) | 变化 |
+|---|---:|---:|---:|
+| committed tok/s | **149.48** | 137.29 | −8.2% |
+| prefill s | 1.748 | **1.466** | −0.282 s |
+| decode s | **0.850** | 0.925 | +0.075 s |
+| acceptance | 0.9903 | 1.0000 | 模式改变 |
+| expert misses | 0 | 0 | 无差异 |
+
+prefill 单项确实 −16%，但 decode 变慢 +9%，端到端净 −8%。两者 expert misses 都为 0，故不是缓存抖动；acceptance 分布从"前高后低"变成"均匀"，greedy token 仍全等，说明是 prefill 结束状态的数值微扰传导到 decode/GDN 路径。按 AGENTS.md"端到端为准"与"局部优化不得损害整体"，**恢复默认关闭**（`=0`），保留实现与测量作证据。教训：prefill 与 decode 共享状态，prefill 的数值路径变更必须做端到端 A/B，不能只看 prefill 单项。
