@@ -70,6 +70,7 @@ struct ServeOptions {
     bool prefix_cache_enabled = false; // --prefix-cache: enable hybrid content-addressed prefix cache
     std::uint32_t host_cache_mib = 0;  // --host-cache-mib: pinned host RAM for the prefix pool
     std::uint32_t expert_cache_mib = 0; // --expert-cache-mib: per-rank expert residency cache in MiB; `auto` keeps the automatic plan
+    std::string expert_cache_profile;   // --expert-cache-profile: static residency seed for the Flash-Next expert cache
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;

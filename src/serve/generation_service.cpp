@@ -256,6 +256,7 @@ ninfer::EngineOptions GenerationService::make_engine_options(const std::vector<i
     engine_options.prefix_cache.enabled     = options_.prefix_cache_enabled;
     engine_options.prefix_cache.host_cache_mib = options_.host_cache_mib;
     engine_options.expert_cache_mib         = options_.expert_cache_mib;
+    engine_options.expert_cache_profile     = options_.expert_cache_profile;
     return engine_options;
 }
 

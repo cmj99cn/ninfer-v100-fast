@@ -215,7 +215,7 @@ std::string serve_usage_text(const char* argv0) {
 
            "[--default-max-tokens N] "
              "[--vision] [--cuda-graph|--no-cuda-graph] [--no-prefix-reuse] [--prefix-cache] "
-              "[--host-cache-mib N] [--expert-cache-mib auto|N] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+              "[--host-cache-mib N] [--expert-cache-mib auto|N] [--expert-cache-profile PATH] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
             "[--chat-template-kwargs JSON] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -477,6 +477,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.expert_cache_mib = std::string_view(value) == "auto"
                 ? 0
                 : static_cast<std::uint32_t>(parse_nonnegative_int(value, "expert-cache-mib"));
+        } else if (arg == "--expert-cache-profile") {
+            options.expert_cache_profile = require_value("--expert-cache-profile");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
