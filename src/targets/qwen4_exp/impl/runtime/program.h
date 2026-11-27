@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cuda_runtime.h>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -50,6 +51,31 @@ struct LaneState {
     TokenId last_round_token = 0;
     bool has_last_round_token = false;
     bool active = false;
+};
+
+struct Dflash2PhaseDiag {
+    bool enabled        = false;
+    bool pending        = false;
+    bool pending_drafts = false;
+    bool in_decode      = false;
+    cudaEvent_t round_begin       = nullptr;
+    cudaEvent_t propose_begin     = nullptr;
+    cudaEvent_t propose_end       = nullptr;
+    cudaEvent_t verify_begin      = nullptr;
+    cudaEvent_t verify_end        = nullptr;
+    cudaEvent_t commit_begin      = nullptr;
+    cudaEvent_t commit_end        = nullptr;
+    cudaEvent_t materialize_begin = nullptr;
+    cudaEvent_t materialize_end   = nullptr;
+    double propose_ms             = 0.0;
+    double propose_host_ms        = 0.0;
+    double verify_ms              = 0.0;
+    double commit_ms              = 0.0;
+    double materialize_ms         = 0.0;
+    double total_ms               = 0.0;
+    std::uint64_t rounds          = 0;
+    std::uint64_t tokens          = 0;
+    std::uint64_t pending_tokens  = 0;
 };
 
 class ProgramImplCore {
@@ -171,6 +197,7 @@ private:
     std::uint32_t dflash2_window_     = 0;
     std::uint32_t dflash2_feature_width_ = 0;
     SpeculativeStats dflash2_stats_{};
+    Dflash2PhaseDiag dflash2_phase_diag_{};
     std::array<std::unique_ptr<DeviceBuffer>, kMaximumDevices> residual_sinks_;
     std::uint32_t mtp_draft_window_ = 0;
     SpeculativeStats mtp_stats_{};

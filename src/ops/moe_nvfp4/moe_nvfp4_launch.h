@@ -26,6 +26,20 @@ struct MoeNvfp4Scratch {
 
 inline constexpr std::int32_t kMoeMaxSmallT = 8;
 
+// Grouped multi-column routed path (DFlash2 T>1 verify, env gated). Top-k selection is without
+// replacement within one token, so one resident expert can be selected at most once per column;
+// the member capacity is the verify width, not kTopK * width.
+inline constexpr std::int32_t kMoeGroupMaxMembers     = kMoeMaxSmallT;
+inline constexpr std::int32_t kMoeGroupMaxGroups      = 80;
+inline constexpr std::int32_t kMoeGroupBucketStride   = 1 + kMoeGroupMaxMembers;
+inline constexpr std::int32_t kMoeGroupPrepareThreads = 256;
+
+struct MoeNvfp4GroupedScratch {
+    std::int32_t* buckets = nullptr;
+    std::int32_t* meta    = nullptr;
+    float* partial        = nullptr;
+};
+
 struct MoeNvfp4Probe {
     std::int32_t* active_ids   = nullptr;
     std::int32_t* miss_ids     = nullptr;
@@ -59,6 +73,17 @@ void moe_nvfp4_cached_down_launch(const std::uint8_t* slots, std::uint64_t slot_
                                   const std::int32_t* lookup, const float* divisors,
                                   MoeNvfp4Scratch scratch, const MoeNvfp4RouteOutputs& route,
                                   Tensor& destination, cudaStream_t stream);
+
+void moe_nvfp4_grouped_prepare_launch(const std::int32_t* ids, std::int32_t entries,
+                                       const std::int32_t* lookup, std::int32_t slot_count,
+                                       MoeNvfp4GroupedScratch grouped, cudaStream_t stream);
+
+void moe_nvfp4_grouped_cached_launch(const Tensor& x, const std::uint8_t* slots,
+                                     std::uint64_t slot_bytes, std::int32_t slot_count,
+                                     const std::int32_t* lookup, const float* divisors,
+                                     MoeNvfp4Scratch scratch, MoeNvfp4GroupedScratch grouped,
+                                     const MoeNvfp4RouteOutputs& route, Tensor& destination,
+                                     cudaStream_t stream);
 
 void moe_nvfp4_route_probe_launch(const std::int32_t* ids, std::int32_t entries,
                                   const std::int32_t* lookup, std::int32_t expert_begin,

@@ -1525,6 +1525,144 @@ int run_cached_multi_bitwise_case(const BatchedFixture& gate_up, const BatchedFi
     return failures;
 }
 
+// Grouped multi-column routed oracle. The naive FP32/FP64 expert_contribution is the independent
+// mathematical oracle; the ungrouped cached path (itself oracle-checked above) is the bit-exact
+// reference. The grouped path must satisfy both at real T=2/T=6/T=8 geometry.
+int run_grouped_bitwise_case(const BatchedFixture& gate_up, const BatchedFixture& down,
+                             const MoeNvfp4Weights& full_weights,
+                             const std::vector<std::vector<float>>& activation_values,
+                             DType dtype, const std::string& label) {
+    const std::int32_t tokens = static_cast<std::int32_t>(activation_values.size());
+    std::vector<std::uint16_t> activation_words(static_cast<std::size_t>(tokens) * kHidden);
+    std::vector<std::uint16_t> residual_words(static_cast<std::size_t>(tokens) * kHidden);
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        std::vector<std::uint16_t> token_activation;
+        std::vector<std::uint16_t> token_residual;
+        build_token_words(activation_values[static_cast<std::size_t>(token)], dtype,
+                          token_activation, token_residual);
+        std::copy(token_activation.begin(), token_activation.end(),
+                  activation_words.begin() + static_cast<std::ptrdiff_t>(token) * kHidden);
+        std::copy(token_residual.begin(), token_residual.end(),
+                  residual_words.begin() + static_cast<std::ptrdiff_t>(token) * kHidden);
+    }
+
+    DeviceBuffer device_x = to_device(activation_words);
+    GuardedDeviceBuffer ids_buffer(static_cast<std::size_t>(tokens) * kTopK * sizeof(std::int32_t));
+    GuardedDeviceBuffer coefficients_buffer(static_cast<std::size_t>(tokens) * kTopK * sizeof(float));
+    GuardedDeviceBuffer shared_gate_buffer(static_cast<std::size_t>(tokens) * sizeof(float));
+    Tensor x{device_x.p, dtype, {kHidden, tokens}};
+    Tensor ids{ids_buffer.data(), DType::I32, {kTopK, tokens}};
+    Tensor coefficients{coefficients_buffer.data(), DType::FP32, {kTopK, tokens}};
+    Tensor shared_gate{shared_gate_buffer.data(), DType::FP32, {tokens}};
+    ops::moe_nvfp4_route(x, full_weights, ids, coefficients, shared_gate, 0);
+    cuda_synchronize();
+
+    const MoeNvfp4RouteView route{ids, coefficients, shared_gate};
+    const auto selected = from_device<std::int32_t>(
+        ids_buffer.data(), static_cast<std::size_t>(tokens) * kTopK);
+    const auto selected_coefficients = from_device<float>(
+        coefficients_buffer.data(), static_cast<std::size_t>(tokens) * kTopK);
+    const SlotBank slots = make_slot_bank(gate_up, down, selected);
+    DeviceBuffer slot_payload = to_device(slots.payload);
+    DeviceBuffer slot_divisors = to_device(slots.divisors);
+    DeviceBuffer slot_lookup = to_device(slots.lookup);
+    const std::size_t slot_bytes = slots.payload.size() / static_cast<std::size_t>(slots.slots);
+    const MoeNvfp4ExpertSlots bank{
+        .payload    = static_cast<const std::uint8_t*>(slot_payload.p),
+        .slot_bytes = slot_bytes,
+        .slot_count = slots.slots,
+        .lookup     = static_cast<const std::int32_t*>(slot_lookup.p),
+        .divisors   = static_cast<const float*>(slot_divisors.p),
+    };
+
+    const std::size_t scratch_values = static_cast<std::size_t>(tokens) * kTopK * kIntermediate;
+    DeviceBuffer scratch(scratch_values * sizeof(float));
+    DeviceBuffer buckets(static_cast<std::size_t>(slots.slots) *
+                         ops::detail::kMoeGroupBucketStride * sizeof(std::int32_t));
+    DeviceBuffer meta((1 + 2 * ops::detail::kMoeGroupMaxGroups) * sizeof(std::int32_t));
+    DeviceBuffer partial(static_cast<std::size_t>(tokens) * kTopK * kHidden * sizeof(float));
+    const ops::detail::MoeNvfp4Scratch detail_scratch{static_cast<float*>(scratch.p)};
+    const ops::detail::MoeNvfp4GroupedScratch grouped{
+        .buckets = static_cast<std::int32_t*>(buckets.p),
+        .meta    = static_cast<std::int32_t*>(meta.p),
+        .partial = static_cast<float*>(partial.p),
+    };
+    const ops::detail::MoeNvfp4RouteOutputs outputs{
+        static_cast<std::int32_t*>(ids_buffer.data()),
+        static_cast<float*>(coefficients_buffer.data()),
+        static_cast<float*>(shared_gate_buffer.data())};
+
+    const std::size_t destination_bytes = static_cast<std::size_t>(tokens) * kHidden *
+                                          sizeof(std::uint16_t);
+    GuardedDeviceBuffer baseline(destination_bytes);
+    GuardedDeviceBuffer grouped_destination(destination_bytes);
+    baseline.copy_from_host(residual_words.data(), destination_bytes);
+    grouped_destination.copy_from_host(residual_words.data(), destination_bytes);
+    Tensor baseline_tensor{baseline.data(), dtype, {kHidden, tokens}};
+    Tensor grouped_tensor{grouped_destination.data(), dtype, {kHidden, tokens}};
+
+    ops::moe_routed_nvfp4_cached(x, bank, ops::MoeNvfp4ExpertScratch{static_cast<float*>(scratch.p)},
+                                 route, baseline_tensor, 0);
+    ops::detail::moe_nvfp4_grouped_cached_launch(
+        x, static_cast<const std::uint8_t*>(slot_payload.p), slot_bytes, slots.slots,
+        static_cast<const std::int32_t*>(slot_lookup.p),
+        static_cast<const float*>(slot_divisors.p), detail_scratch, grouped, outputs,
+        grouped_tensor, 0);
+    cuda_synchronize();
+
+    int failures = 0;
+    const auto baseline_words = from_device<std::uint16_t>(baseline.data(),
+        static_cast<std::size_t>(tokens) * kHidden);
+    const auto grouped_words = from_device<std::uint16_t>(grouped_destination.data(),
+        static_cast<std::size_t>(tokens) * kHidden);
+    failures += verify_exact((label + " grouped vs cached raw bits").c_str(),
+                             grouped_words, baseline_words);
+
+    const auto meta_host = from_device<std::int32_t>(meta.p,
+        1 + 2 * static_cast<std::size_t>(ops::detail::kMoeGroupMaxGroups));
+    if (meta_host[0] < 1 || meta_host[0] > ops::detail::kMoeGroupMaxGroups) {
+        std::cerr << label << ": invalid grouped expert count " << meta_host[0] << '\n';
+        ++failures;
+    }
+
+    const ReductionCriterion criterion =
+        dtype == DType::FP16 ? kF16DestinationCriterion : kDestinationCriterion;
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        std::vector<double> expected(kHidden, 0.0);
+        for (std::int32_t row = 0; row < kHidden; ++row) {
+            expected[static_cast<std::size_t>(row)] =
+                dtype == DType::FP16
+                    ? f16_to_f32(residual_words[static_cast<std::size_t>(token) * kHidden + row])
+                    : bf16_to_f32(residual_words[static_cast<std::size_t>(token) * kHidden + row]);
+        }
+        for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+            const std::size_t index = static_cast<std::size_t>(token) * kTopK + rank;
+            const std::vector<double> contribution = expert_contribution(
+                gate_up, down, selected[index],
+                activation_values[static_cast<std::size_t>(token)],
+                selected_coefficients[index]);
+            for (std::int32_t row = 0; row < kHidden; ++row) {
+                expected[static_cast<std::size_t>(row)] += contribution[static_cast<std::size_t>(row)];
+            }
+        }
+        std::vector<double> got(kHidden);
+        for (std::int32_t row = 0; row < kHidden; ++row) {
+            const std::uint16_t word =
+                grouped_words[static_cast<std::size_t>(token) * kHidden + row];
+            got[static_cast<std::size_t>(row)] = dtype == DType::FP16 ? f16_to_f32(word)
+                                                                      : bf16_to_f32(word);
+        }
+        failures += verify_reduction(label + " grouped oracle token " + std::to_string(token),
+                                     got, expected, criterion);
+    }
+    failures += baseline.verify_guards(label + " baseline guard");
+    failures += grouped_destination.verify_guards(label + " grouped guard");
+    failures += ids_buffer.verify_guards(label + " ids guard");
+    failures += coefficients_buffer.verify_guards(label + " coefficients guard");
+    failures += shared_gate_buffer.verify_guards(label + " shared gate guard");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1965,6 +2103,18 @@ int main() {
                                                DType::BF16, "moe_nvfp4 cached multi bf16 T=8");
     failures += run_cached_multi_bitwise_case(gate_up_f16, down_f16, weights_f16, t8_activations,
                                                DType::FP16, "moe_nvfp4 cached multi f16 T=8");
+    failures += run_grouped_bitwise_case(inputs.gate_up, inputs.down, weights, t2_activations,
+                                         DType::BF16, "moe_nvfp4 grouped bf16 T=2");
+    failures += run_grouped_bitwise_case(gate_up_f16, down_f16, weights_f16, t2_activations,
+                                         DType::FP16, "moe_nvfp4 grouped f16 T=2");
+    failures += run_grouped_bitwise_case(inputs.gate_up, inputs.down, weights, t6_activations,
+                                         DType::BF16, "moe_nvfp4 grouped bf16 T=6");
+    failures += run_grouped_bitwise_case(gate_up_f16, down_f16, weights_f16, t6_activations,
+                                         DType::FP16, "moe_nvfp4 grouped f16 T=6");
+    failures += run_grouped_bitwise_case(inputs.gate_up, inputs.down, weights, t8_activations,
+                                         DType::BF16, "moe_nvfp4 grouped bf16 T=8");
+    failures += run_grouped_bitwise_case(gate_up_f16, down_f16, weights_f16, t8_activations,
+                                         DType::FP16, "moe_nvfp4 grouped f16 T=8");
     failures += run_shared_bitwise_case(weights, inputs.activation[1], DType::BF16,
                                         "moe_nvfp4 shared bf16");
     failures += run_shared_bitwise_case(weights_f16, inputs.activation[2], DType::FP16,

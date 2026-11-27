@@ -259,6 +259,7 @@ add_library(ninfer_ops STATIC
   ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
   ops/moe_nvfp4/route.cu
   ops/moe_nvfp4/grouped.cu
+  ops/moe_nvfp4/grouped_multi.cu
   ops/moe_nvfp4/shared.cu
   ops/moe_nvfp4/route_unique.cu
   ops/moe_nvfp4/moe_nvfp4.cpp

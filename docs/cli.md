@@ -116,8 +116,9 @@ MTP with one to five draft positions; the V100X2 profile qualifies at most three
 supports one to fifteen on 35B-A3B, or one to seven on Qwen3.8-27B artifacts containing the
 optional DFlash2 package. The official NVFP4 v3 container includes that package. The standalone
 Flash-Next DFlash2 companion is selected with `--spec dflash2 --draft-model PATH` and accepts one
-to seven draft positions (four when `--draft-tokens` is omitted); `--draft-model` is required for
-that backend and ignored by the others. The companion keeps its own 2048-token context ring beside
+to seven draft positions (four when `--draft-tokens` is omitted); on the V100X2 profile the measured
+optimum is five drafts with `NINFER_FLASH_NEXT_DRAFT_MIN_P=0.8`, so pass `--draft-tokens 5`
+explicitly. `--draft-model` is required for that backend and ignored by the others. The companion keeps its own 2048-token context ring beside
 the target's 262144-token KV capacity, so decode runs eagerly rather than under CUDA Graph capture.
 On the V100X2 profile DFlash2 currently drafts and validates on TP1 and TP2 only.
 `--lm-head-draft` selects the optimized proposal head and requires a selected backend:
@@ -154,7 +155,7 @@ For the standalone Flash-Next DFlash2 companion:
 ```bash
 build/apps/ninfer models/qwen3_8_flash_next.ninfer \
   --tp 2 --devices 0,1 --max-context 16384 --max-new 512 --greedy --no-thinking \
-  --spec dflash2 --draft-tokens 7 \
+  --spec dflash2 --draft-tokens 5 \
   --draft-model models/Qwen3.8-Flash-Next-DFlash2-Infernix/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix
 ```
 

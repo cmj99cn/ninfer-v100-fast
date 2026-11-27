@@ -241,10 +241,12 @@ PP + 定制 verify kernel，二者 MTP 都 >100 tok/s，证明 batch verify 在�
 **DFlash2 并行 draft（`--spec dflash2 --draft-model <companion>`）**：本轮移植
 `iamwavecut/ninfer-all` 的 DFlash2 后端（Apache-2.0，commit 9ba1276）。在 2×V100 / TP2 /
 greedy / 512-token prompt / 128 decode / expert cache 15000 MiB / min_p 0.8 下实测
-**DFlash2-4 118.9 tok/s（acceptance 0.937，1.67× base）**，MTP-3 为 112.2 tok/s（0.859），
-plain 为 71.0 tok/s；三者的 greedy token 序列逐 token 相同（无损）。DFlash2 需额外
-`--draft-model` 指向 companion artifact，草稿窗口 2048，eager decode（不做 CUDA Graph），
-TP4 拒绝；它仍低于 120 tok/s，但把 acceptance 从 MTP 的 0.86 提到 0.94。
+**DFlash2-5 加 drafter GEMM 位级不变优化后约 146–149 tok/s（acceptance 0.99，约 2.07× base）**
+（仅 K=5 未优化 GEMM 时为 138.4 / 1.95×），MTP-3 为 112.2 tok/s（0.859），
+plain 为 71.0 tok/s；三者的 greedy token 序列逐 token 相同（无损）。五个 draft 明显优于四个
+（后者 118.8）、六到七个（135.7/133.9），故 Flash-Next 建议显式 `--draft-tokens 5`。DFlash2 需
+额外 `--draft-model` 指向 companion artifact，草稿窗口 2048，eager decode（不做 CUDA Graph），
+TP4 拒绝；它把 acceptance 从 MTP 的 0.86 提到 0.99，已接近 2× base。
 
 #### 口径澄清：greedy vs 随机采样（上游证据）
 
@@ -927,12 +929,14 @@ below) and are unreachable under greedy.
 
 **DFlash2 parallel drafting (`--spec dflash2 --draft-model <companion>`)**: this round ports the
 DFlash2 backend from `iamwavecut/ninfer-all` (Apache-2.0, commit 9ba1276). On 2×V100 / TP2 / greedy
-/ 512-token prompt / 128 decode / 15000 MiB expert cache / min_p 0.8 it measures **DFlash2-4 at
-118.9 tok/s (acceptance 0.937, 1.67× base)**, against MTP-3 at 112.2 tok/s (0.859) and plain at
-71.0 tok/s; all three emit token-identical greedy sequences (lossless). DFlash2 additionally needs
-`--draft-model` pointing at the companion artifact, uses a 2048-token draft window, decodes eagerly
-(no CUDA Graph), and rejects TP4; it stays below 120 tok/s but lifts acceptance from MTP's 0.86 to
-0.94.
+/ 512-token prompt / 128 decode / 15000 MiB expert cache / min_p 0.8 it measures **DFlash2-5 with
+the bit-identical drafter-GEMM tuning at about 146–149 tok/s (acceptance 0.99, ~2.07× base)**
+(138.4 / 1.95× with K=5 alone), against MTP-3 at 112.2 tok/s (0.859) and plain at 71.0 tok/s; all
+three emit token-identical greedy sequences (lossless). Five drafts clearly beat four (118.8) and
+six/seven (135.7/133.9), so Flash-Next should pass `--draft-tokens 5` explicitly. DFlash2
+additionally needs `--draft-model` pointing at the companion artifact, uses a 2048-token draft
+window, decodes eagerly (no CUDA Graph), and rejects TP4; it lifts acceptance from MTP's 0.86 to
+0.99 and now exceeds 2× base.
 
 #### Caliber Clarification: Greedy vs Random Sampling (Upstream Evidence)
 

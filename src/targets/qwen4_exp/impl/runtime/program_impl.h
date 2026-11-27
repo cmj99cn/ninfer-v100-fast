@@ -19,6 +19,8 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -31,7 +33,87 @@ namespace ninfer::targets::qwen4_exp::detail::NINFER_QWEN4EXP_RUNTIME_NS {
 
 inline constexpr std::uint32_t kGraphCaptureWarmSteps = 8;
 
-ProgramImplCore::~ProgramImplCore() noexcept = default;
+namespace {
+
+inline bool dflash2_phase_diag_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_PHASE_DIAG");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+inline void dflash2_event_create(cudaEvent_t& event) {
+    if (event == nullptr) { CUDA_CHECK(cudaEventCreate(&event)); }
+}
+
+inline void dflash2_event_destroy(cudaEvent_t& event) noexcept {
+    if (event != nullptr) {
+        (void)cudaEventDestroy(event);
+        event = nullptr;
+    }
+}
+
+inline void dflash2_event_record(cudaEvent_t event, cudaStream_t stream) {
+    if (event != nullptr) { CUDA_CHECK(cudaEventRecord(event, stream)); }
+}
+
+inline double dflash2_event_ms(cudaEvent_t begin, cudaEvent_t end) {
+    if (begin == nullptr || end == nullptr) { return 0.0; }
+    float ms = 0.0F;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, begin, end));
+    return static_cast<double>(ms);
+}
+
+inline void dflash2_phase_print(const Dflash2PhaseDiag& diag) {
+    if (diag.rounds == 0) { return; }
+    const double rounds = static_cast<double>(diag.rounds);
+    std::fprintf(stderr,
+                 "dflash2_phase avg_ms: propose=%.4f propose_host=%.4f verify=%.4f "
+                 "commit=%.4f materialize=%.4f total=%.4f rounds=%llu tokens=%llu "
+                 "tokens_per_round=%.3f\n",
+                 diag.propose_ms / rounds, diag.propose_host_ms / rounds,
+                 diag.verify_ms / rounds, diag.commit_ms / rounds,
+                 diag.materialize_ms / rounds, diag.total_ms / rounds,
+                 static_cast<unsigned long long>(diag.rounds),
+                 static_cast<unsigned long long>(diag.tokens),
+                 static_cast<double>(diag.tokens) / rounds);
+    std::fflush(stderr);
+}
+
+inline void dflash2_phase_read_pending(Dflash2PhaseDiag& diag, std::uint64_t print_every) {
+    if (!diag.pending) { return; }
+    if (diag.pending_drafts) {
+        diag.verify_ms += dflash2_event_ms(diag.verify_begin, diag.verify_end);
+        diag.commit_ms += dflash2_event_ms(diag.commit_begin, diag.commit_end);
+    }
+    diag.materialize_ms += dflash2_event_ms(diag.materialize_begin, diag.materialize_end);
+    diag.total_ms += dflash2_event_ms(diag.round_begin, diag.materialize_end);
+    diag.tokens += diag.pending_tokens;
+    diag.rounds += 1;
+    diag.pending        = false;
+    diag.pending_drafts = false;
+    diag.pending_tokens = 0;
+    if (print_every != 0 && diag.rounds % print_every == 0) { dflash2_phase_print(diag); }
+}
+
+} // namespace
+
+ProgramImplCore::~ProgramImplCore() noexcept {
+    if (dflash2_phase_diag_.enabled && dflash2_phase_diag_.rounds > 0) {
+        dflash2_phase_print(dflash2_phase_diag_);
+    }
+    auto& diag = dflash2_phase_diag_;
+    dflash2_event_destroy(diag.round_begin);
+    dflash2_event_destroy(diag.propose_begin);
+    dflash2_event_destroy(diag.propose_end);
+    dflash2_event_destroy(diag.verify_begin);
+    dflash2_event_destroy(diag.verify_end);
+    dflash2_event_destroy(diag.commit_begin);
+    dflash2_event_destroy(diag.commit_end);
+    dflash2_event_destroy(diag.materialize_begin);
+    dflash2_event_destroy(diag.materialize_end);
+}
 
 namespace {
 
@@ -123,6 +205,20 @@ ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevi
             execution_, state_ptrs_, activation_ptrs_, workspace_ptrs_, execution_.tp);
     }
     if (dflash2_enabled) { setup_dflash2(); }
+    if (dflash2_enabled && dflash2_phase_diag_enabled()) {
+        const ScopedDevice diag_scope(execution_.dev[0]->device);
+        auto& diag       = dflash2_phase_diag_;
+        diag.enabled     = true;
+        dflash2_event_create(diag.round_begin);
+        dflash2_event_create(diag.propose_begin);
+        dflash2_event_create(diag.propose_end);
+        dflash2_event_create(diag.verify_begin);
+        dflash2_event_create(diag.verify_end);
+        dflash2_event_create(diag.commit_begin);
+        dflash2_event_create(diag.commit_end);
+        dflash2_event_create(diag.materialize_begin);
+        dflash2_event_create(diag.materialize_end);
+    }
     CUDA_CHECK(cudaSetDevice(execution_.dev[0]->device));
 }
 
@@ -548,7 +644,13 @@ void ProgramImplCore::dflash2_capture_committed(std::uint32_t start_position, st
     call.min_count = static_cast<std::uint32_t>(count);
     call.max_count = static_cast<std::uint32_t>(count);
     auto work_scope = dflash2_work_->scope();
+    if (dflash2_phase_diag_.enabled && dflash2_phase_diag_.in_decode) {
+        dflash2_event_record(dflash2_phase_diag_.materialize_begin, stream);
+    }
     dflash2_drafter_->materialize(call, *dflash2_work_, stream);
+    if (dflash2_phase_diag_.enabled && dflash2_phase_diag_.in_decode) {
+        dflash2_event_record(dflash2_phase_diag_.materialize_end, stream);
+    }
 }
 
 TokenId ProgramImplCore::decode_dflash2(LaneState& state, const runtime::RoundBudget& budget,
@@ -557,6 +659,18 @@ TokenId ProgramImplCore::decode_dflash2(LaneState& state, const runtime::RoundBu
     committed.clear();
     const ScopedDevice scope(execution_.dev[0]->device);
     cudaStream_t stream = states_[0]->stream();
+    auto& diag          = dflash2_phase_diag_;
+    const bool diag_on  = diag.enabled;
+    if (diag_on) {
+        if (diag.pending) {
+            // The prior round's materialize (and anything before it) is still in flight; drain it
+            // once and read the completed phase events before starting the next round's records.
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            dflash2_phase_read_pending(diag, /*print_every=*/16);
+        }
+        dflash2_event_record(diag.round_begin, stream);
+        diag.in_decode = true;
+    }
     const std::uint32_t frontier = states_[0]->next_position();
     const std::uint32_t drafts =
         flash::verify_extent(dflash2_window_, dflash2_window_, budget, frontier,
@@ -597,10 +711,14 @@ TokenId ProgramImplCore::decode_dflash2(LaneState& state, const runtime::RoundBu
         call.candidates    = Tensor(dflash2_candidates_.p, DType::I32, {16, k, 1});
         call.proposal_q    = Tensor(dflash2_proposal_q_.p, DType::FP32, {16, k, 1});
         call.confidence    = Tensor(dflash2_confidence_.p, DType::FP32, {k, 1});
+        if (diag_on) { dflash2_event_record(diag.propose_begin, stream); }
         {
             auto work_scope = dflash2_work_->scope();
             dflash2_drafter_->propose(call, *dflash2_work_, stream);
         }
+        if (diag_on) { dflash2_event_record(diag.propose_end, stream); }
+        const auto propose_host_begin = diag_on ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point{};
         std::vector<TokenId> proposals(static_cast<std::size_t>(k));
         std::vector<float> confidence(static_cast<std::size_t>(k));
         CUDA_CHECK(cudaMemcpyAsync(proposals.data(), dflash2_drafts_.p,
@@ -610,6 +728,16 @@ TokenId ProgramImplCore::decode_dflash2(LaneState& state, const runtime::RoundBu
                                    static_cast<std::size_t>(k) * sizeof(float),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (diag_on) {
+            const double propose_gpu =
+                dflash2_event_ms(diag.propose_begin, diag.propose_end);
+            const double host_wall = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - propose_host_begin).count();
+            diag.propose_ms += propose_gpu;
+            // The host block's sync waits for the propose GPU work that the propose event already
+            // charges; subtract it so the phases stay non-overlapping.
+            diag.propose_host_ms += std::max(0.0, host_wall - propose_gpu);
+        }
 
         // The selector marks how far the conditional chain is worth extending. As with the MTP
         // chain, a positive min_p keeps the first step and stops before the first weak one.
@@ -627,6 +755,7 @@ TokenId ProgramImplCore::decode_dflash2(LaneState& state, const runtime::RoundBu
         verify_tokens.push_back(state.context.next_input);
         verify_tokens.insert(verify_tokens.end(), proposals.begin(), proposals.end());
 
+        if (diag_on) { dflash2_event_record(diag.verify_begin, stream); }
         const TextTrunk::VerificationBaseline baseline =
             trunk_->capture_verification_baseline();
         struct ActionGuard {
@@ -636,10 +765,13 @@ TokenId ProgramImplCore::decode_dflash2(LaneState& state, const runtime::RoundBu
         trunk_->set_gdn_state_action(GdnStateAction::RecordForReplay);
         last_stage_capture() = &logits_capture_;
         const std::vector<TokenId> predictions = trunk_->decode_span(verify_tokens);
+        if (diag_on) { dflash2_event_record(diag.verify_end, stream); }
+        if (diag_on) { dflash2_event_record(diag.commit_begin, stream); }
         accepted = flash::accepted_prefix(proposals, predictions);
         committed = flash::commit_tokens(proposals, predictions);
         if (committed.empty()) { committed.push_back(predictions.front()); }
         trunk_->commit_verified_span(verify_tokens, accepted + 1, baseline);
+        if (diag_on) { dflash2_event_record(diag.commit_end, stream); }
         dflash2_capture_committed(frontier, static_cast<std::int32_t>(accepted + 1));
     }
     dflash2_stats_.rounds += 1;
@@ -650,6 +782,12 @@ TokenId ProgramImplCore::decode_dflash2(LaneState& state, const runtime::RoundBu
     }
     for (std::uint32_t at = 0; at < accepted && at < dflash2_window_; ++at) {
         dflash2_stats_.accepted_per_position[at] += 1;
+    }
+    if (diag_on) {
+        diag.pending        = true;
+        diag.pending_drafts = drafts > 0;
+        diag.pending_tokens = committed.size();
+        diag.in_decode      = false;
     }
     token = committed.back();
     return token;

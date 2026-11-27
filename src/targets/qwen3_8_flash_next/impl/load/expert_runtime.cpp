@@ -4,9 +4,12 @@
 #include "ops/moe_nvfp4/moe_nvfp4_launch.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -40,6 +43,213 @@ constexpr std::int32_t kExperts      = TextConfig::experts;
 constexpr std::int32_t kTopK         = TextConfig::experts_per_token;
 constexpr std::size_t kLookupEntries = static_cast<std::size_t>(kTextLayers) * kExperts;
 
+// ---------------------------------------------------------------------------
+// DFlash2 cross-column route-overlap diagnostic (NINFER_DFLASH2_ROUTE_OVERLAP=1).
+//
+// For every eager multi-column target forward (the T in [2,8] verify/decoded
+// span) this records, per rank and layer, how many of the kTopK*T routed slots
+// collapse onto the same expert. Routing is replicated across tensor-parallel
+// ranks (moe/router is Axis::Replicated) and the ids are global, so the metric
+// is reported two ways:
+//   * global  - distinct ids over the full kTopK*T slab (rank-invariant);
+//   * owned   - only the slots whose global id falls in this rank's expert
+//               range, i.e. the experts this rank actually reads. This is the
+//               ratio that bounds a grouped (one-weight-read-per-expert) path.
+// The gate is evaluated once; when it is off nothing is copied, synchronized or
+// accumulated, so the default execution path is byte-for-byte unchanged.
+// ---------------------------------------------------------------------------
+constexpr std::int32_t kOverlapMaxTokens = 8;
+constexpr std::uint32_t kOverlapRanks    = kTp;
+constexpr std::uint64_t kOverlapWarmupRounds = 16;
+
+bool route_overlap_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_ROUTE_OVERLAP");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+// DFlash2 grouped multi-column routed path. The gate is evaluated once; with it off no grouped
+// buffer is allocated and the cached kernel sequence is unchanged.
+bool grouped_routed_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_GROUPED_ROUTED");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+struct RouteOverlapAccum {
+    std::uint64_t calls           = 0;
+    std::uint64_t global_slots    = 0;
+    std::uint64_t global_distinct = 0;
+    std::uint64_t owned_slots     = 0;
+    std::uint64_t owned_distinct  = 0;
+};
+
+struct RouteOverlapRegistry {
+    std::mutex mutex;
+    std::array<std::array<std::uint64_t, kOverlapMaxTokens + 1>, kOverlapRanks> records{};
+    std::array<std::array<std::array<RouteOverlapAccum, kTextLayers>, kOverlapMaxTokens + 1>,
+               kOverlapRanks>
+        accum{};
+    bool at_exit_registered = false;
+};
+
+RouteOverlapRegistry& route_overlap_registry() {
+    static RouteOverlapRegistry registry;
+    return registry;
+}
+
+void route_overlap_print() {
+    RouteOverlapRegistry& registry = route_overlap_registry();
+    std::lock_guard lock(registry.mutex);
+    for (std::uint32_t rank = 0; rank < kOverlapRanks; ++rank) {
+        for (std::int32_t tokens = 2; tokens <= kOverlapMaxTokens; ++tokens) {
+            const auto& by_layer = registry.accum[rank][static_cast<std::size_t>(tokens)];
+            std::uint64_t calls = 0, global_slots = 0, global_distinct = 0;
+            std::uint64_t owned_slots = 0, owned_distinct = 0, layers = 0;
+            double global_min = 2.0, global_max = -1.0;
+            double owned_min = 2.0, owned_max = -1.0;
+            for (const RouteOverlapAccum& layer : by_layer) {
+                if (layer.calls == 0) { continue; }
+                ++layers;
+                calls += layer.calls;
+                global_slots += layer.global_slots;
+                global_distinct += layer.global_distinct;
+                owned_slots += layer.owned_slots;
+                owned_distinct += layer.owned_distinct;
+                if (layer.global_slots != 0) {
+                    const double overlap =
+                        1.0 - static_cast<double>(layer.global_distinct) /
+                                  static_cast<double>(layer.global_slots);
+                    global_min = std::min(global_min, overlap);
+                    global_max = std::max(global_max, overlap);
+                }
+                if (layer.owned_slots != 0) {
+                    const double overlap =
+                        1.0 - static_cast<double>(layer.owned_distinct) /
+                                  static_cast<double>(layer.owned_slots);
+                    owned_min = std::min(owned_min, overlap);
+                    owned_max = std::max(owned_max, overlap);
+                }
+            }
+            if (layers == 0 || global_slots == 0) { continue; }
+            const double global_ratio = static_cast<double>(global_distinct) /
+                                        static_cast<double>(global_slots);
+            std::fprintf(
+                stderr,
+                "[dflash2-route-overlap] rank=%u tokens=%d layers=%llu calls=%llu "
+                "global distinct/total=%.5f overlap=%.5f per-layer[min=%.5f max=%.5f] "
+                "owned distinct/total=%.5f overlap=%.5f per-layer[min=%.5f max=%.5f]\n",
+                rank, tokens, static_cast<unsigned long long>(layers),
+                static_cast<unsigned long long>(calls), global_ratio, 1.0 - global_ratio,
+                global_min, global_max,
+                owned_slots == 0 ? 1.0
+                                 : static_cast<double>(owned_distinct) /
+                                       static_cast<double>(owned_slots),
+                owned_slots == 0 ? 0.0
+                                 : 1.0 - static_cast<double>(owned_distinct) /
+                                             static_cast<double>(owned_slots),
+                owned_slots == 0 ? 0.0 : owned_min, owned_slots == 0 ? 0.0 : owned_max);
+        }
+    }
+    // Combined across ranks for the canonical verify width (tokens == 6).
+    constexpr std::int32_t kVerifyTokens = 6;
+    std::uint64_t global_slots = 0, global_distinct = 0, owned_slots = 0, owned_distinct = 0;
+    std::array<std::uint64_t, kTextLayers> layer_global_slots{};
+    std::array<std::uint64_t, kTextLayers> layer_global_distinct{};
+    std::array<std::array<double, kTextLayers>, kOverlapRanks> layer_owned_overlap{};
+    for (std::uint32_t rank = 0; rank < kOverlapRanks; ++rank) {
+        const auto& by_layer = registry.accum[rank][kVerifyTokens];
+        for (std::uint32_t layer = 0; layer < kTextLayers; ++layer) {
+            const RouteOverlapAccum& value = by_layer[layer];
+            layer_global_slots[layer] += value.global_slots;
+            layer_global_distinct[layer] += value.global_distinct;
+            global_slots += value.global_slots;
+            global_distinct += value.global_distinct;
+            owned_slots += value.owned_slots;
+            owned_distinct += value.owned_distinct;
+            if (value.owned_slots != 0) {
+                layer_owned_overlap[rank][layer] =
+                    1.0 - static_cast<double>(value.owned_distinct) /
+                              static_cast<double>(value.owned_slots);
+            }
+        }
+    }
+    if (global_slots == 0) { return; }
+    double layer_min = 2.0, layer_max = -1.0;
+    for (std::uint32_t layer = 0; layer < kTextLayers; ++layer) {
+        if (layer_global_slots[layer] == 0) { continue; }
+        const double overlap = 1.0 - static_cast<double>(layer_global_distinct[layer]) /
+                                          static_cast<double>(layer_global_slots[layer]);
+        layer_min = std::min(layer_min, overlap);
+        layer_max = std::max(layer_max, overlap);
+        std::fprintf(stderr,
+                     "[dflash2-route-overlap] layer=%-2u tokens=%d global_overlap=%.5f "
+                     "owned_overlap rank0=%.5f rank1=%.5f\n",
+                     layer, kVerifyTokens, overlap, layer_owned_overlap[0][layer],
+                     layer_owned_overlap[kOverlapRanks - 1][layer]);
+    }
+    const double ratio = static_cast<double>(global_distinct) / static_cast<double>(global_slots);
+    std::fprintf(stderr,
+                 "[dflash2-route-overlap] COMBINED tokens=%d ranks=%u "
+                 "total_slots=%llu distinct=%llu distinct/total=%.5f overlap=%.5f "
+                 "per-layer[min=%.5f max=%.5f] owned distinct/total=%.5f\n",
+                 kVerifyTokens, kOverlapRanks,
+                 static_cast<unsigned long long>(global_slots),
+                 static_cast<unsigned long long>(global_distinct), ratio, 1.0 - ratio, layer_min,
+                 layer_max,
+                 owned_slots == 0 ? 1.0
+                                  : static_cast<double>(owned_distinct) /
+                                        static_cast<double>(owned_slots));
+}
+
+void route_overlap_record(std::uint32_t rank, std::uint32_t layer, std::int32_t tokens,
+                          std::uint32_t expert_begin, const std::int32_t* ids) {
+    if (rank >= kOverlapRanks || layer >= kTextLayers || tokens < 2 ||
+        tokens > kOverlapMaxTokens) {
+        return;
+    }
+    RouteOverlapRegistry& registry = route_overlap_registry();
+    std::lock_guard lock(registry.mutex);
+    if (!registry.at_exit_registered) {
+        registry.at_exit_registered = true;
+        std::atexit(route_overlap_print);
+    }
+    const std::uint64_t index = registry.records[rank][static_cast<std::size_t>(tokens)]++;
+    if (index / kTextLayers < kOverlapWarmupRounds) { return; }
+
+    const std::int32_t slots = kTopK * tokens;
+    const std::int32_t begin = static_cast<std::int32_t>(expert_begin);
+    const std::int32_t end   = begin + static_cast<std::int32_t>(kRankExperts);
+    std::array<bool, static_cast<std::size_t>(kExperts)> seen{};
+    std::array<bool, static_cast<std::size_t>(kExperts)> owned_seen{};
+    std::uint64_t distinct = 0, owned_slots = 0, owned_distinct = 0;
+    for (std::int32_t slot = 0; slot < slots; ++slot) {
+        const std::int32_t id = ids[slot];
+        if (id < 0 || id >= kExperts) { continue; }
+        if (!seen[static_cast<std::size_t>(id)]) {
+            seen[static_cast<std::size_t>(id)] = true;
+            ++distinct;
+        }
+        if (id >= begin && id < end) {
+            ++owned_slots;
+            if (!owned_seen[static_cast<std::size_t>(id)]) {
+                owned_seen[static_cast<std::size_t>(id)] = true;
+                ++owned_distinct;
+            }
+        }
+    }
+    RouteOverlapAccum& accum = registry.accum[rank][static_cast<std::size_t>(tokens)][layer];
+    accum.calls += 1;
+    accum.global_slots += static_cast<std::uint64_t>(slots);
+    accum.global_distinct += distinct;
+    accum.owned_slots += owned_slots;
+    accum.owned_distinct += owned_distinct;
+}
+
 } // namespace
 
 ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int device,
@@ -56,6 +266,17 @@ ExpertRuntime::ExpertRuntime(const std::filesystem::path& artifact_path, int dev
         static_cast<std::size_t>(ops::detail::kMoeMaxSmallT) *
         static_cast<std::size_t>(kTopK) *
         static_cast<std::size_t>(TextConfig::expert_intermediate) * sizeof(float));
+    if (grouped_routed_enabled()) {
+        const std::size_t bucket_slots = static_cast<std::size_t>(cache_.slots());
+        grouped_buckets_ = DeviceBuffer(bucket_slots *
+            static_cast<std::size_t>(ops::detail::kMoeGroupBucketStride) * sizeof(std::int32_t));
+        grouped_meta_ = DeviceBuffer(
+            (1 + 2 * static_cast<std::size_t>(ops::detail::kMoeGroupMaxGroups)) *
+            sizeof(std::int32_t));
+        grouped_partial_ = DeviceBuffer(
+            static_cast<std::size_t>(ops::detail::kMoeMaxSmallT) * static_cast<std::size_t>(kTopK) *
+            static_cast<std::size_t>(TextConfig::hidden) * sizeof(float));
+    }
     rollback_ = DeviceBuffer(static_cast<std::size_t>(TextConfig::hidden) * sizeof(std::uint16_t));
     lookup_host_ = std::make_unique<PinnedHostBuffer>(kLookupEntries * 4);
     route_history_ = DeviceBuffer(kRouteHistoryBytes);
@@ -339,9 +560,45 @@ void ExpertRuntime::publish_prefetch(std::uint32_t layer, cudaStream_t stream) {
     prefetch_pending_[layer] = false;
 }
 
+void ExpertRuntime::routed_cached_launch(std::uint32_t layer, const Tensor& x,
+                                          const ops::MoeNvfp4RouteView& route, Tensor& destination,
+                                          cudaStream_t stream) {
+    const std::int32_t tokens = route.expert_ids.ne[1];
+    const auto* table_row = static_cast<const std::int32_t*>(lookup_.p) +
+                            static_cast<std::size_t>(layer) * kExperts;
+    const ops::detail::MoeNvfp4RouteOutputs outputs{
+        static_cast<std::int32_t*>(route.expert_ids.data),
+        static_cast<float*>(route.coefficients.data),
+        static_cast<float*>(route.shared_gate.data)};
+    const ops::MoeNvfp4ExpertSlots bank{
+        .payload    = static_cast<const std::uint8_t*>(slab_.p),
+        .slot_bytes = kPairBytes,
+        .slot_count = static_cast<std::int32_t>(cache_.slots()),
+        .lookup     = table_row,
+        .divisors   = static_cast<const float*>(divisors_.p),
+    };
+    const ops::MoeNvfp4ExpertScratch scratch{.activation = activation_scratch()};
+    if (grouped_routed_enabled() && tokens >= 2 &&
+        tokens <= ops::detail::kMoeMaxSmallT) {
+        const ops::detail::MoeNvfp4Scratch detail_scratch{.activation = activation_scratch()};
+        const ops::detail::MoeNvfp4GroupedScratch grouped{
+            .buckets  = static_cast<std::int32_t*>(grouped_buckets_.p),
+            .meta     = static_cast<std::int32_t*>(grouped_meta_.p),
+            .partial  = static_cast<float*>(grouped_partial_.p),
+        };
+        ops::detail::moe_nvfp4_grouped_cached_launch(
+            x, static_cast<const std::uint8_t*>(slab_.p), kPairBytes,
+            static_cast<std::int32_t>(cache_.slots()), table_row,
+            static_cast<const float*>(divisors_.p), detail_scratch, grouped, outputs, destination,
+            stream);
+        return;
+    }
+    ops::moe_routed_nvfp4_cached(x, bank, scratch, route, destination, stream);
+}
+
 void ExpertRuntime::routed_launch(std::uint32_t layer, const Tensor& x,
-                                  const ops::MoeNvfp4RouteView& route, Tensor& destination,
-                                  cudaStream_t stream) {
+                                   const ops::MoeNvfp4RouteView& route, Tensor& destination,
+                                   cudaStream_t stream) {
     const ScopedDevice scope(device_);
     const std::int32_t tokens = route.expert_ids.ne[1];
     if (tokens < 1) { return; }
@@ -401,13 +658,22 @@ void ExpertRuntime::routed_launch(std::uint32_t layer, const Tensor& x,
     }
 
     if (!graph_mode_ && tokens <= kRouteHistoryTokens) {
+        if (route_overlap_enabled()) {
+            overlap_ids_.resize(static_cast<std::size_t>(kTopK) * static_cast<std::size_t>(tokens));
+            CUDA_CHECK(cudaMemcpyAsync(overlap_ids_.data(), route.expert_ids.data,
+                                       overlap_ids_.size() * 4, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const std::uint32_t rank =
+                static_cast<std::uint32_t>(expert_begin_) / kRankExperts;
+            route_overlap_record(rank, layer, tokens, expert_begin_, overlap_ids_.data());
+        }
         CUDA_CHECK(cudaMemsetAsync(probe_miss_count_dev_, 0, 2 * sizeof(std::int32_t), stream));
         ops::detail::moe_nvfp4_route_probe_launch(
             static_cast<const std::int32_t*>(route.expert_ids.data), kTopK * tokens, table_row,
             expert_begin, expert_end, probe_active_ids_dev_, probe_miss_ids_dev_,
             probe_active_count_dev_, probe_miss_count_dev_, stream);
         CUDA_CHECK(cudaEventRecord(probe_done_, stream));
-        ops::moe_routed_nvfp4_cached(x, bank, scratch, route, destination, stream);
+        routed_cached_launch(layer, x, route, destination, stream);
         CUDA_CHECK(cudaEventRecord(down_done_, stream));
         pending_.active      = true;
         pending_.layer       = layer;
@@ -467,7 +733,7 @@ void ExpertRuntime::routed_launch(std::uint32_t layer, const Tensor& x,
         CUDA_CHECK(cudaStreamWaitEvent(stream, copy_done_, 0));
     }
 
-    ops::moe_routed_nvfp4_cached(x, bank, scratch, route, destination, stream);
+    routed_cached_launch(layer, x, route, destination, stream);
 
     if (stats_ != nullptr) {
         const CacheStats stats = cache_.stats();
@@ -574,7 +840,7 @@ void ExpertRuntime::routed_finish(cudaStream_t stream) {
         };
         const ops::MoeNvfp4ExpertScratch scratch{.activation = activation_scratch()};
         CUDA_CHECK(cudaMemsetAsync(destination.data, 0, destination.bytes(), stream));
-        ops::moe_routed_nvfp4_cached(x, bank, scratch, route, destination, stream);
+        routed_cached_launch(layer, x, route, destination, stream);
     }
     pending_.active = false;
 

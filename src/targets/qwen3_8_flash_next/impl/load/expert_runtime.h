@@ -36,6 +36,9 @@ public:
     void routed_launch(std::uint32_t layer, const Tensor& x,
                        const ops::MoeNvfp4RouteView& route, Tensor& destination,
                        cudaStream_t stream);
+    void routed_cached_launch(std::uint32_t layer, const Tensor& x,
+                              const ops::MoeNvfp4RouteView& route, Tensor& destination,
+                              cudaStream_t stream);
     void routed_finish(cudaStream_t stream);
     void prefetch_previous_round(cudaStream_t stream);
     void prime_static_residency();
@@ -112,6 +115,9 @@ private:
     DeviceBuffer lookup_;
     DeviceBuffer divisors_;
     DeviceBuffer activation_scratch_;
+    DeviceBuffer grouped_buckets_;
+    DeviceBuffer grouped_meta_;
+    DeviceBuffer grouped_partial_;
     DeviceBuffer rollback_;
     std::unique_ptr<PinnedHostBuffer> lookup_host_;
     DeviceBuffer route_history_;
@@ -131,6 +137,7 @@ private:
     std::condition_variable prefetch_recorded_cv_;
     bool prefetch_failed_ = false;
     std::vector<std::int32_t> host_ids_;
+    std::vector<std::int32_t> overlap_ids_;
     bool frozen_                       = false;
     bool graph_mode_                   = false;
     std::int32_t* probe_host_          = nullptr;
