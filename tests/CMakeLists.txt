@@ -422,6 +422,15 @@ ninfer_add_test(ninfer_qwen4_exp_frontend_test
 target_include_directories(ninfer_qwen4_exp_frontend_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen4_exp/export)
 set_tests_properties(ninfer_qwen4_exp_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen4_exp_prefix_publish_test
+  SOURCES targets/qwen4_exp/test_prefix_publish.cpp)
+# Real-artifact Engine-level gate for F1: warm a 128-token prefill through the public Engine, then
+# read the published host manifest and probe it. Opt-in like the other flash-next Engine tests.
+ninfer_add_test(ninfer_qwen4_exp_prefix_publish_real_test
+  SOURCES targets/qwen4_exp/test_prefix_publish_integration.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen4_exp_prefix_publish_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen4_exp_prefix_publish_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)

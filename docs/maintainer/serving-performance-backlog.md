@@ -46,7 +46,7 @@
 
 | # | 项 | 现状 | 目标/路径 | 风险 |
 |---|---|---|---|---|
-| S1 | **qwen4_exp 前缀复用** | 未实现（stub） | 多轮/重复前缀只 prefill 新 suffix。最小可行：block-snapshot 复用（64-token 边界 + state snapshot）；完整：移植 qwen3_6 的 retained-lane/checkpoint 机制。需覆盖 KV pages、GDN state、QSA tail、PLE history、route counter、hidden、position metadata。 | 大改；状态快照/恢复需 oracle + 端到端 A/B；不可改变 greedy 输出 |
+| S1 | **qwen4_exp 前缀复用** | 未实现（stub） | 多轮/重复前缀只 prefill 新 suffix。**移植源 = `Neroued/ninfer` 的 `src/models/qwen4_exp/session/checkpoints.cpp` + `state/state_image`（与 qwen4_exp 同源），不是 qwen3_6**。前缀缓存**落 pinned 系统内存**：本 fork 已有 `src/runtime/prefix_cache`（`PrefixIndex` 不占 device、`SharedHostTier`/`HostSlabPool` pinned host，预算 `--host-cache-mib`）与 `state_transaction_impl`（GDN/QSA/PLE/route/KV/position 快照）。设计见 `.superpowers/.../qwen4exp-prefix-reuse-port.md`。 | 大改；分阶段 oracle + 端到端 A/B；不可改变 greedy 输出 |
 | S2 | **专家缓存冷启动/抖动** | 已完成机制：`serve` 原先**没有** `--expert-cache-profile`（只有 bench 有）。已给 serve 增加该参数并映射到 `EngineOptions.expert_cache_profile`；DFlash2+KV 下可用显存 ~14.6GB，profile 需 `--expert-cache-mib` ≤12000 MiB 才放得下 | 服务端启动即加载 profile；目标 0 miss | 小；已验证 flag 生效 |
 | S3 | 预填充吞吐（gdn_proj 权重每 8 列重读） | 已有 FP16 融合 GEMM 实现，默认关 | 该 op −87%、prefill −16.5%；但单请求 512/decode128 门禁下 decode 变慢 −8%（数值微扰改变 acceptance）。需在**服务端短 decode** 负载重估端到端；或先查 decode 变慢根因 | 中；已实现，需针对性 A/B |
 | S4 | prefill routed（45%）/ moe_reduce | routed 按 token 重读，HBM 边际 ~719 GB/s | 需 grouped/tensor-core 大 T 专家 kernel（多次负结果，慎重）；moe_reduce 为 TP2 allreduce，随 T 线性 | 大；低优先 |

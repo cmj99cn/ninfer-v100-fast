@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -100,6 +101,7 @@ inline void dflash2_phase_read_pending(Dflash2PhaseDiag& diag, std::uint64_t pri
 } // namespace
 
 ProgramImplCore::~ProgramImplCore() noexcept {
+    for (std::uint32_t lane = 0; lane < plan_->max_concurrency; ++lane) { release_retained(lane); }
     if (dflash2_phase_diag_.enabled && dflash2_phase_diag_.rounds > 0) {
         dflash2_phase_print(dflash2_phase_diag_);
     }
@@ -219,7 +221,84 @@ ProgramImplCore::ProgramImplCore(const std::array<const ModelView*, kMaximumDevi
         dflash2_event_create(diag.materialize_begin);
         dflash2_event_create(diag.materialize_end);
     }
+    setup_prefix_cache();
     CUDA_CHECK(cudaSetDevice(execution_.dev[0]->device));
+}
+
+void ProgramImplCore::setup_prefix_cache() {
+    prefix_index_ = std::make_unique<pc::PrefixIndex>(
+        pc::PrefixIndexOptions{.device_snapshot_slots = plan_->max_concurrency + 1U},
+        &prefix_sink_);
+    const bool wants_host_tier = options_.prefix_cache.host_cache_mib > 0 ||
+                                 options_.shared_host_tier != nullptr ||
+                                 options_.create_shared_host_tier;
+    if (!wants_host_tier) { return; }
+
+    // One pinned slab block holds this rank's QSA K/V/index-K page for every QSA layer; one
+    // snapshot slab holds the rank's continuation image. Ranks occupy disjoint slices, matching
+    // the SharedHostTier geometry checked below.
+    const auto cache = states_[0]->cache(0);
+    const auto page_bytes = [](const Tensor& plane) {
+        return static_cast<std::size_t>(plane.ne[0]) * static_cast<std::size_t>(plane.ne[1]) *
+               static_cast<std::size_t>(plane.ne[2]) * sizeof(std::uint16_t);
+    };
+    prefix_block_rank_bytes_ = static_cast<std::size_t>(TextConfig::qsa_layers()) *
+                               (page_bytes(cache.k_pages) + page_bytes(cache.v_pages) +
+                                page_bytes(cache.index_k_pages));
+    prefix_snapshot_rank_bytes_ =
+        sizeof(state_transaction_detail::StateImageHeader) +
+        state_transaction_detail::state_image_tensor_bytes(*states_[0]);
+    if (prefix_block_rank_bytes_ == 0 || prefix_snapshot_rank_bytes_ == 0) {
+        throw std::invalid_argument("qwen4_exp prefix cache has zero slab geometry");
+    }
+    const std::size_t tp = static_cast<std::size_t>(execution_.tp);
+    const std::size_t block_slab_bytes = tp * prefix_block_rank_bytes_;
+    const std::size_t snapshot_slab_bytes = tp * prefix_snapshot_rank_bytes_;
+
+    if (options_.shared_host_tier != nullptr) {
+        if (options_.shared_host_tier->tp() != static_cast<std::uint32_t>(execution_.tp) ||
+            options_.shared_host_tier->block_slab_bytes() != block_slab_bytes ||
+            options_.shared_host_tier->snapshot_slab_bytes() != snapshot_slab_bytes) {
+            throw std::invalid_argument("EngineOptions.shared_host_tier geometry does not match qwen4_exp");
+        }
+        shared_tier_ = options_.shared_host_tier;
+    } else {
+        const std::size_t total_bytes =
+            static_cast<std::size_t>(options_.prefix_cache.host_cache_mib) * 1024U * 1024U;
+        const std::size_t block_budget  = (total_bytes * 8) / 10;
+        const std::size_t snapshot_budget = total_bytes - block_budget;
+        const std::size_t block_slabs = block_budget / block_slab_bytes;
+        const std::size_t snapshot_slabs = snapshot_budget / snapshot_slab_bytes;
+        if (block_slabs == 0 || snapshot_slabs == 0) {
+            if (options_.create_shared_host_tier) {
+                throw std::invalid_argument("prefix cache host budget is too small for one slab of each kind");
+            }
+            std::fprintf(stderr,
+                         "[host-cache] requested %u MiB is too small for qwen4_exp slab geometry; "
+                         "host tier disabled\n",
+                         options_.prefix_cache.host_cache_mib);
+            return;
+        }
+        shared_tier_ = SharedHostTier::create(SharedHostTier::Config{
+            .host_bytes          = total_bytes,
+            .block_slab_bytes    = block_slab_bytes,
+            .snapshot_slab_bytes = snapshot_slab_bytes,
+            .block_slabs         = block_slabs,
+            .snapshot_slabs      = snapshot_slabs,
+            .block_tokens        = static_cast<std::uint32_t>(pc::kBlockTokens),
+            .tp                  = static_cast<std::uint32_t>(execution_.tp),
+        });
+    }
+    prefix_host_allocator_ = shared_tier_.get();
+    prefix_index_->set_host_allocator(prefix_host_allocator_);
+    prefix_index_->set_shared_host_tier(shared_tier_.get());
+    for (int rank = 0; rank < execution_.tp; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        const ScopedDevice scope(execution_.dev[slot]->device);
+        prefix_snapshot_staging_[slot] =
+            std::make_unique<DeviceBuffer>(state_transaction_detail::state_image_tensor_bytes(
+                *states_[slot]));
+    }
 }
 
 void ProgramImplCore::setup_dflash2() {
@@ -419,6 +498,131 @@ void ProgramImplCore::clear_lane(std::uint32_t lane) noexcept {
     lanes_[lane].timings            = timings;
 }
 
+void ProgramImplCore::capture_aligned_state(std::uint32_t lane, std::uint32_t frontier) {
+    if (prefix_index_ == nullptr || shared_tier_ == nullptr || frontier < pc::kBlockTokens ||
+        frontier % pc::kBlockTokens != 0) {
+        return;
+    }
+    lanes_[lane].capture_frontier = frontier;
+    try {
+        for (int rank = 0; rank < execution_.tp; ++rank) {
+            const auto slot = static_cast<std::size_t>(rank);
+            const ScopedDevice scope(execution_.dev[slot]->device);
+            std::size_t cursor = 0;
+            prefix_snapshot_headers_[slot] = state_transaction_detail::capture_state_image(
+                *states_[slot], static_cast<std::byte*>(prefix_snapshot_staging_[slot]->p), cursor,
+                prefix_snapshot_staging_[slot]->bytes, states_[slot]->stream());
+        }
+    } catch (...) {
+        lanes_[lane].capture_frontier = 0;
+    }
+}
+
+void ProgramImplCore::release_retained(std::uint32_t lane) noexcept {
+    RetainedPrefix& retained = retained_[lane];
+    if (!retained.valid) { return; }
+    if (retained.manifest_id != 0 && shared_tier_ != nullptr) {
+        (void)shared_tier_->release_manifest(retained.manifest_id);
+    }
+    retained = RetainedPrefix{};
+}
+
+void ProgramImplCore::publish_prefix(std::uint32_t lane) noexcept {
+    try {
+        LaneState& state = lanes_[lane];
+        if (prefix_index_ == nullptr || shared_tier_ == nullptr ||
+            state.capture_frontier < pc::kBlockTokens || state.block_hashes.empty()) {
+            return;
+        }
+        const std::size_t blocks = state.capture_frontier / pc::kBlockTokens;
+        if (blocks > state.block_hashes.size() ||
+            blocks * pc::kBlockTokens > state.context.prompt_tokens.size()) {
+            return;
+        }
+        const pc::SlotId slot = prefix_index_->device_snapshot_slots_free() != 0
+                                    ? prefix_index_->reserve_snapshot_slot(state.capture_frontier)
+                                    : pc::kInvalidSlot;
+        const auto published = commit_prefix_blocks(
+            *prefix_index_, std::span<const std::uint64_t>(state.block_hashes.data(), blocks),
+            std::span<const TokenId>(state.context.prompt_tokens.data(), blocks * pc::kBlockTokens),
+            slot);
+        if (published.snapshot == pc::kInvalidSnapshot) { return; }
+        const std::uint32_t generation = prefix_index_->snapshot_generation(published.snapshot);
+        for (std::size_t block = 0; block < published.block_nodes.size(); ++block) {
+            const auto write = prefix_index_->begin_host_write(published.block_nodes[block]);
+            if (write.page == pc::kInvalidHostPage) { continue; }
+            std::byte* base =
+                static_cast<std::byte*>(prefix_host_allocator_->data(write.page));
+            for (int rank = 0; rank < execution_.tp; ++rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                const ScopedDevice scope(execution_.dev[r]->device);
+                std::byte* dst = base + r * prefix_block_rank_bytes_;
+                for (int qsa = 0; qsa < TextConfig::qsa_layers(); ++qsa) {
+                    const ops::QsaCacheView cache = states_[r]->cache(qsa);
+                    const auto page_bytes = [](const Tensor& plane) {
+                        return static_cast<std::size_t>(plane.ne[0]) *
+                               static_cast<std::size_t>(plane.ne[1]) *
+                               static_cast<std::size_t>(plane.ne[2]) * sizeof(std::uint16_t);
+                    };
+                    const std::size_t k_bytes = page_bytes(cache.k_pages);
+                    const std::size_t v_bytes = page_bytes(cache.v_pages);
+                    const std::size_t index_bytes = page_bytes(cache.index_k_pages);
+                    const cudaStream_t stream = states_[r]->stream();
+                    const auto* src = static_cast<const std::byte*>(cache.k_pages.data) +
+                                      block * k_bytes;
+                    CUDA_CHECK(cudaMemcpyAsync(dst, src, k_bytes, cudaMemcpyDeviceToHost, stream));
+                    dst += k_bytes;
+                    src = static_cast<const std::byte*>(cache.v_pages.data) + block * v_bytes;
+                    CUDA_CHECK(cudaMemcpyAsync(dst, src, v_bytes, cudaMemcpyDeviceToHost, stream));
+                    dst += v_bytes;
+                    src = static_cast<const std::byte*>(cache.index_k_pages.data) +
+                          block * index_bytes;
+                    CUDA_CHECK(cudaMemcpyAsync(dst, src, index_bytes, cudaMemcpyDeviceToHost, stream));
+                    dst += index_bytes;
+                }
+            }
+            for (int rank = 0; rank < execution_.tp; ++rank) {
+                const ScopedDevice scope(execution_.dev[static_cast<std::size_t>(rank)]->device);
+                CUDA_CHECK(cudaStreamSynchronize(states_[static_cast<std::size_t>(rank)]->stream()));
+            }
+            prefix_index_->finish_host_write(published.block_nodes[block], true);
+        }
+        const auto image = prefix_index_->begin_snapshot_write(published.snapshot);
+        if (image.page != pc::kInvalidHostPage) {
+            std::byte* base = static_cast<std::byte*>(prefix_host_allocator_->data(image.page));
+            for (int rank = 0; rank < execution_.tp; ++rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                std::byte* rank_base = base + r * prefix_snapshot_rank_bytes_;
+                std::memcpy(rank_base, &prefix_snapshot_headers_[r],
+                            sizeof(state_transaction_detail::StateImageHeader));
+                const ScopedDevice scope(execution_.dev[r]->device);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    rank_base + sizeof(state_transaction_detail::StateImageHeader),
+                    prefix_snapshot_staging_[r]->p, prefix_snapshot_staging_[r]->bytes,
+                    cudaMemcpyDeviceToHost, states_[r]->stream()));
+            }
+            for (int rank = 0; rank < execution_.tp; ++rank) {
+                const ScopedDevice scope(execution_.dev[static_cast<std::size_t>(rank)]->device);
+                CUDA_CHECK(cudaStreamSynchronize(states_[static_cast<std::size_t>(rank)]->stream()));
+            }
+            prefix_index_->finish_snapshot_write(published.snapshot, true);
+            const std::uint64_t manifest = prefix_index_->publish_snapshot_manifest(
+                published.snapshot, shared_tier_owner_, static_cast<std::uint32_t>(execution_.tp),
+                generation);
+            RetainedPrefix& retained = retained_[lane];
+            retained.valid     = true;
+            retained.frontier  = published.frontier;
+            retained.snapshot  = published.snapshot;
+            retained.generation = generation;
+            retained.manifest_id = manifest;
+            retained.hashes.assign(state.block_hashes.begin(),
+                                   state.block_hashes.begin() + static_cast<std::ptrdiff_t>(blocks));
+        }
+    } catch (...) {
+      // Publication is a best-effort cache side effect; it must never change request semantics.
+    }
+}
+
 void ProgramImplCore::prefill_chunk(LaneState& state, std::uint32_t begin, std::uint32_t count) {
     const std::span<const TokenId> chunk{state.context.prompt_tokens.data() + begin, count};
     const std::uint32_t base = states_[0]->next_position();
@@ -486,6 +690,8 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
 
 bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     std::uint32_t lane, const RequestPlan& plan) const noexcept {
+    // Retained prefixes live in pinned host memory; evicting one frees a manifest reference and
+    // its lane metadata but no device KV, so admission cannot improve beyond the plain check.
     return can_admit_lane(lane, plan);
 }
 
@@ -564,7 +770,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     state.transient  = std::move(transient);
     state.sampling   = plan.impl_->sampling;
     state.context.prompt_tokens = std::move(tokens);
+    state.block_hashes          = std::move(data.block_hashes);
     state.context.processed_prompt_tokens = chunk;
+    capture_aligned_state(lane, chunk);
     state.timings.prefill_seconds += prefill_seconds;
     state.context.decode_ready = state.context.processed_prompt_tokens >=
                                  static_cast<std::uint32_t>(state.context.prompt_tokens.size());
@@ -602,6 +810,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t l
     state.timings.prefill_seconds +=
         std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_start).count();
     state.context.processed_prompt_tokens += chunk;
+    capture_aligned_state(lane, state.context.processed_prompt_tokens);
     state.context.decode_ready = state.context.processed_prompt_tokens >=
                                  static_cast<std::uint32_t>(state.context.prompt_tokens.size());
     if (state.context.decode_ready) {
@@ -968,7 +1177,10 @@ void ProgramImplCore::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
     if (lane >= plan_->max_concurrency) {
         throw std::invalid_argument("qwen4_exp prefill resolution lane is outside the finalized concurrency");
     }
-    if (terminal) { clear_lane(lane); }
+    if (terminal) {
+        publish_prefix(lane);
+        clear_lane(lane);
+    }
 }
 
 void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes,
@@ -994,20 +1206,27 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             }
             state.context.next_input = state.last_round_token;
         }
-        if (finished) { clear_lane(lane); }
+        if (finished) {
+            publish_prefix(lane);
+            clear_lane(lane);
+        }
     }
 }
 
 void ProgramImplCore::abort_lane(std::uint32_t lane) noexcept {
-    if (lane < plan_->max_concurrency) { clear_lane(lane); }
+    if (lane < plan_->max_concurrency) {
+        release_retained(lane);
+        clear_lane(lane);
+    }
 }
 
 bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
-    (void)lane;
-    return false;
+    return lane < plan_->max_concurrency && retained_[lane].valid;
 }
 
-void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept { (void)lane; }
+void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
+    if (lane < plan_->max_concurrency) { release_retained(lane); }
+}
 
 GenerationTimings
 ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
@@ -1096,10 +1315,13 @@ MetricsSnapshot ProgramImplCore::metrics() const noexcept {
 }
 
 PrefixProbe ProgramImplCore::prefix_probe(std::span<const std::uint64_t> hashes) const {
-    (void)hashes;
-    PrefixProbe probe;
-    probe.block_tokens = 64;
-    return probe;
+    if (prefix_index_ == nullptr) {
+        PrefixProbe probe;
+        probe.block_tokens = static_cast<std::uint32_t>(pc::kBlockTokens);
+        return probe;
+    }
+    return probe_prefix(*prefix_index_, shared_tier_.get(),
+                        static_cast<std::uint32_t>(execution_.tp), hashes);
 }
 
 CapacitySnapshot ProgramImplCore::capacity_snapshot() const noexcept {

@@ -3,9 +3,13 @@
 #include "core/cyclic_kv_cache.h"
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
+#include "runtime/prefix_cache/prefix_index.h"
+#include "runtime/prefix_cache/shared_host_tier.h"
 #include "targets/qwen4_exp/impl/runtime/instance.h"
 #include "targets/qwen4_exp/impl/runtime/layouts.h"
+#include "targets/qwen4_exp/impl/runtime/prefix_cache_impl.h"
 #include "targets/qwen4_exp/impl/runtime/sampling.h"
+#include "targets/qwen4_exp/impl/runtime/state_image.h"
 #include "targets/qwen4_exp/impl/runtime/text_context.h"
 #include "targets/qwen4_exp/impl/runtime/workspace_recipe.h"
 #include "targets/qwen3_8_flash_next/impl/dflash2_draft.h"
@@ -52,6 +56,8 @@ struct LaneState {
     runtime::TransientRegion transient;
     GenerationTimings timings;
     ops::SamplingConfig sampling{};
+    std::vector<std::uint64_t> block_hashes;
+    std::uint32_t capture_frontier = 0;
     TokenId last_round_token = 0;
     bool has_last_round_token = false;
     bool active = false;
@@ -142,18 +148,22 @@ public:
     [[nodiscard]] std::uint64_t peer_egress_check_mismatches() const noexcept { return 0; }
 
     [[nodiscard]] std::shared_ptr<SharedHostTier> shared_host_tier() const noexcept {
-        return nullptr;
+        return shared_tier_;
     }
-    void set_shared_tier_owner(std::uint64_t owner) noexcept { (void)owner; }
+    void set_shared_tier_owner(std::uint64_t owner) noexcept { shared_tier_owner_ = owner; }
 
 private:
     [[nodiscard]] runtime::RequestPlanSummary make_summary(std::uint32_t prompt_tokens,
-                                                           std::uint32_t requested_output_tokens,
-                                                           std::size_t transient_bytes) const;
+                                                            std::uint32_t requested_output_tokens,
+                                                            std::size_t transient_bytes) const;
     [[nodiscard]] std::uint32_t page_groups_for(std::uint32_t tokens) const noexcept;
     void clear_lane(std::uint32_t lane) noexcept;
+    void capture_aligned_state(std::uint32_t lane, std::uint32_t frontier);
+    void publish_prefix(std::uint32_t lane) noexcept;
+    void release_retained(std::uint32_t lane) noexcept;
     void prefill_chunk(LaneState& state, std::uint32_t begin, std::uint32_t count);
     void setup_dflash2();
+    void setup_prefix_cache();
     void dflash2_capture_committed(std::uint32_t start_position, std::int32_t count);
     TokenId decode_dflash2(LaneState& state, const runtime::RoundBudget& budget,
                            std::vector<TokenId>& committed);
@@ -174,6 +184,16 @@ private:
     std::unique_ptr<ops::CollectiveComms> comms_;
     std::unique_ptr<TextTrunk> trunk_;
     std::unique_ptr<GraphDecodeController> graph_;
+    PrefixCacheSink prefix_sink_;
+    std::unique_ptr<pc::PrefixIndex> prefix_index_;
+    std::shared_ptr<SharedHostTier> shared_tier_;
+    pc::HostPageAllocator* prefix_host_allocator_ = nullptr;
+    std::uint64_t shared_tier_owner_ = 0;
+    std::size_t prefix_block_rank_bytes_ = 0;
+    std::size_t prefix_snapshot_rank_bytes_ = 0;
+    std::array<std::unique_ptr<DeviceBuffer>, kMaximumDevices> prefix_snapshot_staging_;
+    std::array<state_transaction_detail::StateImageHeader, kMaximumDevices> prefix_snapshot_headers_{};
+    std::array<RetainedPrefix, kMaximumConcurrency> retained_;
     std::unique_ptr<ninfer::targets::qwen3_8_flash_next::detail::MtpDraft> mtp_draft_;
     std::unique_ptr<ninfer::targets::qwen3_8_flash_next::detail::DFlash2Draft> dflash2_draft_;
     std::unique_ptr<artifact::MaterializedArtifact> dflash2_materialized_;

@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "targets/qwen4_exp/impl/runtime/state_image.h"
 #include "targets/qwen4_exp/impl/runtime/text_context_impl.h"
 
 #include <cstddef>
@@ -22,52 +23,6 @@ struct RankSnapshot {
     std::uint64_t current  = 0;
     DeviceBuffer buffer;
 };
-
-inline std::size_t page_bytes(const Tensor& plane) {
-    return static_cast<std::size_t>(plane.ne[0]) * static_cast<std::size_t>(plane.ne[1]) *
-           static_cast<std::size_t>(plane.ne[2]) * 2;
-}
-
-inline void require_room(std::size_t cursor, std::size_t bytes, std::size_t limit) {
-    if (cursor + bytes > limit) {
-        throw std::runtime_error("MTP state snapshot exceeds its device buffer");
-    }
-}
-
-inline void copy_out(const Tensor& tensor, std::byte* base, std::size_t& cursor,
-                     std::size_t limit, cudaStream_t stream) {
-    const std::size_t bytes = tensor.bytes();
-    require_room(cursor, bytes, limit);
-    CUDA_CHECK(cudaMemcpyAsync(base + cursor, tensor.data, bytes, cudaMemcpyDeviceToDevice, stream));
-    cursor += bytes;
-}
-
-inline void copy_in(const Tensor& tensor, const std::byte* base, std::size_t& cursor,
-                    std::size_t limit, cudaStream_t stream) {
-    const std::size_t bytes = tensor.bytes();
-    require_room(cursor, bytes, limit);
-    CUDA_CHECK(cudaMemcpyAsync(tensor.data, base + cursor, bytes, cudaMemcpyDeviceToDevice, stream));
-    cursor += bytes;
-}
-
-inline void copy_raw_out(const void* source, std::size_t bytes, std::byte* base,
-                         std::size_t& cursor, std::size_t limit, cudaStream_t stream) {
-    require_room(cursor, bytes, limit);
-    CUDA_CHECK(cudaMemcpyAsync(base + cursor, source, bytes, cudaMemcpyDeviceToDevice, stream));
-    cursor += bytes;
-}
-
-inline void copy_raw_in(void* destination, std::size_t bytes, const std::byte* base,
-                        std::size_t& cursor, std::size_t limit, cudaStream_t stream) {
-    require_room(cursor, bytes, limit);
-    CUDA_CHECK(cudaMemcpyAsync(destination, base + cursor, bytes, cudaMemcpyDeviceToDevice, stream));
-    cursor += bytes;
-}
-
-inline void skip_bytes(std::size_t bytes, std::size_t& cursor, std::size_t limit) {
-    require_room(cursor, bytes, limit);
-    cursor += bytes;
-}
 
 inline void copy_plane_out(const Tensor& plane, int page, std::size_t bytes, std::byte* base,
                            std::size_t& cursor, std::size_t limit, cudaStream_t stream) {
@@ -168,37 +123,40 @@ struct StateTransaction::Impl {
 
     void capture_state(State& state, RankSnapshot& snapshot, bool include_gdn, bool include_kv) {
         CUDA_CHECK(cudaSetDevice(state.device_id()));
-        snapshot.position = state.next_position();
-        snapshot.previous = state.ple_tail(0);
-        snapshot.current  = state.ple_tail(1);
         auto* base = static_cast<std::byte*>(snapshot.buffer.p);
         const std::size_t limit = snapshot.buffer.bytes;
         std::size_t cursor = 0;
         const cudaStream_t stream = state.stream();
-        for (std::size_t index = 0; index < state.gdn_state_entries(); ++index) {
-            if (include_gdn) {
-                state_transaction_detail::copy_out(state.gdn_conv_state(index), base, cursor, limit, stream);
-                state_transaction_detail::copy_out(state.gdn_recurrent_state(index), base, cursor, limit, stream);
-            } else {
+        if (include_gdn) {
+            const auto header =
+                state_transaction_detail::capture_state_image(state, base, cursor, limit, stream);
+            snapshot.position = header.position;
+            snapshot.previous = header.previous;
+            snapshot.current  = header.current;
+        } else {
+            snapshot.position = state.next_position();
+            snapshot.previous = state.ple_tail(0);
+            snapshot.current  = state.ple_tail(1);
+            for (std::size_t index = 0; index < state.gdn_state_entries(); ++index) {
                 state_transaction_detail::skip_bytes(state.gdn_conv_state(index).bytes(), cursor,
                                                      limit);
                 state_transaction_detail::skip_bytes(state.gdn_recurrent_state(index).bytes(), cursor,
                                                      limit);
             }
+            for (int slot = 0; slot < TextConfig::qsa_layers(); ++slot) {
+                const ops::QsaTailStateView tail = state.before_tail(slot);
+                state_transaction_detail::copy_out(tail.raw_keys, base, cursor, limit, stream);
+                state_transaction_detail::copy_out(tail.first_rope, base, cursor, limit, stream);
+            }
+            {
+                const ops::QsaTailStateView tail = state.tail(0);
+                state_transaction_detail::copy_out(tail.raw_keys, base, cursor, limit, stream);
+                state_transaction_detail::copy_out(tail.first_rope, base, cursor, limit, stream);
+            }
+            state_transaction_detail::copy_out(state.ple_history(), base, cursor, limit, stream);
+            state_transaction_detail::copy_raw_out(state.route_counter(), sizeof(std::int32_t), base,
+                                                   cursor, limit, stream);
         }
-        for (int slot = 0; slot < TextConfig::qsa_layers(); ++slot) {
-            const ops::QsaTailStateView tail = state.before_tail(slot);
-            state_transaction_detail::copy_out(tail.raw_keys, base, cursor, limit, stream);
-            state_transaction_detail::copy_out(tail.first_rope, base, cursor, limit, stream);
-        }
-        {
-            const ops::QsaTailStateView tail = state.tail(0);
-            state_transaction_detail::copy_out(tail.raw_keys, base, cursor, limit, stream);
-            state_transaction_detail::copy_out(tail.first_rope, base, cursor, limit, stream);
-        }
-        state_transaction_detail::copy_out(state.ple_history(), base, cursor, limit, stream);
-        state_transaction_detail::copy_raw_out(state.route_counter(), sizeof(std::int32_t), base,
-                                               cursor, limit, stream);
         copy_kv(state, snapshot, base, cursor, limit, true, include_kv);
     }
 
@@ -209,32 +167,32 @@ struct StateTransaction::Impl {
         const std::size_t limit = snapshot.buffer.bytes;
         std::size_t cursor = 0;
         const cudaStream_t stream = state.stream();
-        for (std::size_t index = 0; index < state.gdn_state_entries(); ++index) {
-            if (include_gdn) {
-                state_transaction_detail::copy_in(state.gdn_conv_state(index), base, cursor, limit, stream);
-                state_transaction_detail::copy_in(state.gdn_recurrent_state(index), base, cursor, limit, stream);
-            } else {
+        if (include_gdn) {
+            state_transaction_detail::restore_state_image(state, base, cursor, limit, stream);
+        } else {
+            for (std::size_t index = 0; index < state.gdn_state_entries(); ++index) {
                 state_transaction_detail::skip_bytes(state.gdn_conv_state(index).bytes(), cursor,
                                                      limit);
                 state_transaction_detail::skip_bytes(state.gdn_recurrent_state(index).bytes(), cursor,
                                                      limit);
             }
+            for (int slot = 0; slot < TextConfig::qsa_layers(); ++slot) {
+                const ops::QsaTailStateView tail = state.before_tail(slot);
+                state_transaction_detail::copy_in(tail.raw_keys, base, cursor, limit, stream);
+                state_transaction_detail::copy_in(tail.first_rope, base, cursor, limit, stream);
+            }
+            {
+                const ops::QsaTailStateView tail = state.tail(0);
+                state_transaction_detail::copy_in(tail.raw_keys, base, cursor, limit, stream);
+                state_transaction_detail::copy_in(tail.first_rope, base, cursor, limit, stream);
+            }
+            state_transaction_detail::copy_in(state.ple_history(), base, cursor, limit, stream);
+            state_transaction_detail::copy_raw_in(state.route_counter(), sizeof(std::int32_t), base,
+                                                  cursor, limit, stream);
         }
-        for (int slot = 0; slot < TextConfig::qsa_layers(); ++slot) {
-            const ops::QsaTailStateView tail = state.before_tail(slot);
-            state_transaction_detail::copy_in(tail.raw_keys, base, cursor, limit, stream);
-            state_transaction_detail::copy_in(tail.first_rope, base, cursor, limit, stream);
-        }
-        {
-            const ops::QsaTailStateView tail = state.tail(0);
-            state_transaction_detail::copy_in(tail.raw_keys, base, cursor, limit, stream);
-            state_transaction_detail::copy_in(tail.first_rope, base, cursor, limit, stream);
-        }
-        state_transaction_detail::copy_in(state.ple_history(), base, cursor, limit, stream);
-        state_transaction_detail::copy_raw_in(state.route_counter(), sizeof(std::int32_t), base,
-                                              cursor, limit, stream);
         copy_kv(state, snapshot, base, cursor, limit, false, include_kv);
     }
+
 };
 
 StateTransaction::StateTransaction(std::array<State*, kMaximumDevices> states, int tp,
