@@ -431,6 +431,14 @@ ninfer_add_test(ninfer_qwen4_exp_prefix_publish_real_test
   LIBRARIES ninfer_engine)
 target_link_libraries(ninfer_qwen4_exp_prefix_publish_real_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen4_exp_prefix_publish_real_test PROPERTIES SKIP_RETURN_CODE 77)
+# F2 consumer-side gate: same-prefix reuse must reproduce cold greedy tokens exactly, including the
+# 64-token boundary, a multi-chunk prefix, an unmatched prompt and the DFlash2 proposal path.
+ninfer_add_test(ninfer_qwen4_exp_prefix_consume_real_test
+  SOURCES targets/qwen4_exp/test_prefix_consume_integration.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen4_exp_prefix_consume_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen4_exp_prefix_consume_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)

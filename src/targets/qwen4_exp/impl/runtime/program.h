@@ -29,12 +29,18 @@ template <>
 struct RequestBasePlanImpl<NINFER_QWEN4EXP_VARIANT> {
     runtime::RequestPlanSummary summary;
     ops::SamplingConfig sampling{};
+    PrefixReusePath reuse          = PrefixReusePath::FullReset;
+    std::uint32_t reuse_base       = 0;
+    std::uint64_t manifest_id      = 0;
 };
 
 template <>
 struct RequestPlanImpl<NINFER_QWEN4EXP_VARIANT> {
     runtime::RequestPlanSummary summary;
     ops::SamplingConfig sampling{};
+    PrefixReusePath reuse          = PrefixReusePath::FullReset;
+    std::uint32_t reuse_base       = 0;
+    std::uint64_t manifest_id      = 0;
 };
 
 } // namespace ninfer::targets::qwen4_exp::detail
@@ -58,6 +64,9 @@ struct LaneState {
     ops::SamplingConfig sampling{};
     std::vector<std::uint64_t> block_hashes;
     std::uint32_t capture_frontier = 0;
+    PrefixReusePath reuse = PrefixReusePath::FullReset;
+    std::uint32_t reuse_base = 0;
+    std::uint64_t manifest_id = 0;
     TokenId last_round_token = 0;
     bool has_last_round_token = false;
     bool active = false;
@@ -160,6 +169,10 @@ private:
     void clear_lane(std::uint32_t lane) noexcept;
     void capture_aligned_state(std::uint32_t lane, std::uint32_t frontier);
     void publish_prefix(std::uint32_t lane) noexcept;
+    [[nodiscard]] bool restore_prefix(std::uint32_t lane,
+                                      const PreparedPromptData& prompt,
+                                      std::uint32_t reuse_base,
+                                      std::uint64_t manifest_id);
     void release_retained(std::uint32_t lane) noexcept;
     void prefill_chunk(LaneState& state, std::uint32_t begin, std::uint32_t count);
     void setup_dflash2();

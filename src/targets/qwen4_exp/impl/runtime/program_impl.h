@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <numeric>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <sys/resource.h>
@@ -609,6 +611,7 @@ void ProgramImplCore::publish_prefix(std::uint32_t lane) noexcept {
             const std::uint64_t manifest = prefix_index_->publish_snapshot_manifest(
                 published.snapshot, shared_tier_owner_, static_cast<std::uint32_t>(execution_.tp),
                 generation);
+            release_retained(lane);
             RetainedPrefix& retained = retained_[lane];
             retained.valid     = true;
             retained.frontier  = published.frontier;
@@ -620,6 +623,112 @@ void ProgramImplCore::publish_prefix(std::uint32_t lane) noexcept {
         }
     } catch (...) {
       // Publication is a best-effort cache side effect; it must never change request semantics.
+    }
+}
+
+bool ProgramImplCore::restore_prefix(std::uint32_t lane, const PreparedPromptData& prompt,
+                                     std::uint32_t reuse_base, std::uint64_t manifest_id) {
+    if (reuse_base == 0 || reuse_base % pc::kBlockTokens != 0 || manifest_id == 0 ||
+        shared_tier_ == nullptr || prefix_host_allocator_ == nullptr ||
+        reuse_base >= prompt.token_ids.size()) {
+        return false;
+    }
+    const std::size_t blocks = reuse_base / pc::kBlockTokens;
+    if (blocks > prompt.block_hashes.size()) { return false; }
+    ManifestLease lease(*shared_tier_, manifest_id);
+    if (!lease.held()) { return false; }
+    const auto hashes = std::span<const std::uint64_t>(prompt.block_hashes).first(blocks);
+    const auto view = shared_tier_->match(static_cast<std::uint32_t>(execution_.tp), hashes,
+                                          reuse_base);
+    if (!view.has_value() || view->id != manifest_id || view->frontier != reuse_base ||
+        view->hashes != std::vector<std::uint64_t>(hashes.begin(), hashes.end()) ||
+        view->block_pages.size() != blocks || view->state_page == pc::kInvalidHostPage) {
+        return false;
+    }
+
+    const auto page_bytes = [](const Tensor& plane) {
+        return static_cast<std::size_t>(plane.ne[0]) * static_cast<std::size_t>(plane.ne[1]) *
+               static_cast<std::size_t>(plane.ne[2]) * sizeof(std::uint16_t);
+    };
+    try {
+        // Check the continuation frontier before touching device state: a manifest whose image was
+        // captured at a different position cannot be replayed as this request's prefix.
+        using Header = state_transaction_detail::StateImageHeader;
+        for (int rank = 0; rank < execution_.tp; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            Header header{};
+            const std::byte* rank_base =
+                static_cast<const std::byte*>(prefix_host_allocator_->data(view->state_page)) +
+                r * prefix_snapshot_rank_bytes_;
+            std::memcpy(&header, rank_base, sizeof(header));
+            if (header.position != reuse_base) { return false; }
+        }
+
+        for (int rank = 0; rank < execution_.tp; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            states_[r]->reset();
+        }
+
+        for (std::size_t block = 0; block < blocks; ++block) {
+            const std::byte* slab =
+                static_cast<const std::byte*>(prefix_host_allocator_->data(view->block_pages[block]));
+            for (int rank = 0; rank < execution_.tp; ++rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                const ScopedDevice scope(execution_.dev[r]->device);
+                const cudaStream_t stream = states_[r]->stream();
+                const std::byte* src = slab + r * prefix_block_rank_bytes_;
+                for (int qsa = 0; qsa < TextConfig::qsa_layers(); ++qsa) {
+                    const ops::QsaCacheView cache = states_[r]->cache(qsa);
+                    const std::size_t k_bytes = page_bytes(cache.k_pages);
+                    const std::size_t v_bytes = page_bytes(cache.v_pages);
+                    const std::size_t index_bytes = page_bytes(cache.index_k_pages);
+                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(cache.k_pages.data) +
+                                                   block * k_bytes,
+                                               src, k_bytes, cudaMemcpyHostToDevice, stream));
+                    src += k_bytes;
+                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(cache.v_pages.data) +
+                                                   block * v_bytes,
+                                               src, v_bytes, cudaMemcpyHostToDevice, stream));
+                    src += v_bytes;
+                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(cache.index_k_pages.data) +
+                                                   block * index_bytes,
+                                               src, index_bytes, cudaMemcpyHostToDevice, stream));
+                    src += index_bytes;
+                }
+            }
+        }
+
+        for (int rank = 0; rank < execution_.tp; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            const std::size_t image_bytes =
+                static_cast<std::size_t>(prefix_snapshot_staging_[r]->bytes);
+            const ScopedDevice scope(execution_.dev[r]->device);
+            const cudaStream_t stream = states_[r]->stream();
+            const std::byte* rank_base =
+                static_cast<const std::byte*>(prefix_host_allocator_->data(view->state_page)) +
+                r * prefix_snapshot_rank_bytes_;
+            Header header{};
+            std::memcpy(&header, rank_base, sizeof(header));
+            states_[r]->rewind_scalars(header.position, header.previous, header.current);
+            CUDA_CHECK(cudaMemcpyAsync(prefix_snapshot_staging_[r]->p,
+                                       rank_base + sizeof(Header), image_bytes,
+                                       cudaMemcpyHostToDevice, stream));
+            std::size_t cursor = 0;
+            state_transaction_detail::restore_state_image(
+                *states_[r], static_cast<std::byte*>(prefix_snapshot_staging_[r]->p), cursor,
+                image_bytes, stream);
+        }
+        for (int rank = 0; rank < execution_.tp; ++rank) {
+            const ScopedDevice scope(execution_.dev[static_cast<std::size_t>(rank)]->device);
+            CUDA_CHECK(cudaStreamSynchronize(states_[static_cast<std::size_t>(rank)]->stream()));
+        }
+        LaneState& state = lanes_[lane];
+        state.reuse      = PrefixReusePath::BlockSnapshot;
+        state.reuse_base = reuse_base;
+        state.manifest_id = manifest_id;
+        return true;
+    } catch (const std::exception&) {
+        return false;
     }
 }
 
@@ -657,11 +766,56 @@ RequestBasePlan ProgramImplCore::plan_request_base(const PreparedPrompt& prompt,
         throw std::invalid_argument("qwen4_exp request reservation exceeds the finalized capacity");
     }
 
-    return RequestBasePlan(std::make_unique<RequestBasePlanImpl>(RequestBasePlanImpl{
+    RequestBasePlanImpl impl{
         .summary  = make_summary(prompt_tokens, options.requested_output_tokens,
                                  plan_->request_transient_capacity_bytes),
         .sampling = translate_sampling(options.sampling),
-    }));
+    };
+
+    // Content-addressed host-prefix consumption. The local index verifies exact tokens along the
+    // matched block path; only a host-resident snapshot may supply continuation state because the
+    // F1 publisher never wrote the index's device snapshot slots. The shared manifest is the sole
+    // backing store for both the KV blocks and the state image.
+    if (options.allow_prefix_reuse && prefix_index_ != nullptr && shared_tier_ != nullptr &&
+        !data.block_hashes.empty()) {
+        const pc::PrefixMatch matched = prefix_index_->match(
+            data.token_ids, data.block_hashes, std::span<const std::uint64_t>{});
+        std::uint32_t frontier = matched.best_host_frontier;
+        const pc::Snapshot* snapshot =
+            matched.best_host == pc::kInvalidSnapshot ? nullptr : prefix_index_->snapshot(matched.best_host);
+        const std::uint32_t alignment =
+            std::lcm(plan_->prefill_chunk, static_cast<std::uint32_t>(pc::kBlockTokens));
+        if (snapshot != nullptr && snapshot->live && snapshot->tail_len == 0 &&
+            snapshot->frontier == frontier && frontier > 0 && frontier < prompt_tokens &&
+            matched.matched_blocks >= frontier / pc::kBlockTokens) {
+            frontier = frontier / alignment * alignment;
+        } else {
+            frontier = 0;
+        }
+        if (frontier > 0) {
+            const std::size_t blocks = frontier / pc::kBlockTokens;
+            const auto hashes = std::span<const std::uint64_t>(data.block_hashes).first(blocks);
+            const auto manifest = shared_tier_->match(
+                static_cast<std::uint32_t>(execution_.tp), hashes, frontier);
+            if (manifest.has_value() && manifest->id != 0 && manifest->frontier == frontier &&
+                manifest->hashes == std::vector<std::uint64_t>(hashes.begin(), hashes.end()) &&
+                manifest->block_pages.size() == blocks &&
+                manifest->state_page != pc::kInvalidHostPage) {
+                impl.reuse          = PrefixReusePath::BlockSnapshot;
+                impl.reuse_base     = frontier;
+                impl.manifest_id    = manifest->id;
+                impl.summary.reusable_prompt_tokens = frontier;
+                const std::uint64_t prefill_units =
+                    1ULL + (static_cast<std::uint64_t>(prompt_tokens) - frontier - 1ULL) /
+                               plan_->prefill_chunk;
+                impl.summary.service_work_quanta =
+                    prefill_units + (options.requested_output_tokens == 0
+                                         ? 0ULL
+                                         : static_cast<std::uint64_t>(options.requested_output_tokens) - 1ULL);
+            }
+        }
+    }
+    return RequestBasePlan(std::make_unique<RequestBasePlanImpl>(std::move(impl)));
 }
 
 RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
@@ -675,8 +829,14 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         throw std::logic_error("qwen4_exp lane plan does not match its base plan");
     }
 
-    return RequestPlan(std::make_unique<RequestPlanImpl>(
-        RequestPlanImpl{.summary = base.summary(), .sampling = base.impl_->sampling}));
+    const RequestBasePlanImpl& from = *base.impl_;
+    return RequestPlan(std::make_unique<RequestPlanImpl>(RequestPlanImpl{
+        .summary     = base.summary(),
+        .sampling    = from.sampling,
+        .reuse       = from.reuse,
+        .reuse_base  = from.reuse_base,
+        .manifest_id = from.manifest_id,
+    }));
 }
 
 bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
@@ -749,12 +909,23 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         }
     }
     std::vector<TokenId>& tokens = data.token_ids;
+    const std::uint32_t planned_base =
+        plan.impl_->reuse == PrefixReusePath::BlockSnapshot ? plan.impl_->reuse_base : 0U;
+    const bool restored = planned_base != 0 &&
+                          restore_prefix(lane, data, planned_base, plan.impl_->manifest_id);
+    const std::uint32_t base = restored ? planned_base : 0U;
+    if (!restored && planned_base != 0) {
+        for (int rank = 0; rank < execution_.tp; ++rank) {
+            states_[static_cast<std::size_t>(rank)]->reset();
+        }
+    }
     const std::uint32_t chunk = std::min(plan_->prefill_chunk,
-                                         static_cast<std::uint32_t>(tokens.size()));
+                                         static_cast<std::uint32_t>(tokens.size()) - base);
     const auto prefill_start = std::chrono::steady_clock::now();
     const std::uint32_t prefill_base = states_[0]->next_position();
     last_stage_capture() = &logits_capture_;
-    const TokenId sampled = trunk_->prefill(std::span<const TokenId>{tokens.data(), chunk});
+    const TokenId sampled =
+        trunk_->prefill(std::span<const TokenId>{tokens.data() + base, chunk});
     const double prefill_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_start).count();
     if (dflash2_drafter_ != nullptr) {
@@ -769,10 +940,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     state.active     = true;
     state.transient  = std::move(transient);
     state.sampling   = plan.impl_->sampling;
+    state.reuse      = restored ? PrefixReusePath::BlockSnapshot : PrefixReusePath::FullReset;
+    state.reuse_base = base;
+    state.manifest_id = restored ? plan.impl_->manifest_id : 0;
     state.context.prompt_tokens = std::move(tokens);
     state.block_hashes          = std::move(data.block_hashes);
-    state.context.processed_prompt_tokens = chunk;
-    capture_aligned_state(lane, chunk);
+    state.context.processed_prompt_tokens = base + chunk;
+    capture_aligned_state(lane, base + chunk);
     state.timings.prefill_seconds += prefill_seconds;
     state.context.decode_ready = state.context.processed_prompt_tokens >=
                                  static_cast<std::uint32_t>(state.context.prompt_tokens.size());
@@ -784,7 +958,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
 
     runtime::PrefillStepResult result;
     result.summary.prompt_tokens          = static_cast<std::uint32_t>(state.context.prompt_tokens.size());
-    result.summary.reused_prompt_tokens   = 0;
+    result.summary.reused_prompt_tokens   = base;
+    result.summary.prefix_reuse_path      = state.reuse;
+    result.summary.prefix_reuse_reason    = restored ? PrefixReuseReason::ReusedBlockSnapshot
+                                                   : PrefixReuseReason::None;
     result.round.tokens = state.context.decode_ready
                               ? std::span<const TokenId>{&state.context.next_input, 1}
                               : std::span<const TokenId>{};
@@ -820,7 +997,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t l
 
     runtime::PrefillStepResult result;
     result.summary.prompt_tokens          = static_cast<std::uint32_t>(state.context.prompt_tokens.size());
-    result.summary.reused_prompt_tokens   = 0;
+    result.summary.reused_prompt_tokens   = state.reuse_base;
+    result.summary.prefix_reuse_path      = state.reuse;
+    result.summary.prefix_reuse_reason    = state.reuse == PrefixReusePath::BlockSnapshot
+                                                ? PrefixReuseReason::ReusedBlockSnapshot
+                                                : PrefixReuseReason::None;
     result.round.tokens = state.context.decode_ready
                               ? std::span<const TokenId>{&state.context.next_input, 1}
                               : std::span<const TokenId>{};

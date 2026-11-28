@@ -5,7 +5,8 @@
 // The upstream qwen4_exp Session checkpoints/state-image/reclaim algorithms were re-expressed
 // against this fork's PrefixIndex/SharedHostTier host cache: KV pages are published as 64-token
 // blocks, the continuation state as one page-aligned endpoint snapshot, both into pinned host
-// slabs. The consumer side (restore/suffix prefill) is deliberately not part of this cut.
+// slabs. The consumer side restores those slabs into device KV/continuation state and prefills
+// only the suffix tokens.
 
 #include <ninfer/types.h>
 #include "runtime/prefix_cache/prefix_index.h"
@@ -113,6 +114,25 @@ struct RetainedPrefix {
     std::uint32_t generation = 0;
     std::uint64_t manifest_id = 0;
     std::vector<std::uint64_t> hashes;
+};
+
+// Holds a shared-tier manifest alive for the duration of a host-to-device prefix restore. The
+// publisher's own reference is independent; releasing this lease does not disturb publication.
+class ManifestLease {
+public:
+    ManifestLease(SharedHostTier& tier, std::uint64_t id) noexcept
+        : tier_(tier), id_(id), held_(tier.retain_manifest(id)) {}
+    ~ManifestLease() noexcept {
+        if (held_) { (void)tier_.release_manifest(id_); }
+    }
+    ManifestLease(const ManifestLease&) = delete;
+    ManifestLease& operator=(const ManifestLease&) = delete;
+    [[nodiscard]] bool held() const noexcept { return held_; }
+
+private:
+    SharedHostTier& tier_;
+    std::uint64_t id_;
+    bool held_;
 };
 
 } // namespace ninfer::targets::qwen4_exp::detail
