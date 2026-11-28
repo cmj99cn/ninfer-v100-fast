@@ -66,3 +66,16 @@
 - `prefill=46.3tok/s`（24 token）到 `79.3tok/s`（43 token）——短 prompt 固定开销占比高。
 
 结论：服务端慢的三要素是 **无前缀复用（必须实现）+ 短/多轮反复全量 prefill + 冷专家缓存**；投机解码本身可用（`--spec dflash2 --draft-tokens 5 --draft-model <companion>`）。
+
+### 端到端前缀复用实测（F1+F2，2026-11-28）
+
+serve: Flash-Next + DFlash2-5 + `--expert-cache-profile` + `--host-cache-mib 4096` + `--prefix-cache`
++ `--prefill-chunk 512`（TP2，greedy）：
+- req1（冷，985 prompt）：`reuse=full_reset`，TTFT **3416 ms**，wall 3.73 s。
+- req2（同前缀 512 token + suffix，1015 prompt）：`cache=512 reuse=block_snapshot
+  reuse_reason=reused_block_snapshot`，TTFT **1770 ms（−48%）**，wall 2.06 s。
+
+**关键配置约束**：F2 的复用 frontier 按 `lcm(prefill_chunk,64)` 对齐。若 `--prefill-chunk 8192`
+（27B 服务默认值），任何 <8192 token 的 prompt 的 frontier 都取整为 0 → 无法复用（实测两条
+请求均 `full_reset`）。Flash-Next 服务要启用前缀复用必须用小 chunk（如 512），或后续把
+F2 的对齐改为仅 64（需保证 suffix prefill 的 chunk 网格与 cold 一致）。
